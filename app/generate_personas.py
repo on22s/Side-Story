@@ -8,6 +8,8 @@ import shutil
 import tempfile
 from openai import OpenAI
 
+from llm_utils import chat_completion, resolve_api_key
+
 from tts import TTSEngine, sanitize_filename
 from utils import atomic_json_write as _atomic_json_write
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
@@ -158,7 +160,7 @@ def _collect_narrator_context(script, speaker, window=4):
     return context_lines
 
 
-def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
+def _resolve_aliases_batch(client, model_name, speakers_info, existing_names, reasoning_effort=None):
     """Resolve aliases for all speakers in a single one-shot LLM call.
 
     speakers_info is a dict:
@@ -209,12 +211,14 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
     )
 
     try:
-        response = client.chat.completions.create(
-            model=model_name,
+        response = chat_completion(
+            client,
+            model_name,
             messages=[
                 {"role": "system", "content": "You are a precise casting director. You output ONLY valid JSON."},
                 {"role": "user", "content": prompt}
             ],
+            reasoning_effort=reasoning_effort,
             temperature=0.1,
             max_tokens=max(1500, len(speakers_info) * 80),
         )
@@ -521,7 +525,7 @@ def _save_generated_preview(root, engine, voice_config, speaker, description, re
         return False
 
 
-def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None):
+def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None, reasoning_effort=None):
     ref_dir = os.path.join(root, "persona_refs")
     os.makedirs(ref_dir, exist_ok=True)
 
@@ -535,12 +539,14 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
         prompt = _build_batch_discovery_prompt(batch_start, batch, selected_speakers)
         print(f"Advanced discovery batch {batch_number}/{len(batches)} ({len(batch)} entries)")
         try:
-            response = client.chat.completions.create(
-                model=model_name,
+            response = chat_completion(
+                client,
+                model_name,
                 messages=[
                     {"role": "system", "content": "You produce concise JSON only."},
                     {"role": "user", "content": prompt}
                 ],
+                reasoning_effort=reasoning_effort,
                 temperature=0.2,
                 max_tokens=4000,
             )
@@ -589,12 +595,14 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
         description = ""
         ref_text = ""
         try:
-            response = client.chat.completions.create(
-                model=model_name,
+            response = chat_completion(
+                client,
+                model_name,
                 messages=[
                     {"role": "system", "content": system_prompt or "You produce concise JSON only."},
                     {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt)}
                 ],
+                reasoning_effort=reasoning_effort,
                 temperature=0.25,
                 max_tokens=600,
             )
@@ -674,10 +682,13 @@ def main():
 
     llm_cfg = config.get("llm", {})
     base_url = llm_cfg.get("base_url", "http://localhost:11434/v1")
-    api_key = llm_cfg.get("api_key", "local")
+    api_key = resolve_api_key(llm_cfg.get("api_key", "local"))
     model_name = llm_cfg.get("model_name", "richardyoung/qwen3-14b-abliterated:Q8_0")
+    reasoning_effort = llm_cfg.get("reasoning_effort")
 
     client = OpenAI(base_url=base_url, api_key=api_key)
+    if reasoning_effort:
+        print(f"Reasoning effort: {reasoning_effort}")
 
     # Load persona prompts from config, fall back to defaults
     prompts_cfg = config.get("prompts", {})
@@ -725,6 +736,7 @@ def main():
             args=args,
             system_prompt=persona_system,
             advanced_prompt=persona_advanced,
+            reasoning_effort=reasoning_effort,
         )
         try:
             _atomic_json_write(voice_config, voice_config_path)
@@ -780,7 +792,13 @@ def main():
             existing_configured = list(voice_config.keys()) + list(batch_mapping.values())
             
             print(f"Resolving alias batch {idx//chunk_size + 1} ({len(chunk)} speakers)...")
-            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured)
+            chunk_mapping = _resolve_aliases_batch(
+                client,
+                model_name,
+                speakers_info,
+                existing_configured,
+                reasoning_effort=reasoning_effort,
+            )
             batch_mapping.update(chunk_mapping)
 
         # Build case-insensitive normalized lookup mapping to survive LLM key casing changes
@@ -830,12 +848,14 @@ def main():
                 sample_lines=sample_text
             )
 
-            response = client.chat.completions.create(
-                model=model_name,
+            response = chat_completion(
+                client,
+                model_name,
                 messages=[
                     {"role": "system", "content": persona_system},
                     {"role": "user", "content": user_prompt}
                 ],
+                reasoning_effort=reasoning_effort,
                 temperature=0.3,
                 max_tokens=400,
             )

@@ -4,6 +4,7 @@ import json
 import re
 import argparse
 from openai import OpenAI
+from llm_utils import chat_completion, resolve_api_key
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 
 # Cap for single-speaker mode: entries at this size pass through
@@ -230,7 +231,7 @@ def split_into_chunks(text, max_size=3000):
 
     return chunks
 
-def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None):
+def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, reasoning_effort=None):
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
     sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -265,16 +266,18 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
 
     for attempt in range(max_retries + 1):
         try:
-            response = client.chat.completions.create(
-                model=model_name,
+            response = chat_completion(
+                client,
+                model_name,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
+                reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
-                max_tokens=max_tokens,
                 extra_body={
                     k: v for k, v in {
                         "top_k": top_k if top_k else None,
@@ -431,8 +434,9 @@ def main():
 
     llm_config = config.get("llm", {})
     base_url = llm_config.get("base_url", "http://localhost:11434/v1")
-    api_key = llm_config.get("api_key", "local")
+    api_key = resolve_api_key(llm_config.get("api_key", "local"))
     model_name = llm_config.get("model_name", "richardyoung/qwen3-14b-abliterated:Q8_0")
+    reasoning_effort = llm_config.get("reasoning_effort")
 
     # Load custom prompts or use defaults
     prompts_config = config.get("prompts", {})
@@ -452,6 +456,8 @@ def main():
 
     print(f"Connecting to: {base_url}")
     print(f"Using model: {model_name}")
+    if reasoning_effort:
+        print(f"Reasoning effort: {reasoning_effort}")
     print(f"Chunk size: {chunk_size} chars, Max tokens: {max_tokens}")
     if banned_tokens:
         print(f"Banned tokens: {banned_tokens}")
@@ -484,7 +490,8 @@ def main():
             top_k=top_k,
             min_p=min_p,
             presence_penalty=presence_penalty,
-            banned_tokens=banned_tokens
+            banned_tokens=banned_tokens,
+            reasoning_effort=reasoning_effort
         )
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")

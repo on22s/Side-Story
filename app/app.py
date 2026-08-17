@@ -196,6 +196,8 @@ class LLMConfig(BaseModel):
     base_url: str
     api_key: str
     model_name: str
+    # GPT-5.6/o-series reasoning level; leave empty for local models.
+    reasoning_effort: Optional[str] = None
 
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
@@ -471,7 +473,8 @@ async def get_config():
         "llm": {
             "base_url": "http://localhost:11434/v1",
             "api_key": "local",
-            "model_name": "richardyoung/qwen3-14b-abliterated:Q8_0"
+            "model_name": "richardyoung/qwen3-14b-abliterated:Q8_0",
+            "reasoning_effort": None
         },
         "tts": {
             "mode": "local",

@@ -111,6 +111,19 @@
                             <label class="form-label">Model Name</label>
                             <input type="text" class="form-control" id="llm-model" placeholder="local-model">
                         </div>
+                        <div class="mb-3">
+                            <label class="form-label">Reasoning Effort</label>
+                            <select class="form-select" id="llm-reasoning">
+                                <option value="">Default / disabled</option>
+                                <option value="none">None</option>
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="xhigh">XHigh</option>
+                                <option value="max">Max</option>
+                            </select>
+                            <div class="form-text">For GPT-5.6 Luna, choose Max to use the highest reasoning effort. Leave empty for Ollama/LM Studio models.</div>
+                        </div>
 
                         <h5 class="mb-3 mt-4">TTS Settings (Voice Generation)</h5>
                         <div class="row mb-3">
@@ -1176,6 +1189,7 @@
                 document.getElementById('llm-url').value = config.llm.base_url;
                 document.getElementById('llm-key').value = config.llm.api_key;
                 document.getElementById('llm-model').value = config.llm.model_name;
+                document.getElementById('llm-reasoning').value = config.llm.reasoning_effort || '';
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-device').value = config.tts.device || 'auto';
@@ -1351,7 +1365,8 @@
                 llm: {
                     base_url: document.getElementById('llm-url').value,
                     api_key: document.getElementById('llm-key').value,
-                    model_name: document.getElementById('llm-model').value
+                    model_name: document.getElementById('llm-model').value,
+                    reasoning_effort: document.getElementById('llm-reasoning').value || null
                 },
                 tts: {
                     mode: document.getElementById('tts-mode').value,

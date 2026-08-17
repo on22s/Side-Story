@@ -79,3 +79,5 @@ preparer_output/
 # Docker persistent data
 data/
 
+# CLI long-form audiobook projects (book text and generated audio are local data)
+books/
