@@ -831,14 +831,14 @@ class ProjectManager:
 
         return reordered
 
-    def generate_chunks_batch(self, indices, batch_seed=-1, batch_size=4, progress_callback=None,
+    def generate_chunks_batch(self, indices, batch_seed=-1, batch_size=48, progress_callback=None,
                                batch_group_by_type=False, cancel_check=None):
         """Generate multiple chunks using batch TTS API with a single seed.
 
         Args:
             indices: List of chunk indices to generate
             batch_seed: Single seed for all generations (-1 for random)
-            batch_size: Number of chunks per batch request
+            batch_size: Per-endpoint HTTP batch size; dual HTTP endpoints use one dispatch window per endpoint
             progress_callback: Optional callback(completed, failed, total) for progress updates
             batch_group_by_type: Group indices by voice type before batching for
                 GPU efficiency. When False, indices are batched in sequential order.
@@ -887,9 +887,25 @@ class ProjectManager:
         if batch_group_by_type:
             indices = self._group_indices_by_voice_type(indices, chunks, voice_config)
 
-        # Split indices into batches
-        batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
-        print(f"Processing {len(batches)} batches...")
+        # batch_size is the per-endpoint HTTP batch size. With two
+        # independent TTS endpoints, make each project dispatch window large
+        # enough to fill both endpoints concurrently (48 + 48 by default).
+        configured_batch_size = max(1, int(batch_size or 1))
+        dispatch_batch_size = configured_batch_size
+        if getattr(engine, "supports_http_batch", False):
+            endpoint_count = max(1, int(getattr(engine, "endpoint_count", 1)))
+            dispatch_batch_size *= endpoint_count
+
+        # Split indices into dispatch windows. The HTTP engine splits each
+        # window back into per-endpoint requests capped by its batch setting.
+        batches = [
+            indices[i:i + dispatch_batch_size]
+            for i in range(0, len(indices), dispatch_batch_size)
+        ]
+        print(
+            f"Processing {len(batches)} batches "
+            f"(dispatch_window={dispatch_batch_size}, per_endpoint={configured_batch_size})..."
+        )
 
         cancelled = False
         for batch_num, batch_indices in enumerate(batches):

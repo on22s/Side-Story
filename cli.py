@@ -45,10 +45,12 @@ ROOT_DIR = Path(__file__).resolve().parent
 APP_DIR = ROOT_DIR / "app"
 DEFAULT_BOOKS_DIR = ROOT_DIR / "books"
 SCHEMA_VERSION = 1
-PROMPT_VERSION = os.environ.get("ALEXANDRIA_PROMPT_VERSION", "script_v1")
+PROMPT_VERSION = os.environ.get("ALEXANDRIA_PROMPT_VERSION", "script_v2_roles_profiles")
 SUMMARY_PROMPT_VERSION = os.environ.get("ALEXANDRIA_SUMMARY_PROMPT_VERSION", "summary_v1")
 CODEX_TIMEOUT_SECONDS = int(os.environ.get("ALEXANDRIA_CODEX_TIMEOUT", "1800"))
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex-spark"
+CHAPTER_AUDIO_SUFFIX = ".m4b"
+LEGACY_CHAPTER_AUDIO_SUFFIX = ".m4a"
 
 
 class PipelineError(RuntimeError):
@@ -145,9 +147,22 @@ def load_config() -> Dict[str, Any]:
                 continue
     return {
         "tts": {
-            "mode": os.environ.get("ALEXANDRIA_TTS_MODE", "local"),
+            "mode": os.environ.get("ALEXANDRIA_TTS_MODE", "external"),
+            "url": "http://127.0.0.1:18000/tts",
+            "urls": [
+                "http://127.0.0.1:18000/tts",
+                "http://127.0.0.1:18001/tts",
+            ],
+            "external_batch_size": 48,
+            "voice_profile_urls": [
+                "http://127.0.0.1:18000/voice_profiles/design",
+                "http://127.0.0.1:18001/voice_profiles/design",
+            ],
+            "voice_profile_timeout": 900,
+            "voice_profile_required": True,
             "device": os.environ.get("ALEXANDRIA_TTS_DEVICE", "auto"),
-            "language": os.environ.get("ALEXANDRIA_TTS_LANGUAGE", "Auto"),
+            "language": os.environ.get("ALEXANDRIA_TTS_LANGUAGE", "Chinese"),
+            "parallel_workers": 2,
         }
     }
 
@@ -351,6 +366,378 @@ def title_for_chapter(book: Dict[str, Any], number: int) -> str:
     return f"Chapter {number}"
 
 
+_CHINESE_NUMERAL_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_NUMERAL_UNITS = {
+    "十": 10,
+    "百": 100,
+    "千": 1000,
+    "万": 10000,
+    "亿": 100000000,
+}
+_ORIGINAL_CHAPTER_PREFIX_PATTERNS = (
+    re.compile(
+        r"^\s*第\s*(?P<number>[0-9零〇一二三四五六七八九十百千万两亿]+)\s*"
+        r"(?:章|节|回|卷|集|篇|部)\s*(?P<title>.*?)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:chapter|chap\.?)\s*(?P<number>[0-9]+)\s*"
+        r"[-:：.、]?\s*(?P<title>.*?)\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _parse_novel_chapter_number(value: str) -> Optional[int]:
+    """Parse Arabic or common Chinese numerals used by the source novel."""
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    if any(char not in _CHINESE_NUMERAL_DIGITS and char not in _CHINESE_NUMERAL_UNITS for char in value):
+        return None
+
+    total = 0
+    section = 0
+    number = 0
+    for char in value:
+        if char in _CHINESE_NUMERAL_DIGITS:
+            number = _CHINESE_NUMERAL_DIGITS[char]
+            continue
+        unit = _CHINESE_NUMERAL_UNITS[char]
+        if unit < 10000:
+            section += (number or 1) * unit
+            number = 0
+        else:
+            section += number
+            total += section * unit
+            section = 0
+            number = 0
+    return total + section + number
+
+
+def _split_original_chapter_title(value: str) -> Tuple[Optional[int], str]:
+    for pattern in _ORIGINAL_CHAPTER_PREFIX_PATTERNS:
+        match = pattern.match(str(value or ""))
+        if match:
+            return _parse_novel_chapter_number(match.group("number")), match.group("title").strip()
+    return None, ""
+
+
+def _title_from_chapter_source(book_dir: Path, number: int) -> str:
+    """Recover a title stored on the line after a standalone chapter heading."""
+    source_path = chapter_root(book_dir, number) / "source.txt"
+    if not source_path.exists():
+        return ""
+    try:
+        lines = [line.strip() for line in source_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except OSError:
+        return ""
+    for line in lines[:4]:
+        _, inline_title = _split_original_chapter_title(line)
+        if inline_title:
+            return inline_title
+        if _looks_like_chapter_heading(line):
+            continue
+        # Avoid mistaking the first sentence of a chapter for its title.
+        if len(line) <= 80 and not re.search(r"[。！？!?；;]$", line):
+            return line
+        break
+    return ""
+
+
+def _safe_filename_component(value: str, fallback: str) -> str:
+    value = re.sub(r"[\x00-\x1f\x7f<>:\"/\\|?*]", "-", str(value or ""))
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value or fallback
+
+
+_ARC_ALIASES = {
+    "main": "main",
+    "正文": "main",
+    "主线": "main",
+    "xian": "xian",
+    "xianjie": "xian",
+    "仙": "xian",
+    "仙界": "xian",
+    "仙界篇": "xian",
+    "outside": "outside",
+    "wai": "outside",
+    "外": "outside",
+    "外传": "outside",
+}
+_ARC_DISPLAY_NAMES = {
+    "main": "正文",
+    "xian": "仙界篇",
+    "outside": "外传",
+}
+_ARC_FILENAME_PREFIXES = {
+    "main": "正",
+    "xian": "仙",
+    "outside": "外",
+}
+_ARC_ORDER = ("main", "xian", "outside")
+
+
+def normalize_arc(value: str = "main") -> str:
+    key = str(value or "main").strip().lower()
+    normalized = _ARC_ALIASES.get(key)
+    if normalized is None:
+        raise PipelineError(
+            f"未知章节分区：{value}；可用值为 main、xian/仙界篇、outside/外传"
+        )
+    return normalized
+
+
+def arc_display_name(arc: str) -> str:
+    return _ARC_DISPLAY_NAMES[normalize_arc(arc)]
+
+
+def chapter_display_label(arc: str, number: int) -> str:
+    arc = normalize_arc(arc)
+    if arc == "main":
+        return f"小说第 {number} 章"
+    return f"{arc_display_name(arc)}第 {number} 章"
+
+
+def chapter_audio_filename(
+    book_dir: Path,
+    book: Dict[str, Any],
+    number: int,
+    arc: str = "main",
+    novel_number: Optional[int] = None,
+) -> str:
+    """Return the stable ABS filename based on the novel's original chapter."""
+    arc = normalize_arc(arc)
+    original_heading = title_for_chapter(book, number)
+    original_number, chapter_title = _split_original_chapter_title(original_heading)
+    if not chapter_title:
+        chapter_title = _title_from_chapter_source(book_dir, number)
+    if novel_number is not None:
+        original_number = int(novel_number)
+    if original_number is None:
+        original_number = number
+    if not chapter_title:
+        chapter_title = original_heading or f"Chapter {original_number}"
+    chapter_title = _safe_filename_component(chapter_title, f"Chapter {original_number}")
+    prefix = _ARC_FILENAME_PREFIXES[arc]
+    return f"{prefix}_{original_number}_{chapter_title}{CHAPTER_AUDIO_SUFFIX}"
+
+
+_NOVEL_INDEX_VERSION = 4
+_NARRATIVE_MIN_CHARS = 80
+_NARRATIVE_SECTION_MARKERS = (
+    "目录",
+    "附录",
+    "APPENDIX",
+    "凡人相关文章",
+    "凡人修仙传仙界篇",
+    "凡人修仙传外传",
+)
+
+
+def _chapter_manifest_fingerprint(book: Dict[str, Any]) -> str:
+    payload = {
+        "source_sha256": book.get("source_sha256"),
+        "chapters": book.get("chapters", []),
+    }
+    return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _is_narrative_chapter_candidate(book_dir: Path, item: Dict[str, Any]) -> bool:
+    """Reject TOC/heading-only entries before building the public chapter map."""
+    try:
+        internal = int(item.get("number"))
+        source_chars = int(item.get("source_chars") or 0)
+    except (TypeError, ValueError):
+        return False
+    if internal <= 0 or source_chars < _NARRATIVE_MIN_CHARS:
+        return False
+    source_path = chapter_root(book_dir, internal) / "source.txt"
+    try:
+        text = source_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    leading_lines = [line.strip() for line in text.splitlines() if line.strip()][:16]
+    for line in leading_lines:
+        normalized = re.sub(r"\s+", "", line)
+        if normalized.upper() == "APPENDIX" or normalized in _NARRATIVE_SECTION_MARKERS:
+            return False
+        if normalized.startswith(("凡人修仙传仙界篇", "凡人修仙传外传", "凡人相关文章")):
+            return False
+    return bool(re.search(r"[。！？!?；;，,]", text))
+
+
+def _valid_novel_chapter_index(mapping: Dict[int, int]) -> bool:
+    if not mapping:
+        return False
+    numbers = sorted(mapping)
+    if numbers != list(range(1, numbers[-1] + 1)):
+        return False
+    internal_numbers = list(mapping.values())
+    return len(internal_numbers) == len(set(internal_numbers)) and all(number > 0 for number in internal_numbers)
+
+
+def _contiguous_chapter_runs(candidates: List[Tuple[int, int]]) -> List[List[Tuple[int, int]]]:
+    """Group runs with consecutive public numbers and ordered source records."""
+    runs: List[List[Tuple[int, int]]] = []
+    current: List[Tuple[int, int]] = []
+    for candidate in candidates:
+        if current:
+            previous_public, previous_internal = current[-1]
+            public_number, internal_number = candidate
+            if public_number == previous_public + 1 and internal_number > previous_internal:
+                current.append(candidate)
+                continue
+            runs.append(current)
+        current = [candidate]
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _candidate_chapters(book_dir: Path, book: Dict[str, Any]) -> List[Tuple[int, int]]:
+    candidates: List[Tuple[int, int]] = []
+    for item in book.get("chapters", []):
+        if not isinstance(item, dict) or not _is_narrative_chapter_candidate(book_dir, item):
+            continue
+        novel_number, _ = _split_original_chapter_title(str(item.get("title") or ""))
+        if novel_number is None or novel_number <= 0:
+            continue
+        candidates.append((novel_number, int(item["number"])))
+    return candidates
+
+
+def _run_to_mapping(run: List[Tuple[int, int]]) -> Dict[int, int]:
+    mapping = {novel_number: internal_number for novel_number, internal_number in run}
+    if not _valid_novel_chapter_index(mapping):
+        return {}
+    return mapping
+
+
+def _build_novel_chapter_maps(book_dir: Path, book: Dict[str, Any]) -> Dict[str, Dict[int, int]]:
+    """Build strict maps for the main novel and its two appended arcs.
+
+    The imported manifest has a long main-body run followed by a short
+    仙界篇 run and an 外传 run.  Only those ordered, contiguous runs are
+    public; unrelated appended records remain intentionally unreachable.
+    """
+    candidates = _candidate_chapters(book_dir, book)
+    runs = _contiguous_chapter_runs(candidates)
+    if not runs:
+        raise PipelineError("无法严格识别小说正文章节：没有正文候选")
+    main_run = max(runs, key=len)
+    main = _run_to_mapping(main_run)
+    if len(main) < 3:
+        raise PipelineError(
+            "无法严格识别小说正文章节：正文候选没有形成从第 1 章开始的连续序列；"
+            "已拒绝把目录、标题行或附录当成章节"
+        )
+
+    maps: Dict[str, Dict[int, int]] = {"main": main}
+    main_last_internal = max(main.values())
+    appended_candidates = [candidate for candidate in candidates if candidate[1] > main_last_internal]
+    appended_runs = _contiguous_chapter_runs(appended_candidates)
+    side_runs = [
+        run for run in appended_runs
+        if run and run[0][0] == 1 and _run_to_mapping(run)
+    ]
+    for arc, run in zip(("xian", "outside"), side_runs[:2]):
+        maps[arc] = _run_to_mapping(run)
+    return maps
+
+
+def _valid_novel_chapter_maps(maps: Dict[str, Dict[int, int]]) -> bool:
+    if "main" not in maps or not _valid_novel_chapter_index(maps["main"]):
+        return False
+    used_internal: set[int] = set()
+    for arc, mapping in maps.items():
+        if arc not in _ARC_ORDER or not _valid_novel_chapter_index(mapping):
+            return False
+        if used_internal.intersection(mapping.values()):
+            return False
+        used_internal.update(mapping.values())
+    return True
+
+
+def _mapping_sources_exist(book_dir: Path, maps: Dict[str, Dict[int, int]]) -> bool:
+    return all(
+        (chapter_root(book_dir, internal_number) / "source.txt").exists()
+        for mapping in maps.values()
+        for internal_number in mapping.values()
+    )
+
+
+def novel_chapter_maps(book_dir: Path, book: Dict[str, Any]) -> Dict[str, Dict[int, int]]:
+    """Return cached, validated public maps for all supported arcs."""
+    fingerprint = _chapter_manifest_fingerprint(book)
+    cache_path = book_dir / "state" / "novel_chapters.json"
+    cached = read_json(cache_path, None)
+    if (
+        isinstance(cached, dict)
+        and cached.get("version") == _NOVEL_INDEX_VERSION
+        and cached.get("manifest_fingerprint") == fingerprint
+        and isinstance(cached.get("arcs"), dict)
+    ):
+        raw_arcs = cached["arcs"]
+        maps: Dict[str, Dict[int, int]] = {}
+        for arc, raw_mapping in raw_arcs.items():
+            if not isinstance(raw_mapping, dict):
+                maps = {}
+                break
+            try:
+                maps[normalize_arc(arc)] = {int(key): int(value) for key, value in raw_mapping.items()}
+            except (TypeError, ValueError, PipelineError):
+                maps = {}
+                break
+        if maps and _valid_novel_chapter_maps(maps) and _mapping_sources_exist(book_dir, maps):
+            return maps
+
+    maps = _build_novel_chapter_maps(book_dir, book)
+    atomic_write_json(
+        cache_path,
+        {
+            "version": _NOVEL_INDEX_VERSION,
+            "manifest_fingerprint": fingerprint,
+            "arcs": {
+                arc: {str(key): value for key, value in mapping.items()}
+                for arc, mapping in maps.items()
+            },
+            # Keep the main map at a predictable key for simple external tools.
+            "chapters": {str(key): value for key, value in maps["main"].items()},
+            "updated_at": now_iso(),
+        },
+    )
+    return maps
+
+
+def novel_chapter_index(book_dir: Path, book: Dict[str, Any]) -> Dict[int, int]:
+    """Backward-compatible accessor for the main novel map."""
+    return novel_chapter_maps(book_dir, book)["main"]
+
+
+def available_novel_chapters(book_dir: Path, book: Dict[str, Any], arc: str = "main") -> List[int]:
+    arc = normalize_arc(arc)
+    maps = novel_chapter_maps(book_dir, book)
+    if arc not in maps:
+        raise PipelineError(f"没有识别出{arc_display_name(arc)}正文")
+    return sorted(maps[arc])
+
+
 def init_project(
     books_dir: Path,
     book_id: str,
@@ -416,49 +803,93 @@ def select_chapters(
     chapter: Optional[int] = None,
     first: Optional[int] = None,
     last: Optional[int] = None,
+    count: Optional[int] = None,
     continue_: bool = False,
     book_dir: Optional[Path] = None,
+    arc: str = "main",
 ) -> List[int]:
-    numbers = available_chapters(book)
-    if not numbers:
-        raise PipelineError("书籍没有章节")
+    if book_dir is None:
+        raise PipelineError("章节选择需要 book_dir，不能绕过正文章节映射")
+    arc = normalize_arc(arc)
+    maps = novel_chapter_maps(book_dir, book)
+    mapping = maps.get(arc)
+    if not mapping:
+        raise PipelineError(f"没有识别出{arc_display_name(arc)}正文")
+    novel_numbers = sorted(mapping)
+    section_label = arc_display_name(arc)
+
+    supplied_range_options = [value is not None for value in (first, last, count)]
     if chapter is not None:
-        if chapter not in numbers:
-            raise PipelineError(f"章节不存在：{chapter}")
-        return [chapter]
-    start = first if first is not None else min(numbers)
-    end = last if last is not None else max(numbers)
-    selected = [number for number in numbers if start <= number <= end]
-    if continue_ and book_dir:
-        for number in selected:
-            status = load_chapter_status(book_dir, number)
-            audio_exists = (chapter_root(book_dir, number) / "audio.m4a").exists()
-            if not status.get("done") or not audio_exists:
-                return [n for n in selected if n >= number]
+        if any(supplied_range_options):
+            raise PipelineError("--chapter 不能和 --from/--to/--count 同时使用")
+        if chapter not in mapping:
+            raise PipelineError(f"{section_label}第 {chapter} 章不存在（可用范围：1-{max(novel_numbers)}）")
+        requested_novel_numbers = [chapter]
+    else:
+        if count is not None:
+            if count <= 0:
+                raise PipelineError("--count 必须是正整数")
+            if last is not None:
+                raise PipelineError("--count 不能和 --to 同时使用")
+        start = first if first is not None else min(novel_numbers)
+        if count is not None:
+            end = start + count - 1
+        else:
+            end = last if last is not None else max(novel_numbers)
+        if start <= 0 or end < start:
+            raise PipelineError(f"{section_label}章节范围无效")
+        requested_novel_numbers = list(range(start, end + 1))
+        missing = [number for number in requested_novel_numbers if number not in mapping]
+        if missing:
+            preview = ", ".join(str(number) for number in missing[:12])
+            suffix = "..." if len(missing) > 12 else ""
+            raise PipelineError(f"{section_label}章节不存在：{preview}{suffix}")
+
+    if continue_:
+        published_dir = book_dir / "output" / "chapters"
+        for position, novel_number in enumerate(requested_novel_numbers):
+            internal_number = mapping[novel_number]
+            status = load_chapter_status(book_dir, internal_number)
+            audio_exists = (chapter_root(book_dir, internal_number) / f"audio{CHAPTER_AUDIO_SUFFIX}").exists()
+            published_exists = (
+                published_dir
+                / chapter_audio_filename(
+                    book_dir, book, internal_number, arc=arc, novel_number=novel_number
+                )
+            ).exists()
+            if not status.get("done") or not audio_exists or not published_exists:
+                return [mapping[number] for number in requested_novel_numbers[position:]]
         return []
-    return selected
+    return [mapping[number] for number in requested_novel_numbers]
 
 
 def print_status(book_dir: Path, as_json: bool = False) -> None:
     book = load_book(book_dir)
+    maps = novel_chapter_maps(book_dir, book)
     rows: List[Dict[str, Any]] = []
-    for number in available_chapters(book):
-        status = load_chapter_status(book_dir, number)
-        rows.append({
-            "chapter": number,
-            "title": title_for_chapter(book, number),
-            "analysis": bool(status.get("analysis")),
-            "summary": bool(status.get("summary")),
-            "voices": bool(status.get("voices")),
-            "tts": bool(status.get("tts")),
-            "done": bool(status.get("done")),
-            "analysis_chunks_done": int(status.get("analysis_chunks_done", 0)),
-            "tts_lines_done": int(status.get("tts_lines_done", 0)),
-        })
+    for arc in _ARC_ORDER:
+        mapping = maps.get(arc, {})
+        for novel_number in sorted(mapping):
+            internal_number = mapping[novel_number]
+            status = load_chapter_status(book_dir, internal_number)
+            rows.append({
+                "arc": arc,
+                "arc_name": arc_display_name(arc),
+                "chapter": novel_number,
+                "title": title_for_chapter(book, internal_number),
+                "analysis": bool(status.get("analysis")),
+                "summary": bool(status.get("summary")),
+                "voices": bool(status.get("voices")),
+                "tts": bool(status.get("tts")),
+                "done": bool(status.get("done")),
+                "analysis_chunks_done": int(status.get("analysis_chunks_done", 0)),
+                "tts_lines_done": int(status.get("tts_lines_done", 0)),
+            })
     summary = {
         "book": book.get("book_id"),
         "title": book.get("title"),
         "chapters": len(rows),
+        "arcs": {arc: len(maps.get(arc, {})) for arc in _ARC_ORDER if arc in maps},
         "done": sum(1 for row in rows if row["done"]),
         "analysis": sum(1 for row in rows if row["analysis"]),
         "tts": sum(1 for row in rows if row["tts"]),
@@ -468,11 +899,22 @@ def print_status(book_dir: Path, as_json: bool = False) -> None:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
     print(f"{summary['title']} ({summary['book']})")
-    print(f"chapters: {summary['chapters']} | analysis: {summary['analysis']} | tts: {summary['tts']} | done: {summary['done']}")
-    print("CHAPTER  ANALYSIS  VOICES  TTS  DONE  TITLE")
+    arc_summary = " | ".join(
+        f"{arc_display_name(arc)}: {summary['arcs'].get(arc, 0)}"
+        for arc in _ARC_ORDER
+        if arc in summary["arcs"]
+    )
+    print(
+        f"chapters: {summary['chapters']} ({arc_summary}) | "
+        f"analysis: {summary['analysis']} | tts: {summary['tts']} | done: {summary['done']}"
+    )
+    print("ARC  NOVEL_CHAPTER  ANALYSIS  VOICES  TTS  DONE  TITLE")
     for row in rows:
         flags = "  ".join("✓" if row[key] else "-" for key in ("analysis", "voices", "tts", "done"))
-        print(f"{row['chapter']:>7}  {flags:<22}  {row['title'][:60]}")
+        print(
+            f"{row['arc']:<7} {row['chapter']:>5}  {flags:<22}  "
+            f"{row['title'][:60]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -489,20 +931,36 @@ def _pipeline_from_args(args: argparse.Namespace) -> BookPipeline:
 
 def command_run(args: argparse.Namespace, analysis_only: bool = False, render_only: bool = False) -> int:
     pipeline = _pipeline_from_args(args)
+    arc = normalize_arc(getattr(args, "arc", "main"))
     selected = select_chapters(
         pipeline.book,
         chapter=getattr(args, "chapter", None),
         first=getattr(args, "from_chapter", None),
         last=getattr(args, "to_chapter", None),
-        continue_=getattr(args, "continue_", False),
+        count=getattr(args, "count", None),
+        continue_=getattr(args, "continue_", False) and not getattr(args, "force", False),
         book_dir=pipeline.book_dir,
+        arc=arc,
     )
     if not selected:
         print("没有需要继续处理的章节")
         return 0
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run and not render_only:
+        print(f"codex model: {pipeline.codex.model} (dry-run，不调用 Codex/TTS)")
+        for number in selected:
+            status = load_chapter_status(pipeline.book_dir, number)
+            print(
+                f"{pipeline.chapter_label(number)}: "
+                f"analysis={'done' if status.get('analysis') else 'pending'}, "
+                f"summary={'done' if status.get('summary') else 'pending'}, "
+                "audio=planned"
+            )
+        return 0
     if not render_only:
         print(f"codex model: {pipeline.codex.model}")
     for number in selected:
+        chapter_label = pipeline.chapter_label(number)
         force = bool(getattr(args, "force", False))
         if not render_only:
             status = load_chapter_status(pipeline.book_dir, number)
@@ -519,18 +977,21 @@ def command_run(args: argparse.Namespace, analysis_only: bool = False, render_on
         if analysis_only:
             continue
         if render_only or not analysis_only:
-            dry_run = bool(getattr(args, "dry_run", False))
             pipeline.render_chapter(number, force=force, dry_run=dry_run)
-            print(f"chapter {number}: {'checked' if dry_run else 'DONE'}")
+            print(f"{chapter_label}: {'checked' if dry_run else 'DONE'}")
     return 0
 
 
 def command_review(args: argparse.Namespace) -> int:
     pipeline = _pipeline_from_args(args)
-    numbers = select_chapters(pipeline.book, chapter=args.chapter, first=None, last=None, book_dir=pipeline.book_dir)
+    arc = normalize_arc(getattr(args, "arc", "main"))
+    numbers = select_chapters(
+        pipeline.book, chapter=args.chapter, first=None, last=None,
+        book_dir=pipeline.book_dir, arc=arc
+    )
     for number in numbers:
         pipeline.review_chapter(number, force=args.force)
-        print(f"chapter {number}: reviewed (TTS invalidated)")
+        print(f"{pipeline.chapter_label(number)}: reviewed (TTS invalidated)")
     return 0
 
 
@@ -577,27 +1038,30 @@ def build_parser() -> argparse.ArgumentParser:
     def add_range_options(command_parser: argparse.ArgumentParser, require_chapter: bool = False) -> None:
         command_parser.add_argument("--books-dir", dest="books_dir", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         command_parser.add_argument("--book", required=True)
-        command_parser.add_argument("--chapter", type=int, required=require_chapter)
-        command_parser.add_argument("--from", dest="from_chapter", type=int)
-        command_parser.add_argument("--to", dest="to_chapter", type=int)
-        command_parser.add_argument("--continue", dest="continue_", action="store_true", help="从第一个未完成章节继续")
+        command_parser.add_argument("--arc", default="main", help="章节分区：main、xian/仙界篇、outside/外传")
+        command_parser.add_argument("--chapter", type=int, required=require_chapter, help="分区内小说原始章节号")
+        command_parser.add_argument("--from", dest="from_chapter", type=int, help="起始小说章节号")
+        command_parser.add_argument("--to", dest="to_chapter", type=int, help="结束小说章节号（包含）")
+        command_parser.add_argument("--count", type=int, help="从 --from 起连续处理 N 个小说章节（包含起始章）")
+        command_parser.add_argument("--continue", dest="continue_", action="store_true", help="从范围内第一个未完成的小说章节继续")
         command_parser.add_argument("--force", action="store_true", help="忽略分析/TTS缓存")
 
-    run_parser = subparsers.add_parser("run", help="按章分析、摘要并渲染音频")
+    run_parser = subparsers.add_parser("run", help="按小说章节分析、摘要并渲染音频")
     add_range_options(run_parser)
     run_parser.add_argument("--dry-run", action="store_true", help="只验证流程，不加载 TTS 模型")
 
-    analyze_parser = subparsers.add_parser("analyze", help="只运行 Codex 分析和人物状态更新")
+    analyze_parser = subparsers.add_parser("analyze", help="只运行指定小说章节的 Codex 分析和人物状态更新")
     add_range_options(analyze_parser)
 
-    render_parser = subparsers.add_parser("render", help="只读取已有 script.json 并生成章节音频")
+    render_parser = subparsers.add_parser("render", help="只读取已有 script.json 并生成小说章节音频")
     add_range_options(render_parser)
     render_parser.add_argument("--dry-run", action="store_true", help="只检查待渲染行，不加载 TTS 模型")
 
-    review_parser = subparsers.add_parser("review", help="手动调用一次 Codex 审校指定章节（默认不自动运行）")
+    review_parser = subparsers.add_parser("review", help="手动调用一次 Codex 审校指定小说章节（默认不自动运行）")
     review_parser.add_argument("--books-dir", dest="books_dir", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     review_parser.add_argument("--book", required=True)
-    review_parser.add_argument("--chapter", type=int, required=True)
+    review_parser.add_argument("--arc", default="main", help="章节分区：main、xian/仙界篇、outside/外传")
+    review_parser.add_argument("--chapter", type=int, required=True, help="分区内小说原始章节号")
     review_parser.add_argument("--force", action="store_true")
 
     status_parser = subparsers.add_parser("status", help="查看章节状态")
@@ -605,9 +1069,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--book", required=True)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
 
-    export_parser = subparsers.add_parser("export", help="将章节 m4a 导出为带章节标记的 m4b")
+    export_parser = subparsers.add_parser("export", help="将章节 M4B 导出为带章节标记的 m4b")
     export_parser.add_argument("--books-dir", dest="books_dir", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     export_parser.add_argument("--book", required=True)
+    export_parser.add_argument("--arc", default="main", help="章节分区：main、xian/仙界篇、outside/外传")
     export_parser.add_argument("--format", choices=["m4b"], default="m4b")
     export_parser.add_argument("--from", dest="from_chapter", type=int)
     export_parser.add_argument("--to", dest="to_chapter", type=int)
@@ -652,7 +1117,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if args.command == "export":
             pipeline = _pipeline_from_args(args)
-            output = pipeline.export_m4b(args.from_chapter, args.to_chapter)
+            output = pipeline.export_m4b(args.from_chapter, args.to_chapter, args.arc)
             print(f"exported: {output}")
             return 0
         if args.command == "character":
@@ -813,7 +1278,9 @@ def load_chapter_status(book_dir: Path, number: int) -> Dict[str, Any]:
         status["done"] = False
     if status.get("summary") and not (chapter_dir / "summary.txt").exists():
         status["summary"] = False
-    if status.get("tts") and not (chapter_dir / "audio.m4a").exists():
+    current_audio = chapter_dir / f"audio{CHAPTER_AUDIO_SUFFIX}"
+    legacy_audio = chapter_dir / f"audio{LEGACY_CHAPTER_AUDIO_SUFFIX}"
+    if status.get("tts") and not current_audio.exists() and not legacy_audio.exists():
         status["tts"] = False
         status["done"] = False
     status["updated_at"] = now_iso()
@@ -860,6 +1327,11 @@ class CodexRunner:
     def __init__(self, book_dir: Path, model: Optional[str] = None) -> None:
         self.book_dir = book_dir
         self.model = str(os.environ.get("ALEXANDRIA_CODEX_MODEL") or model or DEFAULT_CODEX_MODEL).strip()
+        requested_effort = str(os.environ.get("ALEXANDRIA_CODEX_REASONING_EFFORT", "xhigh")).strip().lower()
+        # Codex CLI calls this level xhigh; older project docs used max.
+        if requested_effort == "max":
+            requested_effort = "xhigh"
+        self.reasoning_effort = requested_effort if requested_effort in {"low", "medium", "high", "xhigh"} else "high"
         configured = os.environ.get("ALEXANDRIA_CODEX_BIN", "codex")
         self.executable = shlex.split(configured)
         if not self.executable:
@@ -927,7 +1399,8 @@ class CodexRunner:
         output_path = cache_dir / f".codex_output_{os.getpid()}.json"
         atomic_write_json(schema_path, schema)
         command = self.executable + [
-            "exec", "--model", self.model, "--ephemeral", "--sandbox", "read-only",
+            "exec", "--config", f'model_reasoning_effort="{self.reasoning_effort}"',
+            "--model", self.model, "--ephemeral", "--sandbox", "read-only",
             "--output-schema", str(schema_path),
             "--output-last-message", str(output_path),
             "--cd", str(self.book_dir), "--skip-git-repo-check", "-",
@@ -1046,6 +1519,9 @@ SUMMARY_SCHEMA: Dict[str, Any] = {
 class _FakeTTSEngine:
     """Tiny opt-in renderer used for CLI smoke tests without model weights."""
 
+    def ensure_voice_profile(self, voice_profile_id: str, description: str, sample_text: str, language: str = "Chinese", seed: int = -1) -> Dict[str, Any]:
+        return {"voice_profile_id": voice_profile_id, "status": "ready", "cached": True}
+
     def generate_voice(self, text: str, instruct: str, speaker: str, voice_config: Dict[str, Any], output_path: str) -> bool:
         duration_ms = max(250, min(8000, 220 + len(text) * 28))
         sample_rate = 22050
@@ -1067,12 +1543,50 @@ class BookPipeline:
         self.book_dir = book_dir
         self.book = load_book(book_dir)
         ensure_project_state(book_dir)
+        self.chapter_maps = novel_chapter_maps(book_dir, self.book)
+        self.novel_index = self.chapter_maps["main"]
+        self.internal_to_identity = {
+            internal: (arc, novel)
+            for arc, mapping in self.chapter_maps.items()
+            for novel, internal in mapping.items()
+        }
+        self.internal_to_novel = {internal: novel for internal, (_, novel) in self.internal_to_identity.items()}
         self.characters, self.aliases, self.voices = load_state(book_dir)
         self.codex = CodexRunner(book_dir, self.book.get("codex_model"))
 
     @property
     def chapters_dir(self) -> Path:
         return self.book_dir / "chapters"
+
+    def chapter_identity(self, internal_number: int) -> Tuple[str, int]:
+        try:
+            return self.internal_to_identity[int(internal_number)]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PipelineError("请求的章节不在已验证的小说正文映射中") from exc
+
+    def chapter_arc(self, internal_number: int) -> str:
+        return self.chapter_identity(internal_number)[0]
+
+    def novel_chapter_number(self, internal_number: int) -> int:
+        return self.chapter_identity(internal_number)[1]
+
+    def chapter_label(self, internal_number: int) -> str:
+        arc, novel_number = self.chapter_identity(internal_number)
+        return chapter_display_label(arc, novel_number)
+
+    def internal_chapter(self, novel_number: int, arc: str = "main") -> int:
+        arc = normalize_arc(arc)
+        mapping = self.chapter_maps.get(arc)
+        if not mapping or int(novel_number) not in mapping:
+            raise PipelineError(f"{arc_display_name(arc)}第 {novel_number} 章不存在")
+        return mapping[int(novel_number)]
+
+    def _previous_internal_chapter(self, internal_number: int) -> Optional[int]:
+        arc, novel_number = self.chapter_identity(internal_number)
+        mapping = self.chapter_maps[arc]
+        if novel_number <= min(mapping):
+            return None
+        return mapping.get(novel_number - 1)
 
     def refresh_state(self) -> None:
         self.characters, self.aliases, self.voices = load_state(self.book_dir)
@@ -1094,27 +1608,85 @@ class BookPipeline:
     def _character_name(self, character_id: str) -> str:
         return str(self.characters.get(character_id, {}).get("name") or character_id)
 
+    def _book_voice_profile_id(self, character_id: str) -> str:
+        book_id = str(self.book.get("book_id") or self.book_dir.name).strip()
+        return f"vp_{book_id}_{character_id}"
+
+    def _voice_profile_id_for(self, voice_id: Optional[str]) -> Optional[str]:
+        record = self.voices.get(str(voice_id or ""))
+        if not isinstance(record, dict) or record.get("type") != "profile":
+            return None
+        value = str(record.get("voice_profile_id") or "").strip()
+        return value or None
+
+    def _remember_voice_sample(self, character_id: Optional[str], text: str) -> None:
+        if not character_id or character_id not in self.characters:
+            return
+        voice_id = str(self.characters[character_id].get("voice_id") or "")
+        voice = self.voices.get(voice_id)
+        if not isinstance(voice, dict) or voice.get("type") != "profile":
+            return
+        if not str(voice.get("profile_sample_text") or "").strip():
+            sample = re.sub(r"\s+", " ", str(text or "").strip())[:500].strip()
+            if sample:
+                voice["profile_sample_text"] = sample
+
+    def _voice_design_description(self, character_id: str, voice_id: str) -> str:
+        character = self.characters.get(character_id, {})
+        voice = self.voices.get(voice_id, {})
+        gender = str(character.get("gender") or "性别不明").strip()
+        age = str(character.get("age") or "年龄不明").strip()
+        style = str(voice.get("style") or character.get("description") or "自然、清晰、稳定").strip()
+        return f"中文有声书角色声音；{gender}；{age}；{style}"
+
     def _ensure_voice_record(self, character_id: str, style: str = "") -> str:
         record = self.characters[character_id]
+        voice_mode = os.environ.get("ALEXANDRIA_CHARACTER_VOICE_MODE", "profile").strip().lower()
+        profile_mode = voice_mode in {"profile", "xc", "voice_profile", "design_profile"}
         existing = str(record.get("voice_id") or "")
         if existing and existing in self.voices:
+            voice_record = self.voices[existing]
+            if isinstance(voice_record, dict) and voice_record.get("voice_type") == "persistent":
+                if profile_mode:
+                    profile_id = str(
+                        voice_record.get("voice_profile_id")
+                        or voice_record.get("profile_voice_profile_id")
+                        or self._book_voice_profile_id(character_id)
+                    ).strip()
+                    voice_record["voice_profile_id"] = profile_id
+                    voice_record["voice_profile_backend"] = "xc"
+                    voice_record["voice_profile_status"] = "pending"
+                    voice_record["type"] = "profile"
+                elif voice_mode in {"custom", "preset", "legacy"}:
+                    if voice_record.get("type") == "profile":
+                        voice_record["profile_voice_profile_id"] = (
+                            str(voice_record.get("voice_profile_id") or "").strip()
+                            or self._book_voice_profile_id(character_id)
+                        )
+                    voice_record["voice_profile_id"] = None
+                    voice_record["voice_profile_status"] = "disabled_for_custom"
+                    voice_record["type"] = "custom"
             return existing
         voice_id = _next_id("voice_", self.voices.keys())
         voice = _voice_choice(voice_id)
-        voice_mode = os.environ.get("ALEXANDRIA_CHARACTER_VOICE_MODE", "custom").strip().lower()
+        voice_type = "profile" if profile_mode else ("design" if voice_mode == "design" else "custom")
+        style = style or record.get("description") or "清晰、自然、稳定的说话声音"
         self.voices[voice_id] = {
             "voice_id": voice_id,
             "character_id": character_id,
             "voice_type": "persistent",
-            # A stable CustomVoice is the safe default for the first MVP.  A
-            # user can later replace this record with clone/design settings;
-            # the ID and all chapter scripts remain unchanged.
-            "type": "design" if voice_mode == "design" else "custom",
+            "type": voice_type,
             "voice": voice,
-            "style": style or record.get("description") or "clear, natural speaking voice",
+            "style": style,
             "reference_audio": None,
             "ref_audio": None,
             "ref_text": None,
+            "voice_profile_id": self._book_voice_profile_id(character_id) if profile_mode else None,
+            "voice_profile_backend": "xc" if profile_mode else None,
+            "voice_profile_status": "pending" if profile_mode else None,
+            "profile_description": style,
+            "profile_sample_text": None,
+            "profile_seed": -1,
             "locked": True,
         }
         record["voice_id"] = voice_id
@@ -1199,6 +1771,7 @@ class BookPipeline:
         script_entries: List[Dict[str, Any]],
     ) -> None:
         """Merge Codex's small metadata payload into persistent state."""
+        display_chapter = self.novel_chapter_number(chapter)
         new_by_name: Dict[str, Tuple[Optional[str], str]] = {}
         for item in result.get("new_characters", []) or []:
             if not isinstance(item, dict):
@@ -1209,7 +1782,7 @@ class BookPipeline:
             confidence = float(item.get("confidence", 1.0) or 0.0)
             if confidence < 0.5:
                 continue
-            cid, vid = self._ensure_character(name, item, chapter)
+            cid, vid = self._ensure_character(name, item, display_chapter)
             new_by_name[normalized_name(name)] = (cid, vid)
 
         # High-confidence aliases are deliberately automatic; lower confidence
@@ -1238,19 +1811,22 @@ class BookPipeline:
             supplied = str(entry.get("character_id") or "") or None
             data = new_by_name.get(normalized_name(speaker))
             if supplied and supplied in self.characters:
-                cid, vid = self._ensure_character(speaker, {}, chapter, supplied_id=supplied)
+                cid, vid = self._ensure_character(speaker, {}, display_chapter, supplied_id=supplied)
             elif data:
                 cid, vid = data
             else:
                 # Known aliases resolve here; genuinely unknown speakers become
                 # persistent characters only when they look named.
-                cid, vid = self._ensure_character(speaker, {}, chapter)
+                cid, vid = self._ensure_character(speaker, {}, display_chapter)
             if cid:
                 entry["character_id"] = cid
                 entry["voice_id"] = vid
+                entry["voice_profile_id"] = self._voice_profile_id_for(vid)
+                self._remember_voice_sample(cid, str(entry.get("text") or ""))
             else:
                 entry["character_id"] = None
                 entry["voice_id"] = vid
+                entry["voice_profile_id"] = None
 
         save_state(self.book_dir, self.characters, self.aliases, self.voices)
 
@@ -1261,10 +1837,12 @@ class BookPipeline:
         for alias, character_id in sorted(self.aliases.items(), key=lambda pair: len(pair[0]), reverse=True):
             if normalized_name(alias) and normalized_name(alias) in haystack and character_id not in seen:
                 seen.append(character_id)
-        # The previous chapter's speakers are useful even when this chapter
-        # starts with a pronoun or a title rather than a full name.
-        if chapter > 1:
-            previous_script = chapter_root(self.book_dir, chapter - 1) / "script.json"
+        # The previous novel chapter is useful even when this chapter starts
+        # with a pronoun or a title.  Do not use internal source numbers here:
+        # the imported manifest contains heading-only records between chapters.
+        previous_internal = self._previous_internal_chapter(chapter)
+        if previous_internal is not None:
+            previous_script = chapter_root(self.book_dir, previous_internal) / "script.json"
             previous = read_json(previous_script, [])
             if isinstance(previous, list):
                 for item in previous:
@@ -1286,9 +1864,10 @@ class BookPipeline:
         return {"characters": result, "aliases": {alias: self.aliases[alias] for alias in self.aliases if self.aliases[alias] in seen}}
 
     def _previous_context(self, chapter: int) -> Dict[str, Any]:
-        if chapter <= 1:
+        previous_internal = self._previous_internal_chapter(chapter)
+        if previous_internal is None:
             return {"summary": "", "tail": []}
-        previous_dir = chapter_root(self.book_dir, chapter - 1)
+        previous_dir = chapter_root(self.book_dir, previous_internal)
         summary = (previous_dir / "summary.txt").read_text(encoding="utf-8") if (previous_dir / "summary.txt").exists() else ""
         script = read_json(previous_dir / "script.json", [])
         tail = script[-10:] if isinstance(script, list) else []
@@ -1302,21 +1881,24 @@ class BookPipeline:
         chunk: str,
         previous_entries: List[Dict[str, Any]],
     ) -> str:
+        chapter_label = self.chapter_label(chapter)
         context = self.related_context(chapter, chunk)
         previous = self._previous_context(chapter)
         return f"""你是中文长篇有声书脚本分析器。只理解文本，不读写项目文件。
 
 请把当前片段转成旁白/对白脚本，并同时识别新人物和高置信别名。
-这是第 {chapter} 章的第 {chunk_number}/{total_chunks} 个片段。
+这是{chapter_label}的第 {chunk_number}/{total_chunks} 个片段。
 
 硬性规则：
 1. 必须返回符合 JSON Schema 的对象，不要 Markdown，不要解释。
 2. script 必须覆盖当前片段的全部文字，不能改写、删节或重复；按自然段、对白边界拆分。
 3. 旁白 speaker 固定为 NARRATOR，character_id 为 null。
 4. 已知人物使用给出的 character_id；遇到新称呼先在 possible_aliases 中报告，不要凭空创建重复人物。
-5. new_characters 只写当前确实新出现的人物，voice_character 只用简短的说话方式（如“沉稳、低沉、克制”），不要写文学评论。
-6. 无名路人/弟子/守卫等用 new_characters 的 named=false、gender、age 描述，Python 会分配通用声音。
-7. emotion 只写简短值，如 neutral、calm、tense、angry、sad、excited、whisper；不确定就 neutral。
+5. 每一段引号内的对白必须拆成独立脚本条目，speaker 必须是实际说话人；绝不能把人物对白连同引号塞进 NARRATOR。
+6. 对白说话人即使只以“秃眉大汉、女修、韩立”等称呼出现，也必须单独标注；有名字的人必须进入 new_characters 或使用已知 character_id。
+7. 无名路人/弟子/守卫等用 new_characters 的 named=false、gender、age 描述，Python 会分配按性别年龄区分的通用声音。
+8. new_characters 只写当前确实新出现的人物，voice_character 只用简短的说话方式（如“沉稳、低沉、克制”），不要写文学评论。
+9. emotion 只写简短值，如 neutral、calm、tense、angry、sad、excited、whisper；不确定就 neutral。
 
 已知相关人物：
 {json.dumps(context["characters"], ensure_ascii=False, indent=2)}
@@ -1338,9 +1920,10 @@ class BookPipeline:
 """
 
     def _summary_prompt(self, chapter: int, script: List[Dict[str, Any]]) -> str:
+        chapter_label = self.chapter_label(chapter)
         previous = self._previous_context(chapter)
         return f"""你是中文长篇有声书的章节摘要器。只返回 JSON Schema 对象，不要 Markdown 或解释。
-把第 {chapter} 章压缩成 300-800 个中文字符的摘要，保留人物行动、关键冲突、修炼/物品/地点等会影响下一章理解的信息，但不要添加原文没有的事实。
+把{chapter_label}压缩成 300-800 个中文字符的摘要，保留人物行动、关键冲突、修炼/物品/地点等会影响下一章理解的信息，但不要添加原文没有的事实。
 character_updates 只记录本章对已有人物长期说话方式/身份的补充，通常可以为空；不要创建关系图谱。
 
 上一章摘要：
@@ -1362,7 +1945,11 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
                     path.unlink()
                 except OSError:
                     pass
-        for path in (chapter_dir / "audio.wav", chapter_dir / "audio.m4a"):
+        for path in (
+            chapter_dir / "audio.wav",
+            chapter_dir / f"audio{CHAPTER_AUDIO_SUFFIX}",
+            chapter_dir / f"audio{LEGACY_CHAPTER_AUDIO_SUFFIX}",
+        ):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -1374,21 +1961,24 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         chapter: int,
         source_chunk: str,
     ) -> List[Dict[str, Any]]:
+        chapter_label = self.chapter_label(chapter)
+        novel_number = self.novel_chapter_number(chapter)
         raw_entries = result.get("script") or []
         if not isinstance(raw_entries, list):
-            raise PipelineError(f"第 {chapter} 章 Codex script 不是数组")
+            raise PipelineError(f"{chapter_label} Codex script 不是数组")
         entries: List[Dict[str, Any]] = []
         for raw in raw_entries:
             if not isinstance(raw, dict):
                 continue
-            text = str(raw.get("text") or "").strip()
-            if not text:
+            line_text = str(raw.get("text") or "").strip()
+            if not line_text:
                 continue
             speaker = str(raw.get("speaker") or "NARRATOR").strip()
             if normalized_name(speaker) in {"narrator", "旁白", "narration", "叙述"}:
                 speaker = "NARRATOR"
                 character_id = None
                 voice_id = "voice_narrator"
+                voice_profile_id = None
             else:
                 supplied_id = str(raw.get("character_id") or "") or None
                 voice_id = ""
@@ -1396,30 +1986,60 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
                 if character_id:
                     voice_id = self._ensure_voice_record(character_id)
                 else:
-                    # If the model reports a speaker but omitted metadata, the
-                    # state machine decides whether it is a named character or
-                    # one of the generic pools.
-                    character_id, voice_id = self._ensure_character(speaker, {}, chapter, supplied_id=supplied_id)
+                    character_id, voice_id = self._ensure_character(
+                        speaker, {}, novel_number, supplied_id=supplied_id
+                    )
                 if not voice_id:
                     _, voice_id = self._ensure_generic_voice({})
+                voice_profile_id = self._voice_profile_id_for(voice_id)
+                self._remember_voice_sample(character_id, line_text)
             emotion = str(raw.get("emotion") or "neutral").strip() or "neutral"
             entries.append({
                 "speaker": speaker,
                 "character_id": character_id,
                 "voice_id": voice_id,
-                "text": text,
+                "voice_profile_id": voice_profile_id,
+                "text": line_text,
                 "emotion": emotion,
                 "instruct": emotion,
             })
         if not entries and source_chunk.strip():
-            raise PipelineError(f"第 {chapter} 章 Codex 没有返回可用脚本条目")
+            raise PipelineError(f"{chapter_label} Codex 没有返回可用脚本条目")
         return entries
 
+    @staticmethod
+    def _source_has_dialogue(source: str) -> bool:
+        quote_pairs = re.findall(r"[“「『\"](.*?)[”」』\"]", str(source or ""), flags=re.S)
+        for body in quote_pairs:
+            body = re.sub(r"\s+", "", body)
+            if len(body) >= 8 or re.search(r"[。！？!?，：:；;]", body):
+                return True
+        return False
+
+    def _validate_script_roles(
+        self,
+        chapter: int,
+        source: str,
+        script: List[Dict[str, Any]],
+    ) -> None:
+        chapter_label = self.chapter_label(chapter)
+        non_narrator = [
+            item for item in script
+            if isinstance(item, dict)
+            and normalized_name(str(item.get("speaker") or "")) not in {"", "narrator", "旁白", "narration", "叙述"}
+        ]
+        if self._source_has_dialogue(source) and not non_narrator:
+            raise PipelineError(
+                f"{chapter_label} 检测到原文对白，但脚本全部标成 NARRATOR；"
+                "已停止，禁止用旁白声音代替角色对白，请重新分析"
+            )
+
     def analyze_chapter(self, chapter: int, force: bool = False) -> Dict[str, Any]:
+        chapter_label = self.chapter_label(chapter)
         chapter_dir = chapter_root(self.book_dir, chapter)
         source_path = chapter_dir / "source.txt"
         if not source_path.exists():
-            raise PipelineError(f"第 {chapter} 章不存在：{source_path}")
+            raise PipelineError(f"{chapter_label}不存在：{source_path}")
         source = source_path.read_text(encoding="utf-8")
         source_hash = sha256_file(chapter_dir / "source.txt")
         status = load_chapter_status(self.book_dir, chapter)
@@ -1452,6 +2072,7 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         if isinstance(cached, dict) and cached.get("source_sha256") == source_hash and cached.get("prompt_version") == PROMPT_VERSION:
             script = cached.get("script") or []
             if script:
+                self._validate_script_roles(chapter, source, script)
                 atomic_write_json(script_path, script)
                 status["analysis_chunks_done"] = len(cached.get("chunks") or [])
                 status["analysis"] = True
@@ -1496,10 +2117,11 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             all_entries.extend(normalized)
             status["analysis_chunks_done"] = index + 1
             save_chapter_status(self.book_dir, chapter, status)
-            print(f"chapter {chapter}: analyzed chunk {index + 1}/{len(chunks)} ({len(normalized)} lines)")
+            print(f"{chapter_label}: analyzed chunk {index + 1}/{len(chunks)} ({len(normalized)} lines)")
 
         if not all_entries:
-            raise PipelineError(f"第 {chapter} 章没有可保存的脚本")
+            raise PipelineError(f"{chapter_label}没有可保存的脚本")
+        self._validate_script_roles(chapter, source, all_entries)
         # Ensure line IDs are deterministic and easy to inspect.
         for line_number, entry in enumerate(all_entries, 1):
             entry["line_id"] = line_number
@@ -1517,10 +2139,11 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         return all_entries
 
     def finalize_chapter(self, chapter: int, force: bool = False) -> str:
+        chapter_label = self.chapter_label(chapter)
         chapter_dir = chapter_root(self.book_dir, chapter)
         script = read_json(chapter_dir / "script.json", [])
         if not isinstance(script, list) or not script:
-            raise PipelineError(f"第 {chapter} 章没有 script.json，无法生成摘要")
+            raise PipelineError(f"{chapter_label}没有 script.json，无法生成摘要")
         status = load_chapter_status(self.book_dir, chapter)
         source_hash = status.get("source_sha256") or sha256_file(chapter_dir / "source.txt")
         summary_path = chapter_dir / "summary.txt"
@@ -1546,7 +2169,7 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
                 # the structured Chapter Finalize response from Codex.
                 summary = " ".join(str(item.get("text") or "") for item in script if isinstance(item, dict))[:800]
             else:
-                raise PipelineError(f"第 {chapter} 章 Codex 没有返回摘要")
+                raise PipelineError(f"{chapter_label} Codex 没有返回摘要")
         summary_path.write_text(summary + "\n", encoding="utf-8")
         for update in result.get("character_updates", []) or []:
             if not isinstance(update, dict):
@@ -1568,11 +2191,12 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         return script
 
     def ensure_all_voice_ids(self, chapter: int) -> None:
+        chapter_label = self.chapter_label(chapter)
         self.refresh_state()
         script_path = chapter_root(self.book_dir, chapter) / "script.json"
         script = read_json(script_path, [])
         if not isinstance(script, list):
-            raise PipelineError(f"第 {chapter} 章 script.json 格式错误")
+            raise PipelineError(f"{chapter_label} script.json 格式错误")
         changed = False
         for entry in script:
             if not isinstance(entry, dict):
@@ -1580,12 +2204,17 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             cid = entry.get("character_id")
             if cid in self.characters:
                 voice_id = self._ensure_voice_record(cid)
+                self._remember_voice_sample(cid, str(entry.get("text") or ""))
             elif entry.get("speaker") == "NARRATOR":
                 voice_id = "voice_narrator"
             else:
                 voice_id = entry.get("voice_id") or self._ensure_generic_voice({})[1]
+            profile_id = self._voice_profile_id_for(voice_id)
             if entry.get("voice_id") != voice_id:
                 entry["voice_id"] = voice_id
+                changed = True
+            if entry.get("voice_profile_id") != profile_id:
+                entry["voice_profile_id"] = profile_id
                 changed = True
         if changed:
             atomic_write_json(script_path, script)
@@ -1607,6 +2236,55 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             config[voice_id] = item
         return config
 
+    def _voice_profile_for_entry(
+        self,
+        entry: Dict[str, Any],
+        voice_config: Dict[str, Dict[str, Any]],
+        line_number: Optional[int] = None,
+    ) -> Optional[str]:
+        """Select a per-emotion reference profile, falling back to the default."""
+        voice_id = str(entry.get("voice_id") or "voice_narrator")
+        voice_data = voice_config.get(voice_id, {})
+        default_profile = str(voice_data.get("voice_profile_id") or "").strip() or None
+        mapping = voice_data.get("voice_profile_by_emotion")
+        if not isinstance(mapping, dict):
+            return default_profile
+
+        emotion = str(entry.get("emotion") or entry.get("instruct") or "neutral").strip().lower()
+        candidates_value = mapping.get(emotion)
+        if candidates_value is None:
+            aliases = {
+                "neutral": ["calm"],
+                "calm": ["neutral"],
+                "fear": ["afraid"],
+                "tense": ["worried", "afraid"],
+                "concern": ["worried"],
+                "angry": ["annoyed", "pretend_fierce"],
+                "excited": ["lively", "cheerful"],
+                "happy": ["cheerful", "relieved_cheerful"],
+                "sad": ["sorrow"],
+                "confused": ["slightly_puzzled"],
+                "confident": ["earnest", "smug"],
+            }
+            for alias in aliases.get(emotion, []):
+                if alias in mapping:
+                    candidates_value = mapping[alias]
+                    break
+        if candidates_value is None:
+            candidates_value = mapping.get("default")
+        if isinstance(candidates_value, str):
+            candidates = [candidates_value]
+        elif isinstance(candidates_value, list):
+            candidates = [str(value).strip() for value in candidates_value if str(value).strip()]
+        else:
+            candidates = []
+        if not candidates:
+            return default_profile
+        try:
+            position = int(line_number if line_number is not None else entry.get("line_id") or 1)
+        except (TypeError, ValueError):
+            position = 1
+        return candidates[(max(position, 1) - 1) % len(candidates)]
     def _load_tts_engine(self) -> Any:
         configured_mode = load_config().get("tts", {}).get("mode")
         if os.environ.get("ALEXANDRIA_TTS_MODE", "").lower() == "fake" or configured_mode == "fake":
@@ -1643,6 +2321,12 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         voice_config = self._tts_voice_config()
         if voice_id not in voice_config:
             raise PipelineError(f"找不到声音配置：{voice_id}")
+        selected_profile = self._voice_profile_for_entry(entry, voice_config)
+        if selected_profile:
+            voice_config = dict(voice_config)
+            selected_voice_data = dict(voice_config[voice_id])
+            selected_voice_data["voice_profile_id"] = selected_profile
+            voice_config[voice_id] = selected_voice_data
         output_path.parent.mkdir(parents=True, exist_ok=True)
         success = engine.generate_voice(
             str(entry.get("text") or ""),
@@ -1655,17 +2339,60 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             raise PipelineError(f"TTS 生成失败：line {entry.get('line_id') or '?'} / {voice_id}")
 
     def _materialize_design_voice(self, engine: Any, entry: Dict[str, Any]) -> None:
-        """Generate a VoiceDesign reference once, then use it as a clone voice."""
+        """Ensure one persistent xc VoiceDesign profile exists for a named role."""
         voice_id = str(entry.get("voice_id") or "")
         record = self.voices.get(voice_id)
-        if not isinstance(record, dict) or record.get("type") != "design" or record.get("reference_audio"):
+        if not isinstance(record, dict):
             return
-        if getattr(engine, "mode", "local") != "local" or not hasattr(engine, "generate_voice_design"):
-            # External backends may not expose VoiceDesign.  Preserve the
-            # stable ID and fall back to the selected CustomVoice.
-            record["type"] = "custom"
+
+        if record.get("type") == "profile":
+            profile_id = str(record.get("voice_profile_id") or "").strip()
+            if not profile_id:
+                raise PipelineError(f"声音 {voice_id} 缺少 voice_profile_id")
+            if record.get("voice_profile_status") == "ready":
+                return
+            sample = str(record.get("profile_sample_text") or entry.get("text") or "").strip()[:500]
+            if not sample:
+                raise PipelineError(f"角色声音 {profile_id} 没有可用于 VoiceDesign 的样本文本")
+            description = self._voice_design_description(
+                str(record.get("character_id") or ""), voice_id
+            )
+            if not hasattr(engine, "ensure_voice_profile"):
+                raise PipelineError(
+                    f"xc TTS 不支持 VoiceDesign profile（需要 /voice_profiles/design）：{profile_id}"
+                )
+            try:
+                response = engine.ensure_voice_profile(
+                    profile_id,
+                    description,
+                    sample,
+                    language=load_config().get("tts", {}).get("language", "Chinese"),
+                    seed=int(record.get("profile_seed", -1)),
+                )
+            except Exception as exc:
+                record["voice_profile_status"] = "failed"
+                record["voice_profile_error"] = str(exc)
+                save_state(self.book_dir, self.characters, self.aliases, self.voices)
+                raise PipelineError(f"VoiceDesign 生成 {profile_id} 失败：{exc}") from exc
+            record.update({
+                "voice_profile_status": "ready",
+                "voice_profile_backend": "xc",
+                "voice_profile_id": str(response.get("voice_profile_id") or profile_id),
+                "profile_description": description,
+                "profile_sample_text": sample,
+                "profile_ready_at": now_iso(),
+                "voice_profile_error": None,
+            })
             save_state(self.book_dir, self.characters, self.aliases, self.voices)
             return
+
+        # Keep the old local-only design mode available for explicit legacy use.
+        if record.get("type") != "design" or record.get("reference_audio"):
+            return
+        if getattr(engine, "mode", "local") != "local" or not hasattr(engine, "generate_voice_design"):
+            raise PipelineError(
+                f"声音 {voice_id} 仍是旧 design 配置；外部 xc 必须使用 type=profile 并注册 VoiceDesign"
+            )
         sample = str(entry.get("text") or "").strip()
         if not sample:
             return
@@ -1692,10 +2419,25 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         })
         save_state(self.book_dir, self.characters, self.aliases, self.voices)
 
+    def _ensure_render_profiles(self, engine: Any, script: List[Dict[str, Any]]) -> None:
+        """Register every named profile before rendering any line audio."""
+        seen = set()
+        for entry in script:
+            if not isinstance(entry, dict):
+                continue
+            voice_id = str(entry.get("voice_id") or "")
+            if voice_id in seen:
+                continue
+            record = self.voices.get(voice_id)
+            if isinstance(record, dict) and record.get("type") == "profile":
+                seen.add(voice_id)
+                self._materialize_design_voice(engine, entry)
+
     def _combine_chapter_audio(self, chapter: int, script: List[Dict[str, Any]], line_paths: List[Path]) -> Path:
+        chapter_label = self.chapter_label(chapter)
         # Alexandria normally emits WAV files.  Use the standard library for
         # the merge so the CLI does not require pydub merely to checkpoint a
-        # chapter; ffmpeg is still used for the final AAC container.
+        # chapter; ffmpeg is still used for the final M4B container with AAC audio.
         for path in line_paths:
             if not path.exists():
                 raise PipelineError(f"缺少音频行：{path}")
@@ -1706,20 +2448,20 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         same_pause_ms = int(config.get("pause_same_speaker_ms", 250))
         wav_path = chapter_root(self.book_dir, chapter) / "audio.wav"
         self._merge_wav_files(line_paths, speakers, pauses, pause_ms, same_pause_ms, wav_path)
-        m4a_path = chapter_root(self.book_dir, chapter) / "audio.m4a"
+        m4b_path = chapter_root(self.book_dir, chapter) / f"audio{CHAPTER_AUDIO_SUFFIX}"
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            raise PipelineError("导出 m4a 需要 ffmpeg，请安装 ffmpeg 后重试")
+            raise PipelineError("导出 m4b 需要 ffmpeg，请安装 ffmpeg 后重试")
         result = subprocess.run(
-            [ffmpeg, "-y", "-i", str(wav_path), "-c:a", "aac", "-b:a", "128k", "-vn", str(m4a_path)],
+            [ffmpeg, "-y", "-i", str(wav_path), "-c:a", "aac", "-b:a", "128k", "-vn", str(m4b_path)],
             capture_output=True,
             text=True,
             check=False,
         )
-        if result.returncode != 0 or not m4a_path.exists() or m4a_path.stat().st_size == 0:
+        if result.returncode != 0 or not m4b_path.exists() or m4b_path.stat().st_size == 0:
             detail = (result.stderr or result.stdout or "").strip()
-            raise PipelineError(f"ffmpeg 导出第 {chapter} 章 m4a 失败：{detail[-800:]}")
-        return m4a_path
+            raise PipelineError(f"ffmpeg 导出{chapter_label} M4B 失败：{detail[-800:]}")
+        return m4b_path
 
     @staticmethod
     def _merge_wav_files(
@@ -1765,16 +2507,107 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             output.setparams(params)
             output.writeframes(b"".join(chunks))
 
+    @staticmethod
+    def _convert_audio_to_m4b(source_path: Path, target_path: Path) -> Path:
+        """Convert or copy one chapter into the default M4B container atomically."""
+        if not source_path.exists():
+            raise PipelineError(f"音频源不存在：{source_path}")
+        if source_path.resolve() == target_path.resolve():
+            return target_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target_path.with_name(
+            f".{target_path.stem}.{os.getpid()}.tmp{CHAPTER_AUDIO_SUFFIX}"
+        )
+        try:
+            if source_path.suffix.lower() == CHAPTER_AUDIO_SUFFIX:
+                shutil.copy2(source_path, temporary)
+                os.replace(temporary, target_path)
+                return target_path
+
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise PipelineError("M4A 转 M4B 需要 ffmpeg，请安装 ffmpeg 后重试")
+            failures: List[str] = []
+            for codec_args in (("-c:a", "copy"), ("-c:a", "aac", "-b:a", "128k")):
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                result = subprocess.run(
+                    [
+                        ffmpeg, "-y", "-i", str(source_path),
+                        "-map", "0:a:0", "-map_metadata", "0", "-vn",
+                        *codec_args, "-movflags", "+faststart", str(temporary),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode == 0 and temporary.exists() and temporary.stat().st_size > 0:
+                    os.replace(temporary, target_path)
+                    return target_path
+                failures.append((result.stderr or result.stdout or "").strip()[-400:])
+            detail = next((item for item in reversed(failures) if item), "unknown ffmpeg error")
+            raise PipelineError(f"M4A 转 M4B 失败：{detail}")
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _publish_chapter_audio(self, chapter: int, source_path: Path) -> Path:
+        """Publish one finished chapter atomically for Audiobookshelf."""
+        if not source_path.exists():
+            raise PipelineError(f"音频源不存在：{source_path}")
+        output_chapters = self.book_dir / "output" / "chapters"
+        output_chapters.mkdir(parents=True, exist_ok=True)
+        arc = self.chapter_arc(chapter)
+        novel_number = self.novel_chapter_number(chapter)
+        published = output_chapters / chapter_audio_filename(
+            self.book_dir, self.book, chapter, arc=arc, novel_number=novel_number
+        )
+
+        # Convert first, then remove historical names so a failed conversion
+        # never destroys the only published copy.
+        self._convert_audio_to_m4b(source_path, published)
+        legacy_names = {
+            f"chapter_{chapter:06d}{LEGACY_CHAPTER_AUDIO_SUFFIX}",
+            f"chapter_{chapter:06d}{CHAPTER_AUDIO_SUFFIX}",
+        }
+        if published.name.startswith(("正_", "仙_", "外_")):
+            legacy_stem = "chapter_" + published.stem.split("_", 1)[1]
+            legacy_names.update({
+                published.stem + LEGACY_CHAPTER_AUDIO_SUFFIX,
+                legacy_stem + LEGACY_CHAPTER_AUDIO_SUFFIX,
+                legacy_stem + CHAPTER_AUDIO_SUFFIX,
+            })
+        for legacy_name in legacy_names:
+            legacy = output_chapters / legacy_name
+            if legacy != published and legacy.exists():
+                legacy.unlink()
+        return published
+
     def render_chapter(self, chapter: int, force: bool = False, dry_run: bool = False) -> Path:
+        chapter_label = self.chapter_label(chapter)
         chapter_dir = chapter_root(self.book_dir, chapter)
         script_path = chapter_dir / "script.json"
         script = read_json(script_path, [])
         if not isinstance(script, list) or not script:
-            raise PipelineError(f"第 {chapter} 章没有 script.json，请先 analyze")
+            raise PipelineError(f"{chapter_label}没有 script.json，请先 analyze")
+        source_text = (chapter_dir / "source.txt").read_text(encoding="utf-8")
+        self._validate_script_roles(chapter, source_text, script)
         status = load_chapter_status(self.book_dir, chapter)
-        m4a_path = chapter_dir / "audio.m4a"
-        if not force and status.get("tts") and m4a_path.exists():
-            return m4a_path
+        m4b_path = chapter_dir / f"audio{CHAPTER_AUDIO_SUFFIX}"
+        legacy_m4a_path = chapter_dir / f"audio{LEGACY_CHAPTER_AUDIO_SUFFIX}"
+        if not force and status.get("tts"):
+            if m4b_path.exists():
+                self._publish_chapter_audio(chapter, m4b_path)
+                return m4b_path
+            if legacy_m4a_path.exists():
+                self._convert_audio_to_m4b(legacy_m4a_path, m4b_path)
+                legacy_m4a_path.unlink()
+                self._publish_chapter_audio(chapter, m4b_path)
+                return m4b_path
         self.ensure_all_voice_ids(chapter)
         # ensure_all_voice_ids may have refreshed state and rewritten script.
         script = read_json(script_path, [])
@@ -1786,7 +2619,7 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
                     path.unlink()
                 except OSError:
                     pass
-            for path in (chapter_dir / "audio.wav", m4a_path):
+            for path in (chapter_dir / "audio.wav", m4b_path, legacy_m4a_path):
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -1796,43 +2629,167 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             status["done"] = False
 
         engine = None if dry_run else self._load_tts_engine()
+        if engine is not None:
+            self._ensure_render_profiles(engine, script)
         line_paths: List[Path] = []
-        completed = 0
+        pending: List[Tuple[int, Dict[str, Any], Path]] = []
         for index, entry in enumerate(script, 1):
             line_path = line_dir / f"line_{index:06d}.wav"
             line_paths.append(line_path)
             if line_path.exists() and line_path.stat().st_size > 0 and not force:
-                completed = index
-                status["tts_lines_done"] = completed
+                status["tts_lines_done"] = index
                 save_chapter_status(self.book_dir, chapter, status)
                 continue
             if dry_run:
                 # Dry-run is intended for validating state transitions and
                 # prompts on machines without a GPU.  It deliberately does not
                 # claim TTS completion or create a fake audiobook.
-                print(f"chapter {chapter}: would render line {index}/{len(script)}")
+                print(f"{chapter_label}: would render line {index}/{len(script)}")
                 continue
             self._materialize_design_voice(engine, entry)
-            self._render_line(engine, entry, line_path)
-            completed = index
-            status["tts_lines_done"] = completed
-            save_chapter_status(self.book_dir, chapter, status)
-            print(f"chapter {chapter}: rendered line {index}/{len(script)}")
+            pending.append((index, entry, line_path))
 
         if dry_run:
-            return m4a_path
+            return m4b_path
+
+        if (
+            getattr(engine, "supports_http_batch", False)
+            and hasattr(engine, "generate_batch")
+            and pending
+        ):
+            voice_config = self._tts_voice_config()
+            batch_chunks: List[Dict[str, Any]] = []
+            for index, entry, line_path in pending:
+                voice_id = str(entry.get("voice_id") or "voice_narrator")
+                if voice_id not in voice_config:
+                    raise PipelineError(f"Missing voice configuration: {voice_id}")
+                temp_path = line_dir / f"temp_batch_{index}.wav"
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+                batch_chunks.append({
+                    "index": index,
+                    "text": str(entry.get("text") or ""),
+                    "instruct": self._emotion_instruction(
+                        str(entry.get("emotion") or entry.get("instruct") or "neutral")
+                    ),
+                    "speaker": voice_id,
+                    "emotion": str(entry.get("emotion") or entry.get("instruct") or "neutral"),
+                    "voice_profile_id": self._voice_profile_for_entry(entry, voice_config, index),
+                })
+
+            print(
+                f"{chapter_label}: rendering {len(batch_chunks)} lines via "
+                "native HTTP TTS batches"
+            )
+            batch_result = engine.generate_batch(
+                batch_chunks,
+                voice_config,
+                str(line_dir),
+                -1,
+            )
+            completed_ids = {
+                int(index) for index in batch_result.get("completed", [])
+            }
+            failure_map = {
+                int(index): str(error)
+                for index, error in batch_result.get("failed", [])
+            }
+            missing = []
+            for index, entry, line_path in pending:
+                temp_path = line_dir / f"temp_batch_{index}.wav"
+                if index in completed_ids and temp_path.exists() and temp_path.stat().st_size > 0:
+                    temp_path.replace(line_path)
+                    print(f"{chapter_label}: rendered line {index}/{len(script)}")
+                else:
+                    missing.append((index, failure_map.get(index, "missing output")))
+
+            contiguous = 0
+            while contiguous < len(line_paths):
+                candidate = line_paths[contiguous]
+                if not candidate.exists() or candidate.stat().st_size <= 0:
+                    break
+                contiguous += 1
+            status["tts_lines_done"] = contiguous
+            save_chapter_status(self.book_dir, chapter, status)
+            if missing:
+                detail = "; ".join(
+                    f"line {index}: {message}" for index, message in missing
+                )
+                raise PipelineError(f"HTTP TTS batch generation failed: {detail}")
+        else:
+            configured_workers = 2
+            try:
+                configured_workers = max(1, int(load_config().get("tts", {}).get("parallel_workers", 2)))
+            except (TypeError, ValueError):
+                configured_workers = 2
+            endpoint_count = max(1, int(getattr(engine, "endpoint_count", 1)))
+            if getattr(engine, "uses_http_tts", False):
+                worker_count = min(configured_workers, endpoint_count)
+            else:
+                worker_count = 1
+
+            if worker_count <= 1 or len(pending) <= 1:
+                for index, entry, line_path in pending:
+                    self._render_line(engine, entry, line_path)
+                    status["tts_lines_done"] = index
+                    save_chapter_status(self.book_dir, chapter, status)
+                    print(f"{chapter_label}: rendered line {index}/{len(script)}")
+            else:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                print(
+                    f"{chapter_label}: rendering {len(pending)} pending lines "
+                    f"with {worker_count} HTTP TTS workers"
+                )
+
+                def render_pending(item: Tuple[int, Dict[str, Any], Path]) -> int:
+                    index, entry, line_path = item
+                    self._render_line(engine, entry, line_path)
+                    return index
+
+                failures: List[Tuple[int, Exception]] = []
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = {
+                        executor.submit(render_pending, item): item[0]
+                        for item in pending
+                    }
+                    for future in as_completed(futures):
+                        index = futures[future]
+                        try:
+                            future.result()
+                            print(f"{chapter_label}: rendered line {index}/{len(script)}")
+                        except Exception as exc:
+                            failures.append((index, exc))
+                            print(f"{chapter_label}: line {index} failed: {exc}")
+                        contiguous = 0
+                        while contiguous < len(line_paths):
+                            candidate = line_paths[contiguous]
+                            if not candidate.exists() or candidate.stat().st_size <= 0:
+                                break
+                            contiguous += 1
+                        status["tts_lines_done"] = contiguous
+                        save_chapter_status(self.book_dir, chapter, status)
+
+                if failures:
+                    index, exc = sorted(failures, key=lambda item: item[0])[0]
+                    raise PipelineError(f"Parallel TTS generation failed: line {index}: {exc}")
         self._combine_chapter_audio(chapter, script, line_paths)
+        self._publish_chapter_audio(chapter, m4b_path)
         status.update({"voices": True, "tts": True, "done": True, "tts_lines_done": len(script)})
         save_chapter_status(self.book_dir, chapter, status)
-        return m4a_path
+        return m4b_path
 
     def review_chapter(self, chapter: int, force: bool = False) -> List[Dict[str, Any]]:
         """Manually review an existing chapter; never run as part of `run`."""
+        chapter_label = self.chapter_label(chapter)
         chapter_dir = chapter_root(self.book_dir, chapter)
         source = (chapter_dir / "source.txt").read_text(encoding="utf-8")
         script = read_json(chapter_dir / "script.json", [])
         if not isinstance(script, list) or not script:
-            raise PipelineError(f"第 {chapter} 章没有可审校的脚本")
+            raise PipelineError(f"{chapter_label}没有可审校的脚本")
         source_hash = sha256_file(chapter_dir / "source.txt")
         review_schema = {
             "type": "object",
@@ -1844,39 +2801,51 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         }
         prompt = f"""你是中文有声书脚本审校器。只返回 JSON，不要解释。
 保持每个 text 的原文内容，不增删文字；只修正明显的旁白/对白归属、speaker 和 emotion。
-已有持久人物身份不能重建，保留已有 character_id、voice_id；输出完整脚本数组。
+已有持久人物身份不能重建，保留已有 character_id、voice_id；每一段对白都必须有实际说话人，不能把对白放在 NARRATOR 中。
+输出完整脚本数组。
 原始章节：\n{source}\n\n当前脚本：\n{json.dumps(script, ensure_ascii=False)}"""
         result = self.codex.run(prompt, review_schema)
         reviewed = result.get("script") if isinstance(result.get("script"), list) else None
         if not reviewed:
             raise PipelineError("Codex 审校没有返回脚本")
         normalized: List[Dict[str, Any]] = []
+        novel_number = self.novel_chapter_number(chapter)
         for raw in reviewed:
             if not isinstance(raw, dict) or not str(raw.get("text") or "").strip():
                 continue
             old = next((item for item in script if item.get("text") == raw.get("text")), {})
+            speaker = str(raw.get("speaker") or old.get("speaker") or "NARRATOR").strip()
             entry = dict(old)
             entry.update({
-                "speaker": str(raw.get("speaker") or old.get("speaker") or "NARRATOR"),
+                "speaker": speaker,
                 "text": str(raw.get("text") or "").strip(),
                 "emotion": str(raw.get("emotion") or old.get("emotion") or "neutral"),
             })
-            if entry["speaker"] == "NARRATOR":
+            if normalized_name(speaker) in {"narrator", "旁白", "narration", "叙述"}:
+                entry["speaker"] = "NARRATOR"
                 entry["character_id"] = None
                 entry["voice_id"] = "voice_narrator"
-            elif entry.get("character_id") not in self.characters:
-                cid = self._character_for_name(entry["speaker"])
-                if cid:
-                    entry["character_id"] = cid
-                    entry["voice_id"] = self._ensure_voice_record(cid)
+                entry["voice_profile_id"] = None
+            else:
+                cid = str(entry.get("character_id") or "") or self._character_for_name(speaker)
+                if cid not in self.characters:
+                    cid, voice_id = self._ensure_character(speaker, {}, novel_number)
+                else:
+                    voice_id = self._ensure_voice_record(cid)
+                entry["character_id"] = cid
+                entry["voice_id"] = voice_id
+                entry["voice_profile_id"] = self._voice_profile_id_for(voice_id)
+                self._remember_voice_sample(cid, entry["text"])
             entry["instruct"] = entry["emotion"]
             normalized.append(entry)
+        self._validate_script_roles(chapter, source, normalized)
         for index, entry in enumerate(normalized, 1):
             entry["line_id"] = index
         atomic_write_json(chapter_dir / "script.json", normalized)
         status = load_chapter_status(self.book_dir, chapter)
         status.update({"source_sha256": source_hash, "tts": False, "done": False, "tts_lines_done": 0})
         self._invalidate_audio_files(chapter_dir)
+        save_state(self.book_dir, self.characters, self.aliases, self.voices)
         save_chapter_status(self.book_dir, chapter, status)
         return normalized
 
@@ -1937,11 +2906,13 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
                 if entry.get("character_id") == source_id:
                     entry["character_id"] = target_id
                     entry["voice_id"] = target_voice
+                    entry["voice_profile_id"] = self._voice_profile_id_for(target_voice)
                     if entry.get("speaker") == source.get("name"):
                         entry["speaker"] = target.get("name")
                     changed = True
                 elif source_voice and entry.get("voice_id") == source_voice:
                     entry["voice_id"] = target_voice
+                    entry["voice_profile_id"] = self._voice_profile_id_for(target_voice)
                     changed = True
             if changed:
                 atomic_write_json(script_path, script)
@@ -1954,39 +2925,59 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             self.voices.pop(source_voice, None)
         save_state(self.book_dir, self.characters, self.aliases, self.voices)
 
-    def export_m4b(self, first: Optional[int] = None, last: Optional[int] = None) -> Path:
-        all_numbers = [int(item.get("number")) for item in self.book.get("chapters", []) if isinstance(item, dict) and item.get("number")]
-        if not all_numbers:
-            raise PipelineError("书籍没有章节")
-        first = first or min(all_numbers)
-        last = last or max(all_numbers)
-        numbers = [number for number in all_numbers if first <= number <= last]
-        if not numbers:
-            raise PipelineError(f"没有落在 {first}-{last} 范围内的章节")
+    def export_m4b(
+        self,
+        first: Optional[int] = None,
+        last: Optional[int] = None,
+        arc: str = "main",
+    ) -> Path:
+        arc = normalize_arc(arc)
+        mapping = self.chapter_maps.get(arc)
+        if not mapping:
+            raise PipelineError(f"没有识别出{arc_display_name(arc)}正文")
+        all_numbers = sorted(mapping)
+        first = min(all_numbers) if first is None else first
+        last = max(all_numbers) if last is None else last
+        if first <= 0 or last < first:
+            raise PipelineError(f"{arc_display_name(arc)}章节导出范围无效")
+        numbers = list(range(first, last + 1))
+        missing = [number for number in numbers if number not in mapping]
+        if missing:
+            raise PipelineError(f"{arc_display_name(arc)}章节不存在，无法导出：{missing[:12]}")
         chapter_paths: List[Tuple[int, Path]] = []
         output_chapters = self.book_dir / "output" / "chapters"
         output_chapters.mkdir(parents=True, exist_ok=True)
-        for number in numbers:
-            path = chapter_root(self.book_dir, number) / "audio.m4a"
+        for novel_number in numbers:
+            internal_number = mapping[novel_number]
+            path = chapter_root(self.book_dir, internal_number) / f"audio{CHAPTER_AUDIO_SUFFIX}"
             if not path.exists():
-                raise PipelineError(f"第 {number} 章缺少 audio.m4a，请先 render")
-            copied = output_chapters / f"chapter_{number:06d}.m4a"
-            shutil.copy2(path, copied)
-            chapter_paths.append((number, copied))
+                legacy_path = chapter_root(self.book_dir, internal_number) / f"audio{LEGACY_CHAPTER_AUDIO_SUFFIX}"
+                if legacy_path.exists():
+                    self._convert_audio_to_m4b(legacy_path, path)
+                    legacy_path.unlink()
+            if not path.exists():
+                raise PipelineError(
+                    f"{chapter_display_label(arc, novel_number)}缺少 audio.m4b，请先 render"
+                )
+            copied = self._publish_chapter_audio(internal_number, path)
+            chapter_paths.append((novel_number, copied))
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise PipelineError("导出 m4b 需要 ffmpeg，请安装 ffmpeg 后重试")
-        concat_list = self.book_dir / "cache" / f"export_{first}_{last}.txt"
-        meta_path = self.book_dir / "cache" / f"export_{first}_{last}.ffmeta"
+        cache_stem = f"export_{arc}_{first}_{last}"
+        concat_list = self.book_dir / "cache" / f"{cache_stem}.txt"
+        meta_path = self.book_dir / "cache" / f"{cache_stem}.ffmeta"
         durations: List[int] = [self._audio_duration_ms(path) for _, path in chapter_paths]
         concat_lines = []
         for _, path in chapter_paths:
             safe_path = str(path).replace("'", "'\\''")
             concat_lines.append(f"file '{safe_path}'")
         concat_list.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+        book_title = str(self.book.get("title") or self.book.get("book_id") or "Audiobook")
+        meta_title = book_title if arc == "main" else f"{book_title} {arc_display_name(arc)}"
         meta_lines = [
             ";FFMETADATA1",
-            f"title={self._escape_ffmeta(self.book.get('title') or self.book.get('book_id') or 'Audiobook')}",
+            f"title={self._escape_ffmeta(meta_title)}",
             "genre=Audiobook",
             "",
         ]
@@ -1994,16 +2985,22 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
         for index, (number, _) in enumerate(chapter_paths):
             duration = durations[index] if index < len(durations) else 0
             end = cursor + max(1, duration)
+            internal_number = mapping[number]
             meta_lines.extend([
                 "[CHAPTER]", "TIMEBASE=1/1000", f"START={cursor}", f"END={end}",
-                f"title={self._escape_ffmeta(title_for_chapter(self.book, number))}", "",
+                f"title={self._escape_ffmeta(title_for_chapter(self.book, internal_number))}", "",
             ])
             cursor = end
         meta_path.write_text("\n".join(meta_lines), encoding="utf-8")
-        if first == min(all_numbers) and last == max(all_numbers):
+        is_full_arc = first == min(all_numbers) and last == max(all_numbers)
+        if is_full_arc and arc == "main":
             output_name = f"{self.book.get('book_id', 'book')}.m4b"
-        else:
+        elif is_full_arc:
+            output_name = f"{self.book.get('book_id', 'book')}_{arc}.m4b"
+        elif arc == "main":
             output_name = f"{self.book.get('book_id', 'book')}_{first:03d}-{last:03d}.m4b"
+        else:
+            output_name = f"{self.book.get('book_id', 'book')}_{arc}_{first:03d}-{last:03d}.m4b"
         output = self.book_dir / "output" / output_name
         command = [
             ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),

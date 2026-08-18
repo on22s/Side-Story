@@ -6,10 +6,17 @@
     "reasoning_effort": "max"
   },
   "tts": {
-    "mode": "local",
-    "url": "http://127.0.0.1:7860",
-    "device": "cuda:0",
-    "language": "Auto",
+    "mode": "external",
+    "url": "http://127.0.0.1:18000/tts",
+    "urls": [
+      "http://127.0.0.1:18000/tts",
+      "http://127.0.0.1:18001/tts"
+    ],
+    "external_timeout": 300,
+    "external_max_chars": 2000,
+    "external_batch_size": 48,
+    "device": "auto",
+    "language": "Chinese",
     "parallel_workers": 2,
     "compile_codec": false,
     "sub_batch_enabled": true,
@@ -17,7 +24,13 @@
     "sub_batch_ratio": 5.0,
     "sub_batch_max_items": 0,
     "pause_between_speakers_ms": 500,
-    "pause_same_speaker_ms": 250
+    "pause_same_speaker_ms": 250,
+    "voice_profile_urls": [
+      "http://127.0.0.1:18000/voice_profiles/design",
+      "http://127.0.0.1:18001/voice_profiles/design"
+    ],
+    "voice_profile_timeout": 900,
+    "voice_profile_required": true
   },
   "generation": {
     "chunk_size": 3000,

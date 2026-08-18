@@ -21,8 +21,6 @@ services:
       - ./data/scripts:/alexandria/scripts
       # Persist WebUI settings (OpenAI endpoint, prompts, TTS mode, etc.)
       - ./data/config:/alexandria/config
-      # Persist audiobook output
-      - ./data/output:/alexandria/voicelines
     deploy:
       resources:
         reservations:
@@ -30,6 +28,21 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    container_name: audiobookshelf
+    ports:
+      - "13378:80"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # ABS state stays with the project's persistent data.
+      - ./data/audiobookshelf/config:/config
+      - ./data/audiobookshelf/metadata:/metadata
+      # Alexandria's CLI book projects and generated audio.
+      # Keep the library read-only so ABS cannot alter pipeline state.
+      - ./books:/audiobooks:ro
+    restart: unless-stopped
 
 volumes:
   hf_cache:

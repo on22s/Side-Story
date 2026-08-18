@@ -28,7 +28,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ### Voice Generation
 - **Built-in TTS Engine** - Qwen3-TTS runs locally with no external server required
-- **External Server Mode** - Optionally connect to a remote Qwen3-TTS Gradio server
+- **External Server Mode** - Connect to a remote Qwen3-TTS Gradio server or a JSON/WAV HTTP <code>/tts</code> endpoint
 - **Multi-Language Support** - English, Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto-detect
 - **Custom Voices** - 9 pre-trained voices with instruct-based emotion/tone control
 - **Voice Cloning** - Clone any voice from a 5-15 second reference audio sample
@@ -227,10 +227,14 @@ These tabs are for power users who want more control over voice creation:
 Configure connections to your LLM and TTS engine.
 
 **TTS Settings:**
-- **Mode** - `local` (built-in engine) or `external` (connect to Gradio server)
+- **Mode** - `local` (built-in engine) or `external` (connect to a Gradio server or an HTTP endpoint ending in `/tts`)
 - **Device** - `auto` (recommended), `cuda`, `cpu`, or `mps`
+- **External URL / Endpoint** - For the standalone HTTP service, set the URL to the full `/tts` endpoint. The service accepts CustomVoice requests and persistent `voice_profile_id` requests and returns WAV audio. VoiceDesign profiles are created at `/voice_profiles/design`.
+- **HTTP Endpoint Pool** - Set `tts.urls` to multiple `/tts` endpoints and `parallel_workers` to the number of available instances. Alexandria round-robins requests and keeps output order; one model instance remains serialized, so use one service process per GPU.
+- **xc single-GPU mode** - Use one `/tts` endpoint with `parallel_workers: 1`; keep `external_batch_size: 48`. `parallel_workers` controls endpoint workers, not the per-endpoint batch size.
 - **Language** - TTS synthesis language: English (default), Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto (let the model detect)
-- **Parallel Workers** - Batch size for fast batch rendering (higher = more VRAM usage)
+- **Parallel Workers** - Number of concurrent external endpoint workers; for xc dual-GPU use `2`
+- **External Batch Size** - Set `tts.external_batch_size` in config; xc is tuned for `48` texts per `/tts_batch` request
 - **Batch Seed** - Fixed seed for reproducible batch output (leave empty for random)
 - **Compile Codec** - Enable `torch.compile` for 3-4x faster batch decoding (adds ~30-60s warmup on first generation)
 - **Sub-batching** - Split batches by text length to reduce wasted GPU compute on padding (enabled by default)
@@ -502,7 +506,7 @@ curl -X POST http://127.0.0.1:4200/api/config \
       "mode": "local",
       "device": "auto",
       "language": "English",
-      "parallel_workers": 25,
+      "parallel_workers": 2,
       "batch_seed": 12345,
       "compile_codec": true,
       "sub_batch_enabled": true,
@@ -853,7 +857,10 @@ For script generation, non-thinking models work best:
 ### TTS generation fails
 - Check the Pinokio terminal for model loading errors
 - Ensure sufficient VRAM (16+ GB recommended for bfloat16)
-- For external mode, ensure the Gradio TTS server is running at the configured URL
+- For external mode, ensure the configured Gradio server or HTTP `/tts` endpoint is reachable
+- If the xc service is only reachable through SSH, run `./start_xc_tts_tunnel.sh` and configure `http://127.0.0.1:18000/tts`; keep the tunnel running while rendering
+- For xc dual-GPU mode, start GPU1 on remote port 8001, then run `./start_xc_tts_tunnel.sh` (it forwards both 18000 and 18001 by default) and configure `tts.urls` as `http://127.0.0.1:18000/tts` plus `http://127.0.0.1:18001/tts`; set `parallel_workers` to 2.
+- The xc HTTP service supports CustomVoice plus persistent VoiceDesign profiles; if a profile request fails, Alexandria stops instead of silently using the narrator voice
 - Check voice_config.json has valid settings for all speakers
 - For clone voices, verify reference audio exists and transcript is accurate
 

@@ -3,7 +3,12 @@ import re
 import json
 import threading
 import shutil
+import io
+import wave
+from urllib.parse import urlparse
+
 import numpy as np
+import requests
 import soundfile as sf
 from pydub import AudioSegment
 
@@ -86,11 +91,13 @@ def compute_timeline(chunks_with_audio, pause_ms=DEFAULT_PAUSE_MS,
 
 
 class TTSEngine:
-    """TTS engine supporting local (qwen-tts) and external (Gradio) backends.
+    """TTS engine supporting local and external backends.
 
     Mode is determined by config["tts"]["mode"]:
       - "local": Loads Qwen3TTSModel directly. No external server needed.
-      - "external": Connects via Gradio client to a running TTS server.
+      - "external": Connects to either a Gradio server or an HTTP ``/tts``
+        endpoint. URLs ending in ``/tts`` use the JSON/WAV HTTP protocol;
+        other URLs retain the existing Gradio behavior.
 
     Models and clients are lazily initialized on first use.
     """
@@ -98,12 +105,64 @@ class TTSEngine:
     def __init__(self, config):
         tts_config = config.get("tts", {})
         self._mode = tts_config.get("mode", "external")
-        self._url = tts_config.get("url", "http://127.0.0.1:7860")
+        configured_urls = tts_config.get("urls", tts_config.get("external_urls"))
+        if isinstance(configured_urls, str):
+            configured_urls = [configured_urls]
+        if isinstance(configured_urls, (list, tuple)):
+            external_urls = [str(item).strip() for item in configured_urls if str(item).strip()]
+        else:
+            external_urls = []
+        if not external_urls:
+            configured_single = str(tts_config.get("url") or "").strip()
+            external_urls = [configured_single] if configured_single else [
+                "http://127.0.0.1:18000/tts",
+                "http://127.0.0.1:18001/tts",
+            ]
+        self._external_urls = external_urls
+        self._url = self._external_urls[0]
         self._device = tts_config.get("device", "auto")
         self._compile_codec_enabled = tts_config.get("compile_codec", False)
+        try:
+            self._external_timeout = max(1.0, float(tts_config.get("external_timeout", 300)))
+        except (TypeError, ValueError):
+            self._external_timeout = 300.0
+        try:
+            self._external_max_chars = max(1, int(tts_config.get("external_max_chars", 2000)))
+        except (TypeError, ValueError):
+            self._external_max_chars = 2000
+        try:
+            self._external_batch_size = max(1, int(tts_config.get("external_batch_size", 48)))
+        except (TypeError, ValueError):
+            self._external_batch_size = 48
+        self._uses_http_tts = bool(self._external_urls) and all(
+            self._is_http_tts_url(url) for url in self._external_urls
+        )
+        configured_profile_urls = tts_config.get("voice_profile_urls")
+        if isinstance(configured_profile_urls, str):
+            configured_profile_urls = [configured_profile_urls]
+        if isinstance(configured_profile_urls, (list, tuple)):
+            self._voice_profile_urls = [
+                str(item).strip() for item in configured_profile_urls if str(item).strip()
+            ]
+        else:
+            explicit_profile_url = str(tts_config.get("voice_profile_url") or "").strip()
+            self._voice_profile_urls = [explicit_profile_url] if explicit_profile_url else []
+        if not self._voice_profile_urls:
+            self._voice_profile_urls = [self._voice_profile_design_url(url) for url in self._external_urls]
+        try:
+            self._voice_profile_timeout = max(
+                1.0, float(tts_config.get("voice_profile_timeout", self._external_timeout))
+            )
+        except (TypeError, ValueError):
+            self._voice_profile_timeout = self._external_timeout
+        self._voice_profile_required = tts_config.get("voice_profile_required", True) is not False
+        try:
+            self._external_parallel_workers = max(1, int(tts_config.get("parallel_workers", 2)))
+        except (TypeError, ValueError):
+            self._external_parallel_workers = 2
 
         # Language setting (passed to Qwen3-TTS)
-        self._language = tts_config.get("language", "English")
+        self._language = tts_config.get("language", "Chinese")
 
         # Sub-batching config
         self._sub_batch_enabled = tts_config.get("sub_batch_enabled", True)
@@ -120,15 +179,46 @@ class TTSEngine:
         self._warmup_needed = True  # cleared after first batch warmup
         self._lora_adapter_path = None  # track which adapter is currently loaded
         self._gradio_client = None
+        self._external_url_lock = threading.Lock()
+        self._external_url_index = 0
 
         # Clone prompt cache: speaker_name -> (ref_audio_path, reusable voice_clone_prompt)
         self._clone_prompt_cache = {}
         # LoRA clone prompt cache: adapter_path -> reusable voice_clone_prompt
         self._lora_prompt_cache = {}
 
+    @staticmethod
+    def _is_http_tts_url(url):
+        """Return whether an external URL points at the REST ``/tts`` API.
+
+        The remote service supplied for this project exposes a single
+        ``POST /tts`` endpoint rather than a Gradio app. Keeping detection
+        URL-based preserves compatibility with existing Gradio configurations.
+        """
+        try:
+            path = urlparse(str(url)).path.rstrip("/")
+        except ValueError:
+            return False
+        return path.endswith("/tts")
+
     @property
     def mode(self):
         return self._mode
+
+    @property
+    def uses_http_tts(self):
+        """Whether the configured external backend is the HTTP /tts protocol."""
+        return self._uses_http_tts
+
+    @property
+    def endpoint_count(self):
+        """Number of configured external endpoints."""
+        return len(self._external_urls)
+
+    @property
+    def supports_http_batch(self):
+        """Whether the configured HTTP backend has a native batch endpoint."""
+        return self._uses_http_tts
 
     @staticmethod
     def _concat_audio(wav):
@@ -142,8 +232,18 @@ class TTSEngine:
         """Free GPU memory: garbage-collect Python objects, then clear CUDA cache."""
         import gc
         gc.collect()
-        import torch
+        try:
+            import torch
+        except ImportError:
+            return
         torch.cuda.empty_cache()
+
+    def _next_http_tts_url(self):
+        """Return the next HTTP endpoint using thread-safe round-robin."""
+        with self._external_url_lock:
+            endpoint = self._external_urls[self._external_url_index % len(self._external_urls)]
+            self._external_url_index += 1
+        return endpoint
 
     @staticmethod
     def _reset_compile_cache():
@@ -942,7 +1042,7 @@ class TTSEngine:
         """Generate multiple audio files.
 
         Local mode: uses native list-based batch API for custom voices.
-        External mode: sequential individual calls.
+        External HTTP mode: native /tts_batch calls across the configured endpoint pool.
 
         Args:
             chunks: List of dicts with 'text', 'instruct', 'speaker', 'index' keys
@@ -1082,6 +1182,7 @@ class TTSEngine:
                 return False
 
             voice = voice_data.get("voice", "Ryan")
+            voice_profile_id = voice_data.get("voice_profile_id")
             default_style = voice_data.get("default_style", "")
             seed = int(voice_data.get("seed", -1))
 
@@ -1613,8 +1714,246 @@ class TTSEngine:
 
     # ── External backend methods ─────────────────────────────────
 
+    @staticmethod
+    def _split_http_text(text, max_chars):
+        """Split text at punctuation so it fits the HTTP service limit."""
+        text = str(text or "").strip()
+        if not text:
+            return []
+        max_chars = max(1, int(max_chars))
+        chunks = []
+        remaining = text
+        break_chars = "。！？!?；;，,、\n "
+        while len(remaining) > max_chars:
+            window = remaining[:max_chars]
+            cut = max((window.rfind(char) for char in break_chars), default=-1)
+            if cut >= max_chars // 2:
+                cut += 1
+            else:
+                cut = max_chars
+            part = remaining[:cut].strip()
+            if part:
+                chunks.append(part)
+            remaining = remaining[cut:].lstrip()
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    @staticmethod
+    def _concat_wav_bytes(wav_parts):
+        """Concatenate PCM WAV responses while preserving the first format."""
+        if not wav_parts:
+            raise RuntimeError("HTTP TTS endpoint returned no WAV parts")
+
+        frames = []
+        audio_format = None
+        for part in wav_parts:
+            with wave.open(io.BytesIO(part), "rb") as reader:
+                current_format = (
+                    reader.getnchannels(),
+                    reader.getsampwidth(),
+                    reader.getframerate(),
+                    reader.getcomptype(),
+                    reader.getcompname(),
+                )
+                if audio_format is None:
+                    audio_format = current_format
+                elif current_format != audio_format:
+                    raise RuntimeError("HTTP TTS returned WAV parts with inconsistent formats")
+                frames.append(reader.readframes(reader.getnframes()))
+
+        channels, sample_width, sample_rate, compression, compression_name = audio_format
+        output = io.BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setnchannels(channels)
+            writer.setsampwidth(sample_width)
+            writer.setframerate(sample_rate)
+            writer.setcomptype(compression, compression_name)
+            writer.writeframes(b"".join(frames))
+        return output.getvalue()
+
+    def _external_http_tts(self, text, speaker, instruct, endpoint=None, voice_profile_id=None):
+        """Call a JSON/WAV HTTP TTS endpoint and return its WAV bytes."""
+        endpoint = endpoint or self._next_http_tts_url()
+        payload = {
+            "text": text,
+            "speaker": speaker,
+            "voice_profile_id": voice_profile_id,
+            "instruct": instruct or "",
+            "language": self._language,
+        }
+
+        response = requests.post(
+            endpoint,
+            json=payload,
+            timeout=self._external_timeout,
+        )
+        if response.status_code >= 400:
+            detail = response.text[:500].strip()
+            raise RuntimeError(
+                f"HTTP TTS request failed at {endpoint} ({response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+
+        audio = response.content
+        content_type = response.headers.get("content-type", "").lower()
+        if not audio:
+            raise RuntimeError("HTTP TTS endpoint returned an empty response")
+        if not (audio[:4] == b"RIFF" and audio[8:12] == b"WAVE"):
+            raise RuntimeError(
+                "HTTP TTS endpoint did not return a WAV file"
+                + (f" (content-type={content_type or 'unknown'})" if content_type else "")
+            )
+        return audio
+
+    @staticmethod
+    def _http_batch_url(endpoint):
+        """Map a single-item /tts URL to the native /tts_batch URL."""
+        endpoint = str(endpoint).rstrip("/")
+        if endpoint.endswith("/tts"):
+            return endpoint[:-4] + "/tts_batch"
+        return endpoint + "/tts_batch"
+
+    @staticmethod
+    def _voice_profile_design_url(endpoint):
+        endpoint = str(endpoint).rstrip("/")
+        if endpoint.endswith("/tts"):
+            return endpoint[:-4] + "/voice_profiles/design"
+        if endpoint.endswith("/voice_profiles/design"):
+            return endpoint
+        return endpoint + "/voice_profiles/design"
+
+    def ensure_voice_profile(self, voice_profile_id, description, sample_text, language=None, seed=-1):
+        """Create an xc VoiceDesign profile once and return its stable ID.
+
+        The remote service persists the reference audio and metadata. The
+        request is idempotent: repeating it with the same ID returns the
+        existing profile without redesigning the voice. With two GPUs we try
+        both profile endpoints; they share the remote profile directory.
+        """
+        if self._mode != "external" or not self._uses_http_tts:
+            raise RuntimeError("persistent xc voice profiles require external HTTP /tts endpoints")
+        profile_id = str(voice_profile_id or "").strip()
+        if not profile_id:
+            raise RuntimeError("voice_profile_id is required")
+        payload_body = {
+            "voice_profile_id": profile_id,
+            "description": str(description or "").strip(),
+            "sample_text": str(sample_text or "").strip(),
+            "language": language or self._language,
+            "seed": int(seed),
+            "force": False,
+        }
+        failures = []
+        for endpoint in self._voice_profile_urls:
+            try:
+                response = requests.post(
+                    endpoint,
+                    json=payload_body,
+                    timeout=self._voice_profile_timeout,
+                )
+                if response.status_code >= 400:
+                    detail = response.text[:800].strip()
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}"
+                        + (f": {detail}" if detail else "")
+                    )
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise RuntimeError("invalid JSON response") from exc
+                returned_id = str(payload.get("voice_profile_id") or payload.get("profile_id") or "").strip()
+                status = str(payload.get("status") or "ready").lower()
+                if returned_id and returned_id != profile_id:
+                    raise RuntimeError(
+                        f"returned profile {returned_id!r}, expected {profile_id!r}"
+                    )
+                if status not in {"ready", "created", "cached", "ok"}:
+                    raise RuntimeError(f"profile status is {status}")
+                return {**payload, "voice_profile_id": returned_id or profile_id, "status": status}
+            except Exception as exc:
+                failures.append(f"{endpoint}: {exc}")
+        raise RuntimeError("xc VoiceDesign profile request failed: " + "; ".join(failures))
+
+    def _external_http_tts_batch(self, chunks, voice_config, endpoint=None):
+        """Call the native HTTP batch endpoint and return WAV byte strings."""
+        import base64
+
+        if not chunks:
+            return []
+        endpoint = endpoint or self._next_http_tts_url()
+        texts = []
+        speakers = []
+        profile_ids = []
+        instructs = []
+        for chunk in chunks:
+            speaker_name = str(chunk.get("speaker") or "")
+            voice_data = voice_config.get(speaker_name, {})
+            voice = voice_data.get("voice", "Ryan")
+            profile_id = chunk.get("voice_profile_id") or voice_data.get("voice_profile_id")
+            default_style = voice_data.get("default_style", "")
+            instruct = (
+                chunk.get("instruct")
+                or default_style
+                or "neutral"
+            )
+            texts.append(str(chunk.get("text") or "").strip())
+            speakers.append(voice)
+            profile_ids.append(str(profile_id).strip() if profile_id else None)
+            instructs.append(str(instruct))
+
+        response = requests.post(
+            self._http_batch_url(endpoint),
+            json={
+                "texts": texts,
+                "speaker": speakers,
+                "voice_profile_ids": profile_ids,
+                "instruct": instructs,
+                "language": self._language,
+            },
+            timeout=self._external_timeout,
+        )
+        if response.status_code >= 400:
+            detail = response.text[:500].strip()
+            raise RuntimeError(
+                f"HTTP TTS batch request failed at {endpoint} ({response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("HTTP TTS batch endpoint returned invalid JSON") from exc
+
+        encoded_audios = payload.get("audios")
+        if not isinstance(encoded_audios, list) or len(encoded_audios) != len(chunks):
+            raise RuntimeError(
+                "HTTP TTS batch endpoint returned an unexpected audio count"
+            )
+
+        audios = []
+        for encoded in encoded_audios:
+            if not isinstance(encoded, str):
+                raise RuntimeError("HTTP TTS batch endpoint returned invalid audio data")
+            try:
+                audio = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("HTTP TTS batch endpoint returned invalid base64") from exc
+            if not audio or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+                raise RuntimeError("HTTP TTS batch endpoint returned a non-WAV payload")
+            audios.append(audio)
+        return audios
+
+    @staticmethod
+    def _write_external_wav(audio, output_path):
+        """Persist bytes returned by an HTTP TTS endpoint."""
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, "wb") as handle:
+            handle.write(audio)
+
     def _external_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
-        """Generate custom voice audio via external Gradio server."""
+        """Generate custom voice audio via an external Gradio or HTTP server."""
         try:
             voice_data = voice_config.get(speaker)
             if not voice_data:
@@ -1622,12 +1961,30 @@ class TTSEngine:
                 return False
 
             voice = voice_data.get("voice", "Ryan")
+            voice_profile_id = voice_data.get("voice_profile_id")
             default_style = voice_data.get("default_style", "")
             seed = int(voice_data.get("seed", -1))
 
             instruct = instruct_text if instruct_text else (default_style if default_style else "neutral")
 
             print(f"TTS [external] generating with instruct='{instruct}' for text='{text[:50]}...'")
+
+            if self._uses_http_tts:
+                text_parts = self._split_http_text(text, self._external_max_chars)
+                if len(text_parts) > 1:
+                    print(
+                        f"HTTP TTS: splitting {len(text)} characters into "
+                        f"{len(text_parts)} requests (max {self._external_max_chars})"
+                    )
+                audio_parts = [
+                    self._external_http_tts(
+                        part, voice, instruct, voice_profile_id=voice_profile_id
+                    )
+                    for part in text_parts
+                ]
+                audio = self._concat_wav_bytes(audio_parts)
+                self._write_external_wav(audio, output_path)
+                return True
 
             client = self._init_external()
 
@@ -1660,8 +2017,19 @@ class TTSEngine:
             return False
 
     def _external_generate_clone(self, text, speaker, voice_config, output_path):
-        """Generate voice-cloned audio via external Gradio server."""
+        """Generate voice-cloned audio via an external Gradio server.
+
+        The standalone HTTP ``/tts`` service only exposes CustomVoice and has
+        no reference-audio upload or clone endpoint.
+        """
         try:
+            if self._uses_http_tts:
+                print(
+                    "Error: HTTP /tts external service supports CustomVoice and profile voices; "
+                    f"legacy clone voice '{speaker}' requires migration to voice_profile_id."
+                )
+                return False
+
             from gradio_client import handle_file
 
             voice_data = voice_config.get(speaker)
@@ -1720,27 +2088,134 @@ class TTSEngine:
             return False
 
     def _sequential_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
-        """Sequential custom voice generation for external mode (no native batch)."""
+        """Generate external custom voices with native HTTP batching when available."""
         results = {"completed": [], "failed": []}
+        if not chunks:
+            return results
 
-        for chunk in chunks:
+        def render_one(chunk):
             idx = chunk["index"]
             output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
             try:
+                speaker_name = str(chunk.get("speaker") or "")
+                chunk_voice_config = voice_config
+                selected_profile = chunk.get("voice_profile_id")
+                if selected_profile:
+                    chunk_voice_config = dict(voice_config)
+                    selected_voice_data = dict(voice_config.get(speaker_name, {}))
+                    selected_voice_data["voice_profile_id"] = selected_profile
+                    chunk_voice_config[speaker_name] = selected_voice_data
                 success = self.generate_custom_voice(
                     chunk.get("text", ""),
                     chunk.get("instruct", ""),
-                    chunk.get("speaker", ""),
-                    voice_config,
+                    speaker_name,
+                    chunk_voice_config,
                     output_path,
                 )
                 if success:
-                    results["completed"].append(idx)
-                    print(f"Batch chunk {idx} saved: {os.path.getsize(output_path)} bytes")
+                    return idx, True, f"Batch chunk {idx} saved: {os.path.getsize(output_path)} bytes"
+                return idx, False, "Custom voice generation failed"
+            except Exception as exc:
+                return idx, False, str(exc)
+
+        if not self._uses_http_tts:
+            for chunk in chunks:
+                outcome = render_one(chunk)
+                if outcome[1]:
+                    results["completed"].append(outcome[0])
+                    print(outcome[2])
                 else:
-                    results["failed"].append((idx, "Custom voice generation failed"))
-            except Exception as e:
-                results["failed"].append((idx, str(e)))
+                    results["failed"].append((outcome[0], outcome[2]))
+            return results
+
+        eligible = []
+        oversized = []
+        for chunk in chunks:
+            if len(str(chunk.get("text") or "").strip()) <= self._external_max_chars:
+                eligible.append(chunk)
+            else:
+                oversized.append(chunk)
+
+        batch_size = max(1, self._external_batch_size)
+        if eligible:
+            natural_group_count = (len(eligible) + batch_size - 1) // batch_size
+            parallel_group_count = min(
+                len(self._external_urls),
+                max(1, len(eligible) // 4),
+            )
+            group_count = min(
+                len(eligible),
+                max(natural_group_count, parallel_group_count),
+            )
+            group_size = (len(eligible) + group_count - 1) // group_count
+            batch_groups = [
+                eligible[start:start + group_size]
+                for start in range(0, len(eligible), group_size)
+            ]
+        else:
+            batch_groups = []
+        tasks = [("batch", index, group) for index, group in enumerate(batch_groups)]
+        tasks.extend(("single", index, [chunk]) for index, chunk in enumerate(oversized))
+        if not tasks:
+            return results
+
+        def run_task(task):
+            task_type, task_index, group = task
+            if task_type == "single":
+                return [render_one(group[0])]
+
+            endpoint = self._external_urls[task_index % len(self._external_urls)]
+            try:
+                audios = self._external_http_tts_batch(
+                    group,
+                    voice_config,
+                    endpoint=endpoint,
+                )
+                outcomes = []
+                for chunk, audio in zip(group, audios):
+                    idx = chunk["index"]
+                    output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+                    self._write_external_wav(audio, output_path)
+                    outcomes.append(
+                        (idx, True, f"Batch chunk {idx} saved: {os.path.getsize(output_path)} bytes")
+                    )
+                return outcomes
+            except Exception as exc:
+                print(
+                    f"HTTP TTS batch failed for {len(group)} chunks at {endpoint}: {exc}; "
+                    "falling back to single /tts requests"
+                )
+                return [render_one(chunk) for chunk in group]
+
+        worker_count = min(
+            max(1, self._external_parallel_workers),
+            len(self._external_urls),
+            len(tasks),
+        )
+        print(
+            f"HTTP TTS: dispatching {len(chunks)} chunks as {len(batch_groups)} "
+            f"batch request(s) and {len(oversized)} single request(s) across "
+            f"{worker_count} endpoint worker(s), batch_size={batch_size}"
+        )
+
+        if worker_count <= 1:
+            grouped_outcomes = [run_task(task) for task in tasks]
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            grouped_outcomes = []
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(run_task, task) for task in tasks]
+                for future in as_completed(futures):
+                    grouped_outcomes.append(future.result())
+
+        for outcomes in grouped_outcomes:
+            for idx, success, message in outcomes:
+                if success:
+                    results["completed"].append(idx)
+                    print(message)
+                else:
+                    results["failed"].append((idx, message))
 
         return results
 

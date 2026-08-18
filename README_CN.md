@@ -18,9 +18,20 @@
 # 默认生成到 ./books/fanren；也可以设置 ALEXANDRIA_BOOKS_DIR
 python cli.py init --book fanren --input /data/books/fanren.txt --title "凡人修仙传"
 
+# 所有章节号都是小说原始章节号，不是导入清单的内部切分号
 # 从第 1 章处理；中断后安全续跑
 python cli.py run --book fanren --from 1
 python cli.py run --book fanren --continue
+
+# 推荐：从正文第 729 章起生成 10 章；先 --plan 检查严格章节映射
+./generate_chapters.py 729 10 --plan
+./generate_chapters.py 729 10
+./generate_chapters.py 729 20 --continue
+
+# 仙界篇第 1 章起生成 5 章；外传第 1 章起生成 3 章
+./generate_chapters.py --arc xian 1 5 --plan
+./generate_chapters.py --arc xian 1 5
+./generate_chapters.py --arc outside 1 3
 
 # 单章重做、查看进度、导出带章节标记的 M4B
 python cli.py run --book fanren --chapter 127 --force
@@ -37,13 +48,14 @@ books/fanren/
 ├── state/
 │   ├── characters.json
 │   ├── aliases.json
-│   └── voices.json
+│   ├── voices.json
+│   └── novel_chapters.json  # 正文/仙界篇/外传的严格小说章节映射
 ├── chapters/000001/
 │   ├── source.txt
 │   ├── script.json
 │   ├── summary.txt
 │   ├── status.json
-│   └── audio.m4a
+│   └── audio.m4b
 └── output/
     ├── chapters/
     └── fanren.m4b
@@ -60,7 +72,21 @@ python cli.py review --book fanren --chapter 37
 
 `merge SOURCE TARGET` 会把前者并入后者，并重写已有章节中的 `character_id` 和声音引用。默认不会自动执行审校；只有显式运行 `review` 才会再次调用 Codex。TTS 失败时，已有 `script.json` 和分析缓存会保留，下一次 `run --continue` 只从音频阶段继续。
 
-CLI 运行前请确认：`codex` 已安装并完成 `codex auth login`，`ffmpeg` 在 `PATH` 中，且 Alexandria 的 Python 依赖和 Qwen3-TTS 模型可用。每个 `book.json` 会记录 `codex_model`，初始化时默认是 `gpt-5.3-codex-spark`；也可以用 `--codex-model` 或 `ALEXANDRIA_CODEX_MODEL` 覆盖。Codex 不读取或修改项目状态文件，Python 会把每次分析结果写入章节缓存；更换提示词时修改 `ALEXANDRIA_PROMPT_VERSION`，再用 `analyze --force` 有选择地重跑。默认给有名角色分配一个锁定的 CustomVoice；需要按 Codex 的 `voice_character` 只生成一次 VoiceDesign 参考音频时，可设置 `ALEXANDRIA_CHARACTER_VOICE_MODE=design`，之后自动转为 Clone voice。没有 GPU 时可用 `--dry-run` 检查拆章、提示词和断点状态。
+`generate_chapters.py` 会根据原小说标题、正文内容和导入记录的连续性，自动建立一次 `state/novel_chapters.json` 严格映射。当前支持三个相互独立的章节分区：正文、仙界篇、外传；每个分区都从小说自己的第 1 章开始编号。目录、标题行、断开的内部记录和无法形成连续序列的内容都会被拒绝，不会被猜成小说章节。所有 `--chapter`、`--from`、`--to`、`--count` 参数都是所选分区内的小说原始章节号，不是导入后的内部切分号。
+
+项目默认使用 M4B 作为章节和整本有声书容器；逐行 WAV 只作为 TTS 中间文件保留。旧的 M4A 章节会在继续处理或导出时自动转换为 M4B。
+
+发布到 `output/chapters/` 的文件名固定使用小说原章节名：
+
+```text
+正文：   正_729_黄龙山.m4b
+仙界篇： 仙_1_昆吾三老.m4b
+外传：   外_1_梦开始的地方.m4b
+```
+
+每个章节生成后会原子发布，Audiobookshelf 开启 File Watcher 后会自动看到新增或更新的章节。当前 xc TTS 默认使用两个端点、每张卡 native batch=48 并行生成；章节按顺序推进，单章内的文本行交给 xc 的 `/tts_batch` 批量生成。
+
+CLI 运行前请确认：`codex` 已安装并完成 `codex auth login`，`ffmpeg` 在 `PATH` 中，且 Alexandria 的 Python 依赖和 Qwen3-TTS 模型可用。每个 `book.json` 会记录 `codex_model`，初始化时默认是 `gpt-5.3-codex-spark`；也可以用 `--codex-model` 或 `ALEXANDRIA_CODEX_MODEL` 覆盖。CLI 默认使用 Codex CLI 支持的 `xhigh` 推理档位；需要降档时设置 `ALEXANDRIA_CODEX_REASONING_EFFORT=high`（旧配置中的 `max` 会自动转换为 `xhigh`）。Codex 不读取或修改项目状态文件，Python 会把每次分析结果写入章节缓存；更换提示词时修改 `ALEXANDRIA_PROMPT_VERSION`，再用 `analyze --force` 有选择地重跑。默认给每个有名角色分配一个稳定的 xc VoiceDesign profile：首次遇到角色时生成一次参考音频，后续章节只复用同一个 profile；旁白固定一个声音，无名路人/弟子按性别年龄复用通用声音。只有显式设置 `ALEXANDRIA_CHARACTER_VOICE_MODE=custom` 才回到旧的预置音色模式。没有 GPU 时可用 `--dry-run` 检查拆章、提示词和断点状态。
 
 ## 示例音频：[sample.mp3](https://github.com/user-attachments/files/25276110/sample.mp3)
 
@@ -233,7 +259,14 @@ Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
 - **LLM Base URL**：`http://localhost:1234/v1`（LM Studio）或 `http://localhost:11434/v1`（Ollama）
 - **LLM API Key**：你的 API 密钥（本地服务器使用 `local`）
 - **LLM Model Name**：要使用的模型（例如 `qwen2.5-14b`）
-- **TTS Mode**：`local`（内置引擎，推荐）— 直接加载模型，无需外部服务器
+- **TTS Mode**：`local`（内置引擎，推荐）— 直接加载模型，无需外部服务器；也可以选择 `external` 使用远端服务
+- 使用独立 HTTP TTS 时，把 URL 填成完整的 `/tts` 地址，例如 `http://127.0.0.1:18000/tts`；该接口接收 JSON 并返回 WAV，支持预置 CustomVoice 和持久化 `voice_profile_id`。VoiceDesign 创建接口为同一服务下的 `/voice_profiles/design`。
+- 双卡外部 TTS 可在配置中写 `tts.urls` 端点数组，并将 `parallel_workers` 设为端点数；每张卡运行一个独立模型进程，请求按轮询分流。
+- 这里的 `parallel_workers` 是 HTTP 端点/显卡 worker 数，不是 batch size：双卡用 `2`，单卡用 `1`；单卡时 `tts.external_batch_size` 仍保持 `48`。
+- `tts.external_batch_size` 控制每张卡每次 `/tts_batch` 请求的文本数；当前 xc 默认是 `48` 段。
+  - `parallel_workers=2` 会同时使用两个独立端点；每个端点最多处理一个 batch=48 请求，避免同一张卡叠加多个生成请求。
+- 如果远端服务只能通过 SSH 的 `xc` 别名访问，先运行 `./start_xc_tts_tunnel.sh`，并保持隧道进程运行
+- xc 双卡时：远端 `8000/cuda:0` 保持不变，在 `8001/cuda:1` 启动第二个实例，直接运行 `./start_xc_tts_tunnel.sh` 即可（默认同时转发 18000/18001）；配置 `tts.urls` 为两个本地 `/tts` 地址，`parallel_workers` 设为 `2`。
 - 完成后点击 **Save Configuration**
 
 **第 2 步 — 脚本**

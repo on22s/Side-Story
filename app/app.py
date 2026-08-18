@@ -200,11 +200,24 @@ class LLMConfig(BaseModel):
     reasoning_effort: Optional[str] = None
 
 class TTSConfig(BaseModel):
-    mode: str = "local"  # "local" or "external"
-    url: str = "http://127.0.0.1:7860"  # external mode only
+    mode: str = "external"  # "local" or "external"
+    url: str = "http://127.0.0.1:18000/tts"  # external mode only
+    urls: List[str] = [
+        "http://127.0.0.1:18000/tts",
+        "http://127.0.0.1:18001/tts",
+    ]  # optional HTTP /tts endpoint pool
+    external_timeout: float = 300  # HTTP /tts request timeout in seconds
+    external_max_chars: int = 2000  # split long HTTP /tts requests at this length
+    external_batch_size: int = 48  # max texts per HTTP /tts_batch request
+    voice_profile_urls: List[str] = [
+        "http://127.0.0.1:18000/voice_profiles/design",
+        "http://127.0.0.1:18001/voice_profiles/design",
+    ]  # xc VoiceDesign profile endpoints; shared storage makes one endpoint sufficient
+    voice_profile_timeout: float = 900  # VoiceDesign profile creation timeout in seconds
+    voice_profile_required: bool = True  # never silently replace a profile with narrator/custom voice
     device: str = "auto"  # local mode: "auto", "cuda:0", "cpu", etc.
-    language: str = "English"  # TTS language
-    parallel_workers: int = 2  # concurrent TTS workers
+    language: str = "Chinese"  # TTS language
+    parallel_workers: int = 2  # concurrent endpoint workers
     batch_seed: Optional[int] = None  # Single seed for batch mode, None/-1 = random
     compile_codec: bool = False  # torch.compile the codec for ~3-4x batch throughput (slow first run)
     sub_batch_enabled: bool = True  # split batch by text length to reduce padding waste
@@ -477,9 +490,24 @@ async def get_config():
             "reasoning_effort": None
         },
         "tts": {
-            "mode": "local",
-            "url": "http://127.0.0.1:7860",
-            "device": "auto"
+            "mode": "external",
+            "url": "http://127.0.0.1:18000/tts",
+            "urls": [
+                "http://127.0.0.1:18000/tts",
+                "http://127.0.0.1:18001/tts"
+            ],
+            "external_timeout": 300,
+            "external_max_chars": 2000,
+            "external_batch_size": 48,
+            "voice_profile_urls": [
+                "http://127.0.0.1:18000/voice_profiles/design",
+                "http://127.0.0.1:18001/voice_profiles/design",
+            ],
+            "voice_profile_timeout": 900,
+            "voice_profile_required": True,
+            "device": "auto",
+            "language": "Chinese",
+            "parallel_workers": 2
         },
         "prompts": {
             "system_prompt": "",
@@ -1207,7 +1235,7 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
 
     # Load batch_seed and batch_size from config
     batch_seed = -1
-    batch_size = 4
+    batch_size = 48
     batch_group_by_type = False
     if os.path.exists(CONFIG_PATH):
         try:
@@ -1217,7 +1245,10 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
                 seed_val = tts_cfg.get("batch_seed")
                 if seed_val is not None and seed_val != "":
                     batch_seed = int(seed_val)
-                batch_size = max(1, tts_cfg.get("parallel_workers", 4))
+                if tts_cfg.get("mode") == "external":
+                    batch_size = max(1, int(tts_cfg.get("external_batch_size", 48)))
+                else:
+                    batch_size = max(1, int(tts_cfg.get("parallel_workers", 4)))
                 batch_group_by_type = tts_cfg.get("batch_group_by_type", False)
         except (json.JSONDecodeError, ValueError):
             pass

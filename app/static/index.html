@@ -133,12 +133,12 @@
                                     <option value="external">External Server</option>
                                     <option value="local">Local Model</option>
                                 </select>
-                                <div class="form-text">Local loads model in-process; External connects to a Gradio TTS server</div>
+                                <div class="form-text">Local loads model in-process; External accepts a Gradio URL or an HTTP endpoint ending in <code>/tts</code></div>
                             </div>
                             <div class="col-md-5" id="tts-url-group">
-                                <label class="form-label">TTS Server URL</label>
-                                <input type="text" class="form-control" id="tts-url" value="http://127.0.0.1:7860">
-                                <div class="form-text">URL for the Qwen3-TTS Gradio server</div>
+                                <label class="form-label">TTS Server URL / Endpoint</label>
+                                <input type="text" class="form-control" id="tts-url" value="http://127.0.0.1:18000/tts">
+                                <div class="form-text">Use a Gradio base URL or an HTTP TTS endpoint such as <code>http://127.0.0.1:18000/tts</code></div>
                             </div>
                             <div class="col-md-4" id="tts-device-group" style="display:none;">
                                 <label class="form-label">Device</label>
@@ -170,13 +170,18 @@
                             <div class="col-md-2">
                                 <label class="form-label">Parallel Workers</label>
                                 <input type="number" class="form-control" id="parallel-workers" value="2" min="1">
-                                <div class="form-text">Concurrent TTS requests</div>
+                                <div class="form-text">xc 双卡填 2；单卡填 1（每卡 batch=48）</div>
                             </div>
                             <div class="col-md-2">
                                 <label class="form-label">Batch Seed</label>
                                 <input type="number" class="form-control" id="batch-seed" placeholder="-1 (random)">
                                 <div class="form-text">Seed for reproducibility</div>
                             </div>
+                        </div>
+                        <div class="mb-3" id="tts-url-pool-group">
+                            <label class="form-label">HTTP TTS Endpoint Pool (optional)</label>
+                            <input type="text" class="form-control" id="tts-urls" placeholder="http://127.0.0.1:18000/tts, http://127.0.0.1:18001/tts">
+                            <div class="form-text">xc 双卡默认填两个 <code>/tts</code> 端点；每个端点 native batch=48。单卡可只填一个端点。</div>
                         </div>
                         <div class="row mb-3" id="tts-local-options" style="display:none;">
                             <div class="col-md-2">
@@ -1176,6 +1181,7 @@
         function toggleTTSMode() {
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
+            document.getElementById('tts-url-pool-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-device-group').style.display = mode === 'local' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
         }
@@ -1191,9 +1197,10 @@
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('llm-reasoning').value = config.llm.reasoning_effort || '';
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
-                document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
+                document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:18000/tts';
+                document.getElementById('tts-urls').value = Array.isArray(config.tts.urls) ? config.tts.urls.join(', ') : '';
                 document.getElementById('tts-device').value = config.tts.device || 'auto';
-                document.getElementById('tts-language').value = config.tts.language || 'English';
+                document.getElementById('tts-language').value = config.tts.language || 'Chinese';
                 document.getElementById('parallel-workers').value = config.tts.parallel_workers || 2;
                 if (config.tts.batch_seed != null) {
                     document.getElementById('batch-seed').value = config.tts.batch_seed;
@@ -1371,6 +1378,10 @@
                 tts: {
                     mode: document.getElementById('tts-mode').value,
                     url: document.getElementById('tts-url').value,
+                    urls: document.getElementById('tts-urls').value
+                        .split(',')
+                        .map(value => value.trim())
+                        .filter(Boolean),
                     device: document.getElementById('tts-device').value,
                     language: document.getElementById('tts-language').value,
                     parallel_workers: parallelWorkers,
