@@ -1,0 +1,252 @@
+{
+  "version": 2,
+  "effects": {
+    "sword_whoosh": {
+      "file": "combat/sword_whoosh.wav",
+      "variants": [
+        "recorded/sword/fast_sword_whoosh.wav",
+        "recorded/sword/sword_slash_swoosh.wav"
+      ],
+      "category": "combat",
+      "description": "挥剑、剑气或小型法器快速破空",
+      "gain_db": -12,
+      "loop": false
+    },
+    "sword_clash": {
+      "file": "combat/sword_clash.wav",
+      "variants": [
+        "recorded/metal/heavy_sword_metal.wav",
+        "recorded/metal/metal_hammer_hit.wav",
+        "recorded/sword/metallic_sword_strike.wav"
+      ],
+      "category": "combat",
+      "description": "刀剑、飞剑或金属法器正面交击",
+      "gain_db": -11,
+      "loop": false
+    },
+    "heavy_impact": {
+      "file": "combat/heavy_impact.wav",
+      "category": "combat",
+      "description": "重击、坠地、掌力命中或肉身碰撞",
+      "gain_db": -12,
+      "loop": false
+    },
+    "qi_blast": {
+      "file": "combat/qi_blast.wav",
+      "variants": [
+        "recorded/spell/light_energy_shot.wav"
+      ],
+      "category": "combat",
+      "description": "灵力、剑芒、掌风或法术冲击波爆发",
+      "gain_db": -13,
+      "loop": false
+    },
+    "explosion": {
+      "file": "combat/explosion.wav",
+      "variants": [
+        "recorded/explosion/metal_explosion_impact.wav",
+        "recorded/explosion/explosion_hit.wav"
+      ],
+      "category": "combat",
+      "description": "法宝爆裂、丹炉炸裂或大范围爆炸",
+      "gain_db": -15,
+      "loop": false
+    },
+    "thunder_strike": {
+      "file": "combat/thunder_strike.wav",
+      "variants": [
+        "recorded/thunder/fast_thunder_impact.wav"
+      ],
+      "category": "combat",
+      "description": "雷法、天雷、雷劫或雷击落下",
+      "gain_db": -17,
+      "loop": false
+    },
+    "spell_charge": {
+      "file": "magic/spell_charge.wav",
+      "category": "magic",
+      "description": "结印、聚气、法宝蓄能或阵法启动",
+      "gain_db": -18,
+      "loop": false
+    },
+    "spell_release": {
+      "file": "magic/spell_release.wav",
+      "variants": [
+        "recorded/spell/mystery_spell_whoosh.wav"
+      ],
+      "category": "magic",
+      "description": "术法完成、符箓激发或法宝释放",
+      "gain_db": -14,
+      "loop": false
+    },
+    "teleport": {
+      "file": "magic/teleport.wav",
+      "category": "magic",
+      "description": "瞬移、遁术、传送阵或人物凭空消失出现",
+      "gain_db": -16,
+      "loop": false
+    },
+    "barrier_hum": {
+      "file": "magic/barrier_hum.wav",
+      "category": "ambience",
+      "description": "护罩、禁制、阵法持续运转的低沉灵力声",
+      "gain_db": -27,
+      "loop": true
+    },
+    "flying_whoosh": {
+      "file": "movement/flying_whoosh.wav",
+      "variants": [
+        "recorded/whoosh/air_whoosh.wav",
+        "recorded/whoosh/arrow_whoosh.wav"
+      ],
+      "category": "movement",
+      "description": "御剑飞行、遁光掠过或高速冲刺",
+      "gain_db": -16,
+      "loop": false
+    },
+    "footsteps_stone": {
+      "file": "movement/footsteps_stone.wav",
+      "category": "movement",
+      "description": "石室、洞府、山门台阶上的关键脚步",
+      "gain_db": -18,
+      "loop": false
+    },
+    "door_wood": {
+      "file": "movement/door_wood.wav",
+      "variants": [
+        "recorded/door/creaky_door_open.wav"
+      ],
+      "category": "movement",
+      "description": "木门、洞府门或房门开启关闭",
+      "gain_db": -18,
+      "loop": false
+    },
+    "sect_bell": {
+      "file": "world/sect_bell.wav",
+      "category": "world",
+      "description": "宗门钟声、召集弟子或重大仪式",
+      "gain_db": -19,
+      "loop": false
+    },
+    "beast_roar": {
+      "file": "creatures/beast_roar.wav",
+      "category": "creature",
+      "description": "妖兽、灵兽或大型怪物咆哮",
+      "gain_db": -17,
+      "loop": false
+    },
+    "mountain_wind": {
+      "file": "ambience/mountain_wind.wav",
+      "variants": [
+        "recorded/wind_rain/wind_blowing.wav"
+      ],
+      "category": "ambience",
+      "description": "山巅、悬崖、高空或荒野的持续风声",
+      "gain_db": -28,
+      "loop": true
+    },
+    "forest_night": {
+      "file": "ambience/forest_night.wav",
+      "category": "ambience",
+      "description": "夜间森林、山谷或野外虫鸣环境",
+      "gain_db": -29,
+      "loop": true
+    },
+    "cave_drip": {
+      "file": "ambience/cave_drip.wav",
+      "category": "ambience",
+      "description": "洞府、地窟、秘境石洞中的滴水回响",
+      "gain_db": -28,
+      "loop": true
+    },
+    "rain": {
+      "file": "ambience/rain.wav",
+      "variants": [
+        "recorded/wind_rain/long_rain.wav"
+      ],
+      "category": "ambience",
+      "description": "持续下雨、雨夜或暴雨场景底声",
+      "gain_db": -29,
+      "loop": true
+    },
+    "fire": {
+      "file": "ambience/fire.wav",
+      "variants": [
+        "recorded/fire/campfire_burning.wav",
+        "recorded/fire/campfire_crackles.wav"
+      ],
+      "category": "ambience",
+      "description": "篝火、炉火、炼丹炉或燃烧现场",
+      "gain_db": -28,
+      "loop": true
+    },
+    "stream": {
+      "file": "ambience/stream.wav",
+      "variants": [
+        "recorded/water/river_water.wav",
+        "recorded/water/water_ambience_loop.wav"
+      ],
+      "category": "ambience",
+      "description": "溪流、河边、瀑布附近的持续水声",
+      "gain_db": -29,
+      "loop": true
+    },
+    "cave_resonance": {
+      "file": "recorded/cave/cave_short_effect.wav",
+      "category": "world",
+      "description": "进入洞府、地窟或秘境时的短促空洞回响",
+      "gain_db": -16,
+      "loop": false,
+      "source": "user-provided:cave/Cave_short_effect.wav"
+    },
+    "cavern_ambience": {
+      "file": "recorded/cave/cavern_ambience_1.wav",
+      "variants": [
+        "recorded/cave/cavern_ambience_2.wav"
+      ],
+      "category": "ambience",
+      "description": "大型洞窟、地下空间或古修洞府的持续空旷氛围",
+      "gain_db": -28,
+      "loop": true,
+      "source": "user-provided:cave/Cavern_ambience_*.wav"
+    },
+    "door_slam": {
+      "file": "recorded/door/door_slam.wav",
+      "category": "movement",
+      "description": "房门、殿门或木门突然重重关闭",
+      "gain_db": -16,
+      "loop": false,
+      "source": "user-provided:door/Slamming_a_door.wav"
+    },
+    "forest_footsteps": {
+      "file": "recorded/footsteps/forest_ground.wav",
+      "variants": [
+        "recorded/footsteps/tall_grass.wav"
+      ],
+      "category": "movement",
+      "description": "人物在林地、泥土或高草间持续行走的脚步",
+      "gain_db": -13,
+      "loop": true,
+      "source": "user-provided:footsteps/*.wav"
+    },
+    "forest_day": {
+      "file": "recorded/forest/european_forest.wav",
+      "variants": [
+        "recorded/forest/forest_birds.wav"
+      ],
+      "category": "ambience",
+      "description": "白昼森林、山林或宗门后山的鸟鸣与自然环境",
+      "gain_db": -28,
+      "loop": true,
+      "source": "user-provided:forest/*.wav"
+    },
+    "storm_thunder": {
+      "file": "recorded/thunder/storm_thunder_rumble.wav",
+      "category": "ambience",
+      "description": "雷雨、暴风雨或雷劫前持续翻滚的远雷",
+      "gain_db": -27,
+      "loop": true,
+      "source": "user-provided:thunder/Thunder_rumble_during_storm.wav"
+    }
+  }
+}
