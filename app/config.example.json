@@ -32,6 +32,11 @@
     "voice_profile_timeout": 900,
     "voice_profile_required": true
   },
+  "sfx": {
+    "enabled": true,
+    "manifest": "assets/sfx/manifest.json",
+    "max_effects_per_chapter": 80
+  },
   "generation": {
     "chunk_size": 3000,
     "max_tokens": 4096,

@@ -10,6 +10,7 @@ The legacy Alexandria browser UI and its HTTP API have been removed. There is no
 
 - cli.py owns book projects, chapter mapping, analysis state, character IDs, voice IDs, caching, resume, and M4B export.
 - app/tts.py is the shared TTS backend. It supports the local Qwen3-TTS engine and external HTTP/Gradio TTS endpoints.
+- assets/sfx/ contains the built-in cultivation-novel SFX catalog. Chapter analysis emits controlled cues and FFmpeg mixes them on the dialogue timeline.
 - books/<book>/output/chapters/ is the publish directory watched by Audiobookshelf.
 - Codex CLI is invoked as an ephemeral read-only subprocess for chapter analysis and summaries.
 
@@ -21,7 +22,7 @@ The legacy Alexandria browser UI and its HTTP API have been removed. There is no
 - A local Qwen3-TTS installation or the configured external TTS endpoints
 - GPU is recommended for local TTS; external TTS can be used without a local GPU
 
-The default CLI analysis configuration is gpt-5.3-codex-spark with xhigh reasoning. Override it with ALEXANDRIA_CODEX_MODEL or ALEXANDRIA_CODEX_REASONING_EFFORT when needed.
+The default CLI analysis configuration is gpt-5.6-luna with max reasoning. Override it with ALEXANDRIA_CODEX_MODEL or ALEXANDRIA_CODEX_REASONING_EFFORT when needed.
 
 ## Quick start
 
@@ -49,6 +50,16 @@ For a safe preflight without Codex or TTS:
 
     python cli.py run --book fanren --from 742 --count 1 --dry-run
 
+## Sound effects
+
+Sound effects are enabled by default. The catalog contains 21 deterministic, locally generated WAV assets plus 28 user-provided recorded variants for weapon clashes, qi and spell effects, thunder, explosions, movement, creatures, bells, and common ambience. Variant selection is deterministic for reproducible rerenders. Regenerate the built-in subset with:
+
+    python3 scripts/generate_builtin_sfx.py
+
+New chapter analyses write controlled cues into each script line's `effects` array. Re-analyze an existing chapter with `--force` to add automatic cues, then render it normally. `assets/sfx/manifest.json` is the catalog and mixing defaults. Rendered chapters retain `dialogue.wav` as the speech-only master and write resolved cue timestamps to `sfx_timeline.json`.
+
+Disable mixing for a run with `ALEXANDRIA_SFX_ENABLED=0`. Higher-quality WAV files can replace the built-ins without code changes as long as their manifest cue and filename remain stable.
+
 ## Book layout
 
     books/<book>/
@@ -63,6 +74,8 @@ For a safe preflight without Codex or TTS:
     │   ├── script.json
     │   ├── summary.txt
     │   ├── status.json
+    │   ├── dialogue.wav
+    │   ├── sfx_timeline.json
     │   └── audio.m4b
     └── output/chapters/
 
