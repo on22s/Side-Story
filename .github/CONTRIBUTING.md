@@ -34,33 +34,28 @@ Alexandria runs on Linux, Windows, and macOS. Avoid platform-specific APIs witho
 
 ## Project Structure
 
-Keep app code in `app/`. New modules should go there, not at the repo root.
+Keep shared runtime code in `app/`. The supported long-form workflow is the
+file-based CLI in `cli.py`; `app/tts.py` is the shared TTS backend.
 
 ```
-app/           # Application code (FastAPI, TTS, frontend)
+app/           # Shared TTS and voice utilities
 builtin_lora/  # Pre-trained LoRA presets
+books/         # Book projects and generated audio (local workspace)
 ```
-
-Launcher scripts (`install.js`, `start.js`, etc.) stay at the root.
 
 ## Testing
 
-Before submitting a PR, run the API test suite to make sure nothing is broken:
+Before submitting a PR, run the CLI checks relevant to the change:
 
 ```bash
-cd app
-python test_api.py              # Quick tests (~37) — no TTS/LLM needed
-python test_api.py --full       # Full tests (~49) — requires running TTS + LLM
+python cli.py status --book fanren
+python generate_chapters.py 1 1 --plan
 ```
-
-Quick mode tests config, upload, scripts CRUD, voice config, chunks, status polling, voice design listing, LoRA models/datasets listing, dataset builder CRUD, and error handling — all without loading TTS models. If quick tests pass, your changes are unlikely to break existing functionality.
-
-If your PR modifies or adds API endpoints, add corresponding tests to `test_api.py`.
 
 ## Getting Started
 
 1. Fork the repo and create a feature branch from `dev`
 2. Make your changes
-3. Run `python test_api.py` and verify tests pass
-4. Test manually by restarting the app
+3. Run the relevant CLI checks and verify they pass
+4. Test manually with a dry-run or a small chapter range
 5. Open a PR targeting `dev`

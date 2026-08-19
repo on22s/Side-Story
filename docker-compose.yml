@@ -1,33 +1,4 @@
 services:
-  alexandria:
-    build: .
-    ports:
-      - "4200:4200"
-    environment:
-      # Store WebUI settings on a mounted volume so they survive container restarts
-      - ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json
-      # Optional OpenAI API key; set OPENAI_API_KEY in the host environment.
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-    volumes:
-      # Persist HuggingFace model cache (~3.5 GB per model, downloaded on first use)
-      - hf_cache:/root/.cache/huggingface
-      # Persist user data
-      - ./data/uploads:/alexandria/app/uploads
-      - ./data/designed_voices:/alexandria/designed_voices
-      - ./data/clone_voices:/alexandria/clone_voices
-      - ./data/lora_models:/alexandria/lora_models
-      - ./data/lora_datasets:/alexandria/lora_datasets
-      - ./data/dataset_builder:/alexandria/dataset_builder
-      - ./data/scripts:/alexandria/scripts
-      # Persist WebUI settings (OpenAI endpoint, prompts, TTS mode, etc.)
-      - ./data/config:/alexandria/config
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
   audiobookshelf:
     image: ghcr.io/advplyr/audiobookshelf:latest
     container_name: audiobookshelf
@@ -43,6 +14,3 @@ services:
       # Keep the library read-only so ABS cannot alter pipeline state.
       - ./books:/audiobooks:ro
     restart: unless-stopped
-
-volumes:
-  hf_cache:

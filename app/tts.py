@@ -729,7 +729,7 @@ class TTSEngine:
     def unload_models(self):
         """Free all cached local TTS models and clear GPU cache.
 
-        Called after a full conversion finishes (or via /api/unload) so
+        Called after a full conversion finishes so
         Qwen3-TTS base/clone/design/LoRA weights don't sit in VRAM
         indefinitely. Next TTS call re-loads on demand.
         """
