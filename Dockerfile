@@ -12,6 +12,11 @@ COPY app/requirements.txt /alexandria/app/requirements.txt
 RUN pip install --no-cache-dir -r app/requirements.txt && \
     pip install --no-cache-dir qwen-tts==0.1.1
 
+# Prebuilt flash-attn wheel matching this image's torch/CUDA/Python/ABI build.
+# The base image has no nvcc, so flash-attn can't be compiled from source here.
+RUN pip install --no-cache-dir \
+    https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+
 # Copy application code
 COPY app/ /alexandria/app/
 COPY default_prompts.txt review_prompts.txt persona_prompts.txt /alexandria/
