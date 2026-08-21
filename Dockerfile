@@ -4,7 +4,7 @@ WORKDIR /alexandria
 
 # Install system dependencies for audio processing
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg libsndfile1 && \
+    apt-get install -y --no-install-recommends ffmpeg libsndfile1 sox && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
