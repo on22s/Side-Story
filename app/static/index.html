@@ -136,6 +136,16 @@
             transition: transform 0.2s ease;
         }
         .chunk-row.expanded .chunk-toggle-btn { transform: rotate(180deg); }
+        .chunk-group-header {
+            background: var(--parchment-2) !important;
+            cursor: pointer;
+            user-select: none;
+        }
+        .chunk-group-header td { padding: 8px 12px; font-family: var(--sans); }
+        .chunk-group-header:hover { background: var(--border) !important; }
+        .chunk-group-header .group-chevron { transition: transform .15s ease; color: var(--bronze-dark); }
+        .chunk-group-header:not(.collapsed) .group-chevron { transform: rotate(90deg); }
+        .chunk-group-header .group-count { color: var(--ink-muted); }
 
         /* Core pipeline tabs - verdigris */
         .nav-link.nav-pipeline { color: rgba(178, 209, 197, 0.75); }
@@ -1027,6 +1037,14 @@
                      <!-- Full Progress Bar -->
                      <div class="progress mb-3" style="height: 25px;">
                          <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                     </div>
+
+                     <div class="d-flex justify-content-between align-items-center mb-2">
+                         <div class="small text-muted">Lines are grouped by speaker — click a speaker to expand.</div>
+                         <div>
+                             <button class="btn btn-sm btn-outline-secondary" onclick="setAllChunkGroups(true)"><i class="fas fa-angles-down me-1"></i>Expand All</button>
+                             <button class="btn btn-sm btn-outline-secondary" onclick="setAllChunkGroups(false)"><i class="fas fa-angles-up me-1"></i>Collapse All</button>
+                         </div>
                      </div>
 
                      <div class="table-responsive">
@@ -2005,6 +2023,7 @@
         let isPlayingSequence = false;
         let isRenderingAll = false;
         let cachedChunks = []; // Cache to track changes
+        let expandedGroups = new Set(); // Speaker names currently expanded in the Editor table
 
         function buildSpeakerSelect(chunk) {
             const current = (chunk.speaker || '').trim();
@@ -2129,10 +2148,11 @@
                     return;
                 }
 
-                // Check if we can do incremental update
+                // Check if we can do incremental update (count actual chunk rows,
+                // since group header rows are also children of tbody)
                 const canIncrement = !forceFullRedraw &&
                                     cachedChunks.length === chunks.length &&
-                                    tbody.children.length === chunks.length;
+                                    tbody.querySelectorAll('tr.chunk-row').length === chunks.length;
 
                 if (canIncrement) {
                     // Incremental update - only update changed rows
@@ -2142,9 +2162,17 @@
                             updateChunkRow(chunk);
                         }
                     });
+                    updateGroupHeaderCounts(chunks);
                 } else {
-                    // Full redraw needed
-                    tbody.innerHTML = chunks.map(chunk => {
+                    // Full redraw needed — grouped by speaker, in order of first appearance
+                    const groups = new Map();
+                    chunks.forEach(chunk => {
+                        const speaker = chunk.speaker || '(unknown)';
+                        if (!groups.has(speaker)) groups.set(speaker, []);
+                        groups.get(speaker).push(chunk);
+                    });
+
+                    const renderChunkRow = (chunk, speaker) => {
                         const statusColor = chunk.status === 'done' ? 'success' :
                                           chunk.status === 'generating' ? 'warning' :
                                           chunk.status === 'error' ? 'danger' : 'secondary';
@@ -2159,8 +2187,9 @@
                              </div>` :
                             `<button class="btn btn-sm btn-primary" onclick="generateChunk(${chunk.id})"><i class="fas fa-play"></i> Gen</button>`;
 
+                        const hidden = expandedGroups.has(speaker) ? '' : ' style="display:none;"';
                         return `
-                            <tr data-id="${chunk.id}" class="chunk-row">
+                            <tr data-id="${chunk.id}" data-group="${escapeHtml(speaker)}" class="chunk-row"${hidden}>
                                 <td class="text-center align-middle" style="white-space:nowrap;">
                                     <button class="chunk-action-btn chunk-toggle-btn" onclick="toggleChunkExpand(this)" title="Expand/collapse"><i class="fas fa-chevron-down"></i></button><button class="chunk-action-btn" onclick="insertChunkAfter(${chunk.id})" title="Insert line below"><i class="fas fa-plus"></i></button><button class="chunk-action-btn" onclick="deleteChunk(${chunk.id})" title="Delete line"><i class="fas fa-trash" style="color:#dc3545;"></i></button>
                                 </td>
@@ -2182,7 +2211,24 @@
                                 </td>
                             </tr>
                         `;
-                    }).join('');
+                    };
+
+                    const renderGroupHeader = (speaker, groupChunks) => {
+                        const done = groupChunks.filter(c => c.status === 'done').length;
+                        const expanded = expandedGroups.has(speaker);
+                        return `
+                            <tr class="chunk-group-header${expanded ? '' : ' collapsed'}" data-group="${escapeHtml(speaker)}" onclick="toggleChunkGroup(this.getAttribute('data-group'))">
+                                <td colspan="6">
+                                    <i class="fas fa-chevron-right group-chevron me-2"></i>
+                                    <strong>${escapeHtml(speaker)}</strong>
+                                    <span class="ms-2 small group-count" data-total="${groupChunks.length}">${done}/${groupChunks.length} done</span>
+                                </td>
+                            </tr>`;
+                    };
+
+                    tbody.innerHTML = [...groups.entries()].map(([speaker, groupChunks]) =>
+                        renderGroupHeader(speaker, groupChunks) + groupChunks.map(c => renderChunkRow(c, speaker)).join('')
+                    ).join('');
                 }
 
                 cachedChunks = chunks;
@@ -2196,6 +2242,44 @@
                 console.error("Error loading chunks:", e);
             }
         }
+
+        function updateGroupHeaderCounts(chunks) {
+            const bySpeaker = new Map();
+            chunks.forEach(chunk => {
+                const speaker = chunk.speaker || '(unknown)';
+                const entry = bySpeaker.get(speaker) || { total: 0, done: 0 };
+                entry.total++;
+                if (chunk.status === 'done') entry.done++;
+                bySpeaker.set(speaker, entry);
+            });
+            bySpeaker.forEach((counts, speaker) => {
+                const countEl = document.querySelector(`tr.chunk-group-header[data-group="${CSS.escape(speaker)}"] .group-count`);
+                if (countEl) countEl.textContent = `${counts.done}/${counts.total} done`;
+            });
+        }
+
+        window.toggleChunkGroup = (speaker) => {
+            if (expandedGroups.has(speaker)) expandedGroups.delete(speaker);
+            else expandedGroups.add(speaker);
+            const expanded = expandedGroups.has(speaker);
+
+            const header = document.querySelector(`tr.chunk-group-header[data-group="${CSS.escape(speaker)}"]`);
+            if (header) header.classList.toggle('collapsed', !expanded);
+            document.querySelectorAll(`tr.chunk-row[data-group="${CSS.escape(speaker)}"]`).forEach(tr => {
+                tr.style.display = expanded ? '' : 'none';
+            });
+        };
+
+        window.setAllChunkGroups = (expand) => {
+            document.querySelectorAll('tr.chunk-group-header').forEach(header => {
+                const speaker = header.getAttribute('data-group');
+                if (expand) expandedGroups.add(speaker); else expandedGroups.delete(speaker);
+                header.classList.toggle('collapsed', !expand);
+            });
+            document.querySelectorAll('tr.chunk-row').forEach(tr => {
+                tr.style.display = expand ? '' : 'none';
+            });
+        };
 
         window.toggleChunkExpand = (btn) => {
             const row = btn.closest('tr');
@@ -2320,7 +2404,10 @@
             btn.onclick = stopSequence;
             btn.classList.replace('btn-primary', 'btn-danger');
 
-            const audios = Array.from(document.querySelectorAll('.chunk-audio'));
+            // Sort by chunk id (story order), not DOM order — chunk rows are now
+            // grouped by speaker in the table, which no longer matches reading order.
+            const audios = Array.from(document.querySelectorAll('.chunk-audio'))
+                .sort((a, b) => parseInt(a.dataset.id, 10) - parseInt(b.dataset.id, 10));
             if (audios.length === 0) {
                 stopSequence();
                 return;
@@ -2347,6 +2434,13 @@
 
                 const audio = audios[currentIndex];
                 const tr = audio.closest('tr');
+
+                // Rows are grouped by speaker and start collapsed — expand this
+                // chunk's group so the follow-along highlight is actually visible.
+                const group = tr.getAttribute('data-group');
+                if (group && !expandedGroups.has(group)) {
+                    toggleChunkGroup(group);
+                }
 
                 // Visual feedback
                 document.querySelectorAll('tr').forEach(r => r.classList.remove('table-primary'));
