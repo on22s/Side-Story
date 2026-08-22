@@ -1056,9 +1056,13 @@
                      </table>
                 </div>
                 <div class="card-body">
-                     <!-- Full Progress Bar -->
-                     <div class="progress mb-3" style="height: 25px;">
-                         <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                     <!-- Full Progress Bar. Label is a separate overlay, not text inside
+                          the bar itself — at low percentages the colored fill is too
+                          narrow to contain "N% (done/total)", and it overflows onto the
+                          plain track where white-on-light text is nearly unreadable. -->
+                     <div class="progress mb-3" style="height: 25px; position: relative;">
+                         <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%"></div>
+                         <div id="full-progress-label" style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 0.85rem; font-weight: 600; color: var(--ink); text-shadow: 0 0 3px var(--parchment), 0 0 3px var(--parchment);">0%</div>
                      </div>
 
                      <div class="d-flex justify-content-between align-items-center mb-2">
@@ -2174,7 +2178,10 @@
                 const progressBar = document.getElementById('full-progress-bar');
                 if (progressBar) {
                     progressBar.style.width = `${percentage}%`;
-                    progressBar.innerText = `${percentage}% (${completed}/${total})`;
+                }
+                const progressLabel = document.getElementById('full-progress-label');
+                if (progressLabel) {
+                    progressLabel.innerText = `${percentage}% (${completed}/${total})`;
                 }
 
                 // Skip redraw if playing audio (unless forced)
