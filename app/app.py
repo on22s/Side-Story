@@ -17,6 +17,7 @@ import threading
 import zipfile
 import subprocess
 import aiofiles
+from openai import OpenAI
 from utils import atomic_json_write
 from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
@@ -596,6 +597,16 @@ async def save_config(config: AppConfig):
     # Reset engine so it picks up new TTS settings on next use
     project_manager.engine = None
     return {"status": "saved"}
+
+@app.get("/api/llm/models")
+async def list_llm_models(base_url: str, api_key: str = "local"):
+    try:
+        client = OpenAI(base_url=base_url, api_key=api_key or "local", timeout=8.0)
+        resp = client.models.list()
+        models = sorted({m.id for m in resp.data})
+        return {"models": models}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
 
 class _HTMLTextExtractor(HTMLParser):
     """Strip HTML tags from EPUB content, preserving block-level structure."""

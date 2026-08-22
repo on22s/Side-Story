@@ -6,56 +6,156 @@
     <title>Alexandria Audiobook</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        body { background-color: #f8f9fa; }
+        /* ===== "Library of Alexandria" theme: papyrus, bronze, verdigris =====
+           Bootstrap stays wired for its JS (modals, toasts, collapses) — this
+           layer overrides its look via Bootstrap's own CSS variables plus
+           targeted component rules, rather than replacing it outright. */
+        :root {
+            --parchment: #f6efdf;
+            --parchment-2: #eee3c8;
+            --panel: #fbf6ea;
+            --ink: #2c2416;
+            --ink-muted: #6b5f4a;
+            --border: #ddccA0;
+            --bronze: #a8622e;
+            --bronze-dark: #8a4e22;
+            --verdigris: #4f7a6d;
+            --verdigris-dark: #3d6053;
+            --gold: #a4832f;
+            --good: #4f7a4a;
+            --bad: #a4432f;
+            --serif: 'Spectral', Georgia, 'Iowan Old Style', 'Palatino Linotype', serif;
+            --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+
+        body {
+            background:
+                radial-gradient(1100px 550px at 90% -8%, rgba(168,98,46,0.08), transparent 60%),
+                radial-gradient(900px 500px at -10% 8%, rgba(79,122,109,0.08), transparent 55%),
+                var(--parchment);
+            color: var(--ink);
+            font-family: var(--sans);
+        }
+        body::before {
+            content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .035;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+        }
+        h1, h2, h3, h4, h5, h6 { font-family: var(--serif); color: var(--ink); letter-spacing: .2px; }
+        .form-label { font-weight: 500; color: var(--ink); }
+        .form-text { color: var(--ink-muted); }
+        .text-muted { color: var(--ink-muted) !important; }
+        a { color: var(--bronze-dark); }
+
         .container-wide { max-width: 85%; margin-left: auto; margin-right: auto; padding-left: 12px; padding-right: 12px; }
         .nav-link { cursor: pointer; }
+
+        /* ---- top navbar: deep ink instead of stock Bootstrap dark ---- */
+        .navbar.bg-dark {
+            background: linear-gradient(180deg, #241d12, #1c1610) !important;
+            border-bottom: 2px solid var(--gold);
+        }
+        .navbar-brand { font-family: var(--serif); font-weight: 700; letter-spacing: .3px; }
+        #sys-gpu-val, #sys-disk-val { color: #e8dcc0; }
+
+        /* ---- cards ---- */
+        .card {
+            margin-bottom: 20px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            box-shadow: 0 6px 20px rgba(44,36,22,0.06);
+        }
+        .card-header {
+            background: var(--parchment-2);
+            border-bottom: 1px solid var(--border);
+            border-radius: 10px 10px 0 0 !important;
+            font-family: var(--serif);
+        }
+        .card-header h4, .card-header h5 { margin: 0; }
+
+        .step-indicator {
+            display: inline-block;
+            width: 25px; height: 25px;
+            background-color: var(--parchment-2);
+            color: var(--ink-muted);
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            text-align: center; line-height: 23px;
+            margin-right: 10px;
+            font-weight: bold;
+            font-family: var(--sans);
+        }
+        .step-active { background-color: var(--bronze); color: #fff; border-color: var(--bronze-dark); }
+        .voice-card { border-left: 4px solid var(--bronze); }
+
+        /* ---- buttons ---- */
+        .btn-primary { background-color: var(--bronze); border-color: var(--bronze-dark); }
+        .btn-primary:hover, .btn-primary:focus { background-color: var(--bronze-dark); border-color: var(--bronze-dark); }
+        .btn-success { background-color: var(--verdigris); border-color: var(--verdigris-dark); }
+        .btn-success:hover, .btn-success:focus { background-color: var(--verdigris-dark); border-color: var(--verdigris-dark); }
+        .btn-outline-success { color: var(--verdigris-dark); border-color: var(--verdigris); }
+        .btn-outline-success:hover { background-color: var(--verdigris); border-color: var(--verdigris-dark); }
+        .btn-outline-primary { color: var(--bronze-dark); border-color: var(--bronze); }
+        .btn-outline-primary:hover { background-color: var(--bronze); border-color: var(--bronze-dark); }
+
+        /* ---- form controls ---- */
+        .form-control, .form-select {
+            background-color: #fffdf7;
+            border-color: var(--border);
+            color: var(--ink);
+        }
+        .form-control:focus, .form-select:focus {
+            border-color: var(--bronze);
+            box-shadow: 0 0 0 .2rem rgba(168,98,46,0.15);
+        }
+        .form-check-input:checked {
+            background-color: var(--verdigris);
+            border-color: var(--verdigris-dark);
+        }
+
         .log-window {
-            background-color: #1e1e1e;
-            color: #00ff00;
+            background-color: #1a1710;
+            color: #b7d8b0;
             font-family: 'Courier New', Courier, monospace;
             height: 300px;
             overflow-y: auto;
             padding: 10px;
-            border-radius: 5px;
+            border-radius: 8px;
             font-size: 0.9em;
+            border: 1px solid var(--border);
         }
-        .card { margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .step-indicator {
-            display: inline-block;
-            width: 25px;
-            height: 25px;
-            background-color: #e9ecef;
-            color: #6c757d;
-            border-radius: 50%;
-            text-align: center;
-            line-height: 25px;
-            margin-right: 10px;
-            font-weight: bold;
-        }
-        .step-active { background-color: #0d6efd; color: white; }
-        .voice-card { border-left: 4px solid #0d6efd; }
+
         /* Editor row expand/collapse */
         .chunk-action-btn {
-            border: none;
-            background: none;
-            padding: 2px 4px;
-            cursor: pointer;
-            color: #6c757d;
-            font-size: 0.85em;
+            border: none; background: none; padding: 2px 4px;
+            cursor: pointer; color: var(--ink-muted); font-size: 0.85em;
             transition: transform 0.2s ease;
         }
-        .chunk-row.expanded .chunk-toggle-btn {
-            transform: rotate(180deg);
+        .chunk-row.expanded .chunk-toggle-btn { transform: rotate(180deg); }
+
+        /* Core pipeline tabs - verdigris */
+        .nav-link.nav-pipeline { color: rgba(178, 209, 197, 0.75); }
+        .nav-link.nav-pipeline:hover { color: #b2d1c5; }
+        .nav-link.nav-pipeline.active { color: #fff; background-color: var(--verdigris); border-radius: 4px; }
+        /* Advanced tabs - bronze/gold */
+        .nav-link.nav-advanced { color: rgba(216, 178, 99, 0.75); }
+        .nav-link.nav-advanced:hover { color: #d8b263; }
+        .nav-link.nav-advanced.active { color: #fff; background-color: var(--bronze); border-radius: 4px; }
+
+        /* ---- advanced-settings disclosure (Setup tab) ---- */
+        .advanced-toggle {
+            display: inline-flex; align-items: center; gap: 8px;
+            font-family: var(--sans); font-weight: 500; font-size: .92rem;
+            color: var(--ink-muted); text-decoration: none; cursor: pointer;
         }
-        /* Core pipeline tabs - green */
-        .nav-link.nav-pipeline { color: rgba(125, 227, 161, 0.7); }
-        .nav-link.nav-pipeline:hover { color: #7de3a1; }
-        .nav-link.nav-pipeline.active { color: #fff; background-color: #198754; border-radius: 4px; }
-        /* Advanced tabs - blue */
-        .nav-link.nav-advanced { color: rgba(130, 177, 255, 0.7); }
-        .nav-link.nav-advanced:hover { color: #82b1ff; }
-        .nav-link.nav-advanced.active { color: #fff; background-color: #0d6efd; border-radius: 4px; }
+        .advanced-toggle:hover { color: var(--ink); }
+        .advanced-toggle i { transition: transform .2s ease; }
+        .advanced-toggle[aria-expanded="true"] i { transform: rotate(90deg); }
+        .tab-intro { color: var(--ink-muted); font-size: .95rem; margin-bottom: 1.25rem; max-width: 65ch; }
     </style>
 </head>
 <body>
@@ -96,20 +196,29 @@
                     <h4><span class="step-indicator step-active">1</span>Configuration</h4>
                 </div>
                 <div class="card-body">
+                    <p class="tab-intro">Connect Alexandria to the LLM that annotates your book and the TTS engine that voices it. Most books only need the fields below — the rest is fine-tuning you can leave at its defaults.</p>
                     <form id="config-form">
                         <h5 class="mb-3">LLM Settings (Script Generation)</h5>
                         <div class="mb-3">
                             <label class="form-label">Base URL</label>
-                            <input type="text" class="form-control" id="llm-url" placeholder="http://localhost:1234/v1">
+                            <div class="input-group">
+                                <input type="text" class="form-control" id="llm-url" placeholder="http://localhost:1234/v1" onblur="fetchLLMModels()">
+                                <button class="btn btn-outline-secondary" type="button" title="Fetch installed models from this Base URL" onclick="fetchLLMModels(true)"><i class="fas fa-rotate"></i></button>
+                            </div>
                             <div class="form-text">URL for your OpenAI-compatible server (LM Studio, Ollama, etc.)</div>
                         </div>
                         <div class="mb-3">
                             <label class="form-label">API Key</label>
-                            <input type="text" class="form-control" id="llm-key" value="local">
+                            <input type="text" class="form-control" id="llm-key" value="local" onblur="fetchLLMModels()">
                         </div>
                         <div class="mb-3">
                             <label class="form-label">Model Name</label>
-                            <input type="text" class="form-control" id="llm-model" placeholder="local-model">
+                            <div class="input-group">
+                                <input type="text" class="form-control" id="llm-model" list="llm-model-list" placeholder="local-model" autocomplete="off">
+                                <button class="btn btn-outline-secondary" type="button" id="llm-model-refresh" title="Fetch installed models from Base URL" onclick="fetchLLMModels(true)"><i class="fas fa-rotate"></i></button>
+                            </div>
+                            <datalist id="llm-model-list"></datalist>
+                            <div class="form-text" id="llm-model-status">Type a model name, or set a Base URL above to pick from installed models.</div>
                         </div>
 
                         <h5 class="mb-3 mt-4">TTS Settings (Voice Generation)</h5>
@@ -165,42 +274,51 @@
                                 <div class="form-text">Seed for reproducibility</div>
                             </div>
                         </div>
-                        <div class="row mb-3" id="tts-local-options" style="display:none;">
-                            <div class="col-md-2">
+                        <div class="row mb-2" id="tts-local-options" style="display:none;">
+                            <div class="col-md-3">
                                 <div class="form-check form-switch mt-4">
                                     <input class="form-check-input" type="checkbox" id="compile-codec">
                                     <label class="form-check-label" for="compile-codec">Compile Codec</label>
                                 </div>
-                                <div class="form-text">torch.compile the audio codec (~3-4x batch speed, slow first run)</div>
+                                <div class="form-text">~3-4x faster batch decoding, after a one-time slow first run</div>
                             </div>
-                            <div class="col-md-2">
-                                <div class="form-check form-switch mt-4">
-                                    <input class="form-check-input" type="checkbox" id="batch-group-by-type">
-                                    <label class="form-check-label" for="batch-group-by-type">Optimize Batch Order</label>
+                        </div>
+                        <div class="mb-3" id="tts-batch-tuning-wrap" style="display:none;">
+                            <a class="advanced-toggle" data-bs-toggle="collapse" href="#batchTuning" role="button" aria-expanded="false">
+                                <i class="fas fa-chevron-right"></i>Batch Tuning (Advanced)
+                            </a>
+                            <div class="collapse mt-2" id="batchTuning">
+                                <div class="row mb-3">
+                                    <div class="col-md-3">
+                                        <div class="form-check form-switch mt-1">
+                                            <input class="form-check-input" type="checkbox" id="batch-group-by-type">
+                                            <label class="form-check-label" for="batch-group-by-type">Optimize Batch Order</label>
+                                        </div>
+                                        <div class="form-text">Group by voice type for GPU efficiency (disables sequential order)</div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="form-check form-switch mt-1">
+                                            <input class="form-check-input" type="checkbox" id="sub-batch-enabled" checked>
+                                            <label class="form-check-label" for="sub-batch-enabled">Sub-batching</label>
+                                        </div>
+                                        <div class="form-text">Split batches by text length to reduce padding waste</div>
+                                    </div>
+                                    <div class="col-md-2" id="sub-batch-min-group">
+                                        <label class="form-label">Min Sub-batch Size</label>
+                                        <input type="number" class="form-control" id="sub-batch-min-size" value="4" min="1">
+                                        <div class="form-text">Min chunks before splitting</div>
+                                    </div>
+                                    <div class="col-md-2" id="sub-batch-ratio-group">
+                                        <label class="form-label">Length Ratio</label>
+                                        <input type="number" class="form-control" id="sub-batch-ratio" value="5" min="1" step="0.5">
+                                        <div class="form-text">Max long/short ratio before split</div>
+                                    </div>
+                                    <div class="col-md-2" id="sub-batch-max-items-group">
+                                        <label class="form-label">Max Items/Batch</label>
+                                        <input type="number" class="form-control" id="sub-batch-max-items" value="0" min="0" step="1">
+                                        <div class="form-text">Hard cap on sequences per sub-batch (0 = auto from VRAM estimate)</div>
+                                    </div>
                                 </div>
-                                <div class="form-text">Group by voice type for GPU efficiency (disables sequential order)</div>
-                            </div>
-                            <div class="col-md-2">
-                                <div class="form-check form-switch mt-4">
-                                    <input class="form-check-input" type="checkbox" id="sub-batch-enabled" checked>
-                                    <label class="form-check-label" for="sub-batch-enabled">Sub-batching</label>
-                                </div>
-                                <div class="form-text">Split batches by text length to reduce padding waste</div>
-                            </div>
-                            <div class="col-md-2" id="sub-batch-min-group">
-                                <label class="form-label">Min Sub-batch Size</label>
-                                <input type="number" class="form-control" id="sub-batch-min-size" value="4" min="1">
-                                <div class="form-text">Min chunks before splitting</div>
-                            </div>
-                            <div class="col-md-2" id="sub-batch-ratio-group">
-                                <label class="form-label">Length Ratio</label>
-                                <input type="number" class="form-control" id="sub-batch-ratio" value="5" min="1" step="0.5">
-                                <div class="form-text">Max long/short ratio before split</div>
-                            </div>
-                            <div class="col-md-2" id="sub-batch-max-items-group">
-                                <label class="form-label">Max Items/Batch</label>
-                                <input type="number" class="form-control" id="sub-batch-max-items" value="0" min="0" step="1">
-                                <div class="form-text">Hard cap on sequences per sub-batch (0 = auto from VRAM estimate)</div>
                             </div>
                         </div>
                         <div class="row mb-3">
@@ -1165,6 +1283,48 @@
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-device-group').style.display = mode === 'local' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
+            document.getElementById('tts-batch-tuning-wrap').style.display = mode === 'local' ? '' : 'none';
+        }
+
+        let lastFetchedModelsUrl = null;
+        async function fetchLLMModels(force = false) {
+            const baseUrl = document.getElementById('llm-url').value.trim();
+            const apiKey = document.getElementById('llm-key').value.trim() || 'local';
+            const statusEl = document.getElementById('llm-model-status');
+            const refreshBtn = document.getElementById('llm-model-refresh');
+            if (!baseUrl) return;
+            if (!force && baseUrl === lastFetchedModelsUrl) return;
+
+            refreshBtn.disabled = true;
+            const icon = refreshBtn.querySelector('i');
+            icon.classList.add('fa-spin');
+            statusEl.textContent = 'Fetching installed models...';
+
+            try {
+                const params = new URLSearchParams({ base_url: baseUrl, api_key: apiKey });
+                const res = await fetch(`/api/llm/models?${params}`);
+                const data = await res.json();
+                const list = document.getElementById('llm-model-list');
+                list.innerHTML = '';
+                (data.models || []).forEach(id => {
+                    const opt = document.createElement('option');
+                    opt.value = id;
+                    list.appendChild(opt);
+                });
+                if (data.error) {
+                    statusEl.textContent = `Could not fetch models (${data.error}). You can still type a model name manually.`;
+                } else if (data.models && data.models.length) {
+                    lastFetchedModelsUrl = baseUrl;
+                    statusEl.textContent = `${data.models.length} model(s) found at this Base URL — pick one or type your own.`;
+                } else {
+                    statusEl.textContent = 'No models reported by this server. You can still type a model name manually.';
+                }
+            } catch (e) {
+                statusEl.textContent = 'Could not reach this Base URL. You can still type a model name manually.';
+            } finally {
+                icon.classList.remove('fa-spin');
+                refreshBtn.disabled = false;
+            }
         }
 
         async function loadConfig() {
@@ -1176,6 +1336,7 @@
                 document.getElementById('llm-url').value = config.llm.base_url;
                 document.getElementById('llm-key').value = config.llm.api_key;
                 document.getElementById('llm-model').value = config.llm.model_name;
+                fetchLLMModels();
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-device').value = config.tts.device || 'auto';
