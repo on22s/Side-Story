@@ -466,14 +466,19 @@ class ProjectManager:
 
         return True, output_filename
 
-    def export_audacity(self):
+    def export_audacity(self, progress_callback=None):
         """Export project as an Audacity-compatible zip with per-speaker WAV tracks,
         a LOF file for auto-import, and a labels file for chunk annotations."""
+        def _log(msg):
+            if progress_callback:
+                progress_callback(msg)
+
         chunks_with_audio = self._load_chunks_with_audio()
         if not chunks_with_audio:
             return False, "No audio segments found"
 
         # Phase 1 — Compute timeline
+        _log("Computing timeline...")
         pause_ms, same_speaker_pause_ms = self._load_pause_defaults()
         timeline = compute_timeline(chunks_with_audio, pause_ms, same_speaker_pause_ms)
 
@@ -484,7 +489,10 @@ class ProjectManager:
         last_chunk, last_seg, last_start = timeline[-1]
         total_duration_ms = last_start + len(last_seg)
 
-        # Phase 2 — Build per-speaker WAV tracks
+        # Phase 2 — Build per-speaker WAV tracks. Built from raw PCM bytes joined
+        # in one pass rather than pydub's `+=` operator (which copies the entire
+        # growing buffer on every append — O(n^2) per speaker, over the full
+        # chunk list, for every speaker in the cast).
         speakers_ordered = []
         seen = set()
         for chunk, segment, start_ms in timeline:
@@ -492,10 +500,33 @@ class ProjectManager:
                 speakers_ordered.append(chunk["speaker"])
                 seen.add(chunk["speaker"])
 
+        ref_seg = timeline[0][1]
+        frame_rate = ref_seg.frame_rate
+        sample_width = ref_seg.sample_width
+        channels = ref_seg.channels
+
+        def _match_format(seg):
+            if seg.frame_rate != frame_rate or seg.sample_width != sample_width or seg.channels != channels:
+                seg = seg.set_frame_rate(frame_rate).set_sample_width(sample_width).set_channels(channels)
+            return seg
+
+        silence_cache = {}
+        def _silence_raw(duration_ms):
+            if duration_ms <= 0:
+                return b""
+            raw = silence_cache.get(duration_ms)
+            if raw is None:
+                gap = AudioSegment.silent(duration=duration_ms, frame_rate=frame_rate)
+                gap = gap.set_sample_width(sample_width).set_channels(channels)
+                raw = gap.raw_data
+                silence_cache[duration_ms] = raw
+            return raw
+
         speaker_tracks = {}
-        for speaker in speakers_ordered:
+        for i, speaker in enumerate(speakers_ordered):
+            _log(f"Building track {i+1}/{len(speakers_ordered)}: {speaker}...")
             track_cursor = 0
-            track = AudioSegment.empty()
+            raw_parts = []
 
             for chunk, segment, start_ms in timeline:
                 if chunk["speaker"] != speaker:
@@ -503,18 +534,24 @@ class ProjectManager:
                 # Insert silence gap from current track position to this chunk's start
                 gap = start_ms - track_cursor
                 if gap > 0:
-                    track += AudioSegment.silent(duration=gap)
-                track += segment
+                    raw_parts.append(_silence_raw(gap))
+                raw_parts.append(_match_format(segment).raw_data)
                 track_cursor = start_ms + len(segment)
 
             # Pad to total duration so all tracks are equal length
             remaining = total_duration_ms - track_cursor
             if remaining > 0:
-                track += AudioSegment.silent(duration=remaining)
+                raw_parts.append(_silence_raw(remaining))
 
-            speaker_tracks[speaker] = track
+            speaker_tracks[speaker] = AudioSegment(
+                data=b"".join(raw_parts),
+                sample_width=sample_width,
+                frame_rate=frame_rate,
+                channels=channels,
+            )
 
         # Phase 3 — Build LOF and labels content
+        _log("Building project files (LOF, labels)...")
         lof_lines = []
         for speaker in speakers_ordered:
             safe_name = sanitize_filename(speaker)
@@ -531,17 +568,20 @@ class ProjectManager:
         labels_content = "\n".join(label_lines) + "\n"
 
         # Phase 4 — Zip everything
+        _log("Writing zip archive...")
         zip_path = os.path.join(self.root_dir, "audacity_export.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("project.lof", lof_content)
             zf.writestr("labels.txt", labels_content)
 
-            for speaker in speakers_ordered:
+            for i, speaker in enumerate(speakers_ordered):
+                _log(f"Encoding WAV {i+1}/{len(speakers_ordered)}: {speaker}...")
                 safe_name = sanitize_filename(speaker)
                 wav_buffer = io.BytesIO()
                 speaker_tracks[speaker].export(wav_buffer, format="wav")
                 zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
 
+        _log("Audacity export complete.")
         return True, zip_path
 
     def merge_m4b(self, per_chunk_chapters=False, metadata=None):

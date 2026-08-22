@@ -249,11 +249,12 @@
                         <div class="mb-3">
                             <label class="form-label">Model Name</label>
                             <div class="input-group">
-                                <input type="text" class="form-control" id="llm-model" list="llm-model-list" placeholder="local-model" autocomplete="off">
-                                <button class="btn btn-outline-secondary" type="button" id="llm-model-refresh" title="Fetch installed models from Base URL" onclick="fetchLLMModels(true)"><i class="fas fa-rotate"></i></button>
+                                <input type="text" class="form-control" id="llm-model" placeholder="local-model" autocomplete="off">
+                                <select class="form-select" id="llm-model-picker" style="max-width: 3rem;" title="Pick from installed models" onfocus="fetchLLMModels()" onchange="if(this.value){document.getElementById('llm-model').value=this.value; this.selectedIndex=0;}">
+                                    <option value="" selected>▾</option>
+                                </select>
                             </div>
-                            <datalist id="llm-model-list"></datalist>
-                            <div class="form-text" id="llm-model-status">Type a model name, or set a Base URL above to pick from installed models.</div>
+                            <div class="form-text" id="llm-model-status">Type a model name, or set a Base URL above and use the dropdown to pick from installed models.</div>
                         </div>
 
                         <h5 class="mb-3 mt-4">TTS Settings (Voice Generation)</h5>
@@ -1112,10 +1113,6 @@
                         <button class="btn btn-outline-secondary mt-3 ms-2" onclick="downloadAllZip()">
                             <i class="fas fa-file-zipper me-2"></i>Download All (.zip)
                         </button>
-                        <button class="btn btn-outline-primary mt-3 ms-2" onclick="exportAudacity()">
-                            <i class="fas fa-headphones me-2"></i>Export to Audacity
-                        </button>
-                        <span id="audacity-status" class="ms-2 mt-3 d-inline-block"></span>
                         <div class="w-100 mt-3">
                             <a class="text-decoration-none" data-bs-toggle="collapse" href="#m4b-options" role="button" aria-expanded="false">
                                 <i class="fas fa-book-reader me-1"></i>M4B Export Options <i class="fas fa-chevron-down fa-xs ms-1"></i>
@@ -1163,6 +1160,20 @@
                                         </button>
                                         <span id="m4b-status" class="ms-2 d-inline-block"></span>
                                     </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="w-100 mt-3">
+                            <a class="advanced-toggle" data-bs-toggle="collapse" href="#audacityOptions" role="button" aria-expanded="false">
+                                <i class="fas fa-chevron-right"></i>Advanced: Export to Audacity
+                            </a>
+                            <div class="collapse mt-2" id="audacityOptions">
+                                <div class="border rounded p-3" style="background: var(--parchment-2);">
+                                    <p class="small text-muted mb-2">Zip with a full-length WAV track per speaker, padded to stay in sync, plus a project file for one-click multi-track import — for fine-tuning the audiobook in a DAW rather than just listening to it.</p>
+                                    <button class="btn btn-outline-primary btn-sm" onclick="exportAudacity()">
+                                        <i class="fas fa-headphones me-2"></i>Export to Audacity
+                                    </button>
+                                    <span id="audacity-status" class="ms-2 d-inline-block"></span>
                                 </div>
                             </div>
                         </div>
@@ -1342,39 +1353,36 @@
             const baseUrl = document.getElementById('llm-url').value.trim();
             const apiKey = document.getElementById('llm-key').value.trim() || 'local';
             const statusEl = document.getElementById('llm-model-status');
-            const refreshBtn = document.getElementById('llm-model-refresh');
+            const picker = document.getElementById('llm-model-picker');
             if (!baseUrl) return;
             if (!force && baseUrl === lastFetchedModelsUrl) return;
 
-            refreshBtn.disabled = true;
-            const icon = refreshBtn.querySelector('i');
-            icon.classList.add('fa-spin');
+            picker.disabled = true;
             statusEl.textContent = 'Fetching installed models...';
 
             try {
                 const params = new URLSearchParams({ base_url: baseUrl, api_key: apiKey });
                 const res = await fetch(`/api/llm/models?${params}`);
                 const data = await res.json();
-                const list = document.getElementById('llm-model-list');
-                list.innerHTML = '';
+                picker.innerHTML = '<option value="" selected>▾</option>';
                 (data.models || []).forEach(id => {
                     const opt = document.createElement('option');
                     opt.value = id;
-                    list.appendChild(opt);
+                    opt.textContent = id;
+                    picker.appendChild(opt);
                 });
                 if (data.error) {
                     statusEl.textContent = `Could not fetch models (${data.error}). You can still type a model name manually.`;
                 } else if (data.models && data.models.length) {
                     lastFetchedModelsUrl = baseUrl;
-                    statusEl.textContent = `${data.models.length} model(s) found at this Base URL — pick one or type your own.`;
+                    statusEl.textContent = `${data.models.length} model(s) found at this Base URL — pick one from the dropdown, or type your own.`;
                 } else {
                     statusEl.textContent = 'No models reported by this server. You can still type a model name manually.';
                 }
             } catch (e) {
                 statusEl.textContent = 'Could not reach this Base URL. You can still type a model name manually.';
             } finally {
-                icon.classList.remove('fa-spin');
-                refreshBtn.disabled = false;
+                picker.disabled = false;
             }
         }
 
@@ -1499,6 +1507,7 @@
                 if (config.current_file) {
                     document.getElementById('upload-status').innerHTML =
                         `<span class="text-success"><i class="fas fa-check me-1"></i>Loaded: ${config.current_file}</span>`;
+                    window._currentFileName = config.current_file;
                 }
             } catch (e) {
                 console.error("Failed to load config", e);
@@ -2822,6 +2831,7 @@
         // --- Audacity Export ---
         window.exportAudacity = async () => {
             const statusEl = document.getElementById('audacity-status');
+            const logEl = document.getElementById('audio-logs');
             statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Exporting...</span>';
 
             try {
@@ -2830,6 +2840,10 @@
                 const poll = setInterval(async () => {
                     try {
                         const status = await API.get('/api/status/audacity_export');
+                        if (logEl && status.logs) {
+                            logEl.innerText = status.logs.join('\n');
+                            logEl.scrollTop = logEl.scrollHeight;
+                        }
                         if (!status.running) {
                             clearInterval(poll);
                             if (status.logs.some(l => l.includes("complete"))) {
@@ -2924,6 +2938,14 @@
         // reloading the page or revisiting the tab later showed nothing even
         // though a finished audiobook existed.
         async function loadResultTab() {
+            // Prefill M4B title from the uploaded filename, without clobbering
+            // anything the user already typed there.
+            const titleField = document.getElementById('m4b-title');
+            if (titleField && !titleField.value && window._currentFileName) {
+                const guess = window._currentFileName.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+                if (guess) titleField.value = guess;
+            }
+
             try {
                 const res = await fetch(`/api/audiobook?t=${Date.now()}`, { method: 'HEAD' });
                 if (res.ok) {

@@ -1071,7 +1071,9 @@ async def export_audacity_endpoint(background_tasks: BackgroundTasks):
         process_state["audacity_export"]["running"] = True
         process_state["audacity_export"]["logs"] = ["Starting Audacity export..."]
         try:
-            success, msg = project_manager.export_audacity()
+            success, msg = project_manager.export_audacity(
+                progress_callback=lambda m: process_state["audacity_export"]["logs"].append(m)
+            )
             if success:
                 process_state["audacity_export"]["logs"].append(f"Export complete: {msg}")
             else:
