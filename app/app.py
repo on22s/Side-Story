@@ -1,12 +1,13 @@
 import os
 import sys
 import gc
+import io
 import json
 import shutil
 import logging
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -951,7 +952,7 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
 
     return {"status": "saved"}
 
-@app.get("/api/audiobook")
+@app.api_route("/api/audiobook", methods=["GET", "HEAD"])
 async def get_audiobook():
     if not os.path.exists(AUDIOBOOK_PATH):
         raise HTTPException(status_code=404, detail="Audiobook not found")
@@ -1025,11 +1026,16 @@ async def merge_audio_endpoint(background_tasks: BackgroundTasks):
 
     def task():
         process_state["audio"]["running"] = True
+        process_state["audio"]["cancel"] = False
         process_state["audio"]["logs"] = ["Starting merge..."]
         try:
-            success, msg = project_manager.merge_audio()
+            success, msg = project_manager.merge_audio(
+                cancel_check=lambda: process_state["audio"]["cancel"]
+            )
             if success:
                 process_state["audio"]["logs"].append(f"Merge complete: {msg}")
+            elif msg == "Merge cancelled":
+                process_state["audio"]["logs"].append("Merge cancelled")
             else:
                 process_state["audio"]["logs"].append(f"Merge failed: {msg}")
         except Exception as e:
@@ -1128,6 +1134,28 @@ async def get_audiobook_m4b():
     if not os.path.exists(M4B_PATH):
         raise HTTPException(status_code=404, detail="M4B audiobook not found. Export it first.")
     return FileResponse(M4B_PATH, filename="audiobook.m4b", media_type="audio/mp4")
+
+@app.get("/api/export_zip")
+async def export_zip():
+    """Bundle whatever exported audio formats currently exist (MP3, M4B) into one zip."""
+    files_to_zip = []
+    if os.path.exists(AUDIOBOOK_PATH):
+        files_to_zip.append((AUDIOBOOK_PATH, "audiobook.mp3"))
+    if os.path.exists(M4B_PATH):
+        files_to_zip.append((M4B_PATH, "audiobook.m4b"))
+    if not files_to_zip:
+        raise HTTPException(status_code=404, detail="No exported audio found. Merge or export first.")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for path, arcname in files_to_zip:
+            zf.write(path, arcname)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=alexandria_export.zip"}
+    )
 
 @app.post("/api/m4b_cover")
 async def upload_m4b_cover(file: UploadFile = File(...)):

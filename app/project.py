@@ -15,7 +15,8 @@ from tts import (
     compute_timeline,
     sanitize_filename,
     DEFAULT_PAUSE_MS,
-    SAME_SPEAKER_PAUSE_MS
+    SAME_SPEAKER_PAUSE_MS,
+    MergeCancelled
 )
 from pydub import AudioSegment
 
@@ -438,7 +439,7 @@ class ProjectManager:
                 print(f"Error loading audio segment {path}: {e}")
         return result
 
-    def merge_audio(self):
+    def merge_audio(self, cancel_check=None):
         chunks_with_audio = self._load_chunks_with_audio()
         if not chunks_with_audio:
             return False, "No audio segments found"
@@ -451,9 +452,14 @@ class ProjectManager:
         speakers = [chunk["speaker"] for chunk, _, _ in timeline]
         pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
 
-        final_audio = combine_audio_with_pauses(
-            audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides
-        )
+        try:
+            final_audio = combine_audio_with_pauses(
+                audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides,
+                cancel_check=cancel_check
+            )
+        except MergeCancelled:
+            return False, "Merge cancelled"
+
         output_filename = "cloned_audiobook.mp3"
         output_path = os.path.join(self.root_dir, output_filename)
         final_audio.export(output_path, format="mp3")

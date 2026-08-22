@@ -11,6 +11,11 @@ DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
 
 
+class MergeCancelled(Exception):
+    """Raised by combine_audio_with_pauses when cancel_check() returns True."""
+    pass
+
+
 def sanitize_filename(name):
     """Make a string safe for use in filenames"""
     name = re.sub(r'[^\w\-]', '_', name)
@@ -19,32 +24,68 @@ def sanitize_filename(name):
 
 def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_MS,
                               same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS,
-                              pause_overrides=None):
+                              pause_overrides=None, cancel_check=None):
     """Combine audio segments with pauses between them.
+
+    Builds the result from raw PCM bytes joined in one pass, rather than
+    pydub's `+=` operator repeated per segment — each `+=` copies the entire
+    growing buffer, which is O(n^2) total for a full audiobook's worth of
+    chunks (thousands of segments). A single bytes.join() is O(n).
 
     Args:
         pause_overrides: Optional list aligned with audio_segments. Each entry is
             the pause (ms) to insert *after* that segment, or None to use the
             default speaker-change logic. The last entry is ignored.
+        cancel_check: Optional no-arg callable; if it returns True, raises
+            MergeCancelled instead of continuing.
     """
     if not audio_segments:
         return None
 
-    combined = audio_segments[0]
+    first = audio_segments[0]
+    frame_rate = first.frame_rate
+    sample_width = first.sample_width
+    channels = first.channels
+
+    def _match_format(seg):
+        if seg.frame_rate != frame_rate or seg.sample_width != sample_width or seg.channels != channels:
+            seg = seg.set_frame_rate(frame_rate).set_sample_width(sample_width).set_channels(channels)
+        return seg
+
+    silence_cache = {}
+
+    def _silence_raw(duration_ms):
+        raw = silence_cache.get(duration_ms)
+        if raw is None:
+            gap = AudioSegment.silent(duration=duration_ms, frame_rate=frame_rate)
+            gap = gap.set_sample_width(sample_width).set_channels(channels)
+            raw = gap.raw_data
+            silence_cache[duration_ms] = raw
+        return raw
+
+    raw_parts = [_match_format(first).raw_data]
     prev_speaker = speakers[0]
 
     for i, (segment, speaker) in enumerate(zip(audio_segments[1:], speakers[1:])):
+        if cancel_check is not None and cancel_check():
+            raise MergeCancelled()
         override = pause_overrides[i] if pause_overrides else None
         if override is not None:
-            gap = AudioSegment.silent(duration=override)
+            gap_ms = override
         elif speaker == prev_speaker:
-            gap = AudioSegment.silent(duration=same_speaker_pause_ms)
+            gap_ms = same_speaker_pause_ms
         else:
-            gap = AudioSegment.silent(duration=pause_ms)
-        combined += gap + segment
+            gap_ms = pause_ms
+        raw_parts.append(_silence_raw(gap_ms))
+        raw_parts.append(_match_format(segment).raw_data)
         prev_speaker = speaker
 
-    return combined
+    return AudioSegment(
+        data=b"".join(raw_parts),
+        sample_width=sample_width,
+        frame_rate=frame_rate,
+        channels=channels,
+    )
 
 
 def compute_timeline(chunks_with_audio, pause_ms=DEFAULT_PAUSE_MS,
