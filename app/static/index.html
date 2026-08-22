@@ -1289,6 +1289,7 @@
                 // Trigger tab specific loads
                 if (e.target.dataset.tab === 'editor') {
                     loadChunks();
+                    restoreEditorRenderState();
                 } else if (e.target.dataset.tab === 'voices') {
                     loadVoices();
                 } else if (e.target.dataset.tab === 'designer') {
@@ -2939,6 +2940,26 @@
                 statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(e.message)}</span>`;
             }
         };
+
+        // Restore the Editor toolbar's render/cancel button state when the tab is
+        // opened — previously these only reflected THIS browser session's own
+        // isRenderingAll flag, so a page reload (or a render started elsewhere)
+        // left the Cancel button hidden even while a render was genuinely active.
+        async function restoreEditorRenderState() {
+            try {
+                const status = await API.get('/api/status/audio');
+                if (status.running) {
+                    isRenderingAll = true;
+                    document.getElementById('btn-batch-fast').style.display = 'none';
+                    document.getElementById('btn-regen-all').style.display = 'none';
+                    document.getElementById('btn-cancel-render').style.display = 'inline-block';
+                } else if (!isRenderingAll) {
+                    document.getElementById('btn-batch-fast').style.display = 'inline-block';
+                    document.getElementById('btn-regen-all').style.display = 'inline-block';
+                    document.getElementById('btn-cancel-render').style.display = 'none';
+                }
+            } catch (e) { /* ignore */ }
+        }
 
         // Restore the Result tab's player/log state when it's opened — previously
         // these only ever got populated by pollLogs() during a live merge, so
