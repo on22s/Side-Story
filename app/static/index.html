@@ -1273,35 +1273,46 @@
         }
 
         // --- Navigation ---
+        // Persist the active tab across reloads (sessionStorage — per-tab in the
+        // browser, not shared across devices, which is the right scope for "which
+        // screen was I on" rather than a real setting).
+        function activateTab(tabName, persist = true) {
+            const link = document.querySelector(`.nav-link[data-tab="${tabName}"]`);
+            const targetEl = document.getElementById(tabName + '-tab');
+            if (!link || !targetEl) return false;
+
+            document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+            link.classList.add('active');
+
+            document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
+            targetEl.style.display = 'block';
+
+            if (persist) {
+                try { sessionStorage.setItem('alexandria-active-tab', tabName); } catch (e) { /* ignore */ }
+            }
+
+            // Trigger tab specific loads
+            if (tabName === 'editor') {
+                loadChunks();
+                restoreEditorRenderState();
+            } else if (tabName === 'voices') {
+                loadVoices();
+            } else if (tabName === 'designer') {
+                loadDesignedVoices();
+            } else if (tabName === 'training') {
+                loadLoraDatasets();
+                loadLoraModels();
+            } else if (tabName === 'dataset-builder') {
+                dsbLoadProjects(dsbCurrentProject);
+            } else if (tabName === 'audio') {
+                loadResultTab();
+            }
+            return true;
+        }
+
         document.querySelectorAll('.nav-link').forEach(link => {
             link.addEventListener('click', (e) => {
-                // Remove active class from all links
-                document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
-                // Add active to clicked
-                e.target.classList.add('active');
-
-                // Hide all tabs
-                document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
-                // Show target tab
-                const targetId = e.target.dataset.tab + '-tab';
-                document.getElementById(targetId).style.display = 'block';
-
-                // Trigger tab specific loads
-                if (e.target.dataset.tab === 'editor') {
-                    loadChunks();
-                    restoreEditorRenderState();
-                } else if (e.target.dataset.tab === 'voices') {
-                    loadVoices();
-                } else if (e.target.dataset.tab === 'designer') {
-                    loadDesignedVoices();
-                } else if (e.target.dataset.tab === 'training') {
-                    loadLoraDatasets();
-                    loadLoraModels();
-                } else if (e.target.dataset.tab === 'dataset-builder') {
-                    dsbLoadProjects(dsbCurrentProject);
-                } else if (e.target.dataset.tab === 'audio') {
-                    loadResultTab();
-                }
+                activateTab(e.target.dataset.tab);
             });
         });
 
@@ -4331,6 +4342,10 @@
         }
 
         // Init
+        try {
+            const savedTab = sessionStorage.getItem('alexandria-active-tab');
+            if (savedTab) activateTab(savedTab, false);
+        } catch (e) { /* ignore */ }
         loadConfig();
         loadVoices();
         loadSavedScripts();
