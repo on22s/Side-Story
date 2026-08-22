@@ -1198,6 +1198,28 @@
 
     </div>
 
+    <script>
+        // Apply the saved active tab immediately, before the (large, ~4000-line)
+        // main script below has finished parsing — otherwise the browser paints
+        // the static default (Setup) first and visibly flashes to the real tab
+        // once the main script's own restoration runs. This is a deliberately
+        // minimal, standalone duplicate of what activateTab() does visually;
+        // the main script's later call still handles per-tab data loading.
+        (function () {
+            try {
+                var tab = sessionStorage.getItem('alexandria-active-tab');
+                if (!tab) return;
+                var link = document.querySelector('.nav-link[data-tab="' + tab + '"]');
+                var targetEl = document.getElementById(tab + '-tab');
+                if (!link || !targetEl) return;
+                document.querySelectorAll('.nav-link').forEach(function (l) { l.classList.remove('active'); });
+                link.classList.add('active');
+                document.querySelectorAll('.tab-content').forEach(function (t) { t.style.display = 'none'; });
+                targetEl.style.display = 'block';
+            } catch (e) { /* ignore */ }
+        })();
+    </script>
+
     <!-- Toast container -->
     <div id="toast-container" class="position-fixed bottom-0 end-0 p-3" style="z-index: 1090;"></div>
 
