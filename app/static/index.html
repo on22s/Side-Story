@@ -28,9 +28,34 @@
             --gold: #a4832f;
             --good: #4f7a4a;
             --bad: #a4432f;
+            --info-blue: #5c7a99;
             --serif: 'Spectral', Georgia, 'Iowan Old Style', 'Palatino Linotype', serif;
             --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+
+            /* Retarget Bootstrap's own semantic palette onto the theme, so every
+               component that already reads these (badges, alerts, btn-*, text-*,
+               bg-*) lines up without needing per-class overrides. */
+            --bs-primary: #a8622e;
+            --bs-primary-rgb: 168, 98, 46;
+            --bs-success: #4f7a6d;
+            --bs-success-rgb: 79, 122, 109;
+            --bs-warning: #a4832f;
+            --bs-warning-rgb: 164, 131, 47;
+            --bs-danger: #a4432f;
+            --bs-danger-rgb: 164, 67, 47;
+            --bs-info: #5c7a99;
+            --bs-info-rgb: 92, 122, 153;
+            --bs-secondary: #6b5f4a;
+            --bs-secondary-rgb: 107, 95, 74;
         }
+        /* Bootstrap's text-warning/text-info/badges use these color-only vars
+           for contrast against light text; keep them legible on parchment. */
+        .text-warning { color: var(--gold) !important; }
+        .text-danger { color: var(--bad) !important; }
+        .text-info { color: var(--info-blue) !important; }
+        .text-secondary { color: var(--ink-muted) !important; }
+        .btn-warning, .btn-danger, .btn-info { color: #fff; }
+        .btn-warning:hover, .btn-danger:hover, .btn-info:hover { color: #fff; filter: brightness(0.92); }
 
         body {
             background:
@@ -2191,7 +2216,7 @@
                         return `
                             <tr data-id="${chunk.id}" data-group="${escapeHtml(speaker)}" class="chunk-row"${hidden}>
                                 <td class="text-center align-middle" style="white-space:nowrap;">
-                                    <button class="chunk-action-btn chunk-toggle-btn" onclick="toggleChunkExpand(this)" title="Expand/collapse"><i class="fas fa-chevron-down"></i></button><button class="chunk-action-btn" onclick="insertChunkAfter(${chunk.id})" title="Insert line below"><i class="fas fa-plus"></i></button><button class="chunk-action-btn" onclick="deleteChunk(${chunk.id})" title="Delete line"><i class="fas fa-trash" style="color:#dc3545;"></i></button>
+                                    <button class="chunk-action-btn chunk-toggle-btn" onclick="toggleChunkExpand(this)" title="Expand/collapse"><i class="fas fa-chevron-down"></i></button><button class="chunk-action-btn" onclick="insertChunkAfter(${chunk.id})" title="Insert line below"><i class="fas fa-plus"></i></button><button class="chunk-action-btn" onclick="deleteChunk(${chunk.id})" title="Delete line"><i class="fas fa-trash" style="color:#a4432f;"></i></button>
                                 </td>
                                 <td>${buildSpeakerSelect(chunk)}</td>
                                 <td><textarea class="form-control form-control-sm chunk-text" rows="2" onchange="updateChunk(${chunk.id}, 'text', this.value)">${escapeHtml(chunk.text)}</textarea></td>
