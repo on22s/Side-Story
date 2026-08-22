@@ -364,8 +364,10 @@ class ProjectManager:
                     mp3_filename = f"{filename_base}.mp3"
                     mp3_filepath = os.path.join(self.voicelines_dir, mp3_filename)
 
-                    # This might fail if ffmpeg is missing or lacks MP3 encoder
-                    segment.export(mp3_filepath, format="mp3")
+                    # This might fail if ffmpeg is missing or lacks MP3 encoder.
+                    # bitrate is explicit — pydub/ffmpeg's unspecified default was
+                    # negotiating down to ~32kbps, audibly muddy for speech.
+                    segment.export(mp3_filepath, format="mp3", bitrate="128k")
 
                     # Validate: conda ffmpeg often lacks libmp3lame, producing
                     # a tiny (~428 byte) header-only file without raising an error
@@ -462,7 +464,7 @@ class ProjectManager:
 
         output_filename = "cloned_audiobook.mp3"
         output_path = os.path.join(self.root_dir, output_filename)
-        final_audio.export(output_path, format="mp3")
+        final_audio.export(output_path, format="mp3", bitrate="128k")
 
         return True, output_filename
 
@@ -994,7 +996,7 @@ class ProjectManager:
 
                         mp3_filename = f"{filename_base}.mp3"
                         mp3_filepath = os.path.join(self.voicelines_dir, mp3_filename)
-                        segment.export(mp3_filepath, format="mp3")
+                        segment.export(mp3_filepath, format="mp3", bitrate="128k")
 
                         # Validate: conda ffmpeg often lacks libmp3lame, producing
                         # a tiny (~428 byte) header-only file without raising an error
