@@ -4,6 +4,17 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Alexandria Audiobook</title>
+    <script>
+        // Set the saved tab as an attribute on <html> before <body> even starts
+        // parsing, so the CSS rules below can show the right tab/nav-highlight
+        // in the very first paint — no flash of Setup, since this runs before
+        // the nav or tab-content elements exist to manipulate directly.
+        (function () {
+            var tab = 'setup';
+            try { tab = sessionStorage.getItem('alexandria-active-tab') || 'setup'; } catch (e) {}
+            document.documentElement.setAttribute('data-initial-tab', tab);
+        })();
+    </script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -191,6 +202,36 @@
         .advanced-toggle i { transition: transform .2s ease; }
         .advanced-toggle[aria-expanded="true"] i { transform: rotate(90deg); }
         .tab-intro { color: var(--ink-muted); font-size: .95rem; margin-bottom: 1.25rem; max-width: 65ch; }
+
+        /* ---- first-paint tab restoration (no-flash) ----
+           Governs only the very first paint, before any JS below has run.
+           The main script's activateTab() takes over from there with real
+           classes/inline styles — this is pure CSS so it applies instantly. */
+        html[data-initial-tab] .tab-content { display: none !important; }
+        html[data-initial-tab="setup"] #setup-tab,
+        html[data-initial-tab="script"] #script-tab,
+        html[data-initial-tab="voices"] #voices-tab,
+        html[data-initial-tab="editor"] #editor-tab,
+        html[data-initial-tab="audio"] #audio-tab,
+        html[data-initial-tab="designer"] #designer-tab,
+        html[data-initial-tab="preparer"] #preparer-tab,
+        html[data-initial-tab="dataset-builder"] #dataset-builder-tab,
+        html[data-initial-tab="training"] #training-tab { display: block !important; }
+
+        html[data-initial-tab] .nav-link.active { color: rgba(178, 209, 197, 0.75); background-color: transparent; }
+        html[data-initial-tab="setup"] .nav-link[data-tab="setup"],
+        html[data-initial-tab="script"] .nav-link[data-tab="script"],
+        html[data-initial-tab="voices"] .nav-link[data-tab="voices"],
+        html[data-initial-tab="editor"] .nav-link[data-tab="editor"],
+        html[data-initial-tab="audio"] .nav-link[data-tab="audio"] {
+            color: #fff; background-color: var(--verdigris); border-radius: 4px;
+        }
+        html[data-initial-tab="designer"] .nav-link[data-tab="designer"],
+        html[data-initial-tab="preparer"] .nav-link[data-tab="preparer"],
+        html[data-initial-tab="dataset-builder"] .nav-link[data-tab="dataset-builder"],
+        html[data-initial-tab="training"] .nav-link[data-tab="training"] {
+            color: #fff; background-color: var(--bronze); border-radius: 4px;
+        }
     </style>
 </head>
 <body>
@@ -1199,12 +1240,15 @@
     </div>
 
     <script>
-        // Apply the saved active tab immediately, before the (large, ~4000-line)
-        // main script below has finished parsing — otherwise the browser paints
-        // the static default (Setup) first and visibly flashes to the real tab
-        // once the main script's own restoration runs. This is a deliberately
-        // minimal, standalone duplicate of what activateTab() does visually;
-        // the main script's later call still handles per-tab data loading.
+        // Formalize the tab restoration into real classes/inline styles, now
+        // that the nav-link and tab-content elements exist — the actual
+        // no-flash first paint is handled by the data-initial-tab CSS rules
+        // in <head>, which ran before this. Critically: those CSS rules use
+        // !important (required to beat the tab-content divs' own inline
+        // style="display:none"), which would otherwise keep overriding every
+        // later plain-inline-style tab switch for the rest of the session —
+        // so the data-initial-tab attribute is always removed here to hand
+        // control back to normal JS-driven switching immediately.
         (function () {
             try {
                 var tab = sessionStorage.getItem('alexandria-active-tab');
@@ -1216,7 +1260,11 @@
                 link.classList.add('active');
                 document.querySelectorAll('.tab-content').forEach(function (t) { t.style.display = 'none'; });
                 targetEl.style.display = 'block';
-            } catch (e) { /* ignore */ }
+            } catch (e) {
+                /* ignore */
+            } finally {
+                document.documentElement.removeAttribute('data-initial-tab');
+            }
         })();
     </script>
 
