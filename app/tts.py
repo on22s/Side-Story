@@ -151,6 +151,10 @@ class TTSEngine:
         self._sub_batch_min_size = max(1, tts_config.get("sub_batch_min_size", 4))
         self._sub_batch_ratio = max(1.0, float(tts_config.get("sub_batch_ratio", 5)))
         self._sub_batch_max_items = int(tts_config.get("sub_batch_max_items", 0))  # 0 = auto
+        # Hard cap on generated codec tokens per line (~12 tokens/sec of audio).
+        # Also drives the VRAM batch-size estimate, so a lower value both caps
+        # worst-case generation length and allows more sequences per batch.
+        self._max_generation_tokens = max(64, int(tts_config.get("max_generation_tokens", 2048)))
 
         # Lazy-loaded backends (guarded by _model_lock to prevent concurrent loads)
         self._model_lock = threading.Lock()
@@ -317,7 +321,7 @@ class TTSEngine:
                 speaker="serena",
                 instruct="neutral",
                 non_streaming_mode=True,
-                max_new_tokens=2048,
+                max_new_tokens=self._max_generation_tokens,
             )
             print(f"Warmup done in {time.time()-t0:.1f}s")
         except Exception as e:
@@ -813,7 +817,7 @@ class TTSEngine:
             instruct=description,
             language=lang,
             non_streaming_mode=True,
-            max_new_tokens=2048,
+            max_new_tokens=self._max_generation_tokens,
         )
         gen_time = time.time() - t_start
 
@@ -955,7 +959,7 @@ class TTSEngine:
                 text=text,
                 voice_clone_prompt=prompt,
                 non_streaming_mode=True,
-                max_new_tokens=2048,
+                max_new_tokens=self._max_generation_tokens,
                 **gen_extra,
             )
             gen_time = time.time() - t_start
@@ -1144,7 +1148,7 @@ class TTSEngine:
                 speaker=voice,
                 instruct=instruct,
                 non_streaming_mode=True,
-                max_new_tokens=2048,
+                max_new_tokens=self._max_generation_tokens,
             )
             gen_time = time.time() - t_start
 
@@ -1193,7 +1197,7 @@ class TTSEngine:
                 text=text,
                 voice_clone_prompt=prompt,
                 non_streaming_mode=True,
-                max_new_tokens=2048,
+                max_new_tokens=self._max_generation_tokens,
             )
             gen_time = time.time() - t_start
 
@@ -1278,7 +1282,7 @@ class TTSEngine:
 
 
         max_items = self._estimate_max_batch_size(
-            model, max_text_chars=len(texts[-1]),
+            model, max_text_chars=len(texts[-1]), max_new_tokens=self._max_generation_tokens,
         )
         sub_batches = self._build_sub_batches(texts, max_items=max_items)
 
@@ -1309,7 +1313,7 @@ class TTSEngine:
                     speaker=sb_speakers,
                     instruct=sb_instructs,
                     non_streaming_mode=True,
-                    max_new_tokens=2048,
+                    max_new_tokens=self._max_generation_tokens,
                 )
                 gen_time = time.time() - t_start
 
@@ -1409,6 +1413,7 @@ class TTSEngine:
             ref_text_chars = len(prompt[0].ref_text) if prompt[0].ref_text else 0
             max_items = self._estimate_max_batch_size(
                 model, clone_tokens, ref_text_chars, len(texts[-1]),
+                max_new_tokens=self._max_generation_tokens,
             )
             sub_batches = self._build_sub_batches(texts, max_items=max_items)
 
@@ -1428,7 +1433,7 @@ class TTSEngine:
                         text=sb_texts,
                         voice_clone_prompt=prompt,
                         non_streaming_mode=True,
-                        max_new_tokens=2048,
+                        max_new_tokens=self._max_generation_tokens,
                     )
                     gen_time = time.time() - t_start
 
@@ -1574,6 +1579,7 @@ class TTSEngine:
             ref_text_chars = len(prompt[0].ref_text) if prompt[0].ref_text else 0
             max_items = self._estimate_max_batch_size(
                 model, clone_tokens, ref_text_chars, len(texts[-1]),
+                max_new_tokens=self._max_generation_tokens,
             )
             sub_batches = self._build_sub_batches(texts, max_items=max_items)
 
@@ -1610,7 +1616,7 @@ class TTSEngine:
                         text=sb_texts,
                         voice_clone_prompt=prompt,
                         non_streaming_mode=True,
-                        max_new_tokens=2048,
+                        max_new_tokens=self._max_generation_tokens,
                         **gen_extra,
                     )
                     gen_time = time.time() - t_start

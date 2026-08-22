@@ -396,6 +396,19 @@
                                         <div class="form-text">Hard cap on sequences per sub-batch (0 = auto from VRAM estimate)</div>
                                     </div>
                                 </div>
+                                <div class="row mb-3">
+                                    <div class="col-md-4">
+                                        <label class="form-label">Max Line Length (safety limit)</label>
+                                        <input type="number" class="form-control" id="max-generation-tokens" value="2048" min="64" step="64" oninput="updateMaxGenSecondsHint()">
+                                        <div class="form-text">
+                                            The longest a single line is <em>allowed</em> to run before Alexandria cuts it off — currently
+                                            <strong id="max-gen-seconds-hint">~170 seconds</strong>. This isn't how long lines actually are, it's a safety
+                                            ceiling in case something goes wrong. Lower it and each line reserves less GPU memory, so more lines can render
+                                            together at once (faster) — but set it below your longest real line's length and that line will get cut off
+                                            mid-sentence. Check the Editor for your longest line before lowering this.
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                         <div class="row mb-3">
@@ -1426,6 +1439,15 @@
 
         // --- Setup Tab ---
 
+        function updateMaxGenSecondsHint() {
+            const el = document.getElementById('max-generation-tokens');
+            const hint = document.getElementById('max-gen-seconds-hint');
+            if (!el || !hint) return;
+            const tokens = parseInt(el.value) || 0;
+            const seconds = Math.round(tokens / 12); // ~12 codec tokens/sec of audio
+            hint.textContent = `~${seconds} seconds`;
+        }
+
         function toggleTTSMode() {
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
@@ -1501,6 +1523,10 @@
                 }
                 if (config.tts.sub_batch_max_items != null) {
                     document.getElementById('sub-batch-max-items').value = config.tts.sub_batch_max_items;
+                }
+                if (config.tts.max_generation_tokens != null) {
+                    document.getElementById('max-generation-tokens').value = config.tts.max_generation_tokens;
+                    updateMaxGenSecondsHint();
                 }
                 if (config.tts.pause_between_speakers_ms != null) {
                     document.getElementById('pause-between-speakers').value = config.tts.pause_between_speakers_ms;
@@ -1673,6 +1699,7 @@
                     sub_batch_min_size: parseInt(document.getElementById('sub-batch-min-size').value) || 4,
                     sub_batch_ratio: parseFloat(document.getElementById('sub-batch-ratio').value) || 5,
                     sub_batch_max_items: parseInt(document.getElementById('sub-batch-max-items').value) || 0,
+                    max_generation_tokens: parseInt(document.getElementById('max-generation-tokens').value) || 2048,
                     pause_between_speakers_ms: parseInt(document.getElementById('pause-between-speakers').value) || 500,
                     pause_same_speaker_ms: parseInt(document.getElementById('pause-same-speaker').value) || 250
                 },
