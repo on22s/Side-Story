@@ -8,8 +8,8 @@
     ./generate_chapters.py --arc outside 1 3 --plan
 
 脚本只接受小说章节号。内部导入切分号由 cli.py 的严格正文映射自动处理，
-生成完成后会原子发布到 output/chapters，Audiobookshelf 的 File Watcher
-会看到新增或更新的章节。
+生成完成后会原子保存到 output/chapter_sources，供固定文件名的合并版导出使用。
+Audiobookshelf 只扫描 output/chapters 中的合并版，不展示这些单章源文件。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import cli
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="从指定小说章节开始，连续生成 N 章并发布到 Audiobookshelf 目录"
+        description="从指定小说章节开始，连续生成 N 章并保存为合并版的单章源文件"
     )
     parser.add_argument("start", type=int, help="起始小说章节号")
     parser.add_argument("count", type=int, nargs="?", default=1, help="连续生成的小说章节数，默认 1")
@@ -73,7 +73,7 @@ def _print_plan(pipeline: cli.BookPipeline, args: argparse.Namespace) -> int:
         output_name = cli.chapter_audio_filename(
             pipeline.book_dir, pipeline.book, internal_number, arc=arc, novel_number=novel_number
         )
-        print(f"{novel_number:>5}  {title}  -> output/chapters/{output_name}")
+        print(f"{novel_number:>5}  {title}  -> output/chapter_sources/{output_name}")
     return 0
 
 

@@ -28,10 +28,11 @@ scripts/
 scripts/*
 !scripts/generate_builtin_sfx.py
 !scripts/voice_profile.py
+!scripts/update_serial.py
+!scripts/generate_parallel.py
 app/config.json
 app/output_audio_cloned/
 app/output_audio/
-/AGENTS.md
 /CLAUDE.md
 /GEMINI.md
 /QWEN.md

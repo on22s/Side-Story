@@ -11,7 +11,8 @@ The legacy Alexandria browser UI and its HTTP API have been removed. There is no
 - cli.py owns book projects, chapter mapping, analysis state, character IDs, voice IDs, caching, resume, and M4B export.
 - app/tts.py is the shared TTS backend. It supports the local Qwen3-TTS engine and external HTTP/Gradio TTS endpoints.
 - assets/sfx/ contains the built-in cultivation-novel SFX catalog. Chapter analysis emits controlled cues and FFmpeg mixes them on the dialogue timeline.
-- books/<book>/output/chapters/ is the publish directory watched by Audiobookshelf.
+- books/<book>/output/chapter_sources/ stores per-chapter source files outside the Audiobookshelf library.
+- books/<book>/output/chapters/ contains only fixed-name merged editions watched by Audiobookshelf.
 - Codex CLI is invoked as an ephemeral read-only subprocess for chapter analysis and summaries.
 
 ## Requirements
@@ -20,9 +21,12 @@ The legacy Alexandria browser UI and its HTTP API have been removed. There is no
 - Codex CLI installed and authenticated with codex auth login
 - ffmpeg available on PATH
 - A local Qwen3-TTS installation or the configured external TTS endpoints
+- With the canonical 127.0.0.1:18000/18001 xc endpoints, the CLI automatically checks the remote services over SSH, starts them when needed, creates or reuses the tunnels, and waits for /health; set ALEXANDRIA_XC_TTS_AUTO_START=0 to disable recovery.
 - GPU is recommended for local TTS; external TTS can be used without a local GPU
 
 The default CLI analysis configuration is gpt-5.6-luna with max reasoning. Override it with ALEXANDRIA_CODEX_MODEL or ALEXANDRIA_CODEX_REASONING_EFFORT when needed.
+
+Exact source-text coverage validation is disabled by default, so small omissions, insertions, or rewrites do not block audiobook generation. Set `ALEXANDRIA_COVERAGE_MODE=warn` or `strict` only for explicit diagnostics.
 
 ## Quick start
 
@@ -37,6 +41,12 @@ Plan and generate a range of novel chapters:
 
 The range uses the novel original chapter numbers. The count includes the starting chapter.
 
+For parallel analysis with pipelined TTS rendering, use the configurable coordinator; each chapter enters rendering as soon as its analysis is ready:
+
+    .venv/bin/python scripts/generate_parallel.py 774 10 --continue --workers 8
+
+The coordinator also lets the CLI recover the xc TTS services over SSH before rendering.
+
 Inspect status or resume after an interruption:
 
     python cli.py status --book fanren
@@ -49,6 +59,28 @@ Export a combined M4B when needed:
 For a safe preflight without Codex or TTS:
 
     python cli.py run --book fanren --from 742 --count 1 --dry-run
+
+## Per-book configuration
+
+`app/config.json` remains the global baseline. An optional `books/<book>/config.json` is deep-merged on top of it, so TTS URLs, timeouts, endpoint settings, and other fields not listed by a book continue to inherit the global values.
+
+Create an English book with the matching defaults:
+
+    python cli.py init --book english-book --input /data/books/novel.txt --language English --voice-preset english_narrator
+
+This writes `books/english-book/config.json` and selects English prompts, the `English` TTS language, and the English narrator preset. The same file can be edited manually:
+
+    {
+      "language": {"source": "en", "tts": "English", "prompt": "en"},
+      "tts": {
+        "voice_preset": "english_narrator"
+      },
+      "sfx": {"enabled": false}
+    }
+
+The example intentionally omits TTS URLs, so it still uses the global endpoints. Use `--prompt-locale en` to override only the Codex prompt language, or `--disable-sfx` to disable mixing for one book.
+
+When a book config changes, the next run invalidates only the affected artifacts: language/prompt changes re-run script analysis and summaries, while voice, TTS, or SFX changes re-render audio.
 
 ## Sound effects
 
@@ -64,6 +96,7 @@ Disable mixing for a run with `ALEXANDRIA_SFX_ENABLED=0`. Higher-quality WAV fil
 
     books/<book>/
     ├── book.json
+    ├── config.json          # optional per-book overrides
     ├── state/
     │   ├── characters.json
     │   ├── aliases.json
@@ -77,7 +110,9 @@ Disable mixing for a run with `ALEXANDRIA_SFX_ENABLED=0`. Higher-quality WAV fil
     │   ├── dialogue.wav
     │   ├── sfx_timeline.json
     │   └── audio.m4b
-    └── output/chapters/
+    └── output/
+        ├── chapter_sources/
+        └── chapters/        # merged editions only
 
 Analysis and TTS state are checkpointed per chapter. If TTS fails, the next run can reuse the existing analysis and continue from the audio stage.
 
@@ -88,6 +123,12 @@ Audiobookshelf is not part of the CLI process. The included Compose file only ma
     docker compose up -d audiobookshelf
 
 It listens on http://localhost:13378, stores its configuration under data/audiobookshelf/, and reads the project books through the read-only mount ./books:/audiobooks:ro. Enable the Audiobookshelf File Watcher for automatic discovery of newly published chapters.
+
+Publish and verify the rolling `fanren` edition with one command:
+
+    .venv/bin/python scripts/update_serial.py
+
+The command discovers the latest contiguous chapter from chapter 757, exports and atomically publishes the fixed-name M4B, and verifies the result through the Audiobookshelf API. Per-chapter sources remain available, while `output/chapters/fanren_serial.m4b` is the only retained merged edition; temporary range exports are deleted after publication. If the catalog is stale, the command stops the container, backs up SQLite, synchronizes chapters, duration, and file metadata for only the matching book record, restarts the service, and performs a delayed verification. Use `--dry-run` to inspect the range, `--force` to re-encode, or `--skip-audiobookshelf` for a local-only publish.
 
 ## License
 
