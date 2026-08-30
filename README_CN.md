@@ -11,8 +11,10 @@ Alexandria 现在是一个基于文件的 CLI 长篇有声书流水线：使用 
 - cli.py 管理书籍项目、章节映射、分析状态、角色 ID、声音 ID、缓存、断点续跑和 M4B 导出。
 - app/tts.py 是共享 TTS 后端，支持本地 Qwen3-TTS 和外部 HTTP/Gradio TTS 端点。
 - assets/sfx/ 是内置修仙小说音效库；章节分析生成受控 cue，CLI 使用 FFmpeg 按人声时间轴混音。
+- Dasheng-AudioGen 可作为独立的外部 `/sfx` HTTP 后端；本机通过 SSH 隧道调用，不与 TTS `/tts` 接口混用。
 - books/<book>/output/chapter_sources/ 保存单章源文件，不提供给 Audiobookshelf 扫描。
 - books/<book>/output/chapters/ 只保存固定文件名的合并版，Audiobookshelf 从这里扫描。
+- 音频约定：内部旁白/音效混音使用 48 kHz、单声道、PCM 16-bit WAV；章节和滚动合并版发布为 AAC-LC、44.1 kHz、单声道、96 kbps，并开启 faststart。
 - Codex CLI 以临时只读子进程运行，用于章节分析和摘要生成。
 
 ## 环境要求
@@ -22,6 +24,7 @@ Alexandria 现在是一个基于文件的 CLI 长篇有声书流水线：使用 
 - PATH 中可用的 ffmpeg
 - 本地 Qwen3-TTS，或已经配置好的外部 TTS 端点
 - 使用默认的 127.0.0.1:18000/18001 xc 端点时，CLI 渲染前会自动通过 SSH 检测并拉起 xc 上的两个服务，建立/复用隧道并等待 /health 就绪；设置 ALEXANDRIA_XC_TTS_AUTO_START=0 可关闭。
+- 当前 `app/config.json` 使用已由 Dasheng 重生成的 manifest 素材；如需后续按 cue 动态生成，可将 SFX provider 改为 Dasheng，CLI 会自动拉起 `xc` 服务并建立 127.0.0.1:18100 隧道。手动启动隧道可运行 `ALEXANDRIA_XC_SFX_BACKGROUND=1 ./start_xc_sfx_tunnel.sh`。
 - 本地 TTS 推荐使用 GPU；使用外部 TTS 时本机可以不配 GPU
 
 CLI 默认分析模型为 gpt-5.6-luna，推理档位为 max。需要覆盖时可设置 ALEXANDRIA_CODEX_MODEL 或 ALEXANDRIA_CODEX_REASONING_EFFORT。
@@ -86,6 +89,20 @@ CLI 默认分析模型为 gpt-5.6-luna，推理档位为 max。需要覆盖时�
 
 音效默认启用。项目包含 21 个可重复生成的修仙小说基础音效，以及 28 个用户提供的真实录音变体，包括剑气破空、金铁交击、灵力爆发、法术蓄力/释放、雷击、爆炸、遁光、传送、护罩、脚步、开门、宗门钟声、妖兽咆哮，以及风、雨、森林、洞府、火焰和流水环境音。同一 cue 有多个素材时会根据台词和时间点稳定选择，重复渲染结果一致。
 
+启用 Dasheng 后，现有 `manifest.json` 中的 cue 会按其描述生成 WAV，并写入每本书的 `cache/sfx`；生成结果会复用现有 `sfx_timeline.json` 和 FFmpeg 混音流程。配置示例：
+
+    "sfx": {
+      "provider": "builtin",
+      "auto_generate_missing": true,
+      "url": "http://127.0.0.1:18100/sfx",
+      "cache_dir": "cache/sfx",
+      "fallback_to_manifest": true
+    }
+
+当 `auto_generate_missing` 为 true 时，已有静态素材优先直接使用；脚本里出现 manifest 没有的 cue，或 manifest 中的素材文件缺失，渲染当前章节时会自动通过 xc 上的 Dasheng 生成并缓存到每本书的 `cache/sfx`，随后立即进入当前章混音。若服务失败且存在静态素材则回退，若没有可回退素材则明确报错。该流程只为脚本已经标记的音效生成，不会凭空给普通文本添加音效。
+
+远端 Dasheng 部署目录为 `/mnt/workspace/xinchao.gou/Dasheng-AudioGen`，服务端口为 `8100`，本机隧道端口为 `18100`。Dasheng 原生生成约 10 秒音频，章节混音阶段负责按 cue 的 `duration_ms` 裁剪或循环。
+
 重新生成内置 WAV：
 
     python3 scripts/generate_builtin_sfx.py
@@ -108,7 +125,7 @@ CLI 默认分析模型为 gpt-5.6-luna，推理档位为 max。需要覆盖时�
       }
     ]
 
-cue 必须存在于 assets/sfx/manifest.json。gain_db 是相对素材默认音量的微调；环境音只有清单中 loop=true 的素材才能循环。渲染后，dialogue.wav 是纯人声母轨，audio.wav 是混音结果，sfx_timeline.json 可用于检查每个音效的绝对时间点。
+通常 cue 应存在于 `assets/sfx/manifest.json`，这样可以提供更准确的类别、描述和循环属性；开启 `auto_generate_missing` 后，原文中明确出现但目录没有的 cue 也会按需生成。`gain_db` 是相对素材默认音量的微调；环境音只有清单中 `loop=true` 的素材才能循环。渲染后，`dialogue.wav` 是纯人声母轨，`audio.wav` 是混音结果，`sfx_timeline.json` 可用于检查每个音效的绝对时间点。
 
 临时关闭音效：
 
@@ -152,7 +169,7 @@ Audiobookshelf 不参与 CLI 生成过程。项目中的 Compose 文件只管理
 
     .venv/bin/python scripts/update_serial.py
 
-默认从第 757 章开始，自动找到连续生成的最新章节，然后依次完成导出、轻量章节校验、原子发布和手机端 API 校验。单章音频始终保留，但合并音频只保留 `output/chapters/fanren_serial.m4b` 一个版本；导出过程产生的范围版在发布成功后自动删除。如果目录章节不一致，脚本会先停止容器并备份 SQLite，只把 M4B 的章节、时长和文件元数据同步到当前合并版记录，再启动服务并延迟复核。它不会重建书籍条目，因此保留原有播放进度；也不必等待不可靠的文件监听或耗时的全库扫描。
+默认从第 757 章开始，自动找到连续生成的最新章节，然后依次完成导出、轻量章节校验、原子发布和手机端 API 校验。单章音频始终保留，但合并音频只保留 `output/chapters/fanren_serial.m4b` 一个版本；导出过程产生的范围版在发布成功后自动删除。如果目录章节不一致，脚本会先停止容器并备份 SQLite，只把 M4B 的章节、时长和文件元数据同步到当前合并版记录，再启动服务并延迟复核。若 Audiobookshelf 现有条目指向 `/audiobooks` 挂载内的另一个路径，脚本还会先把新合并版原子同步到该实际扫描路径，避免项目目录和书库文件分叉。它不会重建书籍条目，因此保留原有播放进度；也不必等待不可靠的文件监听或耗时的全库扫描。
 
 常用选项：
 

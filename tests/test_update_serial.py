@@ -48,6 +48,24 @@ class UpdateSerialProbeTests(unittest.TestCase):
             )
         )
 
+    def test_abs_host_path_maps_compose_mount(self):
+        path = update_serial.abs_host_path(
+            "/audiobooks/mysterious_island/output/chapters/mysterious_island_serial.m4b"
+        )
+        self.assertEqual(
+            path,
+            update_serial.ROOT
+            / "books"
+            / "mysterious_island"
+            / "output"
+            / "chapters"
+            / "mysterious_island_serial.m4b",
+        )
+
+    def test_abs_host_path_rejects_path_outside_mount(self):
+        with self.assertRaises(update_serial.SerialUpdateError):
+            update_serial.abs_host_path("/config/absdatabase.sqlite")
+
 
 if __name__ == "__main__":
     unittest.main()

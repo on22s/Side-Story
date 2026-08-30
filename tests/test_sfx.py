@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import tempfile
 import unittest
 import wave
@@ -187,6 +188,17 @@ class SoundEffectTests(unittest.TestCase):
             timeline = cli.read_json(chapter_dir / "sfx_timeline.json", [])
             self.assertEqual(len(timeline), 1)
             self.assertEqual(timeline[0]["start_ms"], 350)
+            probe = subprocess.check_output(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=sample_rate,channels",
+                    "-of", "default=noprint_wrappers=1",
+                    str(chapter_dir / "audio.m4b"),
+                ],
+                text=True,
+            )
+            self.assertIn("sample_rate=44100", probe)
+            self.assertIn("channels=1", probe)
 
 
 if __name__ == "__main__":

@@ -35,7 +35,28 @@
   "sfx": {
     "enabled": true,
     "manifest": "assets/sfx/manifest.json",
-    "max_effects_per_chapter": 80
+    "max_effects_per_chapter": 80,
+    "provider": "builtin",
+    "auto_generate_missing": true,
+    "url": "http://127.0.0.1:18100/sfx",
+    "cache_dir": "cache/sfx",
+    "fallback_to_manifest": true,
+    "timeout": 300,
+    "seed": 0,
+    "steps": 25,
+    "guidance_scale": 5.0,
+    "sway_sampling_coef": -1.0
+  },
+  "audio": {
+    "mix_sample_rate": 48000,
+    "mix_channels": 1,
+    "mix_sample_format": "pcm_s16le",
+    "publish_sample_rate": 44100,
+    "publish_channels": 1,
+    "publish_codec": "aac",
+    "publish_profile": "aac_low",
+    "publish_bitrate": "96k",
+    "faststart": true
   },
   "generation": {
     "chunk_size": 3000,

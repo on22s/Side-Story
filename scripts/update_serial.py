@@ -14,7 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -147,6 +147,47 @@ def atomic_publish(generated: Path, destination: Path) -> None:
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def abs_host_path(container_path: str) -> Path:
+    """Map an Audiobookshelf container path back to this compose checkout."""
+    container_root = PurePosixPath(
+        os.environ.get("AUDIOBOOKSHELF_CONTAINER_ROOT", "/audiobooks")
+    )
+    path = PurePosixPath(container_path)
+    try:
+        relative = path.relative_to(container_root)
+    except ValueError as exc:
+        raise SerialUpdateError(
+            f"Audiobookshelf 文件路径不在挂载根目录下：{container_path}"
+        ) from exc
+
+    host_root = Path(
+        os.environ.get("AUDIOBOOKSHELF_HOST_ROOT", str(ROOT / "books"))
+    ).expanduser().resolve()
+    target = (host_root / Path(*relative.parts)).resolve()
+    try:
+        target.relative_to(host_root)
+    except ValueError as exc:
+        raise SerialUpdateError(
+            f"Audiobookshelf 文件路径解析后越过宿主机挂载根目录：{target}"
+        ) from exc
+    return target
+
+
+def publish_to_abs_path(serial: Path, item: AbsItem) -> Path:
+    """Keep the file at the path Audiobookshelf actually indexes in sync.
+
+    A book may have been generated under its own project directory while the
+    existing Audiobookshelf library indexes a shared mounted directory. In
+    that case, publish an atomic copy to the indexed host path before asking
+    Audiobookshelf to refresh its metadata.
+    """
+    target = abs_host_path(item.path)
+    if target.resolve() != serial.resolve():
+        atomic_publish(serial, target)
+        print(f"Audiobookshelf 文件已同步：{target}")
+    return target
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -290,6 +331,7 @@ def synchronize_abs(args: argparse.Namespace, serial: Path, probe: ProbeResult) 
     if not db_path.exists():
         raise SerialUpdateError(f"Audiobookshelf 数据库不存在：{db_path}")
     item = find_abs_item(db_path, serial.name)
+    publish_to_abs_path(serial, item)
     payload = api_json(args.server, item.token, f"/api/items/{quote(item.item_id)}?expanded=1")
     if chapters_match(api_chapters(payload), probe.chapters):
         return None

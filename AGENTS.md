@@ -8,6 +8,12 @@
 - Do not launch generation through a transient user systemd unit without passing the current PATH and proxy environment. The user systemd manager previously retained dead `127.0.0.1:7890` proxy variables while the live sing-box ports were different. The pipeline now fails fast when a configured loopback proxy is not listening.
 - Finished per-chapter M4B sources belong in `books/<book>/output/chapter_sources/` and must be retained.
 
+## Audio format policy
+
+- For `mysterious_island` and future books using the shared defaults, keep the internal dialogue/effects master at 48 kHz, mono, PCM 16-bit WAV.
+- Publish chapter and rolling M4B files as AAC-LC, 44.1 kHz, mono, 96 kbps, with `+faststart`.
+- Keep the mix mono; environmental effects do not require a stereo delivery track for this project.
+
 ## Rolling merged edition
 
 - After a generation batch, run `.venv/bin/python scripts/update_serial.py`.
