@@ -487,14 +487,20 @@ def make_provider(variant, alias_groups=None, texts=None):
     run_id = uuid.uuid4().hex
     memory = {"previous": [], "summary": "", "tail": []}
 
+    def build_request(frozen_batch, params, roster=None, neighbor_contexts=None,
+                      surround=None, roster_traits=None):
+        """Preview the exact next request, including this run's rolling memory."""
+        return build_variant_request(
+            variant, frozen_batch, params, roster, alias_groups, neighbor_contexts,
+            surround, memory, texts, roster_traits)
+
     def provider(client, model_name, sys_prompt, user_prompt, params, log_name, label,
                  max_retries, validate_entries, attempt_observer, frozen_batch,
                  roster=None, neighbor_contexts=None, surround=None, roster_traits=None,
                  **_ignored):
         michel2_family = variant.startswith("michel2")
-        sys_prompt, body = build_variant_request(
-            variant, frozen_batch, params, roster, alias_groups, neighbor_contexts,
-            surround, memory, texts, roster_traits)
+        sys_prompt, body = build_request(
+            frozen_batch, params, roster, neighbor_contexts, surround, roster_traits)
         validator = validate_entries
         if variant == "judge":
             from dataclasses import replace
@@ -529,4 +535,5 @@ def make_provider(variant, alias_groups=None, texts=None):
         return named
 
     provider.variant = variant
+    provider.build_request = build_request
     return provider

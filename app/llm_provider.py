@@ -410,6 +410,13 @@ class _FailoverCompletions:
         return getattr(self._owner._client().chat.completions, name)
 
 
+def is_manual_client(client):
+    """Whether the currently serving transport is the manual reply queue."""
+    if isinstance(client, FailoverClient):
+        client = client._pair[client.get_active_profile_index()][0]
+    return isinstance(client, ManualClient)
+
+
 def make_run_client(config, active_llm_config, timeout):
     """The client a generation run should use: the active profile's, wrapped
     with the failover profile's when `llm_failover` is on and the other profile
