@@ -2690,7 +2690,7 @@ def _ensure_annotated_script_diff():
 @router.get("/api/status")
 async def get_task_statuses():
     """Discover registered tasks without serializing logs or live process handles."""
-    return {name: {"running": bool(state.get("running"))}
+    return {name: {"running": is_task_running(name)}
             for name, state in process_state.items()}
 
 
@@ -2699,6 +2699,7 @@ async def get_status(task_name: str, include_health: bool = False):
     if task_name not in process_state:
         raise HTTPException(status_code=404, detail="Task not found")
     state = dict(process_state[task_name])
+    state["running"] = is_task_running(task_name)
     state.pop("process", None)
     state.pop("processes", None)
     if task_name == "batch_review":
