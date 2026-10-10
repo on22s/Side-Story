@@ -1,247 +1,35 @@
-<img width="475" height="467" alt="Alexandria Logo" src="https://github.com/user-attachments/assets/fa2c36d3-a5f3-49ab-9dfe-30933359dfbd" />
+<img src="icon.png" alt="Alexandria logo" width="160" />
 
-# Alexandria Audiobook Generator
+# Alexandria Audiobook Nya
 
-English | [中文](README_CN.md)
+Turn a book into a multi-voice audiobook. Alexandria combines AI script annotation, local Qwen3-TTS, and a browser editor so you can assign characters, listen, fix individual lines, and export the finished book.
 
-> **A note to new users:** Alexandria has recently seen a sudden surge of attention and new users. As a small project, I may not be able to respond to every issue promptly. Before opening an issue, please read this README and the [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki) thoroughly — most common questions are already answered there. Thank you for your patience!
+**[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting)**
 
-Transform any book or novel into a fully-voiced audiobook using AI-powered script annotation and text-to-speech. Features a built-in Qwen3-TTS engine with batch processing and a browser-based editor for fine-tuning every line before final export.
+English | [中文](README_CN.md) (the Chinese guide may lag behind this page)
 
-This lean fork brings the application improvements from [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) into `alexandria-audiobook-nya`. The everyday install stays focused on audiobook production; native Voice Lab and Preparer dependencies are an optional second install. Research datasets, experiment campaigns, and machine-specific model launchers are not required.
+## At a glance
 
-## Example: [sample.mp3](https://github.com/user-attachments/files/25276110/sample.mp3)
+- **Bring your book:** upload TXT, Markdown, or EPUB and generate an editable script with speaker and delivery directions.
+- **Build a cast:** use preset voices, clone a reference voice, design a voice, or load a LoRA adapter. Reuse voices and series casts across books.
+- **Review before export:** preview chunks, edit text and speakers, regenerate selected lines, and run text-integrity and voice checks.
+- **Export your audiobook:** merged MP3, chaptered M4B, individual lines/chapters, or per-speaker tracks for Audacity.
+- **Choose your setup:** run TTS locally or connect an external Qwen3-TTS Gradio server. Automated annotation uses an OpenAI-compatible local or remote LLM; a manual copy-and-paste mode is also available.
 
-
-## Screenshots
-
-<img src="https://github.com/user-attachments/assets/874b5e30-56d2-4292-b754-4408fc53f5d6" width="30%"></img> <img src="https://github.com/user-attachments/assets/488cde02-6b93-47fa-874b-97a618ae482c" width="30%"></img> <img src="https://github.com/user-attachments/assets/4c0805a6-bb9d-42c1-a9ff-79bb29d0613c" width="30%"></img> <img src="https://github.com/user-attachments/assets/8e58a5bf-ed8f-4864-8545-1e3d9681b0cf" width="30%"></img> <img src="https://github.com/user-attachments/assets/531830da-8668-4189-a0dc-020e6661bfb6" width="30%"></img> 
-
-## Features
-
-### AI-Powered Pipeline
-- **Local & Cloud LLM Support** - Use any OpenAI-compatible API (LM Studio, Ollama, OpenAI, etc.)
-- **Three-Pass Script Annotation** - Separate segmentation, speaker attribution, and delivery instructions, with editable prompt presets and surrounding-text context
-- **Resumable Generation** - Pause, save snapshots, resume failed runs, and process batches of books
-- **Provider Profiles** - Separate local/remote settings, request timeouts and retries, custom provider options, and optional failover
-- **LLM Script Review** - Optional second LLM pass that fixes common annotation errors: strips attribution tags from dialogue, splits misattributed narration/dialogue, merges over-split narrator entries, and validates instruct fields
-- **Persona Generation** - LLM analyzes the script to create voice descriptions for each character, then generates reference audio via VoiceDesign and assigns clone voices automatically — one click to go from script to fully-voiced cast
-- **Reusable Voices & Series Casts** - Save voices to a library, apply a cast across books, and change character style over a timeline
-- **Speaker Aliases** - Map multiple speaker names to the same voice (e.g. "YOUNG ELENA" → "ELENA") so variants share a single voice configuration
-- **Smart Chunking** - Groups consecutive lines by speaker (up to 500 chars) for natural flow
-- **Context Preservation** - Passes character roster and last 3 script entries between chunks for name and style continuity
-
-### Voice Generation
-- **Built-in TTS Engine** - Qwen3-TTS runs locally with no external server required
-- **External Server Mode** - Optionally connect to a remote Qwen3-TTS Gradio server
-- **Multi-Language Support** - English, Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto-detect
-- **Custom Voices** - 9 pre-trained voices with instruct-based emotion/tone control
-- **Voice Cloning** - Clone any voice from a 5-15 second reference audio sample
-- **Voice Designer** - Create new voices from text descriptions (e.g. "A warm, deep male voice with a calm and steady tone")
-- **LoRA Voice Training** - Fine-tune the Base model on custom voice datasets to create persistent voice identities with instruct-following
-- **Built-in LoRA Presets** - Pre-trained voice adapters included out of the box, ready to assign to characters
-- **Dataset Builder** - Interactive tool for creating LoRA training datasets with per-sample text, emotion, and audio preview
-- **Batch Processing** - Generate dozens of chunks simultaneously with 3-6x real-time throughput
-- **Codec Compilation** - Optional `torch.compile` optimization for 3-4x faster batch decoding
-- **Non-verbal Sounds** - LLM writes natural vocalizations ("Ahh!", "Mmm...", "Haha!") with context-aware instruct directions
-- **Natural Pauses** - Configurable silence between speakers (default 500ms) and same-speaker segments (default 250ms)
-
-### Web UI Editor
-- **Streamlined Interface** - 5-step core pipeline (Setup, Script, Voices, Editor, Result) plus advanced tools
-- **System Health & Run Reports** - GPU/disk status, task diagnostics, and run history
-- **Quality Checks** - Text-integrity checks and voice-drift checks before export
-- **Chunk Editor** - Edit speaker, text, and instruct for any line
-- **Selective Regeneration** - Re-render individual chunks without regenerating everything
-- **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
-- **Live Progress** - Real-time logs and status tracking for all operations
-- **Audio Preview** - Play individual chunks or sequence through the entire audiobook
-- **Script Library** - Save and load annotated scripts with voice configurations
-
-### Export Options
-- **Combined Audiobook** - Single MP3 with all voices and natural pauses
-- **Individual Voicelines** - Separate MP3 per line for DAW editing (Audacity, etc.)
-- **Audacity Export** - One-click zip with per-speaker WAV tracks, LOF project file, and labels for automatic multi-track import into Audacity
-- **M4B Audiobook** - Chaptered M4B (AAC) with title/author/narrator metadata, cover art, and chapter markers
-- **Chapter Export** - Export individual chapters with filename templates and readiness checks
-
-## Requirements
-
-- [Pinokio](https://pinokio.computer/)
-- LLM server (one of the following):
-  - [LM Studio](https://lmstudio.ai/) (local) - recommended: Qwen3 or similar
-  - [Ollama](https://ollama.ai/) (local)
-  - [OpenAI API](https://platform.openai.com/) (cloud)
-  - Any OpenAI-compatible API
-- **GPU:** 8 GB VRAM minimum, 16 GB+ recommended — see compatibility table below
-  - Each TTS model uses ~3.4 GB; remaining VRAM determines batch size
-  - CPU mode available on all platforms but significantly slower
-- **RAM:** 16 GB recommended (8 GB minimum)
-- **Disk:** ~20 GB (8 GB venv/PyTorch, ~7 GB for model weights, working space for audio)
-
-### GPU Compatibility
-
-| GPU | OS | Status | Driver Requirement | Notes |
-|-----|-----|--------|-------------------|-------|
-| **NVIDIA** | Windows | Full support | Driver 550+ (CUDA 12.8) | Flash attention included for faster encoding |
-| **NVIDIA** | Linux | Full support | Driver 550+ (CUDA 12.8) | Flash attention + triton included |
-| **AMD** | Linux | Supported | ROCm 7.0-compatible system | Installer pins torch 2.10 + ROCm 7.0; upstream tested RX 9070 XT. Check compatibility for older cards |
-| **AMD** | Windows | CPU only | N/A | GPU acceleration is not supported — the app runs in CPU mode. For GPU acceleration with AMD, use Linux |
-| **Apple Silicon** | macOS | CPU only | N/A | MPS acceleration is not currently supported. Functional but slow |
-| **Intel** | macOS | CPU only | N/A | |
-
-> **Note:** No external TTS server is required. Alexandria includes a built-in Qwen3-TTS engine that loads models directly. Model weights are downloaded automatically on first use (~3.5 GB per model variant).
-
-> **Documentation:** For in-depth guidance on voice types, LoRA training, batch generation, and more, see the [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki).
+Start with the five numbered tabs: **Setup → Script → Voices → Editor → Result**. Designer, Dataset, Training, Preparer, Voice Lab, and Reports are there when you need them.
 
 ## Installation
 
-### Option A: Pinokio (Recommended)
+### Pinokio (recommended)
 
-1. Install [Pinokio](https://pinokio.computer/) if you haven't already
-2. In Pinokio, click **Download** and paste `https://github.com/on22s/alexandria-audiobook-nya`
-3. Click **Install** to create `app/env`, install platform-correct PyTorch first, and constrain subsequent runtime dependencies to that build
-4. Click **Start** to launch the web interface
+1. Install [Pinokio](https://pinokio.computer/).
+2. Choose **Download** and paste `https://github.com/on22s/alexandria-audiobook-nya`.
+3. Click **Install**, then **Start** and **Open Web UI**.
+4. Follow [Quick Start](#quick-start) to connect your LLM and make a short test audiobook.
 
-Fresh environments use CPython 3.10 for the NVIDIA attention wheels. Existing environments are preserved; optional attention wheels report a compatibility error if the environment uses another Python version.
+The normal install includes the audiobook app and Qwen3-TTS runtime. TTS weights download on first use; LLM weights are separate. **Install Voice Tools (Optional)** is needed for native Preparer/Voice Lab stages and the bundled local LLM launchers, not for the basic audiobook workflow.
 
-#### Optional Voice Lab / Preparer dependencies
-
-For audiobook-to-dataset preparation or native Voice Lab profiling, stop the app and choose **Install Voice Tools (Optional)** in Pinokio. This separate installer:
-
-- builds `llama-cpp-python` for CUDA, HIP, Metal, or CPU as appropriate;
-- creates an isolated `preparer_env` on every platform, with its own PyTorch constraints;
-- fetches the pinned whisper.cpp source and model, verifies them, and builds the selected backend;
-- installs speaker diarization only on Linux AMD, whose current PyTorch pin meets pyannote 4’s `torch>=2.8` requirement. Other platform pins do not, so do not add pyannote to `app/env`.
-
-Native builds need CMake and a working C/C++ toolchain, plus the matching CUDA/ROCm SDK for GPU builds. This adds download time and disk use. Configure the relevant model and interpreter paths in the tools before use. Diarization additionally needs a Hugging Face token and acceptance of the [Community-1 model terms](https://huggingface.co/pyannote/speaker-diarization-community-1). The core audiobook pipeline does not need this optional install.
-
-#### Command-line preparation and review
-
-The production command-line tools are included too. Run these commands from the checkout root after **Install Voice Tools (Optional)**. On Windows, replace `preparer_env/bin/python` with `preparer_env\Scripts\python.exe`.
-
-- Prepare a folder of audiobooks with matching EPUB/TXT sources:
-  `preparer_env/bin/python alexandria_batch_processor.py --folder /path/to/audio --source-folder /path/to/books --model /path/to/model.gguf`
-- Review and approve corrections to an extracted dataset against its source:
-  `preparer_env/bin/python alexandria_compare.py --help`
-- Check the core app environment: `python env_doctor.py`. Add `--voice-tools` to check the optional environments, or `--json` for machine-readable output.
-- Download a standalone legacy Whisper-base Transformers bundle for offline use:
-  `preparer_env/bin/python download_model.py`. This downloads Whisper weights to `models/whisper-base`; it does not download a GGUF LLM or replace the current whisper.cpp setup.
-
-On Linux, `bash run_with_restart.sh --audio /path/to/book.wav --source /path/to/book.epub --model /path/to/model.gguf --output /path/to/dataset.zip` adds bounded retries and checkpoint resume while retaining the shared GPU lock. It prefers `preparer_env/bin/python`; set `ALEXANDRIA_PREPARER_PYTHON` to use another prepared interpreter. `MAX_RETRIES` and `BACKOFF_SECONDS` control the retry limit and delay.
-
-For multiple explicitly paired books, `corpus_alignment_prescan.py` validates initial alignment and `corpus_run_report.py` runs preparation and reports verified output receipts. Both accept `--repo`, `--pairs`, and `--output-dir` (see `--help`); new report runs require `--model`, with an optional `--fallback`. The pairs file is a JSON array of `{ "audio": "/path/book.wav", "source": "/path/book.epub", "output_name": "book.zip" }` objects. These launch the Linux restart wrapper, so they need the same optional environment. No research corpora are bundled.
-
-The Docker image includes the scripts but does not install native Voice Tools. Use a separately prepared interpreter via `ALEXANDRIA_PREPARER_PYTHON` for preparation; ordinary audiobook generation is unaffected.
-
-#### Local LLM launchers and runtime diagnostics
-
-After **Install Voice Tools (Optional)**, Pinokio's **Start LLM** actions serve the selected GGUF from the checkout root and update the local LLM profile. Model weights are not downloaded automatically. Reset and Update stop this server before changing files.
-
-For an independently installed native `llama-server` on Linux, `start_llama_server.sh` and `ensure_llama_server.sh` retain verified model/adapter identity and lifecycle locking. Set `LLAMA_BIN`, `LLAMA_MODEL`, and optionally `LLAMA_PORT`/`LLAMA_LOG` explicitly for your installation; these helpers do not install the native binary or models.
-
-Additional production-support CLIs, using the app environment:
-
-- `app/env/bin/python app/analyze_generation_attempts.py --json` summarizes saved generation quality manifests.
-- `app/env/bin/python app/repair_source_llm.py --help` explains source-repair proposals. The default is report-only (it still contacts your configured LLM); writing repaired output requires `--apply`.
-- `app/env/bin/python app/tts_vram_benchmark.py --help` explains custom/clone voice GPU batch and codec tuning. Running a sweep loads real models and consumes GPU time.
-- `app/env/bin/python tools/backfill_adapter_digests.py --root /path/to/adapters` audits missing provenance digests. It is dry-run unless `--apply` is specified; it never replaces mismatched existing digests or claims historical training verification.
-
-On Windows use `app\env\Scripts\python.exe`; in Docker use `python` for these four Python CLIs. The standalone native server shell launchers are intended for a prepared Linux checkout, not the base Docker image.
-
-### Option B: Google Colab (No Install Required)
-
-No GPU or wrong OS? Run Alexandria on a free T4 GPU in your browser:
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
-
-The notebook uses Google Drive persistence and Colab's built-in inline port forwarding; no ngrok account is needed. See the notebook for full instructions.
-
-### Option C: Docker (NVIDIA GPU)
-
-For integration into automated pipelines or server deployments:
-
-```bash
-git clone https://github.com/on22s/alexandria-audiobook-nya.git
-cd alexandria-audiobook-nya
-docker compose up --build
-```
-
-Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. User data persists via bind mounts to the project directory. The default image installs the audiobook runtime; it does not build the optional native Voice Tools or create `preparer_env`.
-
-#### Docker data and upgrades
-
-- Back up `data/` before upgrading. Keep the same project directory and existing Docker model-cache volume.
-- New mutable state uses `ALEXANDRIA_DATA_DIR=/alexandria/runtime`, mounted from `./data/runtime`.
-- Existing host folders (`data/uploads`, `data/scripts`, `data/designed_voices`, `data/clone_voices`, `data/lora_models`, `data/lora_datasets`, `data/dataset_builder`, and `data/output`) remain mounted at the corresponding runtime subdirectories. No host-data move is needed.
-- Legacy container paths such as `/alexandria/scripts`, `/alexandria/voicelines`, and `/alexandria/app/uploads` are symlinks to those locations.
-- WebUI settings keep this fork’s `ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json`, backed by `./data/config`. Keep that mount when customizing Compose.
-- If using `docker run` instead, persist both the runtime directory and the config directory yourself.
-
-#### Network security
-
-Compose publishes only `127.0.0.1:4200`; the container binds `0.0.0.0` for Docker forwarding. Authentication is off by default. Before exposing the host port, using a tunnel, or adding a reverse proxy, set `ALEXANDRIA_AUTH_PASSWORD` in the container environment (and optionally `ALEXANDRIA_AUTH_USERNAME`, default `alexandria`). Use HTTPS for access beyond a trusted local network.
-
-For a domain, set `ALEXANDRIA_ALLOWED_HOSTS` to the hostname. If a separate web origin needs API access, set `ALEXANDRIA_ALLOWED_ORIGINS` to that exact origin. Host/origin checks do not replace authentication. Never bake credentials into the image or commit them to Compose.
-
-## First Launch — What to Expect
-
-If this is your first time running Alexandria, read this before anything else.
-
-### 1. You Need an LLM Server Running First
-
-Alexandria does **not** include an LLM — it connects to one over an API. Before generating a script, you must have one of these running:
-
-| Server | Default URL | Install |
-|--------|-------------|---------|
-| [LM Studio](https://lmstudio.ai/) | `http://localhost:1234/v1` | Download, load a model, start server |
-| [Ollama](https://ollama.ai/) | `http://localhost:11434/v1` | `ollama run qwen3` |
-| [OpenAI API](https://platform.openai.com/) | `https://api.openai.com/v1` | Get an API key |
-
-If the LLM server isn't running when you click "Generate Script", the generation will fail. Check the Pinokio terminal for error details.
-
-### 2. First TTS Generation Downloads ~3.5 GB
-
-The TTS models are **not** included in the install. They download automatically from Hugging Face the first time you generate audio. This is normal:
-
-- **Each model variant is ~3.5 GB** (CustomVoice, Base/Clone, VoiceDesign)
-- Only the variant you use gets downloaded (most users start with CustomVoice)
-- Downloads happen in the background — **check the Pinokio terminal** for progress
-- The web UI may appear frozen during this time. It is not — it's waiting for the download to finish
-- After the first download, models are cached locally and load in seconds
-
-> **Tip:** If the download seems stuck, check your internet connection. If it fails, restart the app and try again — it will resume from where it left off.
-
-### 3. First Batch Has Extra Warmup Time
-
-The very first batch generation in a session takes longer than subsequent ones:
-
-- **MIOpen autotuning** (AMD GPUs): The GPU kernel optimizer runs once per session, adding 30-60 seconds
-- **Codec compilation** (if enabled): One-time ~30-60 second warmup, then 3-4x faster for all remaining batches
-- **This is expected.** After the first batch, generation speed stabilizes
-
-### 4. VRAM Determines What You Can Do
-
-| Available VRAM | What Works |
-|---------------|------------|
-| 8 GB | One model at a time, small batches (2-5 chunks), CPU offload may be needed |
-| 16 GB | Comfortable for most use cases, batches of 10-20 chunks |
-| 24 GB+ | Full speed, batches of 40-60 chunks with codec compilation |
-
-- If you run out of VRAM, reduce **Parallel Workers** or **Max Chars/Batch** in the Setup tab
-- Close other GPU applications (games, other AI tools) before generating
-- Switching between voice types (Custom → Clone → LoRA) unloads and reloads models, which temporarily frees VRAM
-
-### 5. Where to Look When Something Goes Wrong
-
-The web UI shows high-level status, but **detailed logs are in the Pinokio terminal**:
-
-- Click **Terminal** in the Pinokio sidebar to see real-time output
-- Model loading, download progress, VRAM estimates, and errors all appear here
-- If generation fails silently in the UI, the terminal will show why
-
-For common issues and solutions, see [Troubleshooting](https://github.com/Finrandojin/alexandria-audiobook/wiki/Troubleshooting).
-
----
+The launcher creates `app/env` with CPython 3.10 on a fresh install and installs platform-specific PyTorch before the remaining dependencies. Existing environments are retained. See [hardware and first-run guidance](#requirements) before starting a large book.
 
 ## Quick Start
 
@@ -250,26 +38,28 @@ The interface is split into a **5-step core pipeline** (numbered tabs) and **adv
 ### Core Pipeline
 
 **Step 1 — Setup**
-Configure your LLM connection and TTS engine. At minimum you need:
+For automatic annotation, configure your LLM connection and TTS engine:
 - **LLM Base URL**: `http://localhost:1234/v1` (LM Studio) or `http://localhost:11434/v1` (Ollama)
 - **LLM API Key**: Your API key (use `local` for local servers)
-- **LLM Model Name**: The model to use (e.g., `qwen2.5-14b`)
+- **LLM Model Name**: The exact model ID served by your provider
 - **TTS Mode**: `local` (built-in, recommended) — loads models directly, no external server needed
 - Choose the local or remote provider profile, and set **Runs on this machine's GPU?** accurately so script and audio tasks share the GPU safely
 - Click **Save Configuration** when done
 
+Without an API server, choose manual transport and copy/paste the requests and replies through the Script tab. The API address is ignored in that mode.
+
 **Step 2 — Script**
 - Select your book file (.txt, .md, or .epub) using the file picker — it uploads automatically
-- Click **Generate Annotated Script** — this sends the book to your LLM to split it into annotated chunks with speaker labels and voice directions
+- Click **Generate Annotated Script** — automatic mode sends the book to your configured LLM to produce chunks with speaker labels and voice directions
 - *(Optional)* Click **Review Script** if the generated script has issues — this runs a second LLM pass to fix speaker misattributions or formatting problems
-- Use **Pause**, **Save snapshot**, or **Resume failed run** for longer jobs; batch mode handles several books
+- Use snapshots and resume controls for longer jobs; batch mode handles several books. Pause is unavailable on Windows; Cancel followed by Generate can resume checkpoints
 - You can save the script for later use with the Save feature below
 
 **Step 3 — Voices**
 Each character detected in the script gets a voice card. For each speaker:
-- Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
+- Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, Voice Design, or Character Ensemble. External TTS mode supports Custom Voice and Clone; Voice Design and LoRA require local TTS
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
-- **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. This is the fastest way to assign unique voices to all characters
+- **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. Review the generated voices before rendering the book
 - **Speaker Aliases** — Use the "Alias of" dropdown on any voice card to map a speaker to another character's voice (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
 - Changes save automatically — see [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
 
@@ -295,6 +85,178 @@ These tabs are for power users who want more control over voice creation:
 - **Voice Lab** — Inspect voice datasets, train adapters, and profile/name voices; native stages need the optional dependencies and configured model paths
 - **Reports** — Inspect run history, artifacts, and diagnostics
 
+<details>
+<summary>Detailed features</summary>
+
+## Features
+
+### AI-Powered Pipeline
+- **Local & Cloud LLM Support** - Connect an OpenAI-compatible API (LM Studio, Ollama, OpenAI, etc.)
+- **Three-Pass Script Annotation** - Separate segmentation, speaker attribution, and delivery instructions, with editable prompt presets and surrounding-text context
+- **Resumable Generation** - Pause, save snapshots, resume failed runs, and process batches of books
+- **Provider Profiles** - Separate local/remote settings, request timeouts and retries, custom provider options, and optional failover
+- **LLM Script Review** - Optional review of speaker assignments, narration/dialogue boundaries, and delivery directions, with source-text preservation checks
+- **Persona Generation** - LLM analyzes the script to create voice descriptions for each character, then generates reference audio via VoiceDesign and assigns clone voices automatically — one click to go from script to fully-voiced cast
+- **Reusable Voices & Series Casts** - Save voices to a library, apply a cast across books, and change character style over a timeline
+- **Speaker Aliases** - Map multiple speaker names to the same voice (e.g. "YOUNG ELENA" → "ELENA") so variants share a single voice configuration
+- **Chunk Editing** - Review and adjust script chunks before rendering
+- **Context Preservation** - Uses speaker roster and surrounding-text context during annotation
+
+### Voice Generation
+- **Built-in TTS Engine** - Qwen3-TTS runs locally with no external server required
+- **External Server Mode** - Optionally connect to a remote Qwen3-TTS Gradio server
+- **Multi-Language Support** - English, Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto-detect
+- **Custom Voices** - 9 pre-trained voices with instruct-based emotion/tone control
+- **Voice Cloning** - Create a clone voice from a clean reference sample and its exact transcript; uploaded references must pass validation
+- **Voice Designer** - Create new voices from text descriptions (e.g. "A warm, deep male voice with a calm and steady tone")
+- **LoRA Voice Training** - Fine-tune the Base model on custom voice datasets to create persistent voice identities with instruct-following
+- **Built-in LoRA Presets** - Preset catalog included; adapter weights download from Hugging Face when requested
+- **Dataset Builder** - Interactive tool for creating LoRA training datasets with per-sample text, emotion, and audio preview
+- **Batch Processing** - Render multiple chunks with configurable batch sizes
+- **Codec Compilation** - Optional `torch.compile` optimization; benefit and warmup depend on hardware
+- **Source Fidelity** - Preserves written vocalizations and adds delivery directions separately
+- **Natural Pauses** - Configurable silence between speakers (default 500ms) and same-speaker segments (default 250ms)
+
+### Web UI Editor
+- **Streamlined Interface** - 5-step core pipeline (Setup, Script, Voices, Editor, Result) plus advanced tools
+- **System Health & Run Reports** - GPU/disk status, task diagnostics, and run history
+- **Quality Checks** - Text-integrity checks and voice-drift checks before export
+- **Chunk Editor** - Edit speaker, text, and instruct for any line
+- **Selective Regeneration** - Re-render individual chunks without regenerating everything
+- **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
+- **Live Progress** - Real-time logs and status tracking for all operations
+- **Audio Preview** - Play individual chunks or sequence through the entire audiobook
+- **Script Library** - Save and load annotated scripts with voice configurations
+
+### Export Options
+- **Combined Audiobook** - Single MP3 with all voices and natural pauses
+- **Individual Voicelines** - Separate MP3 per line for DAW editing (Audacity, etc.)
+- **Audacity Export** - One-click zip with per-speaker WAV tracks, LOF project file, and labels for automatic multi-track import into Audacity
+- **M4B Audiobook** - Chaptered M4B (AAC) with title/author/narrator metadata, cover art, and chapter markers
+- **Chapter Export** - Export individual chapters with filename templates and readiness checks
+
+</details>
+
+## Requirements
+
+- A local GPU is recommended for practical TTS generation. CPU mode is available but slower. Memory use depends on the model, batch size, and whether an LLM shares the GPU; there is no universal safe batch size.
+- Allow several GB per TTS model variant, plus Python/PyTorch environments, optional LLM weights, source books, and generated audio. Downloads and working data can grow substantially.
+- Automated script generation needs a reachable OpenAI-compatible LLM endpoint. TTS itself does not require an external server in local mode.
+
+### GPU Compatibility
+
+These are the installer paths, not a guarantee for every GPU or driver:
+
+| Platform | Local TTS path | What to check |
+|----------|----------------|---------------|
+| NVIDIA on Windows/Linux | PyTorch 2.7 / CUDA 12.8 | A CUDA-compatible GPU and driver; optional attention wheels depend on Python/platform compatibility |
+| AMD on Linux | PyTorch 2.10 / ROCm 7.0 | Your GPU and host ROCm/driver compatibility; the installer identifies RX 9070 XT / RDNA4 as its tested target, not all AMD cards |
+| AMD on Windows | CPU | This installer does not provide AMD GPU acceleration on Windows |
+| macOS (Apple Silicon) | MPS when available, otherwise CPU | `auto` selects MPS if PyTorch reports it available; end-to-end performance and compatibility are not guaranteed |
+| macOS (Intel) | CPU fallback | The installer uses an older PyTorch pin; validate your environment with a short sample |
+| Other CPU-only setups | CPU | Expect slower generation; start with a short sample |
+
+The exact pins live in [torch.js](torch.js), and runtime selection in [app/device_utils.py](app/device_utils.py). Docker’s supplied Compose configuration targets NVIDIA GPUs; it is not an AMD deployment recipe.
+
+## Other installs and optional tools
+
+### Optional Voice Lab / Preparer dependencies
+
+For audiobook-to-dataset preparation or native Voice Lab profiling, stop the app and choose **Install Voice Tools (Optional)** in Pinokio. This separate installer:
+
+- builds `llama-cpp-python` for CUDA, HIP, Metal, or CPU as appropriate;
+- creates an isolated `preparer_env` on every platform, with its own PyTorch constraints;
+- fetches the pinned whisper.cpp source and model, verifies them, and builds the selected backend;
+- installs speaker diarization only on Linux AMD, whose current PyTorch pin meets pyannote 4’s `torch>=2.8` requirement. Other platform pins do not, so do not add pyannote to `app/env`.
+
+Native builds need CMake and a working C/C++ toolchain, plus the matching CUDA/ROCm SDK for GPU builds. This adds download time and disk use. Configure the relevant model and interpreter paths in the tools before use. Diarization additionally needs a Hugging Face token and acceptance of the [Community-1 model terms](https://huggingface.co/pyannote/speaker-diarization-community-1). The core audiobook pipeline does not need this optional install.
+
+#### Command-line preparation and review
+
+The production command-line tools are included too. Run these commands from the checkout root after **Install Voice Tools (Optional)**. On Windows, replace `preparer_env/bin/python` with `preparer_env\Scripts\python.exe`.
+
+- Prepare a folder of audiobooks with matching EPUB/TXT sources:
+  `preparer_env/bin/python alexandria_batch_processor.py --folder /path/to/audio --source-folder /path/to/books --model /path/to/model.gguf`
+- Review and approve corrections to an extracted dataset against its source:
+  `preparer_env/bin/python alexandria_compare.py --help`
+- Check the core app environment: `python env_doctor.py`. Add `--voice-tools` to check the optional environments, or `--json` for machine-readable output.
+- Download a standalone legacy Whisper-base Transformers bundle for offline use:
+  `preparer_env/bin/python download_model.py`. This downloads Whisper weights to `models/whisper-base`; it does not download a GGUF LLM or replace the current whisper.cpp setup.
+
+On Linux, `bash run_with_restart.sh --audio /path/to/book.wav --source /path/to/book.epub --model /path/to/model.gguf --output /path/to/dataset.zip` adds bounded retries and checkpoint resume while retaining the shared GPU lock. It prefers `preparer_env/bin/python`; set `ALEXANDRIA_PREPARER_PYTHON` to use another prepared interpreter. `MAX_RETRIES` and `BACKOFF_SECONDS` control the retry limit and delay.
+
+For multiple explicitly paired books, `corpus_alignment_prescan.py` validates initial alignment and `corpus_run_report.py` runs preparation and reports verified output receipts. Both accept `--repo`, `--pairs`, and `--output-dir` (see `--help`); new report runs require `--model`, with an optional `--fallback`. The pairs file is a JSON array of `{ "audio": "/path/book.wav", "source": "/path/book.epub", "output_name": "book.zip" }` objects. These launch the Linux restart wrapper, so they need the same optional environment.
+
+The Docker image includes the scripts but does not install native Voice Tools. Use a separately prepared interpreter via `ALEXANDRIA_PREPARER_PYTHON` for preparation; ordinary audiobook generation is unaffected.
+
+#### Local LLM launchers and runtime diagnostics
+
+After **Install Voice Tools (Optional)**, Pinokio's **Start LLM** actions serve the selected GGUF from the checkout root and update the local LLM profile. Model weights are not downloaded automatically. Reset and Update stop this server before changing files.
+
+For an independently installed native `llama-server` on Linux, `start_llama_server.sh` and `ensure_llama_server.sh` retain verified model/adapter identity and lifecycle locking. Set `LLAMA_BIN`, `LLAMA_MODEL`, and optionally `LLAMA_PORT`/`LLAMA_LOG` explicitly for your installation; these helpers do not install the native binary or models.
+
+Additional production-support CLIs, using the app environment:
+
+- `app/env/bin/python app/analyze_generation_attempts.py --json` summarizes saved generation quality manifests.
+- `app/env/bin/python app/repair_source_llm.py --help` explains source-repair proposals. The default is report-only (it still contacts your configured LLM); writing repaired output requires `--apply`.
+- `app/env/bin/python app/tts_vram_benchmark.py --help` explains custom/clone voice GPU batch and codec tuning. Running a sweep loads real models and consumes GPU time.
+- `app/env/bin/python tools/backfill_adapter_digests.py --root /path/to/adapters` audits missing provenance digests. It is dry-run unless `--apply` is specified; it never replaces mismatched existing digests or claims historical training verification.
+
+On Windows use `app\env\Scripts\python.exe`; in Docker use `python` for these four Python CLIs. The standalone native server shell launchers are intended for a prepared Linux checkout, not the base Docker image.
+
+### Google Colab
+
+The included notebook installs and launches the app in a Colab runtime. GPU availability and session limits depend on Colab:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
+
+The notebook uses Google Drive persistence and Colab's built-in inline port forwarding; no ngrok account is needed. See the notebook for full instructions.
+
+### Docker (NVIDIA GPU)
+
+For integration into automated pipelines or server deployments:
+
+```bash
+git clone https://github.com/on22s/alexandria-audiobook-nya.git
+cd alexandria-audiobook-nya
+docker compose up --build
+```
+
+Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. User data persists via bind mounts to the project directory. The default image installs the audiobook runtime; it does not build the optional native Voice Tools or create `preparer_env`.
+
+#### Docker data and upgrades
+
+- Back up `data/` before upgrading. Keep the same project directory and existing Docker model-cache volume.
+- New mutable state uses `ALEXANDRIA_DATA_DIR=/alexandria/runtime`, mounted from `./data/runtime`.
+- Existing host folders (`data/uploads`, `data/scripts`, `data/designed_voices`, `data/clone_voices`, `data/lora_models`, `data/lora_datasets`, `data/dataset_builder`, and `data/output`) remain mounted at the corresponding runtime subdirectories. No host-data move is needed.
+- Legacy container paths such as `/alexandria/scripts`, `/alexandria/voicelines`, and `/alexandria/app/uploads` are symlinks to those locations.
+- WebUI settings use `ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json`, backed by `./data/config`. Keep that mount when customizing Compose.
+- If using `docker run` instead, persist both the runtime directory and the config directory yourself.
+
+#### Network security
+
+Compose publishes only `127.0.0.1:4200`; the container binds `0.0.0.0` for Docker forwarding. Authentication is off by default. Before exposing the host port, using a tunnel, or adding a reverse proxy, set `ALEXANDRIA_AUTH_PASSWORD` in the container environment (and optionally `ALEXANDRIA_AUTH_USERNAME`, default `alexandria`). Use HTTPS for access beyond a trusted local network.
+
+For a domain, set `ALEXANDRIA_ALLOWED_HOSTS` to the hostname. If a separate web origin needs API access, set `ALEXANDRIA_ALLOWED_ORIGINS` to that exact origin. Host/origin checks do not replace authentication. Never bake credentials into the image or commit them to Compose.
+
+## First launch
+
+- **Configure the LLM first** for automatic annotation. Check its server is running, its model name matches Setup, and its URL is reachable from the app. Inside Docker, `localhost` refers to the container, not a server on your host.
+- **Expect model downloads.** Qwen3-TTS variants download from Hugging Face when first needed and are cached locally. Watch the terminal for download or model-loading progress before assuming the app has stalled.
+- **Start small.** Try a short passage and a small batch. The first generation can take longer while models load and GPU kernels warm up. Increase batch size only after checking memory use.
+- **Protect your source and voices.** Remote LLM providers receive the text you submit for annotation/review. External TTS sends generation inputs, including reference audio/transcripts for clone voices, to the configured server. Use books and reference voices you have permission to process.
+
+## Updates and your data
+
+Save your script and back up your work before **Update**. The launcher stops active writers, pulls code, and reruns the core installer; it does not guarantee recovery of an interrupted job. If optional dependencies change, stop the app and rerun **Install Voice Tools (Optional)**.
+
+For a normal Pinokio/local checkout, keep `app/config.json`, active-project JSON files, `app/uploads/`, `voicelines/`, saved scripts, and your voice/dataset/model libraries. These generated files are not backed up by Git. `ALEXANDRIA_DATA_DIR` can relocate mutable data; `ALEXANDRIA_CONFIG_PATH` overrides the settings file independently. Back up the actual configured locations.
+
+**Reset is destructive to the active project.** It removes the default active script, voice assignments, chunk/state files, generated voicelines, merged MP3, and `app/config.json`. It retains reusable libraries. The current reset script names default checkout paths, so do not assume it clears a custom data/config directory. See [reset.js](reset.js) and [Docker data and upgrades](#docker-data-and-upgrades).
+
+<details>
+<summary>Tab-by-tab interface guide</summary>
+
 ## Web Interface
 
 ### Setup Tab
@@ -302,12 +264,13 @@ Configure connections to your LLM and TTS engine.
 
 **TTS Settings:**
 - **Mode** - `local` (built-in engine) or `external` (connect to Gradio server)
-- **Device** - `auto` (recommended), `cuda`, `cpu`, or `mps`
+- **Device** - Start with `auto`; the UI also exposes CUDA device choices and CPU. The backend accepts MPS when available
 - **Language** - TTS synthesis language: English (default), Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto (let the model detect)
-- **Parallel Workers** - Batch size for fast batch rendering (higher = more VRAM usage)
-- **Batch Seed** - Fixed seed for reproducible batch output (leave empty for random)
-- **Compile Codec** - Enable `torch.compile` for 3-4x faster batch decoding (adds ~30-60s warmup on first generation)
+- **Parallel Workers** - Outer local batch size, or concurrent external requests per server; higher values use more resources
+- **Batch Seed** - Seed for local batched Custom/Clone/LoRA generation; it does not override every voice path
+- **Compile Codec** - Optional `torch.compile` optimization; adds warmup and depends on your hardware/software stack
 - **Sub-batching** - Split batches by text length to reduce wasted GPU compute on padding (enabled by default)
+- **Max Items/Batch** - Hard cap on local sub-batches; 0 uses the VRAM estimate. Memory/manual limits still apply with length-based sub-batching disabled
 - **Min Sub-batch Size** - Minimum chunks per sub-batch before allowing a split (default: 4)
 - **Length Ratio** - Maximum longest/shortest text length ratio before forcing a sub-batch split (default: 5)
 - **Speaker Change Pause** - Silence in milliseconds between different speakers during merge (default: 500)
@@ -316,32 +279,27 @@ Configure connections to your LLM and TTS engine.
 **Prompt Settings (Advanced):**
 - **Generation Settings** - Chunk size and max tokens for LLM responses
 - **LLM Sampling Parameters** - Temperature, Top P, Top K, Min P, and Presence Penalty
-- **Banned Tokens** - Comma-separated list of tokens to ban from LLM output (useful for disabling thinking mode on models like GLM4, DeepSeek-R1, etc.)
-- **Prompt Customization** - System and user prompts used for script generation. Defaults are loaded from `default_prompts.txt` and can be customized per-session in the UI. Click "Reset to Defaults" to reload the file-based defaults (picks up edits without restarting the app)
+- **Banned Tokens** - Comma-separated list of tokens to ban from LLM output; this is not a universal reasoning-mode switch
+- **Prompt Customization** - Separate generation-pass presets plus review/persona prompts. See [Prompt Customization](#prompt-customization); save the form to persist edits
 
 ### Script Tab
 Upload a text file (.txt, .md, or .epub) and generate the annotated script. EPUB files are automatically converted to plain text on upload. The LLM converts your book into a structured JSON format with:
 - Speaker identification (NARRATOR vs character names)
-- Dialogue text with natural vocalizations (written as pronounceable text, not tags)
+- Source text preserved through segmentation, including written vocalizations
 - Style directions for TTS delivery
 
-**Review Script** - After generation, click "Review Script" to run a second LLM pass that detects and fixes common annotation errors:
-1. Attribution tags left in dialogue ("said he", "she replied") are stripped
-2. Narration mixed into character entries is split out as NARRATOR
-3. Dialogue embedded in narrator entries is extracted as the correct speaker
-4. Short consecutive narrator entries covering the same scene are merged
-5. Invalid instruct fields (physical actions instead of voice directions) are corrected
+**Review Script** checks speaker assignments, narration/dialogue boundaries, and delivery directions while preserving source text. Consecutive-narrator merging is optional and off by default. Review the result rather than assuming every annotation was corrected.
 
-Review prompts are customizable in `review_prompts.txt` (same format as `default_prompts.txt`).
+Review prompts can be edited in Setup or through their file defaults in `review_prompts.txt`; the runtime’s text-preservation validation still applies.
 
 ### Voices Tab
 After script generation, voices are automatically loaded from the annotated script. For each speaker:
 
 **Persona Generation:**
-Click **Generate Personas** to automatically assign voices to all characters. The LLM analyzes dialogue in the script and produces a voice description and sample text for each speaker. These are fed to the VoiceDesign model to generate reference audio, which is saved and assigned as a clone voice. The result is a fully-voiced cast with no manual configuration.
+Click **Generate Personas** to automatically assign voices to all characters. The LLM analyzes dialogue in the script and produces a voice description and sample text for each speaker. These are fed to the VoiceDesign model to generate reference audio, which is saved and assigned as a clone voice. Review the assigned references and voice settings before rendering.
 
-- **Standard mode** — Processes all speakers at once
-- **Advanced mode** — Toggle "Advanced" to control batch size (default 40) for large casts. In advanced mode, speakers are processed in discovery batches, with the LLM receiving dialogue samples to infer voice characteristics
+- **Standard mode** — Processes selected speakers sequentially
+- **Advanced mode** — Controls discovery batches of script entries (default 40 entries), with dialogue samples used to infer voice characteristics. The default apply mode fills speakers without an assigned voice
 
 **Speaker Aliases:**
 Each voice card has an "Alias of" dropdown. Setting a speaker as an alias of another speaker means it will use the target's voice configuration during audio generation. Useful for:
@@ -353,7 +311,7 @@ Aliases resolve transitively (A → B → C uses C's config) with cycle detectio
 
 **Custom Voice Mode:**
 - Select from 9 pre-trained voices: Aiden, Dylan, Eric, Ono_anna, Ryan, Serena, Sohee, Uncle_fu, Vivian
-- Set a character style that appends persistent traits to every TTS instruct (e.g., "Heavy Scottish accent", "Refined aristocratic tone")
+- Set a character style that combines persistent traits with each line’s delivery direction (e.g., "Heavy Scottish accent", "Refined aristocratic tone")
 - Optionally set a seed for reproducible output
 
 **Clone Voice Mode:**
@@ -363,7 +321,7 @@ Aliases resolve transitively (A → B → C uses C's config) with cycle detectio
 
 **LoRA Voice Mode:**
 - Select a trained LoRA adapter from the Training tab
-- Set a character style (same as Custom — appended to every instruct)
+- Set a character style to combine with each line’s delivery direction
 - Combines voice identity from training with instruct-following from the Base model
 
 **Voice Design Mode:**
@@ -371,7 +329,7 @@ Aliases resolve transitively (A → B → C uses C's config) with cycle detectio
 - Each line's instruct is appended as delivery/emotion direction
 - Generates voice on-the-fly using the VoiceDesign model — ideal for minor characters
 
-### Voice Designer Tab
+### Designer Tab
 Create new voices from text descriptions without needing reference audio.
 
 - **Describe a voice** in natural language (e.g., "A warm elderly woman with a gentle, raspy voice and a slight Southern drawl")
@@ -380,28 +338,17 @@ Create new voices from text descriptions without needing reference audio.
 - Uses the Qwen3-TTS VoiceDesign model to synthesize voice characteristics from descriptions
 
 ### Training Tab
-Train LoRA adapters on the Base model to create custom voice identities. Several built-in LoRA presets are included out of the box and appear alongside your trained adapters.
+Train LoRA adapters on the Base model to create custom voice identities. The built-in preset catalog appears alongside your trained adapters; its weights download separately from Hugging Face.
 
 **Dataset:**
 - **Upload ZIP** — WAV files (24kHz mono) + `metadata.jsonl` with `audio_filepath` and `text` fields
-- **Generate Dataset** — Auto-generate training samples from a Voice Designer description with custom sample texts
+- **Build New Dataset** — Opens the Dataset tab to create training samples
 - **Dataset Builder** — Interactive tool in its own tab (see below) for building datasets sample-by-sample with preview
 
 **Training Configuration:**
-- **Adapter Name** — Identifier for the trained model
-- **Epochs** — Full passes over the dataset (15-30 recommended for 20+ samples)
-- **Learning Rate** — Default 5e-6 (conservative). Higher trains faster but risks instability
-- **LoRA Rank** — Adapter capacity. High (64+) locks voice identity strongly but can flatten delivery. Low (8-16) preserves expressiveness
-- **LoRA Alpha** — Scaling factor. Effective strength = alpha / rank. Common starting point: alpha = 2x rank
-- **Language** — Language for the codec prefix token. Match this to your training data's language (English, Chinese, Korean, Japanese, etc.). Mismatched language can cause the adapter to lose speaker identity
-- **Batch Size / Grad Accum** — Batch 1 with gradient accumulation 8 is typical for 24GB cards
+Set the adapter name, epochs, learning rate, rank/alpha, language, batch size, and gradient accumulation for your dataset and hardware. Use the UI’s current defaults as a starting point and test an adapter on held-out lines before a whole-book render. Training quality and delivery control depend on the data and settings; larger rank or more epochs are not automatic improvements.
 
-**Training tips:**
-- Include samples with varied emotions (happy, sad, angry, calm) for expressive voices
-- Neutral-only training data produces flat voices that resist instruct prompting
-- The settings info panel in the UI explains each parameter's effect on voice quality
-
-### Dataset Builder Tab
+### Dataset Tab
 Build LoRA training datasets interactively, one sample at a time.
 
 - **Create a project** with a voice description and optional global seed
@@ -420,24 +367,9 @@ Fine-tune your audiobook before export:
 - **Play sequence** - Preview audio playback in order
 - **Merge all** - Combine chunks into final audiobook
 
-### Render Modes
+### Rendering
 
-Alexandria offers two methods for batch rendering audio:
-
-#### Render Pending (Standard)
-The default rendering mode. Sends individual TTS calls in parallel using the configured worker count.
-
-- **Per-speaker seeds** - Each voice uses its configured seed for reproducible output
-- **Voice cloning support** - Works with both custom voices and cloned voices
-
-#### Batch (Fast)
-High-speed rendering that sends multiple lines to the TTS engine in a single batched call. Chunks are sorted by text length and processed in optimized sub-batches to minimize padding waste.
-
-- **3-6x real-time throughput** - With codec compilation enabled, batches of 20-60 chunks process at 3-6x real-time speed
-- **Sub-batching** - Automatically groups similarly-sized chunks together for efficient GPU utilization
-- **Single seed** - All voices share the `Batch Seed` from config (set empty for random)
-- **All voice types supported** - Custom, Clone, and LoRA voices are batched; Voice Design is sequential
-- **Parallel Workers** setting controls batch size (higher values use more VRAM)
+**Render Pending** selects the appropriate path automatically: local TTS uses batched generation, while external TTS uses parallel requests. The main UI does not offer separate Standard and Batch (Fast) buttons. Custom, Clone, and LoRA support local batches; Voice Design and Ensemble render sequentially. Tune **Parallel Workers** and **Max Items/Batch** to available memory, and preview a short run before increasing them.
 
 ### Result Tab
 Download your completed audiobook as MP3, export as **M4B** with chapter markers for audiobook players, or click **Export to Audacity** for per-speaker WAV tracks.
@@ -448,53 +380,16 @@ Download your completed audiobook as MP3, export as **M4B** with chapter markers
 
 > **Note:** Some Linux audiobook players (e.g. Cozy) have limited M4B support and may not detect the file. The M4B output has been tested with VLC, Haruna, and Audiobookshelf.
 
-## Performance
+</details>
 
-### Recommended Settings for Batch Generation
+## Performance and GPU tuning
 
-| Setting | Recommended | Notes |
-|---------|-------------|-------|
-| TTS Mode | `local` | Built-in engine, no external server |
-| Compile Codec | `true` | 3-4x faster decoding after one-time warmup |
-| Parallel Workers | 20-60 | Higher = more throughput, more VRAM |
-| Render Mode | Batch (Fast) | Uses batched TTS calls |
+Start with small batches and measure on your own hardware. Local batch rendering and optional **Compile Codec** can improve throughput, but compilation adds warmup and may be unsuitable for a particular stack. Reduce **Parallel Workers** or **Max Items/Batch** after an out-of-memory error. Leave headroom if the LLM and TTS share a GPU.
 
-### Benchmarks
+On AMD/Linux, check the actual GPU/ROCm combination before changing packages. Do not copy device-specific power-profile commands or replace the installer’s PyTorch pins blindly. For a controlled local measurement, see `app/tts_vram_benchmark.py --help`; a sweep loads real models and consumes GPU time. No throughput figure here is a promise for your system.
 
-Tested on AMD RX 7900 XTX (24 GB VRAM, ROCm 6.3/7.2):
-
-| Configuration | Throughput |
-|--------------|------------|
-| Standard mode (sequential) | ~1x real-time |
-| Batch mode, no codec compile | ~2x real-time |
-| Batch mode + compile_codec | **3-6x real-time** |
-
-A 273-chunk audiobook (~54 minutes of audio) generates in approximately 16 minutes with batch mode and codec compilation enabled.
-
-### ROCm (AMD GPU) Notes
-
-> **Linux only.** The installer currently pins PyTorch 2.10 with ROCm 7.0. Check that your GPU and driver support this stack before installing. AMD GPUs on Windows run in CPU mode — see [GPU Compatibility](#gpu-compatibility).
-
-Alexandria automatically applies ROCm-specific optimizations when running on AMD GPUs:
-- **MIOpen fast-find mode** - Prevents workspace allocation failures that cause slow GEMM fallback
-- **Triton AMD flash attention** - Enables native flash attention for the whisper encoder
-- **triton_key compatibility shim** - Fixes `torch.compile` on pytorch-triton-rocm
-
-These are applied transparently and require no configuration.
-
-> **ROCm 7.x GPU downclocking fix:** ROCm 7.x has a regression where the GPU's DPM controller aggressively downclocks the shader engine between autoregressive generation steps, causing batch generation to slow to a crawl or appear to hang. The fix is to set the GPU power profile to COMPUTE, which enforces a minimum clock frequency floor:
->
-> ```bash
-> echo 5 | sudo tee /sys/class/drm/card1/device/pp_power_profile_mode
-> ```
->
-> This needs to be run once per boot (it does not persist across reboots). You can add it to your system startup or run it manually before launching Alexandria. To verify it's active, check for `COMPUTE*` in the output of:
->
-> ```bash
-> cat /sys/class/drm/card1/device/pp_power_profile_mode
-> ```
->
-> ROCm 6.x users and NVIDIA users are not affected.
+<details>
+<summary>Script format, output files, and API examples</summary>
 
 ## Script Format
 
@@ -508,15 +403,11 @@ The generated script is a JSON array with `speaker`, `text`, and `instruct` fiel
 ]
 ```
 
-- **`instruct`** — 2-3 sentence TTS voice direction sent directly to the engine. Set tone, describe delivery, then give specific references. Example: "Devastated by grief, Sniffing between words and pausing to collect herself, end with a wracking sob."
+- **`instruct`** — Short TTS voice direction describing tone and delivery; the default delivery pass asks for 1–2 sentences of roughly 8–15 words. Example: "Devastated by grief, Sniffing between words and pausing to collect herself, end with a wracking sob."
 
-### Non-verbal Sounds
-Vocalizations are written as real pronounceable text that the TTS speaks directly — no bracket tags or special tokens. The LLM generates natural onomatopoeia with short instruct directions:
-- Gasps: "Ah!", "Oh!" with instruct like "Fearful, sharp gasp."
-- Sighs: "Haah...", "Hff..."
-- Laughter: "Haha!", "Ahaha..."
-- Crying: "Hic... sniff..."
-- Exclamations: "Mmm...", "Hmm...", "Ugh..."
+### Source text and delivery
+
+The current three-pass pipeline aims to preserve source words during segmentation and adds short voice directions separately. Written vocalizations remain source text. Review the generated script and text-integrity report before rendering or merging; annotation is not a guarantee of perfect fidelity.
 
 ## Output Files
 
@@ -526,18 +417,7 @@ Vocalizations are written as real pronounceable text that the TTS speaks directl
 - `cloned_audiobook.mp3` - Combined audiobook with natural pauses
 
 **Individual Voicelines (for DAW editing):**
-```
-voicelines/
-├── voiceline_0001_narrator.mp3
-├── voiceline_0002_elena.mp3
-├── voiceline_0003_marcus.mp3
-└── ...
-```
-
-Files are numbered in timeline order with speaker names for easy:
-- Import into Audacity or other DAWs
-- Placement on separate character tracks
-- Fine-tuning of timing and effects
+Files live under `voicelines/` and use a unique chunk identifier plus speaker name, such as `voiceline_<uid>_narrator.mp3`. WAV is used if MP3 encoding fails. Use the Editor or chunk metadata for timeline order; filenames are not sequential timeline numbers.
 
 **Audacity Export (per-speaker tracks):**
 ```
@@ -550,361 +430,74 @@ audacity_export.zip
 └── ...
 ```
 
-Each WAV track is padded to the same total duration with silence where other speakers are talking. Playing all tracks simultaneously sounds identical to the merged MP3.
+Each WAV track is padded to the same total duration with silence where other speakers are talking. Playing the tracks together reconstructs the aligned audiobook timeline.
 
 **M4B Audiobook (chaptered):**
 - `audiobook.m4b` - AAC audiobook with embedded chapter markers
 - Chapters auto-detected from script headings, or per-chunk when toggled
-- Compatible with Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players
+- Use a player that supports AAC M4B files and embedded chapter markers
 
 ## API Reference
 
-Alexandria exposes a REST API for programmatic access. The examples below assume a local instance without authentication; when the password gate is enabled, pass HTTP Basic credentials (for example, `curl -u alexandria:your-password ...`). API keys are redacted from configuration responses:
+Use the base URL shown by your running launcher. Pinokio selects an available port; direct `python app.py` defaults to `http://127.0.0.1:4200` unless `ALEXANDRIA_PORT` is set.
 
-### Configuration
-```bash
-# Get current config (empty prompts fall through to file defaults)
-curl http://127.0.0.1:4200/api/config
+- Interactive API schema: `<BASE>/docs`
+- OpenAPI JSON: `<BASE>/openapi.json`
+- If `ALEXANDRIA_AUTH_PASSWORD` is set, requests require HTTP Basic authentication. The default username is `alexandria`; `ALEXANDRIA_AUTH_USERNAME` can override it.
+- Browser clients must use an allowed origin. Same-origin requests are simplest; review the network-security settings before connecting another web app.
+- Check HTTP response codes before continuing. A successful start response means work was accepted, not completed.
 
-# Get file-based default prompts (hot-reloads from default_prompts.txt)
-curl http://127.0.0.1:4200/api/default_prompts
+### Configuration and scripts
 
-# Save config
-curl -X POST http://127.0.0.1:4200/api/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "llm": {"base_url": "...", "api_key": "...", "model_name": "..."},
-    "tts": {
-      "mode": "local",
-      "device": "auto",
-      "language": "English",
-      "parallel_workers": 25,
-      "batch_seed": 12345,
-      "compile_codec": true,
-      "sub_batch_enabled": true,
-      "sub_batch_min_size": 4,
-      "sub_batch_ratio": 5,
-      "pause_between_speakers_ms": 500,
-      "pause_same_speaker_ms": 250
-    }
-  }'
-```
+- `GET /api/config`: current configuration, with API keys redacted.
+- `GET /api/default_prompts`: default prompt texts for the generation passes, review, and personas.
+- `POST /api/config`: save configuration. Include `llm`, `tts`, and the active `llm_local` or `llm_remote` profile matching `llm_mode`; consult the schema for fields.
+- `POST /api/upload`: multipart field `file`; accepts `.txt`, `.md`, and `.epub` and selects the uploaded source by default.
+- `POST /api/generate_script`: start or resume generation for the selected source. Optional JSON includes `strip_front_matter`, `first_person_narrator`, and `start_over`.
+- `GET /api/annotated_script`: retrieve the current script.
+- `POST /api/review_script`: start script review.
+- `GET /api/scripts`, `POST /api/scripts/save`, `POST /api/scripts/load`: list, save, or load scripts; save/load take `{"name":"my-novel"}`.
 
-### Script Generation
-```bash
-# Upload text file (supports .txt, .md, .epub)
-curl -X POST http://127.0.0.1:4200/api/upload \
-  -F "file=@mybook.epub"
+### Voices and rendering
 
-# Generate script (returns task ID)
-curl -X POST http://127.0.0.1:4200/api/generate_script
+- `GET /api/voices`: list script speakers and their current voice configuration.
+- `POST /api/save_voice_config`: update speaker-keyed settings, such as `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`.
+- `POST /api/generate_personas`: generate personas and voice references; track task `persona`.
+- `GET /api/chunks`: retrieve the editor’s ordered chunk array, including status and audio paths.
+- `POST /api/chunks/{index}`: update a chunk; `POST /api/chunks/{index}/generate`: render it.
+- `POST /api/generate_batch` or `POST /api/generate_batch_fast`: render selected zero-based array positions, for example `{"indices":[0,1,2]}`. These are positions, not chunk IDs.
+- `GET /api/editor/integrity`: compare editor text with the source before merging.
+- `POST /api/merge`: start MP3 merging. An unverified or changed integrity snapshot returns HTTP 409; review the report before explicitly confirming its `snapshot` as `integrity_confirmation`.
+- `GET /api/audiobook`: download the merged MP3 after the merge finishes.
+- `POST /api/export_audacity`: start per-speaker export; `GET /api/export_audacity`: download its ZIP.
+- `POST /api/merge_m4b`: start chaptered M4B export with JSON options; `GET /api/audiobook_m4b`: download it.
 
-# Check status
-curl http://127.0.0.1:4200/api/status/script_generation
+### Task status and workflow
 
-# Review script (fix attribution tags, misattributed lines, etc.)
-curl -X POST http://127.0.0.1:4200/api/review_script
+`GET /api/status` lists registered task names. Poll `GET /api/status/{task_name}` for `running`, logs, and any task-specific result.
 
-# Check review status
-curl http://127.0.0.1:4200/api/status/review
-```
+| Operation | Task name |
+| --- | --- |
+| Script generation | `script` |
+| Script review | `review` |
+| Persona generation | `persona` |
+| Chunk rendering and MP3 merge | `audio` |
+| Audacity / M4B export | `audacity_export` / `m4b_export` |
+| LoRA training | `lora_training` |
 
-### Voice Management
-```bash
-# Get voices and config
-curl http://127.0.0.1:4200/api/voices
+Start endpoints generally return `{"status":"started"}` rather than a task ID. There is no universal `completed`/`error` status field: `running: false` only means the task stopped. Inspect its logs and task-specific result before using outputs.
 
-# Parse voices from script
-curl -X POST http://127.0.0.1:4200/api/parse_voices
+For an end-to-end client: upload → generate → wait and check generation → optionally review and wait → configure voices → render → wait and verify all intended chunks are `done` → review integrity → merge → wait and check merge logs → download. Audacity exports additionally expose `result.status` (`done`, `failed`, or `cancelled`).
 
-# Save voice config
-curl -X POST http://127.0.0.1:4200/api/save_voice_config \
-  -H "Content-Type: application/json" \
-  -d '{"NARRATOR": {"type": "custom", "voice": "Ryan", "character_style": "calm"}}'
-```
+See `/docs` for the current Voice Designer, Dataset Builder, training, cancellation, and advanced request schemas.
 
-### Chunk Management
-```bash
-# Get all chunks
-curl http://127.0.0.1:4200/api/chunks
+</details>
 
-# Update a chunk
-curl -X POST http://127.0.0.1:4200/api/chunks/5 \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Updated dialogue", "instruct": "Excited, bright energy."}'
+## Choosing an LLM
 
-# Generate audio for single chunk
-curl -X POST http://127.0.0.1:4200/api/chunks/5/generate
+Use an instruction-following model that returns the requested structured output. Test a short passage before processing a whole book; quality, context limits, and memory needs vary. LM Studio, Ollama’s OpenAI-compatible endpoint, and compatible hosted APIs can be configured in Setup.
 
-# Standard batch render (parallel individual calls)
-curl -X POST http://127.0.0.1:4200/api/generate_batch \
-  -H "Content-Type: application/json" \
-  -d '{"indices": [0, 1, 2, 3, 4]}'
-
-# Fast batch render (batched TTS calls, much faster)
-curl -X POST http://127.0.0.1:4200/api/generate_batch_fast \
-  -H "Content-Type: application/json" \
-  -d '{"indices": [0, 1, 2, 3, 4]}'
-
-# Merge all chunks into final audiobook
-curl -X POST http://127.0.0.1:4200/api/merge
-```
-
-### Saved Scripts
-```bash
-# List saved scripts
-curl http://127.0.0.1:4200/api/scripts
-
-# Save current script
-curl -X POST http://127.0.0.1:4200/api/scripts/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-novel"}'
-
-# Load a saved script
-curl -X POST http://127.0.0.1:4200/api/scripts/load \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-novel"}'
-```
-
-### Persona Generation
-```bash
-# Generate personas (LLM + VoiceDesign, assigns clone voices automatically)
-curl -X POST http://127.0.0.1:4200/api/generate_personas
-
-# Generate personas in advanced mode with custom batch size
-curl -X POST http://127.0.0.1:4200/api/generate_personas \
-  -H "Content-Type: application/json" \
-  -d '{"advanced": true, "batch_size": 40}'
-
-# Check persona generation status
-curl http://127.0.0.1:4200/api/status/persona
-
-# Cancel persona generation
-curl -X POST http://127.0.0.1:4200/api/cancel_persona
-```
-
-### Voice Designer
-```bash
-# Preview a voice from text description
-curl -X POST http://127.0.0.1:4200/api/voice_design/preview \
-  -H "Content-Type: application/json" \
-  -d '{"description": "A warm, deep male voice", "text": "Hello world."}'
-
-# Save a designed voice
-curl -X POST http://127.0.0.1:4200/api/voice_design/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "warm_narrator", "description": "A warm, deep male voice", "text": "Hello world."}'
-
-# List saved designed voices
-curl http://127.0.0.1:4200/api/voice_design/list
-
-# Delete a designed voice
-curl -X DELETE http://127.0.0.1:4200/api/voice_design/delete/voice_id_here
-```
-
-### LoRA Training
-```bash
-# Upload a training dataset (ZIP with WAV + metadata.jsonl)
-curl -X POST http://127.0.0.1:4200/api/lora/upload_dataset \
-  -F "file=@dataset.zip" -F "name=my_voice"
-
-# List uploaded datasets
-curl http://127.0.0.1:4200/api/lora/datasets
-
-# Delete a dataset
-curl -X DELETE http://127.0.0.1:4200/api/lora/datasets/dataset_id_here
-
-# Start LoRA training
-curl -X POST http://127.0.0.1:4200/api/lora/train \
-  -H "Content-Type: application/json" \
-  -d '{"name": "narrator_warm", "dataset_id": "my_voice", "epochs": 25, "lr": "5e-6", "lora_r": 32, "lora_alpha": 64}'
-
-# Check training status
-curl http://127.0.0.1:4200/api/status/lora_training
-
-# List trained adapters
-curl http://127.0.0.1:4200/api/lora/models
-
-# Test a trained adapter
-curl -X POST http://127.0.0.1:4200/api/lora/test \
-  -H "Content-Type: application/json" \
-  -d '{"adapter_id": "narrator_warm_1234567890", "text": "Test line.", "instruct": "Calm narration."}'
-
-# Delete an adapter
-curl -X DELETE http://127.0.0.1:4200/api/lora/models/adapter_id_here
-```
-
-### Dataset Builder
-```bash
-# List all dataset builder projects
-curl http://127.0.0.1:4200/api/dataset_builder/list
-
-# Create a new project
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/create \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset"}'
-
-# Update project metadata (description and global seed)
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/update_meta \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male narrator", "global_seed": "42"}'
-
-# Update sample rows
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/update_rows \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "rows": [{"text": "Hello world.", "emotion": "cheerful"}]}'
-
-# Generate a single sample preview
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_sample \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male voice", "sample_index": 0, "samples": [{"text": "Hello.", "emotion": "cheerful"}]}'
-
-# Batch generate all samples
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_batch \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male voice", "samples": [{"text": "Hello.", "emotion": "cheerful"}]}'
-
-# Check batch generation status
-curl http://127.0.0.1:4200/api/dataset_builder/status/my_voice_dataset
-
-# Cancel a running batch generation
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/cancel \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset"}'
-
-# Save project as a training dataset
-curl -X POST http://127.0.0.1:4200/api/dataset_builder/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "ref_sample_index": 0}'
-
-# Delete a project
-curl -X DELETE http://127.0.0.1:4200/api/dataset_builder/my_voice_dataset
-```
-
-### Audio Download
-```bash
-# Download audiobook (after merging in editor)
-curl http://127.0.0.1:4200/api/audiobook --output audiobook.mp3
-
-# Export to Audacity (per-speaker tracks + LOF + labels)
-curl -X POST http://127.0.0.1:4200/api/export_audacity
-
-# Poll for completion
-curl http://127.0.0.1:4200/api/status/audacity_export
-
-# Download the zip
-curl http://127.0.0.1:4200/api/export_audacity --output audacity_export.zip
-```
-
-## Python Integration
-
-```python
-import requests
-
-BASE = "http://127.0.0.1:4200"
-
-# Upload and generate script
-with open("mybook.txt", "rb") as f:
-    requests.post(f"{BASE}/api/upload", files={"file": f})
-
-requests.post(f"{BASE}/api/generate_script")
-
-# Poll for completion
-import time
-while True:
-    status = requests.get(f"{BASE}/api/status/script_generation").json()
-    if status.get("status") in ["completed", "error"]:
-        break
-    time.sleep(2)
-
-# Configure voices
-voice_config = {
-    "NARRATOR": {"type": "custom", "voice": "Ryan", "character_style": "calm narrator"},
-    "HERO": {"type": "custom", "voice": "Aiden", "character_style": "brave, determined"}
-}
-requests.post(f"{BASE}/api/save_voice_config", json=voice_config)
-
-# Fast batch render all chunks
-chunks = requests.get(f"{BASE}/api/chunks").json()
-indices = [c["id"] for c in chunks]
-requests.post(f"{BASE}/api/generate_batch_fast", json={"indices": indices})
-# ... poll until all chunks status == "done" ...
-requests.post(f"{BASE}/api/merge")
-
-# Download
-with open("output.mp3", "wb") as f:
-    f.write(requests.get(f"{BASE}/api/audiobook").content)
-
-# Export to Audacity
-requests.post(f"{BASE}/api/export_audacity")
-# ... poll /api/status/audacity_export until not running ...
-with open("audacity_export.zip", "wb") as f:
-    f.write(requests.get(f"{BASE}/api/export_audacity").content)
-```
-
-## JavaScript Integration
-
-```javascript
-const BASE = "http://127.0.0.1:4200";
-
-// Upload file
-const formData = new FormData();
-formData.append("file", fileInput.files[0]);
-await fetch(`${BASE}/api/upload`, { method: "POST", body: formData });
-
-// Generate script
-await fetch(`${BASE}/api/generate_script`, { method: "POST" });
-
-// Poll for completion
-async function waitForTask(taskName) {
-  while (true) {
-    const res = await fetch(`${BASE}/api/status/${taskName}`);
-    const data = await res.json();
-    if (data.status === "completed" || data.status === "error") return data;
-    await new Promise(r => setTimeout(r, 2000));
-  }
-}
-await waitForTask("script_generation");
-
-// Configure and generate
-await fetch(`${BASE}/api/save_voice_config`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    NARRATOR: { type: "custom", voice: "Ryan", character_style: "calm" }
-  })
-});
-
-// Fast batch render all chunks
-const chunks = await (await fetch(`${BASE}/api/chunks`)).json();
-const indices = chunks.map(c => c.id);
-await fetch(`${BASE}/api/generate_batch_fast`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ indices })
-});
-// ... poll until all chunks done ...
-
-// Merge into final audiobook
-await fetch(`${BASE}/api/merge`, { method: "POST" });
-
-// Export to Audacity
-await fetch(`${BASE}/api/export_audacity`, { method: "POST" });
-// ... poll /api/status/audacity_export until not running ...
-// Download zip from GET /api/export_audacity
-```
-
-## Recommended LLM Models
-
-For script generation, non-thinking models work best:
-- **Qwen3-next** (80B-A3B-instruct) - Excellent JSON output and instruct directions
-- **Gemma3** (27B recommended) - Strong JSON output and instruct directions
-- **Qwen2.5** (any size) - Reliable JSON output
-- **Qwen3** (non-thinking variant)
-- **Llama 3.1/3.2** - Good character distinction
-- **Mistral/Mixtral** - Fast and reliable
-
-**Thinking models** (DeepSeek-R1, GLM4-air, etc.) can interfere with JSON output. If you must use one, add `<think>` to the **Banned Tokens** field in Setup to disable thinking mode.
+If the model emits reasoning instead of the requested answer, use that provider/model’s supported non-thinking settings. A banned-token setting is not a universal way to disable reasoning. Manual mode lets you copy each pending request to a model and paste its answer back; it is more work for long books.
 
 ## Troubleshooting
 
@@ -923,16 +516,16 @@ For script generation, non-thinking models work best:
 
 ### TTS generation fails
 - Check the Pinokio terminal for model loading errors
-- Ensure sufficient VRAM (16+ GB recommended for bfloat16)
+- Check available memory and lower the batch limits if model loading or rendering runs out of memory
 - For external mode, ensure the Gradio TTS server is running at the configured URL
 - Check voice_config.json has valid settings for all speakers
 - For clone voices, verify reference audio exists and transcript is accurate
 
 ### Slow batch generation
-- Enable **Compile Codec** in Setup (adds warmup time but 3-4x faster after)
+- Try **Compile Codec** in Setup if your stack supports it; compare performance after warmup
 - Increase **Parallel Workers** (batch size) if VRAM allows
-- Use **Batch (Fast)** render mode instead of Standard
-- If you see MIOpen warnings on AMD, these are handled automatically
+- **Render Pending** selects local batch generation automatically
+- On AMD, check the full error and the installed ROCm/PyTorch build; not every MIOpen warning has the same cause
 
 ### Out of memory errors
 - Reduce **Parallel Workers** (batch size)
@@ -940,38 +533,36 @@ For script generation, non-thinking models work best:
 - Try `device: cpu` as a fallback (much slower)
 
 ### Broken or tiny MP3 files (428 bytes)
-Conda's bundled ffmpeg on Windows often lacks the MP3 encoder (libmp3lame). Alexandria now detects this and automatically falls back to WAV, but if you want MP3 output:
+If ffmpeg lacks the MP3 encoder (libmp3lame), individual chunk export can fall back to WAV. Merged MP3 still requires working MP3 encoding:
 - Install ffmpeg with MP3 support: `conda install -c conda-forge ffmpeg`
 - Or remove conda's ffmpeg to use your system one: `conda remove ffmpeg`
 - Verify with: `ffmpeg -encoders 2>/dev/null | grep mp3`
 
 ### Audio quality issues
-- Use 5-15 second clear reference audio for cloning
+- Use a clean reference clip and an accurate transcript; imported clips must meet the app’s 3–30 second duration and audio-quality checks, with rights confirmation
 - Avoid background noise in reference samples
 - Try different seeds for custom voices
 
 ### Mojibake characters in output
-- The system automatically fixes common encoding issues
+- Known source-encoding problems may be repaired in memory without changing the source file; unresolved problems are reported
 - If problems persist, ensure your input text is UTF-8 encoded
 
 ## Prompt Customization
 
-LLM prompts are stored in plain-text files at the project root, split into system prompt and user prompt sections by a `---SEPARATOR---` delimiter:
+**Setup → Prompt Settings (Advanced)** has separate presets for segmentation (Step 1), attribution (Step 2), and delivery notes (Step 3), plus review and persona prompts. Use **What the model will see** to inspect attribution requests.
 
-- **`default_prompts.txt`** — Prompts for script generation (annotation)
-- **`review_prompts.txt`** — Prompts for script review (error correction)
+**Save Configuration** or **Save preset and Setup** persists edits. **Reset to Defaults** replaces the form contents; save afterward to keep that change.
 
-**How it works:**
-- `app/default_prompts.py` and `app/review_prompts.py` read their respective files and export the prompts
-- Prompts hot-reload from disk on every request, so edits take effect immediately without restarting the app
-- `config.json` stores user overrides for generation prompts — when its prompt fields are empty, the file defaults are used
-- The "Reset to Defaults" button in the Web UI fetches the latest file defaults via `/api/default_prompts`
+Default prompt sources:
+- [app/default_prompts_segment.txt](app/default_prompts_segment.txt): segmentation
+- [app/default_prompts_instruct.txt](app/default_prompts_instruct.txt): delivery notes
+- [app/attribution_prompt_variants.py](app/attribution_prompt_variants.py): attribution variants, with [app/default_prompts_attribute.txt](app/default_prompts_attribute.txt) for the default-shaped variant
+- [review_prompts.txt](review_prompts.txt) and [persona_prompts.txt](persona_prompts.txt): review and persona defaults
 
-**To customize prompts:**
-1. **Temporary (per-session):** Edit generation prompts directly in the Setup tab's Prompt Customization section
-2. **Permanent (all sessions):** Edit `default_prompts.txt` or `review_prompts.txt` directly — changes are picked up on the next request
+Root `default_prompts.txt` belongs to the legacy single-pass generator; editing it alone does not customize the current three-pass workflow. For non-English books, review the prompts against that language’s dialogue conventions and set TTS Language accordingly.
 
-**Non-English books:** The default LLM prompts are written for English text and reference English-specific conventions (attribution tags like "said he", quotation marks, etc.). When processing books in other languages, you'll get better results by editing the prompts to match that language's dialogue conventions — for example, French guillemets (« »), Japanese brackets (「」), or language-appropriate attribution patterns. Set the TTS **Language** dropdown to match as well.
+<details>
+<summary>Project structure</summary>
 
 ## Project Structure
 
@@ -983,18 +574,18 @@ Alexandria/
 │   ├── core.py                # Shared config, task, and runtime helpers
 │   ├── tts.py                 # TTS engine (local + external backends)
 │   ├── train_lora.py          # LoRA training subprocess script
-│   ├── generate_script.py     # LLM script annotation
+│   ├── generate_script.py     # Legacy single-pass annotation
 │   ├── generate_personas.py   # LLM persona generation + VoiceDesign voice assignment
 │   ├── review_script.py       # LLM script review (second pass)
 │   ├── utils.py               # Shared utilities (atomic JSON writes)
-│   ├── default_prompts.py     # Generation prompt loader (reads default_prompts.txt)
+│   ├── default_prompts.py     # Generation-pass prompt loaders
 │   ├── review_prompts.py      # Review prompt loader (reads review_prompts.txt)
 │   ├── project.py             # Chunk management & batch generation
 │   ├── parse_voices.py        # Voice extraction
 │   ├── config.json            # Runtime configuration (gitignored)
 │   ├── static/index.html      # Web UI
 │   └── requirements.txt       # Python dependencies
-├── builtin_lora/              # Pre-trained LoRA voice presets
+├── builtin_lora/              # Preset catalog and downloaded LoRA adapters
 ├── dataset_builder/           # Dataset builder project workspace (gitignored)
 ├── designed_voices/           # Saved Voice Designer outputs (gitignored)
 ├── lora_datasets/             # Uploaded/generated training datasets (gitignored)
@@ -1012,14 +603,18 @@ Alexandria/
 └── README.md
 ```
 
+</details>
+
 ## Acknowledgements
+
+Built on [Alexandria Audiobook](https://github.com/Finrandojin/alexandria-audiobook), with application improvements from [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2). Thanks to the upstream authors and contributors.
 
 - [Ayush Naphade](https://github.com/aayushnaphade) — Persona generation, speaker alias resolution, and contextual script review ([PR #42](https://github.com/Finrandojin/alexandria-audiobook/pull/42)). Check out his project [Lily](https://lily.rayoneai.in/) — looking forward to seeing where it goes!
 - [Michii](https://github.com/on22s) — System Health Dashboard with real-time GPU/disk monitoring ([PR #45](https://github.com/Finrandojin/alexandria-audiobook/pull/45)), cross-platform subprocess runner ([PR #46](https://github.com/Finrandojin/alexandria-audiobook/pull/46)), Voice Training Dataset Preparer tab ([PR #47](https://github.com/Finrandojin/alexandria-audiobook/pull/47))
 
 ## License
 
-MIT
+[MIT](LICENSE). Model weights, datasets, and external services have their own terms.
 
 ### Third-Party Licenses
 
