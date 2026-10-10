@@ -18,7 +18,8 @@ from types import MappingProxyType
 
 from core import llm_timeout_seconds
 from source_encoding import read_source_text, get_normalized_source_newlines
-from llm_provider import make_llm_client, make_run_client, get_run_model_binding, get_run_fingerprint_identity
+from llm_provider import (make_llm_client, make_run_client, get_run_model_binding,
+                          get_run_fingerprint_identity, is_manual_client)
 
 from judge_reason_log import record_judge_run
 from generate_script import (call_llm_for_entries, split_into_chunks,
@@ -880,10 +881,15 @@ def retry_delivery_instructions(client, model_name, entries, params,
 
 
 def does_request_fit_context(system_prompt, user_prompt, params, output_tokens):
-    """Use the production token-budget helper for the full assembled request."""
+    """Check whether the full request can fit within the allowed retry ceiling.
+
+    The initial completion allowance is not the capacity limit: truncation may
+    legitimately increase it. Dispatch still clamps each actual request using
+    its current allowance, the hard ceiling and the remaining context.
+    """
     try:
         available = get_effective_max_tokens(
-            params.max_tokens, params.context_length,
+            params.hard_max_tokens, params.context_length,
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_prompt}],
             params.hard_max_tokens, scale_to_context=False)
@@ -1402,6 +1408,10 @@ def get_segment_chunk_records(source_text, chunk_size, params):
         return split_into_chunk_records(source_text, max_size=chunk_size)
     # Offline admission has no model context yet, but can still split to
     # the configured response ceiling. Runtime applies the real context too.
+    # Keep source chunks within the initial allowance; later attribution and
+    # instruction admission may use retry headroom for observed reasoning.
+    sizing_params = replace(
+        params, hard_max_tokens=min(params.max_tokens, params.hard_max_tokens))
     size = chunk_size
     system_prompt, user_template = load_segment_prompts()
     if params.segment_system_prompt:
@@ -1411,7 +1421,7 @@ def get_segment_chunk_records(source_text, chunk_size, params):
     while True:
         records = split_into_chunk_records(source_text, max_size=size)
         if all(does_request_fit_context(system_prompt, user_template.format(chunk=record["text"]),
-                                        params, resolve_completion_ceiling(len(record["text"].split()), params))
+                                        sizing_params, resolve_completion_ceiling(len(record["text"].split()), params))
                for record in records):
             return records
         if size <= 500:
@@ -2087,7 +2097,11 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
     for target in (attribute_target_chars, instruct_target_chars):
         list(iter_entry_windows([], attribute_batch_size, target))
     if attribute_target_chars or instruct_target_chars or chunk_size > 30000 or attribute_context_chars > 20000:
-        if not params.context_length or params.context_length <= 0:
+        # Manual transport has no serving API from which to discover context.
+        # Keep its output-budget checks, without inventing a model context or
+        # requiring one before the user can receive a copy-and-paste request.
+        if (not is_manual_client(client)
+                and (not params.context_length or params.context_length <= 0)):
             raise TokenBudgetError("Character batching and larger targets require a configured model context length.")
     # Preserve None in checkpoint identity while validating explicit controls.
     get_context_rescue_windows(context_windows)
