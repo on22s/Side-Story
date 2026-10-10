@@ -261,7 +261,7 @@ def _is_owned(run_id):
         return False
 
 
-def _public_run(record, stale=False):
+def _public_run(record, stale=False, aliases=None):
     result = {key: copy.deepcopy(value) for key, value in record.items()
               if key not in ('cache', 'provenance', 'selection')}
     result['stale'] = stale or bool(record.get('applied'))
@@ -278,7 +278,7 @@ def _public_run(record, stale=False):
             if result['stale'] or result['status'] != 'completed':
                 raise ValueError('This review is stale or unfinished; preview and review again')
             require_alias_pair(candidate, record['reviews'], candidate['prediction_label'],
-                               candidate['reference_label'], {})
+                               candidate['reference_label'], aliases or {})
         except ValueError as exc:
             candidate.update(can_apply=False, apply_refusal=str(exc))
         else:
@@ -457,13 +457,14 @@ def _run_review(run_id, profile):
 
 
 def _get_run(run_id):
+    current = None
     record = _read_run(run_id)
     try:
         current = _capture(record['selection'])
         stale = current['public']['snapshot'] != record['snapshot']
     except (ValueError, OSError, HTTPException):
         stale = True
-    return _public_run(record, stale)
+    return _public_run(record, stale, current['aliases'] if current is not None else {})
 
 
 def _cancel(run_id):
