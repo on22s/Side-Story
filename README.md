@@ -6,7 +6,7 @@ Turn a book into a multi-voice audiobook. Alexandria combines AI script annotati
 
 **[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting) · [Full user guide](https://github.com/on22s/alexandria-audiobook-nya/wiki)**
 
-English | [中文](README_CN.md) (the Chinese guide may lag behind this page)
+English | [中文](README_CN.md)
 
 ## At a glance
 
@@ -237,7 +237,7 @@ Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Containe
 
 Compose publishes only `127.0.0.1:4200`; the container binds `0.0.0.0` for Docker forwarding. Authentication is off by default. Before exposing the host port, using a tunnel, or adding a reverse proxy, set `ALEXANDRIA_AUTH_PASSWORD` in the container environment (and optionally `ALEXANDRIA_AUTH_USERNAME`, default `alexandria`). Use HTTPS for access beyond a trusted local network.
 
-For a domain, set `ALEXANDRIA_ALLOWED_HOSTS` to the hostname. If a separate web origin needs API access, set `ALEXANDRIA_ALLOWED_ORIGINS` to that exact origin. Host/origin checks do not replace authentication. Never bake credentials into the image or commit them to Compose.
+For a domain, set `ALEXANDRIA_ALLOWED_HOSTS` to the hostname. For browser API access from a separate web origin, include that exact origin in `CORS_ORIGINS` (comma-separated). This list feeds both CORS and the request-origin gate; `ALEXANDRIA_ALLOWED_ORIGINS` extends only the gate and does not by itself enable cross-origin browser API access. Host/origin checks do not replace authentication. Never bake credentials into the image or commit them to Compose.
 
 ## First launch
 
@@ -299,7 +299,7 @@ After script generation, voices are automatically loaded from the annotated scri
 Click **Generate Personas** to automatically assign voices to all characters. The LLM analyzes dialogue in the script and produces a voice description and sample text for each speaker. These are fed to the VoiceDesign model to generate reference audio, which is saved and assigned as a clone voice. Review the assigned references and voice settings before rendering.
 
 - **Standard mode** — Processes selected speakers sequentially
-- **Advanced mode** — Controls discovery batches of script entries (default 40 entries), with dialogue samples used to infer voice characteristics. The default apply mode fills speakers without an assigned voice
+- **Advanced mode** — Controls discovery batches of script entries (default 40 entries), with dialogue samples used to infer voice characteristics. Use **Apply to** to choose unassigned speakers or regenerate all speakers; check the scope before starting
 
 **Speaker Aliases:**
 Each voice card has an "Alias of" dropdown. Setting a speaker as an alias of another speaker means it will use the target's voice configuration during audio generation. Useful for:
@@ -467,7 +467,7 @@ Use the base URL shown by your running launcher. Pinokio selects an available po
 - `POST /api/chunks/{index}`: update a chunk; `POST /api/chunks/{index}/generate`: render it.
 - `POST /api/generate_batch` or `POST /api/generate_batch_fast`: render selected zero-based array positions, for example `{"indices":[0,1,2]}`. These are positions, not chunk IDs.
 - `GET /api/editor/integrity`: compare editor text with the source before merging.
-- `POST /api/merge`: start MP3 merging. An unverified or changed integrity snapshot returns HTTP 409; review the report before explicitly confirming its `snapshot` as `integrity_confirmation`.
+- `POST /api/merge`: start MP3 merging. A report that is not verified requires confirmation; missing confirmation or a stale supplied snapshot returns HTTP 409. Review the report before explicitly confirming its `snapshot` as `integrity_confirmation`.
 - `GET /api/audiobook`: download the merged MP3 after the merge finishes.
 - `POST /api/export_audacity`: start per-speaker export; `GET /api/export_audacity`: download its ZIP.
 - `POST /api/merge_m4b`: start chaptered M4B export with JSON options; `GET /api/audiobook_m4b`: download it.
