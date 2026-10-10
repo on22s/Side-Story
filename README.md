@@ -607,10 +607,77 @@ Alexandria/
 
 ## Acknowledgements
 
-Built on [Alexandria Audiobook](https://github.com/Finrandojin/alexandria-audiobook), with application improvements from [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2). Thanks to the upstream authors and contributors.
+Alexandria Nya builds on work, ideas, bug reports, and testing shared by many people. Thank you to the original Alexandria community and to everyone helping improve the forks.
 
-- [Ayush Naphade](https://github.com/aayushnaphade) — Persona generation, speaker alias resolution, and contextual script review ([PR #42](https://github.com/Finrandojin/alexandria-audiobook/pull/42)). Check out his project [Lily](https://lily.rayoneai.in/) — looking forward to seeing where it goes!
-- [Michii](https://github.com/on22s) — System Health Dashboard with real-time GPU/disk monitoring ([PR #45](https://github.com/Finrandojin/alexandria-audiobook/pull/45)), cross-platform subprocess runner ([PR #46](https://github.com/Finrandojin/alexandria-audiobook/pull/46)), Voice Training Dataset Preparer tab ([PR #47](https://github.com/Finrandojin/alexandria-audiobook/pull/47))
+### Application, contributions, and testing
+
+- [Finrandojin](https://github.com/Finrandojin/alexandria-audiobook): the original Alexandria Audiobook application and the downloadable [Alexandria voice presets](https://huggingface.co/Finrandojin/Alexandria).
+- [Ayush Naphade](https://github.com/aayushnaphade): persona generation, speaker alias resolution, and contextual script review ([upstream PR #42](https://github.com/Finrandojin/alexandria-audiobook/pull/42)). His related project is [Lily](https://lily.rayoneai.in/).
+- [Michii / on22s](https://github.com/on22s): the [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) improvements carried into Nya, including the upstream System Health Dashboard, cross-platform subprocess runner, and Voice Training Dataset Preparer ([#45](https://github.com/Finrandojin/alexandria-audiobook/pull/45), [#46](https://github.com/Finrandojin/alexandria-audiobook/pull/46), [#47](https://github.com/Finrandojin/alexandria-audiobook/pull/47)).
+- [REFLEXGAMING007](https://github.com/REFLEXGAMING007): detailed feature proposals, reproduction cases, and repeated testing that shaped the forks' manual LLM workflow, snapshots, incremental personas, editable prompts, and character-state voices ([manual generation](https://github.com/on22s/alexandria-audiobook2/issues/593), [snapshots](https://github.com/on22s/alexandria-audiobook2/issues/600), [incremental updates](https://github.com/on22s/alexandria-audiobook2/issues/602), [prompt editing](https://github.com/on22s/alexandria-audiobook2/issues/634), [state personas](https://github.com/on22s/alexandria-audiobook2/issues/866)).
+
+- [Alchemist-Production](https://github.com/Alchemist-Production): the original Web UI, Audio Editor, and chunk-management work integrated into upstream Alexandria ([integration](https://github.com/Finrandojin/alexandria-audiobook/commit/1667edc237418fbf9e819bfb4294b14209da9c27), [editor](https://github.com/Finrandojin/alexandria-audiobook/commit/717f89161b36ced57c97cea5b729be95b3cba39e)).
+- [PierrunoYT](https://github.com/PierrunoYT): the original HTML-escaping security work incorporated by on22s in [upstream PR #39](https://github.com/Finrandojin/alexandria-audiobook/pull/39).
+- [Robertoge65](https://github.com/Robertoge65): the external-TTS missing-import fix ([upstream PR #19](https://github.com/Finrandojin/alexandria-audiobook/pull/19)); [kishore-1404](https://github.com/kishore-1404) for the CUDA VRAM-property correction ([upstream PR #35](https://github.com/Finrandojin/alexandria-audiobook/pull/35)).
+- [MNeMoNiCuZ](https://github.com/MNeMoNiCuZ): the Docker persona-prompt packaging fix, incorporated through upstream's later Docker update ([original contribution and credit](https://github.com/Finrandojin/alexandria-audiobook/pull/56#issuecomment-5044676266)).
+
+<details>
+<summary>Community reports, ideas, and testing behind inherited fixes</summary>
+
+- [ElBiggus](https://github.com/ElBiggus): early Windows/audio feedback and [download](https://github.com/Finrandojin/alexandria-audiobook/pull/5#issuecomment-3870041305) and [CPU-loading](https://github.com/Finrandojin/alexandria-audiobook/issues/4) reports.
+- [1BadAshB](https://github.com/1BadAshB): batch-rendering and cancellation testing, and the [stale clone-prompt cache diagnosis](https://github.com/Finrandojin/alexandria-audiobook/issues/17#issuecomment-3940188658) and fix verification.
+- [generallogin](https://github.com/generallogin): [model-cache loading](https://github.com/Finrandojin/alexandria-audiobook/issues/22) and [NVIDIA slowdown](https://github.com/Finrandojin/alexandria-audiobook/issues/23) reports and testing.
+- [ryuhda](https://github.com/ryuhda): Korean LoRA testing that helped identify and validate the [training/inference prefill fix](https://github.com/Finrandojin/alexandria-audiobook/issues/29#issuecomment-4315574687).
+- [sdbrown67](https://github.com/sdbrown67): the [malformed LLM-output report](https://github.com/Finrandojin/alexandria-audiobook/issues/20#issuecomment-3985423529) behind safer entry filtering.
+- [WirelessRoth](https://github.com/WirelessRoth): [German-language and prompt feedback](https://github.com/Finrandojin/alexandria-audiobook/issues/13) that helped improve language controls and editable review prompts.
+- [damajor](https://github.com/damajor): [Docker startup, configuration, and VRAM-cleanup reports](https://github.com/Finrandojin/alexandria-audiobook/issues/62#issuecomment-5044680044).
+- [futuregadets](https://github.com/futuregadets): [Drive-first storage](https://github.com/Finrandojin/alexandria-audiobook/issues/59) and [ngrok-free Colab](https://github.com/Finrandojin/alexandria-audiobook/issues/60) suggestions adopted upstream.
+- [Tortoise17](https://github.com/Tortoise17): the [external voice-clone language report](https://github.com/Finrandojin/alexandria-audiobook/issues/69#issuecomment-5062433885).
+- [starpause](https://github.com/starpause): the [image-based EPUB chapter-heading discussion](https://github.com/Finrandojin/alexandria-audiobook/issues/80#issuecomment-5309266456) that prompted TOC-based heading recovery ([AA2 implementation](https://github.com/on22s/alexandria-audiobook2/pull/314)).
+
+</details>
+
+### Forks and ideas carried into the app
+
+- [cjdell](https://github.com/cjdell/alexandria-audiobook): the AMD APU precision fix that informed Nya's fp32 model-loading path ([port](https://github.com/on22s/alexandria-audiobook2/pull/573)).
+- [XinchaoGou](https://github.com/XinchaoGou/alexandria-audiobook): OpenAI reasoning-model request handling and environment-referenced API keys, plus ideas for reasoning controls, clone-reference validation, external TTS server pools, and rolling story context ([ports](https://github.com/on22s/alexandria-audiobook2/pull/574), [reasoning controls](https://github.com/on22s/alexandria-audiobook2/pull/530), [reference validation](https://github.com/on22s/alexandria-audiobook2/pull/531), [server pools](https://github.com/on22s/alexandria-audiobook2/pull/532)).
+- [Darkkingwill](https://github.com/Darkkingwill/alexandria-audiobook): MP3 bitrate findings and ideas for cancellable merging, export progress, model selection, and remembered tabs, independently rebuilt in AA2 and carried into Nya ([bitrate](https://github.com/on22s/alexandria-audiobook2/pull/533), [interface improvements](https://github.com/on22s/alexandria-audiobook2/pull/534)).
+- [shangyuok](https://github.com/shangyuok/alexandria-audiobook-gg): the idea of configurable TTS generation-token limits, implemented together with matching memory estimates ([implementation](https://github.com/on22s/alexandria-audiobook2/pull/60)).
+- [dudarenok-maker / Castwright](https://github.com/dudarenok-maker/Castwright): ideas for remembering a cast across books and checking rendered voice consistency, implemented independently in Alexandria ([series memory](https://github.com/on22s/alexandria-audiobook2/pull/524), [voice checks](https://github.com/on22s/alexandria-audiobook2/pull/525)).
+- [Gaspard Michel, Elena V. Epure, Romain Hennequin, and Christophe Cerisara](https://aclanthology.org/2025.naacl-short.62/): the quotation-attribution research behind the `michel` prompt family, adapted into Alexandria's own prompts and surrounding-context handling ([implementation](app/attribution_prompt_variants.py)).
+
+<details>
+<summary>Research influences and shared resources</summary>
+
+Nya also benefits from the research behind AA2. These credits include experiments and evaluation resources; they do not mean every experiment, dataset, or model is included in the Nya runtime.
+
+- [Xiao Zhang / buddies](https://github.com/buddies/alexandria-audiobook): per-line instruction vocabulary and experiments separating stable voice identity from delivery instructions. The lexicon was ported into AA2's research tools; the resulting comparisons informed the voice-identity work ([audit](https://github.com/on22s/alexandria-audiobook2/pull/601), [voice changes](https://github.com/on22s/alexandria-audiobook2/pull/603)).
+- [p0n1](https://github.com/p0n1/epub_to_audiobook): punctuation priorities adapted for AA2's quotation-aware chunking experiment.
+- [zeropointnine](https://github.com/zeropointnine/tts-audiobook-tool): transcribe-back validation and truncation-detection ideas explored in AA2.
+- [Drew Thomasson / VoxNovel](https://github.com/DrewThomasson/VoxNovel): the BookNLP baseline that prompted attribution comparisons; [David Bamman and the BookNLP contributors](https://github.com/booknlp/booknlp) for the underlying literary NLP work.
+- [nazdridoy](https://github.com/nazdridoy/kokoro-tts): weighted voice-blending ideas explored in AA2; [WhiskeyCoder](https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter) for independent Qwen3-TTS chunk-length findings used as a comparison.
+- [Krishnapriya Vishnubhotla, Adam Hammond, and Graeme Hirst](https://aclanthology.org/2022.lrec-1.628/) and the PDNC annotators; [Sean Papay and Sebastian Padó](https://aclanthology.org/2020.lrec-1.104/) for RiQuA; and the [DraCor](https://dracor.org/) community: annotated literary resources used in AA2's attribution research.
+- [David K. Elson and Kathleen R. McKeown](https://www.cs.columbia.edu/~delson/pubs/AAAI10-ElsonMcKeown.pdf): quotation-attribution categories explored in AA2's syntactic-frame experiments; [Frank Rudzicz and the BookNLP-OG coauthors](https://arxiv.org/abs/2307.03734) for end-to-end attribution comparisons.
+- The [CosyVoice team](https://github.com/QwenAudio/CosyVoice): speech-model design ideas studied in AA2; CosyVoice is not a Nya runtime dependency.
+- [LibriVox](https://librivox.org/) readers, [Project Gutenberg](https://www.gutenberg.org/) and [Aozora Bunko](https://www.aozora.gr.jp/) volunteers, and the creators of [LJSpeech](https://keithito.com/LJ-Speech-Dataset/), [Hi-Fi TTS](https://www.openslr.org/109/), [AISHELL-3](https://www.openslr.org/93/), and the [Kokoro Speech Dataset](https://mozilladatacollective.com/datasets/cmmknsho4014wmf087kvq5rc6): human readings and source texts used for research comparisons.
+- [Jay Myers](https://www.jaymyersvoiceover.com/blog-ideas/how-audiobook-narrators-make-characters-sound-distinct-believable-and-consistent), [Malk Williams](https://www.linkedin.com/pulse/character-voices-audiobooks-7-key-considerations-malk-williams), and the casting guidance recorded in [Third-Party Notices](THIRD_PARTY_NOTICES.md#research-and-industry-practice-consulted): practical ideas about consistent character voices and contrast between characters who share scenes.
+
+Further research sources, what was adapted, and resource-specific rights caveats are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+</details>
+
+### Models and tools
+
+Thanks to the maintainers and contributors behind these projects:
+
+- The **Alibaba Qwen team** for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), which powers local speech generation, voice cloning, and voice design.
+- [PyTorch](https://pytorch.org/), [Hugging Face Transformers](https://github.com/huggingface/transformers), and [PEFT](https://github.com/huggingface/peft) for the model runtime and adapter training; [SpeechBrain](https://github.com/speechbrain/speechbrain) for speaker embeddings used by voice checks.
+- [FastAPI](https://github.com/fastapi/fastapi) and the Python audio ecosystem, including [pydub](https://github.com/jiaaro/pydub), [SoundFile](https://github.com/bastibe/python-soundfile), [librosa](https://github.com/librosa/librosa), and [FFmpeg](https://ffmpeg.org/), for serving the app and working with audio; [Gradio](https://github.com/gradio-app/gradio) for the external TTS client.
+- [Bootstrap](https://github.com/twbs/bootstrap), [Font Awesome](https://github.com/FortAwesome/Font-Awesome), [Marked](https://github.com/markedjs/marked), and [DOMPurify](https://github.com/cure53/DOMPurify) for the bundled browser interface assets. Their pinned sources and license files are retained under [app/static/vendor](app/static/vendor).
+- [Pinokio](https://pinokio.computer/) for the installation and launcher platform.
+- For the **optional Voice Tools**: the [llama.cpp](https://github.com/ggml-org/llama.cpp), [llama-cpp-python](https://github.com/abetlen/llama-cpp-python), [OpenAI Whisper](https://github.com/openai/whisper), [whisper.cpp](https://github.com/ggml-org/whisper.cpp), [Silero VAD](https://github.com/snakers4/silero-vad), and [pyannote.audio](https://github.com/pyannote/pyannote-audio) teams. These support local LLM serving, transcription, speech detection, and optional speaker diarization; their installation and model requirements are separate from the core workflow.
+
+Credits do not imply endorsement. This section complements the [license](LICENSE), [third-party notices](THIRD_PARTY_NOTICES.md), and individual model, dataset, and dependency terms; it does not replace them.
 
 ## License
 
@@ -620,4 +687,4 @@ Built on [Alexandria Audiobook](https://github.com/Finrandojin/alexandria-audiob
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled runtime assets and their notices.
 
-- [qwen_tts](https://github.com/Qwen/Qwen3-TTS) — Apache License 2.0, Copyright Alibaba Qwen Team
+- [qwen_tts](https://github.com/QwenLM/Qwen3-TTS) — Apache License 2.0, Copyright Alibaba Qwen Team
