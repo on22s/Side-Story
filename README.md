@@ -4,7 +4,7 @@
 
 Turn a book into a multi-voice audiobook. Alexandria combines AI script annotation, local Qwen3-TTS, and a browser editor so you can assign characters, listen, fix individual lines, and export the finished book.
 
-**[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting)**
+**[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting) · [Full user guide](https://github.com/on22s/alexandria-audiobook-nya/wiki)**
 
 English | [中文](README_CN.md) (the Chinese guide may lag behind this page)
 
@@ -61,7 +61,7 @@ Each character detected in the script gets a voice card. For each speaker:
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
 - **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. Review the generated voices before rendering the book
 - **Speaker Aliases** — Use the "Alias of" dropdown on any voice card to map a speaker to another character's voice (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
-- Changes save automatically — see [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
+- Changes save automatically — see [Voices](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices) for guidance on each type
 
 **Step 4 — Editor**
 - Click **Render Pending** to generate audio for all chunks in batch
