@@ -1676,7 +1676,9 @@
         }
 
         let currentBookFilename = '';
+        let bookSelectionGeneration = 0;
         function applyCurrentBookFilename(filename) {
+            bookSelectionGeneration++;
             currentBookFilename = typeof filename === 'string' ? filename : '';
         }
         function enqueueBookSelection(request, action) {
@@ -4349,8 +4351,11 @@
         async function refreshVoiceMetadata() {
             await flushVoiceSaves();
             const localRevision = voiceSaveQueue.getRevision();
+            const rosterFilename = currentBookFilename;
+            const rosterGeneration = bookSelectionGeneration;
             const snapshot = await API.get('/api/voice_config/snapshot');
-            if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision()) {
+            if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision() || rosterFilename !== currentBookFilename
+                    || rosterGeneration !== bookSelectionGeneration) {
                 throw new Error('Voice edits changed while refreshing. Your edits are still pending; try again.');
             }
             if (!Array.isArray(snapshot.voices) || !/^[0-9a-f]{64}$/.test(snapshot.revision) || !/^[0-9a-f]{64}$/.test(snapshot.book_token)) {
@@ -4368,6 +4373,7 @@
         let _voiceResourcesRefreshedAt = -Infinity;
         let _voiceCardsRevision = null;
         let _voiceCardsBookToken = null;
+        let _voiceCardsBookGeneration = null;
 
         let _voiceSeedRepairPending = false;
 
@@ -4462,6 +4468,11 @@
             if (!refreshResources && loadVoices.pending) { return loadVoices.pending; }
             const loading = (async () => {
                 await flushVoiceSaves();
+                const localRevision = voiceSaveQueue.getRevision();
+                const refreshBook = currentBookFilename;
+                const selectionRequest = window._existingUploadSelectionRequest;
+                const refreshGeneration = bookSelectionGeneration;
+                let renderSnapshot;
                 const reuseResources = !refreshResources && performance.now() - _voiceResourcesRefreshedAt < 10000;
                 let resourcesComplete = true;
                 const refreshedResources = [];
@@ -4483,14 +4494,21 @@
                     catch (e) { resourcesComplete = false; failedResources.push(path); console.debug(`${label} cache refresh failed`, e); }
                 });
                 const [voices] = await Promise.all([
-                    refreshVoiceMetadata(), ...resources,
+                    refreshVoiceMetadata().then(voices => { renderSnapshot = _voiceSaveSnapshot; return voices; }), ...resources,
                     ...(reuseResources ? [] : [loadCastLibrary().catch(e => { resourcesComplete = false; failedResources.push('/api/voice_library'); console.debug('cast library refresh failed', e); })]),
                 ]);
                 if (!reuseResources) {
                     _voiceResourcesRefreshedAt = resourcesComplete ? performance.now() : -Infinity;
                 }
                 if (reuseResources && _voiceCardsRevision === _voiceSaveSnapshot.revision
-                        && _voiceCardsBookToken === _voiceSaveSnapshot.book_token) {
+                        && _voiceCardsBookToken === _voiceSaveSnapshot.book_token
+                        && _voiceCardsBookGeneration === refreshGeneration) {
+                    return {refreshedResources, failedResources};
+                }
+                if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision()
+                        || selectionRequest !== window._existingUploadSelectionRequest
+                        || refreshBook !== currentBookFilename || refreshGeneration !== bookSelectionGeneration
+                        || renderSnapshot !== _voiceSaveSnapshot) {
                     return {refreshedResources, failedResources};
                 }
                 refreshVoicesScope();
@@ -4507,11 +4525,13 @@
                     container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
                     _voiceCardsRevision = _voiceSaveSnapshot.revision;
                     _voiceCardsBookToken = _voiceSaveSnapshot.book_token;
+                    _voiceCardsBookGeneration = refreshGeneration;
                     return {refreshedResources, failedResources};
                 }
                 container.innerHTML = getVoiceSeedRepairMarkup(_voiceSaveSnapshot) + getStateVoiceCardsMarkup(voices);
                 _voiceCardsRevision = _voiceSaveSnapshot.revision;
                 _voiceCardsBookToken = _voiceSaveSnapshot.book_token;
+                _voiceCardsBookGeneration = refreshGeneration;
                 if (typeof renderPersonaRecoveryTargets === 'function') { renderPersonaRecoveryTargets(); }
                 renderReadyCount();
                 onToggleHideReady();
@@ -6021,6 +6041,11 @@
         }
 
         function enqueueVoiceDraft(voices, recovered = null) {
+            if (!recovered && (!_voiceSaveSnapshot || _voiceCardsBookToken !== _voiceSaveSnapshot.book_token
+                    || _voiceCardsBookGeneration !== bookSelectionGeneration)) {
+                showToast('Wait for this book’s voices to finish loading before editing them.', 'warning');
+                return;
+            }
             const key = _voiceDraftRecord?.key || voiceDraftPrefix +
                 (window.crypto?.randomUUID?.() || Date.now() + '-' + Math.random().toString(36).slice(2));
             const record = { version: 1, key, book_token: _voiceSaveSnapshot.book_token,
@@ -6326,6 +6351,7 @@
         let cachedChunks = []; // Cache to track changes
         let chunkSnapshotRevision = null;
         let chunkSnapshotBook = null;
+        let chunkSnapshotBookToken = null;
         let loadChunksTimer = null; // Pending standalone editor poll
         let chunkRefreshPromise = null;
         let chunkRefreshAgain = false;
@@ -6614,6 +6640,10 @@
                 chunkSnapshotRevision = null;
                 throw new Error('Editor snapshot is unavailable.');
             }
+            const snapshotBookToken = snapshot.book_token;
+            if (!/^[0-9a-f]{64}$/.test(snapshotBookToken)) {
+                throw new Error('Editor book identity is unavailable; reload before editing.');
+            }
             let chunks;
             if (snapshot.full) {
                 chunks = snapshot.chunks;
@@ -6635,6 +6665,7 @@
                 tbody.innerHTML = '<tr><td colspan="6" class="text-center">No chunks found. Please generate script first.</td></tr>';
                 cachedChunks = [];
                 chunkSnapshotBook = refreshBook;
+                chunkSnapshotBookToken = snapshotBookToken;
                 chunkSnapshotRevision = snapshot.revision;
                 return chunks;
             }
@@ -6657,6 +6688,7 @@
                 });
                 cachedChunks = chunks;
                 chunkSnapshotBook = refreshBook;
+                chunkSnapshotBookToken = snapshotBookToken;
                 chunkSnapshotRevision = snapshot.revision;
 
                 // Continue polling if generating
@@ -6800,6 +6832,7 @@
 
             cachedChunks = chunks;
             chunkSnapshotBook = refreshBook;
+            chunkSnapshotBookToken = snapshotBookToken;
             chunkSnapshotRevision = snapshot.revision;
 
             // If any chunk is generating, poll (without full redraw)
@@ -7037,20 +7070,29 @@
         let chunkEditsRevision = 0;
 
         function applyChunkEdits(id, data) {
+            const book = currentBookFilename;
+            const bookToken = chunkSnapshotBookToken;
+            const uid = cachedChunks.find(chunk => chunk.id === id)?.uid;
+            if (!bookToken || !uid || chunkSnapshotBook !== book) {
+                return Promise.reject(new Error('Reload the Editor before saving this row.'));
+            }
             const previous = pendingChunkEdits.get(id);
             const captured = JSON.parse(JSON.stringify(data));
+            const isCurrent = () => book === currentBookFilename && bookToken === chunkSnapshotBookToken;
             chunkEditsRevision++;
             invalidateEditorIntegrity('Edits awaiting save');
             const request = (async () => {
                 if (previous) { await previous.catch(() => {}); }
                 try {
-                    await API.post(`/api/chunks/${id}`, captured);
+                    if (!isCurrent()) { throw new Error('Active book changed; the old Editor edit was not sent.'); }
+                    await API.post(`/api/chunks/${id}`, {...captured, expected_book_token: bookToken, expected_uid: uid});
+                    if (!isCurrent()) { return; }
                     cachedChunks = cachedChunks.map(chunk => chunk.id === id ? { ...chunk, ...captured } : chunk);
                     // The server can normalize an edit without changing its revision.
                     chunkSnapshotRevision = null;
                     failedChunkEdits.delete(id);
                 } catch (error) {
-                    failedChunkEdits.set(id, error);
+                    if (isCurrent()) { failedChunkEdits.set(id, error); }
                     throw error;
                 }
             })();
