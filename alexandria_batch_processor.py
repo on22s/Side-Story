@@ -787,7 +787,7 @@ class BatchProcessor:
                 try:
                     stop_worker()
                 finally:
-                    if watchdog is not None:
+                    if watchdog is not None and watchdog.is_alive():
                         watchdog.join()
                     control = getattr(process, "_alexandria_control", None)
                     if control is not None:
