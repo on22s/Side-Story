@@ -1224,7 +1224,8 @@ async def snapshot_script(request: SnapshotRequest):
     entries = completed_script_prefix(checkpoint)
     if not entries:
         raise HTTPException(status_code=409, detail="Nothing is fully finished yet - Step 3 has not completed a window.")
-    safe_name = _require_safe_filename(request.name, "Invalid snapshot name.")
+    from routers.scripts_library import _require_saved_book_name
+    safe_name = _require_saved_book_name(request.name)
     dest = os.path.join(SCRIPTS_DIR, f"{safe_name}.json")
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     companion = os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json")
