@@ -653,6 +653,8 @@ class BatchProcessor:
                 start_new_session=(os.name == "posix"),
                 creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
             )
+            if os.name == "posix":
+                process._alexandria_pgid = process.pid
 
             # Stream output line by line in real-time. `for line in process.stdout`
             # blocks on readline, so an inline deadline check can't fire while the
