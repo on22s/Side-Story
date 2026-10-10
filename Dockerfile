@@ -20,6 +20,7 @@ COPY *.py /alexandria/
 COPY gpu_job.sh gpu_pause.sh run_with_restart.sh /alexandria/
 COPY run_chains/lib/ /alexandria/run_chains/lib/
 COPY tools/voice_lab/ /alexandria/tools/voice_lab/
+COPY tools/backfill_adapter_digests.py /alexandria/tools/
 COPY builtin_lora/ /alexandria/builtin_lora/
 COPY LICENSE THIRD_PARTY_NOTICES.md icon.png /alexandria/
 
