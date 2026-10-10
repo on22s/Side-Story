@@ -1,17 +1,265 @@
+import argparse
+import hashlib
+from chunk_status_journal import remove_chunk_snapshot
+from generation_checkpoint_shards import (GenerationCheckpointShards,
+    load_generation_shard_checkpoint, remove_generation_shard_checkpoint)
 import os
 import sys
 import json
 import re
-import argparse
-from openai import OpenAI
+import time
+import math
+from dataclasses import dataclass, field, replace
+from core import AUTO_PAUSE_MARKER, llm_timeout_seconds
+from generation_completion import get_file_sha256, get_generation_input
+from config_settings import load_app_config, get_generation_config
+from llm_provider import make_llm_client, make_run_client, merge_provider_extra_body
+from llm_provider import classify_llm_error, get_retry_delay, get_run_model_binding, get_run_fingerprint_identity
+from llm_provider import FailoverClient, RunProfileChanged, RunRequestAdmissionError
+from chunk_quality import validate_chunk_quality, is_trigram_only_near_miss
+from validation_reporting import format_validation_findings
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from dialogue_spans import apply_dialogue_map
+from narrator_prompt import (add_first_person_awareness, add_narrator_prior,
+                             get_valid_narrator_name, is_narrator_attested)
+from lmstudio_settings import (ensure_ideal_settings, get_active_llm_config,
+                               get_effective_max_tokens, get_next_retry_max_tokens, TokenBudgetError)
+from repair_source_encoding import preflight_source
+from script_repair import build_deterministic_repair
+from apostrophe_repair import restore_stripped_apostrophes
+from source_normalization import (normalize_extreme_phrase_repetitions,
+                                  normalize_homoglyph_words,
+                                  normalize_known_source_corruptions,
+                                  strip_known_front_matter,
+                                  strip_publisher_matter)
+from speaker_identity import (build_speaker_consistency_report,
+                              stabilize_speaker_identities)
+from script_preflight import (MAX_REPLACEMENT_SHARE, audit_script,
+                              audit_unicode_text,
+                              replacement_load_is_acceptable,
+                              replacement_repair_hint)
+from utils import (atomic_json_write, extract_balanced, get_runtime_data_dir,
+                   get_app_config_path, is_generic_speaker, safe_load_json, file_lock,
+                   is_path_inside)
 
-# Cap for single-speaker mode: entries at this size pass through
-# group_into_chunks (MAX_CHUNK_CHARS=500) as-is without further splitting.
-SINGLE_SPEAKER_MAX_CHARS = 500
+
+def get_generation_checkpoint_path(output_path):
+    return output_path + ".generation_checkpoint.json"
+
+
+def get_generation_quality_path(output_path):
+    return output_path + ".generation_quality.json"
+
+
+def get_response_log_path(log_name):
+    """Return a contained response-log path without creating directories."""
+    log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
+    run_id = os.environ.get("ALEXANDRIA_RUN_ID")
+    if not run_id:
+        return os.path.join(log_dir, log_name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id):
+        raise ValueError("ALEXANDRIA_RUN_ID must be a single safe run identifier")
+    stem, extension = os.path.splitext(log_name)
+    response_base = os.path.join(log_dir, "responses")
+    response_dir = os.path.join(response_base, run_id)
+    log_path = os.path.join(response_dir, stem + (extension or ".log"))
+    if not is_path_inside(log_path, response_base):
+        raise ValueError("Response log escapes the run-response directory")
+    return log_path
+
+
+def build_generation_quality_manifest(status, fingerprint, accepted_chunks,
+                                      source_normalizations, **details):
+    return {
+        "status": status,
+        "fingerprint": fingerprint,
+        "source_normalizations": source_normalizations,
+        "accepted_chunk_count": len(accepted_chunks),
+        # Persist how many chunks were salvaged by the exhaustion-only
+        # trigram-only near-miss path (see chunk_quality.is_trigram_only_near_miss)
+        # so completed-book rescue counts survive in the manifest instead of only
+        # in the per-run checkpoint (cleared on success) and the stdout log.
+        "near_miss_accepted_count": sum(
+            1 for item in accepted_chunks if item.get("near_miss_accepted")),
+        "chunks": [{
+            "chunk_number": item["chunk_number"],
+            "source_sha256": item["source_sha256"],
+            "entry_count": len(item["entries"]),
+            "quality": item["quality"],
+            "adaptively_split": item.get("adaptively_split", False),
+            "near_miss_accepted": item.get("near_miss_accepted", False),
+            "attempts": item.get("attempts", []),
+            "model_binding": item.get("model_binding"),
+        } for item in accepted_chunks],
+        **details,
+    }
+
+
+def save_generation_quality_manifest(output_path, manifest):
+    atomic_json_write(manifest, get_generation_quality_path(output_path))
+
+
+def validate_generation_output_path(input_path, output_path):
+    """Refuse source/output aliases before any generated artifact is written."""
+    collision = (os.path.normcase(os.path.realpath(input_path)) ==
+                 os.path.normcase(os.path.realpath(output_path)))
+    if not collision:
+        try:
+            collision = os.path.samefile(input_path, output_path)
+        except FileNotFoundError:
+            pass
+    if collision:
+        raise ValueError('Generation output must not replace its source input')
+
+
+def publish_completed_generation(output_path, entries, manifest, input_path, input_sha256):
+    """Publish the verified output before binding its completion evidence."""
+    validate_generation_output_path(input_path, output_path)
+    if manifest.get('status') != 'verified':
+        raise ValueError('Cannot publish an unverified generation')
+    if get_file_sha256(input_path) != input_sha256:
+        raise ValueError('Source input changed during generation; preserving prior output')
+    atomic_json_write(entries, output_path)
+    save_generation_quality_manifest(output_path, {
+        **manifest, 'status': 'complete',
+        'completion_artifact': {'version': 1, 'input_sha256': input_sha256,
+                                'output_sha256': get_file_sha256(output_path)},
+    })
+
+
+def passes_final_generation_gate(whole_quality, preflight, unresolved_repairs=None):
+    return bool(whole_quality.get("passed")
+                and not preflight.get("counts", {}).get("blocking")
+                and not unresolved_repairs)
+
+
+def build_final_generation_repair(entries, source_text):
+    """Apply the same source-backed repair after chunks are reassembled.
+
+    Chunk-local repair cannot see a duplicate block spanning a chunk boundary.
+    Running it once more over the assembled book removes only blocks proven to
+    occur once in the source and preserves unresolved findings for a loud final
+    gate failure.
+    """
+    structural = build_deterministic_repair(entries, source_text)
+    if structural["unresolved"]:
+        return structural
+    identities = stabilize_speaker_identities(structural["entries"])
+    return {"entries": identities["entries"],
+            "changes": structural["changes"] + identities["changes"],
+            "notes": structural.get("notes", []),
+            "unresolved": [], "review": identities["review"]}
+
+
+def get_generation_fingerprint(source_text, chunks, model_name, base_url, params, chunk_size):
+    settings = {
+        "model_name": model_name, "base_url": base_url, "chunk_size": chunk_size,
+        "system_prompt": params.system_prompt, "user_prompt_template": params.user_prompt_template,
+        "max_tokens": params.max_tokens, "temperature": params.temperature,
+        "top_p": params.top_p, "top_k": params.top_k, "min_p": params.min_p,
+        "presence_penalty": params.presence_penalty, "banned_tokens": params.banned_tokens,
+        "context_length": params.context_length, "hard_max_tokens": params.hard_max_tokens,
+        "provider_extra_body": getattr(params, "provider_extra_body", None),
+        "structured_output": getattr(params, "structured_output", "auto"),
+        "response_schema": getattr(params, "response_schema", None),
+    }
+    # Output-format is added only when non-default. Every checkpoint written
+    # before that key existed was a JSON run, so including it unconditionally
+    # would discard resumable work that is still valid (Rule 9). Structured
+    # output is included above because it changes the request contract.
+    output_format = getattr(params, "output_format", "json") or "json"
+    if output_format != "json":
+        settings["output_format"] = output_format
+    encoded = json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return {
+        "source_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        "settings_sha256": hashlib.sha256(encoded).hexdigest(),
+        "chunk_sha256": [hashlib.sha256(chunk.encode("utf-8")).hexdigest() for chunk in chunks],
+    }
+
+
+def get_valid_chunk_size(config_value, cli_value=None):
+    """Return the effective single-pass chunk size after validating both inputs."""
+    value = cli_value if cli_value is not None else config_value
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        source = "--chunk-size" if cli_value is not None else "generation.chunk_size"
+        raise ValueError(f"{source} must be an integer >= 1 (got {value!r})")
+    return value
+
+
+def load_generation_checkpoint(output_path, fingerprint):
+    try:
+        checkpoint = load_generation_shard_checkpoint(get_generation_checkpoint_path(output_path))
+    except FileNotFoundError:
+        return []
+    if (not isinstance(checkpoint, dict)
+            or get_run_fingerprint_identity(checkpoint.get("fingerprint"))
+            != get_run_fingerprint_identity(fingerprint)):
+        return []
+    accepted = checkpoint.get("accepted_chunks")
+    if not isinstance(accepted, list) or len(accepted) > len(fingerprint["chunk_sha256"]):
+        return []
+    for index, item in enumerate(accepted):
+        if (not isinstance(item, dict) or not isinstance(item.get("entries"), list)
+                or item.get("source_sha256") != fingerprint["chunk_sha256"][index]):
+            return []
+        quality = item.get("quality")
+        if not isinstance(quality, dict):
+            return []
+        if quality.get("passed") is True:
+            continue
+        if item.get("near_miss_accepted") is not True:
+            return []
+        try:
+            if not is_trigram_only_near_miss(quality):
+                return []
+        except (AttributeError, TypeError, ValueError):
+            return []
+    return accepted
+
+
+def save_generation_checkpoint(output_path, fingerprint, accepted_chunks, writer=None):
+    writer = writer or GenerationCheckpointShards(get_generation_checkpoint_path(output_path), fingerprint)
+    if (os.path.abspath(writer.path) != os.path.abspath(get_generation_checkpoint_path(output_path))
+            or writer.fingerprint != fingerprint):
+        raise ValueError("Generation checkpoint writer belongs to a different run")
+    writer.save_chunks(accepted_chunks)
+
+
+def clear_generation_checkpoint(output_path):
+    remove_generation_shard_checkpoint(get_generation_checkpoint_path(output_path))
+
+
+class AdjacentArrayOverlapError(ValueError):
+    """Adjacent LLM arrays repeat source words at their boundary."""
+
+
+def _get_boundary_overlap(left_entries, right_entries, minimum_words=3):
+    """Return the longest normalized suffix/prefix overlap between two arrays."""
+    if (not left_entries or not right_entries
+            or not isinstance(left_entries[-1], dict)
+            or not isinstance(right_entries[0], dict)):
+        return []
+    left_text = str(left_entries[-1].get("text") or "")
+    right_text = str(right_entries[0].get("text") or "")
+    left_words = re.findall(r"\w+", left_text.casefold(), re.UNICODE)
+    right_words = re.findall(r"\w+", right_text.casefold(), re.UNICODE)
+    maximum = min(len(left_words), len(right_words))
+    for size in range(maximum, minimum_words - 1, -1):
+        if left_words[-size:] == right_words[:size]:
+            return left_words[-size:]
+    return []
+
 
 def clean_json_string(text):
-    """Clean and extract valid JSON array from LLM response."""
+    """Clean and combine adjacent complete JSON arrays from an LLM response."""
+    def parse_array_span(value):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = repair_json_array(value)
+        return parsed if isinstance(parsed, list) else None
+
     # Remove thinking tags (various formats used by different models)
     # GLM, DeepSeek, Qwen, etc. use different thinking tag formats
     text = re.sub(r'<think>[\s\S]*?</think>', '', text)
@@ -30,44 +278,52 @@ def clean_json_string(text):
             text = match.group(1).strip()
 
     # Find the JSON array - match from first [ to its closing ]
-    # Use a bracket counter to find the correct closing bracket
     start = text.find('[')
     if start == -1:
         return None
 
-    bracket_count = 0
-    end = -1
-    in_string = False
-    escape_next = False
-
-    for i, char in enumerate(text[start:], start):
-        if escape_next:
-            escape_next = False
-            continue
-        if char == '\\':
-            escape_next = True
-            continue
-        if char == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == '[':
-            bracket_count += 1
-        elif char == ']':
-            bracket_count -= 1
-            if bracket_count == 0:
-                end = i + 1
-                break
-
-    if end == -1:
+    span = extract_balanced(text, '[', ']')
+    if span is None:
         # No closing bracket found, try to salvage
         last_complete = text.rfind('},')
         if last_complete > start:
             return text[start:last_complete+1] + ']'
         return None
 
-    json_text = text[start:end]
+    spans = [span]
+    cursor = start + len(span)
+    while True:
+        next_start = text.find('[', cursor)
+        if next_start == -1:
+            break
+        next_span = extract_balanced(text, '[', ']', next_start)
+        if next_span is None:
+            if text[cursor:next_start].strip():
+                break
+            return None
+        next_value = parse_array_span(next_span)
+        if next_value is None:
+            if re.match(r'^\[\s*\{', next_span):
+                return None
+            break
+        if text[cursor:next_start].strip():
+            # A later valid array behind prose is ambiguous: do not silently
+            # discard either the intervening material or the array.
+            return None
+        spans.append(next_span)
+        cursor = next_start + len(next_span)
+
+    if len(spans) > 1:
+        parsed_spans = [parse_array_span(item) for item in spans]
+        if any(item is None for item in parsed_spans):
+            parsed_spans = []
+        for left_entries, right_entries in zip(parsed_spans, parsed_spans[1:]):
+            overlap = _get_boundary_overlap(left_entries, right_entries)
+            if overlap:
+                raise AdjacentArrayOverlapError(" ".join(overlap))
+
+    json_text = spans[0] if len(spans) == 1 else "[" + ",".join(
+        item.strip()[1:-1] for item in spans) + "]"
 
     # Clean control characters inside strings (common LLM issue)
     # Replace literal newlines/tabs inside JSON strings with escaped versions
@@ -83,6 +339,29 @@ def clean_json_string(text):
     json_text = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', fix_control_chars, json_text)
 
     return json_text
+
+
+def _extract_valid_json_objects(json_text):
+    """Extract complete JSON objects without assuming a pass-specific schema."""
+    entries = []
+    cursor = 0
+    while True:
+        start = json_text.find("{", cursor)
+        if start < 0:
+            break
+        span = extract_balanced(json_text, "{", "}", start)
+        if span is None:
+            cursor = start + 1
+            continue
+        try:
+            value = json.loads(span)
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+        if isinstance(value, dict):
+            entries.append(value)
+        cursor = start + len(span)
+    return entries
 
 
 def repair_json_array(json_text):
@@ -123,18 +402,10 @@ def repair_json_array(json_text):
     except json.JSONDecodeError:
         pass
 
-    # Fix 3: Try to extract individual entries and rebuild
-    entries = []
-    # Match individual JSON objects
-    pattern = r'\{\s*"speaker"\s*:\s*"[^"]*"\s*,\s*"text"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"instruct"\s*:\s*"(?:[^"\\]|\\.)*"\s*\}'
-    matches = re.findall(pattern, json_text, re.DOTALL)
-
-    for match in matches:
-        try:
-            entry = json.loads(match)
-            entries.append(entry)
-        except json.JSONDecodeError:
-            continue
+    # Fix 3: Try to extract individual entries and rebuild. This is deliberately
+    # schema-neutral: single-pass returns speaker/text/instruct, pass 2 returns
+    # n/head/speaker, and pass 3 returns n/head/instruct.
+    entries = _extract_valid_json_objects(json_text)
 
     if entries:
         return entries
@@ -156,50 +427,143 @@ def repair_json_array(json_text):
     return None
 
 def salvage_json_entries(json_text):
-    """Last resort: extract individual valid entries with regex."""
-    entries = []
-    # Match individual JSON objects with speaker, text, instruct fields
-    pattern = r'\{\s*"speaker"\s*:\s*"([^"]*)"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"instruct"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}'
-    matches = re.finditer(pattern, json_text, re.DOTALL)
-
-    for match in matches:
-        try:
-            entry = {
-                "speaker": match.group(1),
-                "text": match.group(2).replace('\\"', '"').replace('\\n', '\n'),
-                "instruct": match.group(3).replace('\\"', '"').replace('\\n', '\n')
-            }
-            entries.append(entry)
-        except Exception:
-            continue
-
+    """Last resort: extract individual valid objects for any generation pass."""
+    entries = _extract_valid_json_objects(json_text)
     return entries if entries else None
 
 
 def fix_mojibake(text):
     """Fix common mojibake characters resulting from CP1252-as-UTF8."""
-    replacements = {
-        'â€™': ''',  # Right single quote
-        'â€˜': ''',  # Left single quote
-        'â€œ': '"',  # Left double quote
-        'â€\x9d': '"', # Right double quote
-        'â€?': '"', # Sometimes ? if undefined
-        'â€"': '—',  # Em dash
-        'â€"': '–',  # En dash
-        'â€¦': '…',  # Ellipsis
-    }
+    replacements = [
+        ('â€™', '\u2019'),  # Right single quote
+        ('â€˜', '\u2018'),  # Left single quote
+        ('â€œ', '\u201c'),  # Left double quote
+        ('â€\x9d', '\u201d'),  # Right double quote
+        ('â€?', '\u201d'),  # Sometimes ? if undefined
+        ('â€“', '\u2013'),  # En dash (UTF-8 E2 80 93 read as CP1252)
+        ('â€”', '\u2014'),  # Em dash (UTF-8 E2 80 94 read as CP1252)
+        ('â€¦', '\u2026'),  # Ellipsis
+    ]
 
-    for bad, good in replacements.items():
+    for bad, good in replacements:
         text = text.replace(bad, good)
 
     return text
 
-def split_into_chunks(text, max_size=3000):
-    """Split text into chunks at paragraph/sentence boundaries."""
-    paragraphs = re.split(r'\n\s*\n', text)
 
-    chunks = []
+def get_preprocessed_source(text, strip_front_matter=True):
+    """Return source text and cleanup reports exactly as generation uses them."""
+    text = fix_mojibake(text)
+    # RESTORE APOSTROPHES A SOURCE LOST TO SPACES. 9 of PDNC's 28 novels ship
+    # plain text with none, reading "don t" and "Miller s". The model corrects
+    # them, and validate_chunk_quality scores the correction as MISSING source
+    # content - so the retry loop is unwinnable and the chunk can never pass.
+    # DaisyMiller cost 129 rejections, three adaptive splits and a permanent
+    # chunk failure on 2026-09-03 before the run gave up. This runs before every
+    # other normalisation and is a no-op on healthy text (see looks_damaged).
+    text, apostrophe_repairs = restore_stripped_apostrophes(text)
+    text, source_normalizations = normalize_known_source_corruptions(text)
+    source_normalizations.extend(apostrophe_repairs)
+    text, homoglyph_normalizations = normalize_homoglyph_words(text)
+    source_normalizations.extend(homoglyph_normalizations)
+    text, repetition_normalizations = normalize_extreme_phrase_repetitions(text)
+    source_normalizations.extend(repetition_normalizations)
+    front_matter_removed = None
+    if strip_front_matter:
+        text, front_matter_removed = strip_known_front_matter(text)
+    text, publisher_matter = strip_publisher_matter(text)
+    return text, {
+        "source_normalizations": source_normalizations,
+        "front_matter_removed": front_matter_removed,
+        "publisher_matter": publisher_matter,
+    }
+
+def _safe_cut_points(piece, convention=None):
+    """Offsets in `piece` where a chunk may end without cutting a quotation:
+    every newline, and every sentence end (.!?) followed by whitespace, that
+    lies outside a spoken span. Spans come from dialogue_spans - the same
+    quote/dash/label detector pass 1's gate uses - so "cut inside a quote"
+    means the same thing here as it does there. `convention` is the book's,
+    detected once on the whole text: detect_convention wants five spans and
+    a single paragraph rarely has them, so with none given a piece that holds
+    quote marks is read as paired quotes."""
+    from dialogue_spans import spoken_spans, detect_convention
+    convention = convention or detect_convention(piece) or (
+        "paired_quotes" if re.search(r'["\u201c\u201d]', piece) else None)
+    spans = spoken_spans(piece, convention) if convention else []
+
+    points = set(m.start() for m in re.finditer(r"\n", piece))
+    points.update(m.end() for m in re.finditer(r"[.!?][\"'\u201d\u2019)]*(?=\s)", piece))
+    cuts = []
+    span_index = 0
+    for offset in sorted(points):
+        while span_index < len(spans) and spans[span_index][1] <= offset:
+            span_index += 1
+        if 0 < offset < len(piece) and not (
+                span_index < len(spans) and spans[span_index][0] < offset < spans[span_index][1]):
+            cuts.append(offset)
+    return cuts
+
+
+def split_into_chunk_records(text, max_size=3000):
+    """Split text with explicit oversized-paragraph continuation metadata.
+
+    A paragraph longer than `max_size` is cut only at a newline or a sentence
+    end that is OUTSIDE a quotation (issue #611: a book with one paragraph per
+    line has no blank lines, so a chapter was one paragraph and the old
+    sentence split put "My dream is not to be a scholar!" and the rest of the
+    same quotation in different chunks). When a stretch between safe cuts is
+    itself longer than `max_size` the old space split applies and the record
+    says so (`cut_inside_quote`)."""
+    from dialogue_spans import detect_convention
+    max_size = get_valid_chunk_size(max_size)
+    convention = detect_convention(text)
+    paragraphs = re.split(r'\n\s*\n', text)
+    records = []
     current_chunk = ""
+
+    def emit(text, continues_from=False, continues_to=False, cut_inside_quote=False):
+        if text.strip():
+            record = {"text": text.strip(),
+                      "continues_paragraph_from_previous": continues_from,
+                      "continues_paragraph_to_next": continues_to}
+            if cut_inside_quote:
+                record["cut_inside_quote"] = True
+            records.append(record)
+
+    def split_long_piece(piece):
+        pieces = []
+        remaining = piece.strip()
+        while len(remaining) > max_size:
+            cut = remaining.rfind(" ", 0, max_size + 1)
+            if cut <= 0:
+                cut = max_size
+            pieces.append(remaining[:cut].strip())
+            remaining = remaining[cut:].strip()
+        if remaining:
+            pieces.append(remaining)
+        return pieces
+
+    def split_paragraph(para):
+        """-> [(piece, cut_inside_quote)] for an oversized paragraph."""
+        cuts = _safe_cut_points(para, convention)
+        units, last = [], 0
+        for cut in cuts:
+            units.append(para[last:cut]); last = cut
+        units.append(para[last:])
+        out = []
+        for unit in units:
+            if not unit.strip():
+                continue
+            if len(unit.strip()) > max_size:
+                for piece in split_long_piece(unit):
+                    out.append([piece, True])
+                continue
+            if out and len(out[-1][0]) + len(unit) <= max_size:
+                out[-1][0] += unit                  # a flagged piece keeps its flag
+            else:
+                out.append([unit, False])
+        return [(piece.strip(), flagged) for piece, flagged in out if piece.strip()]
 
     for para in paragraphs:
         para = para.strip()
@@ -208,34 +572,887 @@ def split_into_chunks(text, max_size=3000):
 
         if len(current_chunk) + len(para) + 2 > max_size:
             if current_chunk:
-                chunks.append(current_chunk.strip())
+                emit(current_chunk)
                 current_chunk = ""
 
             if len(para) > max_size:
-                sentences = re.split(r'(?<=[.!?])\s+', para)
-                for sentence in sentences:
-                    if len(current_chunk) + len(sentence) + 1 > max_size:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = sentence
-                    else:
-                        current_chunk += " " + sentence if current_chunk else sentence
+                paragraph_pieces = split_paragraph(para)
+                for index, (piece, flagged) in enumerate(paragraph_pieces):
+                    emit(piece, continues_from=index > 0,
+                         continues_to=index + 1 < len(paragraph_pieces),
+                         cut_inside_quote=flagged)
             else:
                 current_chunk = para
         else:
             current_chunk += "\n\n" + para if current_chunk else para
 
     if current_chunk:
-        chunks.append(current_chunk.strip())
+        emit(current_chunk)
 
-    return chunks
+    return records
 
-def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None):
-    """Process a text chunk and return JSON script entries"""
-    # Use provided prompts or fall back to defaults
-    sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-    usr_template = user_prompt_template or DEFAULT_USER_PROMPT
 
+def split_into_chunks(text, max_size=3000):
+    """Split text into strings at paragraph/sentence boundaries."""
+    return [record["text"] for record in split_into_chunk_records(text, max_size)]
+
+@dataclass
+class LLMGenParams:
+    """LLM prompt + sampling settings shared by script generation and review.
+
+    Groups the knobs previously threaded as ~9 separate arguments through
+    process_chunk()/review_batch() and their callers. `system_prompt` and
+    `user_prompt_template` are optional overrides; each caller falls back to its
+    own module default when they are None.
+
+    NOTE: the sampling defaults below are a script-generation baseline only. The
+    review pass uses different tuned values (higher max_tokens, lower temperature,
+    top_k=20) and always constructs this explicitly, so don't rely on these
+    defaults for review — pass review's values in.
+    """
+    system_prompt: str = None
+    user_prompt_template: str = None
+    max_tokens: int = 4096
+    temperature: float = 0.6
+    top_p: float = 0.8
+    top_k: int = None
+    min_p: float = None
+    presence_penalty: float = 0.0
+    banned_tokens: list = None
+    context_length: int = None
+    hard_max_tokens: int = 16384
+    segment_temperature: float = None
+    attribute_temperature: float = None
+    instruct_temperature: float = None
+    segment_output_ratio: float = 3.0
+    # pass-1 mode (three_pass_generate.SEGMENTATION_MODES); the single-pass
+    # path never pre-segments, so "llm" here
+    segmentation: str = "llm"
+    reasoning_allowance: int = 0
+    reasoning_effort: str = None
+    # LM Studio honours seed: same seed twice is identical, a different seed
+    # differs, no seed varies. That is what lets sampled voting stay
+    # reproducible instead of trading determinism for accuracy.
+    seed: int = None
+    # Kept at the end so legacy positional constructors retain their meaning.
+    attribute_system_prompt: str = None
+    # Wire format the model is asked to emit: "json" (shipped) or "lines".
+    # See response_codecs; the compact form drops ~25% of output tokens on real
+    # scripts, all of it wrapper around prose the quality gate measures anyway.
+    output_format: str = "json"
+    provider_extra_body: dict = None
+    # "auto" sends response_schema (when a pass sets one) as a request-level
+    # JSON schema and falls back for the run if the server rejects it; "off"
+    # never sends it. response_schema is set per pass, not from config.
+    structured_output: str = "auto"
+    response_schema: dict = None
+    api_retry_limit: int = None
+    retry_initial_delay_seconds: float = 0
+    retry_multiplier: float = 2
+    retry_max_delay_seconds: float = 30
+    retry_jitter: float = 0
+    segment_system_prompt: str = None
+    segment_user_prompt_template: str = None
+    instruct_system_prompt: str = None
+    instruct_user_prompt_template: str = None
+    # What to do when the API retry budget runs out on a RETRYABLE error (rate
+    # limit, 5xx, timeout): "fail" gives the chunk up as today; "pause" freezes
+    # the run in place so an operator can fix the provider and press Resume,
+    # which retries the same request with a fresh budget. A non-retryable
+    # error (content policy) never pauses - retrying it cannot succeed.
+    on_api_exhaustion: str = "fail"
+    # Per-run capability cache shared by dataclasses.replace() retries. Kept at
+    # the end so legacy positional constructors retain their meaning.
+    schema_rejected_by: set = field(default_factory=set, repr=False,
+                                    compare=False)
+    # Independent pass-1 quote-classification constraints. These affect only
+    # the quote-region gate; source coverage, ordering, duplication, Unicode,
+    # schema, and output-size checks remain active when either is disabled.
+    # Kept after every older field so legacy positional constructors retain
+    # their meaning.
+    quoted_must_be_spoken: bool = True
+    unquoted_must_be_narrator: bool = True
+    request_admission: object = field(default=None, repr=False, compare=False)
+
+
+
+def _rotate_log_if_large(log_path, max_bytes=10 * 1024 * 1024):
+    """Rotate <log_path> to <log_path>.bak once it exceeds max_bytes (best-effort)."""
+    if os.path.exists(log_path) and os.path.getsize(log_path) > max_bytes:
+        backup_path = log_path + ".bak"
+        try:
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+            os.rename(log_path, backup_path)
+        except OSError:
+            pass  # If rotation fails, just append to existing log
+
+
+def classify_length_finish(content, reasoning_tokens, already_escalated):
+    """Decide what a finish_reason=length response means.
+
+    Returns "reasoning_overflow" when a reasoning model spent its whole budget
+    thinking and emitted no visible content, and has already been given one
+    larger budget. Returns "escalate_once" for the first such response, and
+    "truncated_output" for ordinary visible truncation, which keeps its existing
+    retry and subdivision handling. Rule 10: one policy, applied the same way on
+    every attempt.
+    """
+    if reasoning_tokens and not (content or "").strip():
+        return "reasoning_overflow" if already_escalated else "escalate_once"
+    return "truncated_output"
+
+
+def redact_recovery_value(value, key=None):
+    """Copy recovery data while removing values that are likely credentials."""
+    if key and any(token in key.lower() for token in ("api_key", "apikey", "token", "secret", "password", "authorization")):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {item_key: redact_recovery_value(item_value, item_key)
+                for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [redact_recovery_value(item) for item in value]
+    return value
+
+
+def get_response_format(params, client):
+    """-> the OpenAI-style response_format for this call, or None."""
+    if params.structured_output == "off" or not params.response_schema:
+        return None
+    if str(getattr(client, "base_url", "")) in getattr(
+            params, "schema_rejected_by", set()):
+        return None
+    return {"type": "json_schema",
+            "json_schema": {"name": params.response_schema.get("name", "entries"),
+                            "strict": True,
+                            "schema": params.response_schema["schema"]}}
+
+
+def is_schema_rejection(error):
+    """A 4xx that names the structured-output feature, as opposed to any
+    other bad request: the server does not support response_format."""
+    if isinstance(error, TypeError):
+        text = str(error).lower()
+        # An in-process client (distill_eval.LocalClient) without the kwarg.
+        return "response_format" in text and "unexpected keyword" in text
+    status = getattr(error, "status_code", None)
+    if status not in (400, 422):
+        return False
+    text = str(error).lower()
+    # The second list is what a server says when it refuses the FEATURE, as
+    # opposed to a bad schema ("JSON schema error at #: ..."). "must be one
+    # of" / "but got" is llama.cpp's own wording for a response_format type it
+    # does not know (`response_format type must be one of "text" or
+    # "json_object", but got: json_schema` on a build older than json_schema
+    # support), and the usual OpenAI-compatible gateway phrasing.
+    return any(k in text for k in ("response_format", "json_schema")) and any(
+        k in text for k in ("not supported", "unsupported", "unknown", "unexpected",
+                            "must be one of", "but got", "must be 'text'", "invalid parameter"))
+
+
+def create_completion(client, response_format, schema_rejected_by=None,
+                      run_profile_index=None, request_admission=None, **kwargs):
+    """One completion request; if the server rejects the schema, remember
+    that for its base URL and send the same request free-form."""
+    endpoint = str(getattr(client, "base_url", ""))
+    if isinstance(client, FailoverClient) and run_profile_index is not None:
+        endpoint = client.get_profile_base_url(run_profile_index)
+        kwargs["_run_profile_index"] = run_profile_index
+        kwargs["_request_admission"] = request_admission
+    if response_format:
+        try:
+            return client.chat.completions.create(response_format=response_format, **kwargs)
+        except Exception as error:  # noqa: BLE001 - classified below
+            if not is_schema_rejection(error):
+                raise
+            if schema_rejected_by is not None:
+                schema_rejected_by.add(endpoint)
+            print(f"  structured output rejected by the server ({error}); "
+                  "sending free-form JSON for the rest of this run", flush=True)
+    return client.chat.completions.create(**kwargs)
+
+
+def build_extra_body(params):
+    """Collect non-standard sampling options for the OpenAI-compatible call."""
+    request_extra_body = {k: v for k, v in {
+        "top_k": params.top_k,
+        "min_p": params.min_p,
+        "banned_tokens": params.banned_tokens if params.banned_tokens else None,
+        "reasoning_effort": params.reasoning_effort,
+        "seed": params.seed,
+    }.items() if v is not None}
+    return merge_provider_extra_body(params.provider_extra_body, request_extra_body)
+
+
+def get_quality_retry_policy(finish_reason, completion_tokens, effective_max,
+                             quality):
+    """Return one consistent retry action for a deterministic quality failure."""
+    codes = {finding["code"] for finding in quality.get("findings", [])}
+    incomplete = bool({"low_source_token_recall", "low_ordered_trigram_recall",
+                       "output_source_ratio"} & codes
+                      and quality.get("metrics", {}).get("output_source_ratio", 1.0) < 0.9)
+    near_limit = (completion_tokens is not None and effective_max
+                  and completion_tokens >= effective_max * 0.9)
+    if finish_reason == "length" or (incomplete and near_limit):
+        return "increase_tokens"
+    return "retry_same_budget"
+
+
+def is_severe_chunk_truncation(quality):
+    """Return whether quality evidence matches the cheap early-stop failure."""
+    metrics = quality.get("metrics", {})
+    codes = {finding.get("code") for finding in quality.get("findings", [])}
+    return (metrics.get("output_source_ratio", 1.0) < 0.6
+            and "low_source_token_recall" in codes
+            and "low_ordered_trigram_recall" in codes)
+
+
+def get_chunk_retry_action(quality, consecutive_severe, allow_early_split=False):
+    """Choose whether a failed generation attempt should retry or split."""
+    if (allow_early_split and is_severe_chunk_truncation(quality)
+            and consecutive_severe >= 2):
+        return "split"
+    return "retry"
+
+
+def record_attempt_context(observer, attempt, phase, split_part=None):
+    """Label one live attempt record before handing it to its observer."""
+    attempt["phase"] = phase
+    if split_part is not None:
+        attempt.setdefault("split_part", split_part)
+        attempt["split_path"] = [split_part] + attempt.get("split_path", [])
+    observer(attempt)
+
+
+NEAR_MISS_RECALL_THRESHOLD = 0.75
+
+
+def _is_near_miss_recall(metrics):
+    """True if source coverage was close to (but under) chunk_quality.py's
+    0.90 pass threshold - distinguishes an almost-complete, imprecise
+    response from catastrophic early-stop truncation. Shared by
+    _build_retry_feedback_message (wording) and process_chunk (bonus-retry
+    eligibility) so both use the same definition of "near miss" (Rule 15).
+
+    Diagnosed live (2026-07-19): a chunk's retry sequence hit 11%, 11%,
+    11%, then 86% recall on attempt 4 (its last) - a near-complete
+    response one attempt away from passing - then regressed to 5% because
+    the retry message told it "you barely started, redo everything" when
+    it hadn't.
+    """
+    if not metrics:
+        return False
+    recall = metrics.get("source_token_recall")
+    return recall is not None and recall >= NEAR_MISS_RECALL_THRESHOLD
+
+
+def _describe_missing_spans(spans):
+    """Render chunk_quality.py's missing_source_spans as a plain-English
+    clause quoting where the dropped source content begins, so the retry
+    message points at specific text instead of only a coverage percentage.
+    Returns "" when there are no spans (message unchanged from before)."""
+    clauses = [f'the passage beginning "{span["preview"]} ..." '
+               f'(about {span["token_count"]} words)'
+               for span in spans or [] if span.get("preview")]
+    if not clauses:
+        return ""
+    return " The missing content includes " + "; ".join(clauses) + "."
+
+
+def _build_retry_feedback_message(quality):
+    """Plain-English retry instruction instead of a raw JSON findings dump -
+    the model has to act on this, not parse it. Diagnosed from a real
+    production incident (2026-07-19): fresh single attempts against a known
+    failing chunk succeeded 3/3 live, but retries within a rejected session
+    kept producing near-identical tiny output across several tries - the
+    raw `json.dumps(quality["findings"])` dump this replaced gave the model
+    a list of validation codes to parse, not something to act on.
+
+    Falls back to each finding's own human-readable `message`
+    (chunk_quality.py already attaches one to every finding) for finding
+    types outside the dominant incomplete-output cluster, and to the
+    original JSON dump only if no messages exist at all (never worse than
+    before this change).
+    """
+    findings = quality.get("findings", [])
+    truncation_codes = {"low_source_token_recall", "low_ordered_trigram_recall",
+                        "output_source_ratio"}
+    codes = {finding.get("code") for finding in findings}
+    if codes & truncation_codes:
+        metrics = quality.get("metrics", {})
+        recall = metrics.get("source_token_recall")
+        coverage = f"about {recall * 100:.0f}%" if recall is not None else "too little"
+        spans_hint = _describe_missing_spans(quality.get("missing_source_spans"))
+        if _is_near_miss_recall(metrics):
+            return (f"Your previous response was close but only covered {coverage} "
+                    "of the source text, missing some content or phrasing precisely. "
+                    "Review it and produce a complete, precise conversion of the "
+                    "entire chunk, filling in whatever was missing." + spans_hint)
+        return (f"Your previous response covered only {coverage} of the source "
+                "text before stopping early. Convert the ENTIRE source chunk "
+                "from beginning to end this time - do not stop partway through "
+                "and do not summarize any part of it." + spans_hint)
+    formatted = format_validation_findings(findings)
+    if formatted:
+        return formatted
+    return json.dumps(findings, ensure_ascii=False)
+
+
+def pause_for_operator(error_details):
+    """Freeze this process until the operator resumes it. Returns True once
+    resumed, False where a self-stop is impossible (Windows) so the caller
+    falls back to failing the chunk.
+
+    The marker line is the contract with the app: core.py's output reader sets
+    the task's `paused` flag when it sees it, so the UI shows Paused and its
+    Resume button (SIGCONT) is what wakes this process. Frozen, not exited:
+    every accepted chunk, the checkpoint and the retry history stay exactly as
+    they are, which is the point of pausing instead of failing."""
+    if sys.platform == "win32":
+        return False
+    import signal
+    print(f"{AUTO_PAUSE_MARKER} API retries exhausted "
+          f"({error_details['category']}, HTTP {error_details['status_code']}). "
+          "Paused; fix the provider and press Resume to retry this request.",
+          flush=True)
+    os.kill(os.getpid(), signal.SIGSTOP)
+    print(f"{AUTO_PAUSE_MARKER} resumed; retrying with a fresh budget.", flush=True)
+    return True
+
+
+def retry_line(attempt, max_retries):
+    """The one wording for "about to retry" - `attempt` is the 0-based attempt
+    that just failed, so the next one is attempt+2 of max_retries+1, the same
+    numbering as "Succeeded on retry N". A bare "Retrying..." left a user
+    watching a slow model unable to tell attempt 2 from attempt 4 (#588)."""
+    return f"Retrying... (attempt {attempt + 2} of {max_retries + 1})"
+
+
+def ensure_run_request_params(client, params):
+    """Return parameters bound to the serving profile without changing the input."""
+    # Only our explicit wrapper owns runtime-profile switching; ordinary SDK
+    # clients and in-process providers retain their existing caller settings.
+    from llm_provider import FailoverClient
+    if not isinstance(client, FailoverClient):
+        return params
+    profile = client.ensure_active_runtime_profile()
+    if profile is None:
+        return params
+    config = profile["config"]
+    defaults = LLMGenParams()
+    changes = {name: config.get(name, getattr(defaults, name)) for name in (
+        "provider_extra_body", "structured_output", "api_retry_limit",
+        "retry_initial_delay_seconds", "retry_multiplier", "retry_max_delay_seconds",
+        "retry_jitter", "on_api_exhaustion")}
+    changes["context_length"] = profile["context_length"]
+    return replace(params, **changes)
+
+
+def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
+                         log_name, label, max_retries=2, validate_entries=None,
+                         transform_entries=None, attempt_observer=None,
+                         retry_decider=None, near_miss_sink=None, codec=None,
+                         _resume_state=None, _schema_rejected_by=None):
+    """Call the LLM and parse a JSON array of entries, with retries.
+
+    Shared by process_chunk() (script generation) and review_batch() (review):
+    the two only differed in their log file/label and failure sentinel. Returns a
+    list of entries, or [] if every attempt failed to produce parseable JSON.
+    `log_name` is the raw-response log basename; `label` tags each block
+    (e.g. "CHUNK 3/40" or "BATCH 2/10").
+    """
+    run_profile_index = (client.get_active_profile_index()
+                         if isinstance(client, FailoverClient) else None)
+    params = ensure_run_request_params(client, params)
+    if run_profile_index == 1:
+        model_name = client.secondary_model
+    if codec is None:
+        from response_codecs import get_codec
+        codec = get_codec("json")
+    resume_state = _resume_state or {}
+    retry_feedback = resume_state.get("retry_feedback")
+    requested_max = resume_state.get("requested_max", params.max_tokens)
+    consecutive_severe = resume_state.get("consecutive_severe", 0)
+    response_fingerprints = dict(resume_state.get("response_fingerprints", {}))
+    attempt_offset = resume_state.get("attempt_offset", 0)
+    # Prompts already sent on this batch. At temperature 0 the model is
+    # deterministic, so re-sending a prompt it has already rejected must
+    # produce the same rejected answer - the retry cannot succeed and only
+    # costs wall time. Observed on owarimonogatari3's pass-2: attempts 3 and 4
+    # sent the same 764-token prompt and got the same 325-token completion,
+    # then the batch was failed anyway. Rule 10: decide the policy once.
+    attempted_prompts = set(resume_state.get("attempted_prompts", ()))
+    # Persists across attempts: a reasoning model gets exactly one larger
+    # budget before the batch is failed (Rule 10 - one retry policy).
+    reasoning_escalated = resume_state.get("reasoning_escalated", False)
+    schema_rejected_by = (_schema_rejected_by if _schema_rejected_by is not None
+                          else getattr(params, "schema_rejected_by", set()))
+
+    def _retry_same_request(preserve_retry_state=False):
+        """Retry after an external event, preserving same-provider state on resume."""
+        state = None
+        if preserve_retry_state:
+            state = {
+                "retry_feedback": retry_feedback,
+                "requested_max": requested_max,
+                "consecutive_severe": consecutive_severe,
+                "response_fingerprints": response_fingerprints,
+                "attempted_prompts": tuple(attempted_prompts),
+                "reasoning_escalated": reasoning_escalated,
+                "attempt_offset": attempt_offset + request_attempt,
+                "quality_attempt": attempt,
+            }
+        return call_llm_for_entries(
+            client, model_name, sys_prompt, user_prompt, params, log_name, label,
+            max_retries=max_retries, validate_entries=validate_entries,
+            transform_entries=transform_entries, attempt_observer=attempt_observer,
+            retry_decider=retry_decider, near_miss_sink=near_miss_sink, codec=codec,
+            _resume_state=state, _schema_rejected_by=schema_rejected_by)
+
+    attempt = resume_state.get("quality_attempt", 0) - 1
+    advance_quality = True
+    api_failures = 0
+    request_attempt = 0
+    while True:
+        if advance_quality:
+            attempt += 1
+            api_failures = 0
+        if attempt > max_retries:
+            break
+        advance_quality = True
+        request_attempt += 1
+        attempt_number = attempt_offset + request_attempt
+        t0 = time.time()
+        truncation_retry_available = False
+        attempt_record = None
+        effective_max = None
+        try:
+            base_messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            attempt_prompt = user_prompt
+            if retry_feedback:
+                attempt_prompt += ("\n\nYour previous response was rejected by deterministic "
+                                   "quality checks. Return the complete source text exactly once. "
+                                   f"Failures: {retry_feedback}")
+            messages = base_messages if not retry_feedback else [
+                base_messages[0], {"role": "user", "content": attempt_prompt}
+            ]
+            effective_max = get_effective_max_tokens(
+                requested_max, params.context_length, messages,
+                params.hard_max_tokens, scale_to_context=False)
+            # Only when the sampler is deterministic. Above 0 a repeated prompt
+            # is a legitimate second sample and must still be sent. The key is
+            # the prompt AND the completion budget: a truncated response raises
+            # requested_max for the retry, and that retry is a different
+            # request even though its prompt is byte-identical. Keyed on the
+            # prompt alone, this guard cancelled every budget escalation at
+            # temperature 0 - measured 2026-09-12 on Muse at batch 25, where
+            # 70% of windows hit max_tokens and none was ever re-sent larger.
+            attempt_key = (attempt_prompt, effective_max)
+            if not params.temperature:
+                if attempt_key in attempted_prompts:
+                    print(f"  {label}: identical prompt and budget already "
+                          f"rejected at temperature 0; further retries cannot "
+                          f"differ", flush=True)
+                    break
+            response = create_completion(
+                client, get_response_format(params, client),
+                schema_rejected_by=schema_rejected_by,
+                run_profile_index=run_profile_index, request_admission=params.request_admission,
+                model=model_name,
+                messages=messages,
+                temperature=params.temperature,
+                top_p=params.top_p,
+                presence_penalty=params.presence_penalty,
+                max_tokens=effective_max,
+                extra_body=build_extra_body(params)
+            )
+            # Some OpenAI-compatible providers return a successful HTTP
+            # response with no choices (or a JSON null response) during a
+            # transient outage. Raise a clear provider error so the existing
+            # bounded API retry path handles it; never let this surface as an
+            # opaque AttributeError from ``None.choices``.
+            choices = getattr(response, "choices", None) if response is not None else None
+            if not choices:
+                raise RuntimeError("LLM provider returned no choices")
+            choice = choices[0]
+            # An OpenAI-compatible server may return JSON null for content when
+            # a reasoning model spent its whole budget thinking. Calling
+            # .strip() on that raised AttributeError, which the caller booked as
+            # a generic api_error - so the one-escalation-then-overflow policy
+            # never ran on the exact responses it exists for.
+            text = (choice.message.content or "").strip()
+            if not params.temperature:
+                # Only a real response proves this deterministic prompt cannot
+                # differ. Connection/API failures must retain their retry budget.
+                attempted_prompts.add(attempt_key)
+
+            response_fingerprint = hashlib.sha256(
+                " ".join(text.split()).encode("utf-8")).hexdigest()
+            response_fingerprints[response_fingerprint] = (
+                response_fingerprints.get(response_fingerprint, 0) + 1)
+            repeat_count = response_fingerprints[response_fingerprint]
+            finish_reason = choice.finish_reason
+            usage = getattr(response, 'usage', None)
+            # Reasoning models bill thinking tokens to completion_tokens but
+            # return them in message.reasoning_content, so they are invisible
+            # to any budget sized on the visible response.
+            usage_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(usage_details, "reasoning_tokens", None)
+            # llama.cpp returns the trace in message.reasoning_content but
+            # reports no reasoning_tokens in usage, so the allowance never
+            # grew and a short chunk's ceiling (512) was spent entirely on
+            # thinking: Re:Zero vol. 3 failed pass 1 that way on 2026-09-15
+            # under Muse reasoning low. Estimate from the trace when the
+            # server does not count it.
+            if reasoning_tokens is None:
+                trace = getattr(choice.message, "reasoning_content", None) or ""
+                if trace:
+                    reasoning_tokens = max(1, len(trace) // 4)
+
+            # A local log failure must not consume the provider retry/failover budget.
+            response_log_error = None
+            try:
+                log_path = get_response_log_path(log_name)
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with file_lock(log_path):
+                    if not os.environ.get("ALEXANDRIA_RUN_ID"):
+                        _rotate_log_if_large(log_path)
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"\n{'='*80}\n")
+                        lf.write(f"{label} | attempt {attempt_number} | finish_reason={finish_reason}\n")
+                        if usage:
+                            lf.write(f"tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}\n")
+                        lf.write(f"{'─'*80}\n")
+                        lf.write(text)
+                        lf.write(f"\n{'='*80}\n")
+            except (OSError, UnicodeError, ValueError) as exc:
+                response_log_error = f"{type(exc).__name__}: {exc}"
+                print(f"WARNING: response logging failed for {label}: {response_log_error}. "
+                      "Keeping the provider response for validation.", flush=True)
+
+            print(f"  finish_reason={finish_reason}", end="")
+            if usage:
+                print(f" | tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}", end="")
+            print(f" | took {time.time() - t0:.1f}s")
+            if attempt_observer:
+                attempt_record = {
+                    "attempt": attempt_number,
+                    "elapsed_seconds": round(time.time() - t0, 3),
+                    "finish_reason": finish_reason,
+                    "requested_max_tokens": requested_max,
+                    "effective_max_tokens": effective_max,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+                    "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+                    "reasoning_tokens": reasoning_tokens,
+                    "error": None,
+                    "response_fingerprint": response_fingerprint,
+                    "response_repeat_count": repeat_count,
+                }
+                if response_log_error is not None:
+                    attempt_record["response_log_error"] = response_log_error
+                    attempt_record["raw_response"] = text
+                attempt_observer(attempt_record)
+
+            if finish_reason == "length":
+                verdict = classify_length_finish(
+                    text, reasoning_tokens, reasoning_escalated)
+                if verdict == "reasoning_overflow":
+                    print("  Reasoning overflow: the model spent its whole "
+                          "budget thinking and returned no content. Failing "
+                          "this batch instead of subdividing.")
+                    if attempt_record is not None:
+                        attempt_record["outcome"] = "response_rejected"
+                        attempt_record["failure_codes"] = ["reasoning_overflow"]
+                    return []
+                print(f"  WARNING: Response was truncated (hit effective max_tokens={effective_max}). Consider optimizing LM Studio context.")
+                if attempt < max_retries:
+                    next_max = get_next_retry_max_tokens(
+                        requested_max, "token_truncated", params.hard_max_tokens)
+                    next_effective = get_effective_max_tokens(
+                        next_max, params.context_length, base_messages,
+                        params.hard_max_tokens, scale_to_context=False)
+                    if next_effective > effective_max:
+                        print(f"  Token budget: requested={requested_max}, effective={effective_max}, "
+                              f"next_requested={next_max}, next_effective={next_effective}")
+                        requested_max = next_max
+                        retry_feedback = None
+                        truncation_retry_available = True
+                        if verdict == "escalate_once":
+                            reasoning_escalated = True
+                    else:
+                        print(f"  Token escalation exhausted: effective budget cannot grow "
+                              f"beyond {effective_max} in the loaded context.")
+
+        except Exception as e:
+            if isinstance(e, (TokenBudgetError, RunProfileChanged, RunRequestAdmissionError)):
+                category = ("context_budget" if isinstance(e, TokenBudgetError) else
+                            "profile_changed" if isinstance(e, RunProfileChanged) else "request_admission")
+                error_details = {"category": category, "status_code": None, "retryable": False}
+            else:
+                error_details = classify_llm_error(e)
+            api_retry_limit = (params.api_retry_limit if params.api_retry_limit is not None
+                               else max_retries)
+            can_retry = error_details["retryable"] and api_failures < api_retry_limit
+            api_failures += 1
+            retry_delay = (get_retry_delay(
+                params.retry_initial_delay_seconds, params.retry_multiplier,
+                params.retry_max_delay_seconds, api_failures,
+                jitter=params.retry_jitter)
+                if can_retry else None)
+            if attempt_observer:
+                attempt_observer({"attempt": attempt_number,
+                                  "elapsed_seconds": round(time.time() - t0, 3),
+                                  "finish_reason": None, "requested_max_tokens": requested_max,
+                                  "effective_max_tokens": None, "prompt_tokens": None,
+                                  "completion_tokens": None,
+                                  "error": f"{type(e).__name__}: {e}",
+                                  "error_category": error_details["category"],
+                                  "http_status": error_details["status_code"],
+                                  "retryable": error_details["retryable"],
+                                  "next_retry_seconds": retry_delay,
+                                  "request": {
+                                      "model": model_name,
+                                      "system_prompt": sys_prompt,
+                                      "user_prompt": attempt_prompt,
+                                      "temperature": params.temperature,
+                                      "top_p": params.top_p,
+                                      "presence_penalty": params.presence_penalty,
+                                      "max_tokens": effective_max,
+                                      "extra_body": redact_recovery_value(build_extra_body(params)),
+                                  },
+                                  "outcome": "api_error",
+                                  "failure_codes": (["api_error"] if error_details["category"] == "api_error"
+                                                    else ["api_error", error_details["category"]])})
+            print(f"Error calling LLM API (attempt {attempt_number}) after {time.time() - t0:.1f}s "
+                  f"[{error_details['category']}]: {e}")
+            if (run_profile_index is not None
+                    and run_profile_index != client.get_active_profile_index()):
+                return _retry_same_request()
+            if can_retry:
+                advance_quality = False
+                if retry_delay:
+                    print(f"Retrying in {retry_delay:.1f}s...")
+                    time.sleep(retry_delay)
+                continue
+            # Order of last resorts: the other profile first (a fresh provider
+            # is more likely to answer than the same one later), then the
+            # operator, then giving up.
+            switch = getattr(client, "failover", None)
+            if switch is not None and switch(error_details):
+                # The other profile takes this request and the rest of the
+                # run, with a fresh budget: the failure was the provider's.
+                # Content-policy refusals qualify too - that is the case a
+                # second provider exists for.
+                return _retry_same_request()
+            if (error_details["retryable"]
+                    and getattr(params, "on_api_exhaustion", "fail") == "pause"
+                    and pause_for_operator(error_details)):
+                # The same provider resumes with a fresh API budget, while the
+                # quality feedback and deterministic-response guard remain valid.
+                return _retry_same_request(preserve_retry_state=True)
+            return []
+
+        # Clean and extract the payload region for whichever wire format
+        # this run asked for (see response_codecs).
+        try:
+            json_text = codec.extract(text)
+        except AdjacentArrayOverlapError as exc:
+            if attempt_record is not None:
+                attempt_record["outcome"] = "response_rejected"
+                attempt_record["failure_codes"] = ["adjacent_array_overlap"]
+            retry_feedback = f"adjacent_array_overlap: {exc}"
+            print(f"Warning: {label} repeats text across adjacent arrays "
+                  f"(attempt {attempt_number}): {exc}")
+            if attempt < max_retries and (finish_reason != "length" or truncation_retry_available):
+                print(retry_line(attempt, max_retries))
+                continue
+            return []
+
+        if not json_text:
+            if attempt_record is not None:
+                attempt_record["outcome"] = "response_rejected"
+                attempt_record["failure_codes"] = ["missing_json_array"]
+            print(f"Warning: Could not find {codec.name} payload in {label} "
+                  f"response (attempt {attempt_number})")
+            if attempt < max_retries and (finish_reason != "length" or truncation_retry_available):
+                print(retry_line(attempt, max_retries))
+                continue
+            # Last-attempt recovery: clean_json_string deliberately rejects
+            # ambiguous multi-array structure, but repair_json_array can still
+            # extract complete objects from the raw array region. It remains
+            # safe only because the normal transform + deterministic quality
+            # gates below must accept the reconstructed source in full.
+            json_text = codec.raw_fallback(text)
+            if not json_text:
+                print(f"Response preview: {text[:300]}...")
+                return []
+            print("  Trying quality-gated raw-array salvage after retries exhausted")
+
+        # Try to parse, with repair attempts
+        entries = codec.parse(json_text)
+
+        if entries or (codec.name == "json_object" and isinstance(entries, dict)):
+            if transform_entries:
+                transformed = transform_entries(entries)
+                if transformed.get("unresolved"):
+                    if attempt_record is not None:
+                        attempt_record["outcome"] = "response_rejected"
+                        attempt_record["failure_codes"] = ["unresolved_deterministic_repairs"]
+                    retry_feedback = "unresolved_safe_repair"
+                    print(f"Warning: {label} has unresolved deterministic repairs "
+                          f"(attempt {attempt_number}): {transformed['unresolved']}")
+                    if attempt < max_retries:
+                        print(retry_line(attempt, max_retries))
+                        continue
+                    return []
+                entries = transformed["entries"]
+                if transformed.get("changes"):
+                    print(f"  Applied {len(transformed['changes'])} deterministic chunk repair(s)")
+                if transformed.get("review"):
+                    print(f"  Speaker identity review: {transformed['review']}")
+            if validate_entries:
+                quality = validate_entries(entries)
+                if not quality["passed"]:
+                    if near_miss_sink is not None and is_trigram_only_near_miss(quality):
+                        best = (near_miss_sink[0][1]["metrics"]["ordered_trigram_recall"]
+                                if near_miss_sink else -1.0)
+                        if quality["metrics"]["ordered_trigram_recall"] > best:
+                            near_miss_sink[:] = [(entries, quality)]
+                    if attempt_record is not None:
+                        attempt_record["outcome"] = "quality_rejected"
+                        attempt_record["failure_codes"] = [
+                            finding.get("code") for finding in quality.get("findings", [])]
+                        attempt_record["quality_metrics"] = quality.get("metrics", {})
+                    retry_feedback = _build_retry_feedback_message(quality)
+                    metrics = quality.get("metrics", {})
+                    completion_tokens = (getattr(usage, "completion_tokens", None)
+                                         if usage else None)
+                    retry_policy = get_quality_retry_policy(
+                        finish_reason, completion_tokens, effective_max, quality)
+                    if retry_policy == "retry_same_budget" and is_severe_chunk_truncation(quality):
+                        consecutive_severe += 1
+                    else:
+                        consecutive_severe = 0
+                    if attempt < max_retries and retry_policy == "increase_tokens":
+                        next_max = get_next_retry_max_tokens(
+                            requested_max, "incomplete_output", params.hard_max_tokens)
+                        if next_max != requested_max:
+                            print(f"  Increasing token budget after incomplete output: "
+                                  f"{requested_max} -> {next_max}")
+                            requested_max = next_max
+                    elif attempt < max_retries:
+                        print(f"  Retry policy: {retry_policy}; token budget remains {requested_max}")
+                    print(f"Warning: {label} failed quality validation "
+                          f"(attempt {attempt_number}): {retry_feedback}; metrics={metrics}")
+                    retry_evidence = max(consecutive_severe, repeat_count)
+                    if (retry_decider
+                            and retry_decider(quality, retry_evidence) == "split"):
+                        print("  Repeated unproductive response; switching to adaptive split")
+                        return []
+                    if attempt < max_retries:
+                        print(retry_line(attempt, max_retries))
+                        continue
+                    return []
+            if finish_reason == "length":
+                if attempt_record is not None:
+                    attempt_record["outcome"] = "response_rejected"
+                    attempt_record["failure_codes"] = ["token_truncated"]
+                if attempt < max_retries and truncation_retry_available:
+                    print("Retrying truncated response with a larger token budget...")
+                    continue
+                return []
+            if attempt > 0:
+                print(f"  Succeeded on retry {attempt_number}")
+            if attempt_record is not None:
+                if attempt_record.get("failure_codes"):
+                    attempt_record["recovery_codes"] = attempt_record.pop("failure_codes")
+                attempt_record["outcome"] = "accepted"
+            return entries
+
+        print(f"Warning: Could not parse {label} response as JSON (attempt {attempt_number})")
+        if attempt_record is not None:
+            attempt_record["outcome"] = "response_rejected"
+            attempt_record["failure_codes"] = ["malformed_json"]
+        print(f"JSON preview: {json_text[:300]}...")
+
+        if attempt < max_retries and (finish_reason != "length" or truncation_retry_available):
+            print(retry_line(attempt, max_retries))
+            continue
+        if finish_reason == "length":
+            return []
+
+        # Last resort after every full-response retry is exhausted.
+        salvaged_entries = codec.salvage(json_text)
+        if salvaged_entries:
+            if transform_entries:
+                transformed = transform_entries(salvaged_entries)
+                if transformed.get("unresolved"):
+                    print("Regex-salvaged response has unresolved deterministic repairs")
+                    return []
+                salvaged_entries = transformed["entries"]
+            if validate_entries:
+                quality = validate_entries(salvaged_entries)
+                if not quality["passed"]:
+                    codes = ", ".join(finding["code"] for finding in quality["findings"])
+                    print(f"Regex-salvaged response failed quality validation: {codes}")
+                    return []
+            print(f"Regex-salvaged {len(salvaged_entries)} entries from malformed response")
+            if attempt_record is not None:
+                attempt_record["outcome"] = "accepted"
+                attempt_record["recovery_codes"] = attempt_record.pop(
+                    "failure_codes", ["malformed_json"])
+            return salvaged_entries
+
+    return []
+
+
+def call_llm_for_object(client, model_name, sys_prompt, user_prompt, params,
+                        label, validate_object=None, max_retries=2,
+                        attempt_observer=None):
+    """Call the shared reliability pipeline for one JSON object payload."""
+    import json
+    from response_codecs import ResponseCodec
+    from utils import extract_json_object
+
+    def extract(text):
+        try:
+            parsed = extract_json_object(str(text or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        return json.dumps(parsed, ensure_ascii=False) if isinstance(parsed, dict) else ""
+
+    def parse(payload):
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    codec = ResponseCodec("json_object", extract, parse, parse, lambda _text: None)
+
+    def validate(payload):
+        if not isinstance(payload, dict):
+            return {"passed": False, "findings": [{"code": "not_object"}]}
+        if validate_object is None:
+            return {"passed": True, "findings": []}
+        try:
+            validate_object(payload)
+        except (TypeError, ValueError) as exc:
+            return {"passed": False, "findings": [{"code": "invalid_object", "message": str(exc)}]}
+        return {"passed": True, "findings": []}
+
+    return call_llm_for_entries(
+        client, model_name, sys_prompt, user_prompt, params,
+        log_name="persona_responses.log", label=label,
+        max_retries=max_retries, validate_entries=validate,
+        attempt_observer=attempt_observer, codec=codec)
+
+
+def _build_chunk_context(chunk_num, total_chunks, previous_entries):
+    """Build the positional + character-roster context block prepended to a chunk."""
     context_parts = []
 
     if chunk_num == 1:
@@ -260,193 +1477,541 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         for entry in tail:
             context_parts.append(json.dumps(entry, ensure_ascii=False))
 
-    context = "\n".join(context_parts)
-    user_prompt = usr_template.format(context=context, chunk=chunk)
+    return "\n".join(context_parts)
 
-    for attempt in range(max_retries + 1):
+
+
+def build_chunk_request_prompt(chunk, chunk_num, total_chunks, user_prompt_template,
+                               previous_entries=None):
+    """Render the same complete context for prediction and actual requests."""
+    context = _build_chunk_context(chunk_num, total_chunks, previous_entries)
+    return user_prompt_template.format(context=context, chunk=chunk)
+
+def build_book_request_preflight(chunks, system_prompt, user_prompt_template,
+                                 max_tokens, context_length, parallel,
+                                 context_growth_chars=2000, reserve=512,
+                                 previous_entries_by_chunk=None):
+    """Predict known request contexts; unknown future context cannot promise fit."""
+    requests = []
+    total_chunks = len(chunks)
+    for number, chunk in enumerate(chunks, 1):
+        known_contexts = previous_entries_by_chunk or {}
+        context_known = number == 1 or number in known_contexts
+        user_prompt = build_chunk_request_prompt(
+            chunk, number, total_chunks, user_prompt_template, known_contexts.get(number))
+        prompt_tokens = math.ceil((len(system_prompt) + len(user_prompt)
+                                   + context_growth_chars) / 3)
+        predicted_completion = min(int(max_tokens), max(256, math.ceil(len(chunk) * 0.8)))
+        requests.append({"chunk_number": number, "prompt_tokens": prompt_tokens,
+                         "context_known": context_known,
+                         "context_growth_allowance_chars": context_growth_chars,
+                         "predicted_completion_tokens": predicted_completion,
+                         "predicted_total_tokens": prompt_tokens + predicted_completion + reserve})
+    totals = sorted(item["predicted_total_tokens"] for item in requests)
+    per_slot = int(context_length or 0) // max(1, int(parallel or 1))
+    worst = totals[-1] if totals else 0
+    p95 = totals[max(0, math.ceil(len(totals) * 0.95) - 1)] if totals else 0
+    return {"chunk_count": len(chunks), "context_length": context_length,
+            "parallel": parallel, "per_slot_context": per_slot,
+            "worst_predicted_tokens": worst, "p95_predicted_tokens": p95,
+            "average_predicted_tokens": round(sum(totals) / len(totals), 1) if totals else 0,
+            "context_complete": all(item["context_known"] for item in requests),
+            "static_predicted_fits": bool(per_slot and worst <= per_slot),
+            "predicted_fits": (False if not per_slot or worst > per_slot else
+                               True if all(item["context_known"] for item in requests) else None),
+            "required_total_context": {str(level): worst * level for level in range(1, 5)},
+            "requests": requests}
+
+
+def process_chunk(client, model_name, chunk, chunk_num, total_chunks, params,
+                  previous_entries=None, max_retries=4, attempt_observer=None,
+                  allow_early_split=False, near_miss_sink=None):
+    """Process a text chunk and return JSON script entries.
+
+    max_retries=4 (5 total attempts) rather than the previous 2 (3 attempts):
+    live reproduction of two real overnight batch failures measured a genuine
+    ~40% single-attempt success rate on the specific class of content that
+    fails (the model occasionally stops a few lines into a chunk, right after
+    a short opening dialogue exchange, despite much more source remaining) --
+    NOT a 0% "impossible" case. At that rate 3 attempts succeeds ~78% of the
+    time; 5 attempts succeeds ~92%. This is worth the added budget because a
+    failing attempt is cheap here (the model stops in 2-10s when it's going to
+    fail, vs 60-100s for a real full-length generation) -- so the added
+    attempts cost little even in the worst case, while meaningfully reducing
+    how often a single unlucky run costs the rest of a book (checkpoint/resume
+    requires a gapless accepted-chunk prefix, Rule 9).
+    """
+    from response_codecs import get_codec
+    output_format = getattr(params, "output_format", "json") or "json"
+    # two_step runs stage 1 freeform and stage 2 as JSON, so the codec that
+    # matters for the gate is the JSON one; stage 1 gets its own below.
+    two_step = output_format == "two_step"
+    codec = get_codec("json" if two_step else output_format)
+    sys_prompt = params.system_prompt or DEFAULT_SYSTEM_PROMPT
+    usr_template = params.user_prompt_template or DEFAULT_USER_PROMPT
+
+    user_prompt = build_chunk_request_prompt(
+        chunk, chunk_num, total_chunks, usr_template, previous_entries)
+    established_speakers = [entry.get("speaker") for entry in (previous_entries or [])
+                            if isinstance(entry, dict) and entry.get("speaker")]
+
+    def prepare_entries(entries):
+        structural = build_deterministic_repair(entries, chunk)
+        if structural["unresolved"]:
+            return structural
+        identities = stabilize_speaker_identities(structural["entries"], established_speakers)
+        return {"entries": identities["entries"],
+                "changes": structural["changes"] + identities["changes"],
+                "notes": structural.get("notes", []),
+                "unresolved": [], "review": identities["review"]}
+
+    local_attempts = []
+
+    def observe(attempt):
+        local_attempts.append(attempt)
+        if attempt_observer:
+            attempt_observer(attempt)
+
+    def call_two_step(retries):
+        """Annotate freely, then serialise. The gate still scores the FINAL
+        entries against the ORIGINAL chunk, so neither stage can hide a loss."""
+        from response_codecs import FREEFORM_KEY
+        from two_step import (CONVERSION_SYSTEM, build_conversion_prompt,
+                              build_freeform_prompt, PromptShapeError)
+        stage1 = call_llm_for_entries(
+            client, model_name, build_freeform_prompt(sys_prompt), user_prompt,
+            params, log_name="llm_responses.log",
+            label=f"CHUNK {chunk_num}/{total_chunks} stage1",
+            max_retries=retries, attempt_observer=observe,
+            codec=get_codec("freeform"))
+        if not stage1:
+            print(f"  CHUNK {chunk_num}/{total_chunks} stage1 produced nothing")
+            return []
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                max_tokens=max_tokens,
-                extra_body={
-                    k: v for k, v in {
-                        "top_k": top_k if top_k else None,
-                        "min_p": min_p if min_p else None,
-                        "banned_tokens": banned_tokens if banned_tokens else None,
-                    }.items() if v is not None
-                }
-            )
-
-            choice = response.choices[0]
-            text = choice.message.content.strip()
-            finish_reason = choice.finish_reason
-            usage = getattr(response, 'usage', None)
-
-            # Log raw response for debugging
-            log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, "llm_responses.log")
-            with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{'='*80}\n")
-                lf.write(f"CHUNK {chunk_num}/{total_chunks} | attempt {attempt + 1} | finish_reason={finish_reason}\n")
-                if usage:
-                    lf.write(f"tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}\n")
-                lf.write(f"{'─'*80}\n")
-                lf.write(text)
-                lf.write(f"\n{'='*80}\n")
-
-            print(f"  finish_reason={finish_reason}", end="")
-            if usage:
-                print(f" | tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}", end="")
-            print()
-
-            if finish_reason == "length":
-                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}). Consider increasing max_tokens.")
-
-        except Exception as e:
-            print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
-            if attempt < max_retries:
-                continue
+            convert_prompt = build_conversion_prompt(stage1[0].get(FREEFORM_KEY))
+        except PromptShapeError as exc:
+            print(f"  CHUNK {chunk_num}/{total_chunks} stage1 unusable: {exc}")
             return []
+        return call_llm_for_entries(
+            client, model_name, CONVERSION_SYSTEM, convert_prompt, params,
+            log_name="llm_responses.log",
+            label=f"CHUNK {chunk_num}/{total_chunks} stage2",
+            max_retries=retries,
+            validate_entries=lambda entries: validate_chunk_quality(chunk, entries),
+            transform_entries=prepare_entries,
+            attempt_observer=observe,
+            codec=codec)
 
-        # Clean and extract JSON from response
-        json_text = clean_json_string(text)
+    def call(retries):
+        if two_step:
+            return call_two_step(retries)
+        return call_llm_for_entries(
+            client, model_name, sys_prompt, user_prompt, params,
+            log_name="llm_responses.log",
+            label=f"CHUNK {chunk_num}/{total_chunks}",
+            max_retries=retries,
+            validate_entries=lambda entries: validate_chunk_quality(chunk, entries),
+            transform_entries=prepare_entries,
+            attempt_observer=observe,
+            codec=codec,
+            retry_decider=(
+                (lambda quality, attempt_number: get_chunk_retry_action(
+                    quality, attempt_number, allow_early_split=True))
+                if allow_early_split and retries else None),
+            near_miss_sink=near_miss_sink,
+        )
 
-        if not json_text:
-            print(f"Warning: Could not find JSON array in chunk {chunk_num} response (attempt {attempt + 1})")
-            if attempt < max_retries:
-                print("Retrying...")
-                continue
-            print(f"Response preview: {text[:300]}...")
-            return []
-
-        # Try to parse, with repair attempts
-        entries = repair_json_array(json_text)
-
-        if entries and len(entries) > 0:
-            if attempt > 0:
-                print(f"  Succeeded on retry {attempt + 1}")
-            return entries
-
-        # If repair failed, show warning
-        print(f"Warning: Could not parse chunk {chunk_num} response as JSON (attempt {attempt + 1})")
-        print(f"JSON preview: {json_text[:300]}...")
-
-        if attempt < max_retries:
-            print("Retrying with lower temperature...")
-
-        # Last resort: extract individual valid entries with regex
-        salvaged_entries = salvage_json_entries(json_text)
-        if salvaged_entries:
-            print(f"Regex-salvaged {len(salvaged_entries)} entries from malformed response")
-            return salvaged_entries
-
-    return []
-
-def _write_script_output(all_entries):
-    """Write annotated_script.json and clear stale chunks.json."""
-    output_path = os.path.join("..", "annotated_script.json")
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(all_entries, f, indent=2, ensure_ascii=False)
-
-    chunks_path = os.path.join("..", "chunks.json")
-    if os.path.exists(chunks_path):
-        os.remove(chunks_path)
-        print("Cleared old chunks.json")
-
-    speakers = set(entry.get("speaker") or entry.get("type") or "UNKNOWN" for entry in all_entries)
-    print(f"\nGenerated {len(all_entries)} script entries")
-    print(f"Speakers found: {', '.join(sorted(speakers))}")
-    print(f"Output saved to: {output_path}")
+    entries = call(max_retries)
+    # One bonus attempt when the model came very close on its last try -
+    # diagnosed live (2026-07-19): a chunk hit 86% recall on its final
+    # attempt (one attempt away from the 90% pass threshold), then the
+    # retry budget was already exhausted. See _is_near_miss_recall.
+    # Two properties are deliberate, not oversights: this call passes no
+    # retry_feedback (a fresh call_llm_for_entries, same as the first
+    # attempt) - fresh samples measured 3/3 where feedback-looped retries
+    # looped instead; and it can never trigger an early split, since
+    # retry_decider is only wired up when `retries` is truthy above, and
+    # this call always passes max_retries=0.
+    if not entries and local_attempts and _is_near_miss_recall(
+            local_attempts[-1].get("quality_metrics")):
+        print(f"  CHUNK {chunk_num}/{total_chunks} near-miss on final attempt; "
+              "granting one bonus retry")
+        entries = call(0)
+    return entries
 
 
-def run_single_speaker(book_content, speaker_name, instruct):
-    """Bypass the LLM and emit one entry per text segment, all attributed
-    to a single speaker. Used for first-person memoirs, non-fiction, etc.,
-    where character detection is unnecessary."""
-    segments = split_into_chunks(book_content, max_size=SINGLE_SPEAKER_MAX_CHARS)
-    print(f"Split into {len(segments)} narration segments at paragraph/sentence boundaries")
+def split_failed_chunk(chunk, minimum_chars=400):
+    """Split near the midpoint at a natural boundary, or return [] if unsafe."""
+    if len(chunk) < minimum_chars * 2:
+        return []
+    candidates = [match.end() for match in re.finditer(r"\n\s*\n", chunk)]
+    if not candidates:
+        candidates = [match.end() for match in re.finditer(r"(?<=[.!?])\s+", chunk)]
+    valid = [offset for offset in candidates
+             if offset >= minimum_chars and len(chunk) - offset >= minimum_chars]
+    if not valid:
+        return []
+    offset = min(valid, key=lambda value: abs(value - len(chunk) / 2))
+    return [chunk[:offset].strip(), chunk[offset:].strip()]
 
-    entries = [
-        {"speaker": speaker_name, "text": segment, "instruct": instruct}
-        for segment in segments
-    ]
 
-    if not entries:
-        print("Error: No script entries generated (input text is empty?)")
-        sys.exit(1)
+def process_chunk_adaptively(client, model_name, chunk, chunk_num, total_chunks,
+                             params, previous_entries=None, attempt_observer=None,
+                             near_miss_out=None):
+    """Try a full chunk, then a bounded natural-boundary split on exhaustion.
 
-    _write_script_output(entries)
+    Each split half gets its own independent retry budget. Measured on real
+    production failures: a single attempt on this class of content has roughly
+    a 40-60% failure rate even at tuned sampling params (the model occasionally
+    "stops" a few lines into a chunk despite the source having much more left),
+    so one half failing is not rare and is not evidence the other half will
+    fail too. Earlier code returned as soon as the first half failed without
+    ever attempting the second half, which meant a single unlucky sample on
+    part 1 could silently forfeit the model's independent, often-good chance
+    on part 2 -- and since the caller treats any empty result as fatal for the
+    whole book (checkpoint/resume requires a gapless accepted-chunk prefix,
+    Rule 9), that one unlucky sample cost the rest of the book's chunks too.
 
+    Splitting recurses: a part that itself exhausts its retry budget is split
+    again rather than given up on. Diagnosed live (2026-07-19): a chunk failed
+    identically across 3 independent full-book runs, oscillating between
+    near-perfect (89-93% recall) and near-total collapse (1-11%) on otherwise
+    identical retries -- not content-driven (the source text is unremarkable),
+    so a smaller target has a real independent chance the original size didn't
+    get. `split_failed_chunk`'s own minimum_chars floor (refuses to split
+    below 800 chars) already bounds the recursion depth, so no new depth
+    limit is needed here.
+    """
+    # Captures the best full-chunk trigram-only near-miss (see
+    # is_trigram_only_near_miss). Only accepted below if BOTH the full-chunk
+    # retries and the adaptive split fail, so it never changes a chunk that
+    # recovers by any means (Rule 9): a chunk that passes at 0.90 - full retry
+    # or split - always takes a success return before the fallback is reached.
+    near_miss = []
+    entries = process_chunk(client, model_name, chunk, chunk_num, total_chunks,
+                            params, previous_entries=previous_entries,
+                            allow_early_split=True, near_miss_sink=near_miss,
+                            attempt_observer=(
+                                (lambda attempt: record_attempt_context(
+                                    attempt_observer, attempt, "full"))
+                                if attempt_observer else None))
+    if entries:
+        return entries, False
+    parts = split_failed_chunk(chunk)
+    if not parts:
+        _report_near_miss(near_miss, near_miss_out)
+        return _accept_near_miss(near_miss, chunk_num, total_chunks), False
+    print(f"  Adaptive split: chunk {chunk_num}/{total_chunks} -> "
+          f"{len(parts[0])} + {len(parts[1])} chars")
+    combined = []
+    any_part_failed = False
+    part_results = []
+    for part_number, part in enumerate(parts, 1):
+        context_entries = list(previous_entries or []) + combined
+        part_near_miss = []
+        part_entries, _ = process_chunk_adaptively(
+            client, model_name, part, chunk_num, total_chunks, params,
+            near_miss_out=part_near_miss,
+            previous_entries=context_entries,
+            attempt_observer=(
+                (lambda attempt, part_number=part_number: record_attempt_context(
+                    attempt_observer, attempt, "split", part_number))
+                if attempt_observer else None))
+        part_results.append((part_entries, part_near_miss))
+        if not part_entries:
+            print(f"  Adaptive split part {part_number}/{len(parts)} failed"
+                  + (" (a trigram-only near-miss was kept)" if part_near_miss else ""))
+            any_part_failed = True
+            continue
+        combined.extend(part_entries)
+    if any_part_failed:
+        # A PART THAT NEARLY SUCCEEDED USED TO BE THROWN AWAY. grimgar06 failed
+        # five times on chunk 27 this way: the full chunk never produced a
+        # trigram-only near-miss (its recall was below 0.90 too, so two codes
+        # fired), the split produced one part at 0.8868 - a clean trigram-only
+        # near-miss over the 0.82 floor - and the sibling part failed outright,
+        # which discarded it and forfeited the whole book.
+        #
+        # Rebuild the chunk from whatever each part managed, using a part's
+        # near-miss entries where it has them, and judge the RESULT against the
+        # full chunk. The 0.90 gate stays authoritative: this is accepted only
+        # if the recombined text is itself a trigram-only near-miss, the same
+        # test used a few lines below for the all-parts-succeeded case. Still
+        # exhaustion-only, and a chunk that recovers by any other means has
+        # already returned above (Rule 9).
+        salvaged, used_near_miss = [], False
+        for part_entries, part_near_miss in part_results:
+            if part_entries:
+                salvaged.extend(part_entries)
+            elif part_near_miss:
+                salvaged.extend(part_near_miss)
+                used_near_miss = True
+            else:
+                salvaged = []
+                break
+        if salvaged and used_near_miss:
+            salvaged_quality = validate_chunk_quality(chunk, salvaged)
+            # PASSING IS THE BEST CASE, not a disqualification. An earlier
+            # version asked only is_trigram_only_near_miss, which requires
+            # `not passed` - so a rebuild that cleared 0.90 outright was thrown
+            # away while a worse one was kept. Accept either, and nothing below.
+            if (salvaged_quality["passed"]
+                    or is_trigram_only_near_miss(salvaged_quality)):
+                print(f"  CHUNK {chunk_num}/{total_chunks} rebuilt from split "
+                      f"parts including a trigram-only near-miss "
+                      f"({'passes 0.90' if salvaged_quality['passed'] else 'near-miss'}, "
+                      f"ordered_trigram_recall="
+                      f"{salvaged_quality['metrics']['ordered_trigram_recall']})")
+                return salvaged, True
+        _report_near_miss(near_miss, near_miss_out)
+        return _accept_near_miss(near_miss, chunk_num, total_chunks), True
+    combined_quality = validate_chunk_quality(chunk, combined)
+    if not combined_quality["passed"]:
+        # The recombined halves clear the 0.90 gate for most split recoveries.
+        # When they instead land as a whole-chunk trigram-only near-miss - the
+        # case where the model only reaches near-complete quality on the smaller
+        # split targets, never on the full chunk (e.g. real books whose sole
+        # near-miss telemetry is in the split phase) - accept it here rather than
+        # forfeiting the whole book. Still exhaustion-only and zero blast radius:
+        # a combined result that passes 0.90 takes the success return below
+        # unchanged, so no already-accepted chunk is affected.
+        if is_trigram_only_near_miss(combined_quality):
+            print(f"  Adaptive split recombination accepted as trigram-only near-miss "
+                  f"(ordered_trigram_recall="
+                  f"{combined_quality['metrics']['ordered_trigram_recall']})")
+            return combined, True
+        print("  Adaptive split recombination failed original-chunk validation")
+        return _accept_near_miss(near_miss, chunk_num, total_chunks), True
+    return combined, True
+
+
+def _report_near_miss(near_miss, near_miss_out):
+    """Hand a failing call's captured near-miss entries back to its caller.
+
+    A split part that reaches a trigram-only near-miss still returns [] - it did
+    not clear the 0.90 gate - but the parent may be able to rebuild the whole
+    chunk from it. Without this the material is simply lost, which is how
+    grimgar06 forfeited a book five times over a chunk one of whose halves was
+    at 0.8868.
+    """
+    if near_miss_out is None or not near_miss:
+        return
+    near_miss_out[:] = list(near_miss[0][0])
+
+
+def _accept_near_miss(near_miss, chunk_num, total_chunks):
+    """Return a captured full-chunk trigram-only near-miss's entries as a last
+    resort after full retries and adaptive split are both exhausted, else [].
+
+    This is the ONLY place the near-miss is accepted, and only on failure-return
+    paths, so a chunk that recovers by any means never reaches it (zero change
+    to already-accepted chunks). The caller's post-return gate re-checks the
+    same is_trigram_only_near_miss condition before committing the chunk.
+    """
+    if not near_miss:
+        return []
+    entries, quality = near_miss[0]
+    print(f"  CHUNK {chunk_num}/{total_chunks} accepted as trigram-only near-miss "
+          f"after full exhaustion (ordered_trigram_recall="
+          f"{quality['metrics']['ordered_trigram_recall']})")
+    return entries
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate annotated audiobook script.")
-    parser.add_argument("input_file_path", help="Path to the input text/markdown/EPUB text file.")
-    parser.add_argument("--single-speaker", action="store_true",
-                        help="Skip LLM and attribute the whole text to one speaker.")
-    parser.add_argument("--speaker-name", default="Narrator",
-                        help="Speaker name used in single-speaker mode (default: Narrator).")
-    parser.add_argument("--instruct", default="Neutral narration.",
-                        help="Voice direction used in single-speaker mode.")
+    parser = argparse.ArgumentParser(description="Generate annotated script from a book file.")
+    parser.add_argument("input_file", help="Path to the input text/epub file")
+    parser.add_argument("--output", default=None, help="Output JSON path (default: ../annotated_script.json)")
+    parser.add_argument("--model", default=None, help="Generation model for this run; config.json is unchanged.")
+    parser.add_argument("--strip-front-matter", action=argparse.BooleanOptionalAction, default=True,
+                         help="Strip known non-narrative compiler front matter (translator's "
+                              "note / table of contents) before generation")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                         help="Override generation.chunk_size (chars per LLM call) for this "
+                              "run only, without editing config.json. Smaller chunks shorten "
+                              "each call's output. The chunk size is part of the generation "
+                              "fingerprint, so a different value starts a fresh checkpoint.")
+    parser.add_argument("--output-format", choices=("json", "lines", "two_step"),
+                        default="json",
+                        help="wire format the model is asked to emit. 'lines' "
+                             "uses SPEAKER|INSTRUCT|TEXT, which measured ~25%% "
+                             "fewer output tokens than the JSON the model "
+                             "actually emits, on 100,776 real entries. The "
+                             "RULES half of the prompt is identical either way; "
+                             "only the format spec is rewritten. It is part of "
+                             "the generation fingerprint, so switching starts a "
+                             "fresh checkpoint.")
+    parser.add_argument("--narrator", default=None,
+                        help="Name of the first-person narrator, if the book "
+                             "has one. Measured on PDNC gold: telling the model "
+                             "who narrates took attribution from 61.7%% to 79.4%% "
+                             "over 720 rows (pdnc_narrator_prior__clean-3book.json), "
+                             "and production has never passed it.")
     args = parser.parse_args()
 
-    input_file_path = args.input_file_path
+    input_file_path = args.input_file
     print(f"Processing book from: {input_file_path}")
 
     if not os.path.exists(input_file_path):
         print(f"Error: Input file not found: {input_file_path}")
         sys.exit(1)
 
-    with open(input_file_path, 'r', encoding='utf-8') as f:
-        book_content = f.read()
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    app_dir = os.path.dirname(__file__)
+    data_dir = get_runtime_data_dir(root)
+    output_path = args.output or os.path.join(data_dir, "annotated_script.json")
+    try:
+        validate_generation_output_path(input_file_path, output_path)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    # Fix encoding artifacts
-    book_content = fix_mojibake(book_content)
+    book_content, input_sha256 = get_generation_input(input_file_path)
+
+    book_content, preprocessing = get_preprocessed_source(
+        book_content, strip_front_matter=args.strip_front_matter)
+    source_normalizations = preprocessing["source_normalizations"]
+    if source_normalizations:
+        print(f"Normalized {len(source_normalizations)} known source corruption(s) in memory; "
+              "the upload was not modified.")
+    front_matter_removed = preprocessing["front_matter_removed"]
+    # Publisher colophon: copyright page, ISBN/CIP block, imprint lines. The
+    # three-pass path has always stripped this; the single-pass path did not,
+    # so a published book's chunk 1 was its legal notice. The model has no way
+    # to turn "This book is a work of fiction. Names, characters..." into
+    # annotated dialogue, and the coverage gate then failed the chunk for not
+    # reproducing it - index18 retried chunk 1 eight times before this.
+    publisher_matter = preprocessing["publisher_matter"]
+    if publisher_matter["front_paragraphs"] or publisher_matter["back_paragraphs"]:
+        print(f"Stripped publisher matter: "
+              f"{publisher_matter['front_paragraphs']} paragraph(s) from the "
+              f"front, {publisher_matter['back_paragraphs']} from the back")
+    if front_matter_removed:
+        print(f"Stripped {front_matter_removed['removed_chars']} characters of known "
+              "front matter (translator's note / table of contents) before generation")
+    # PREFLIGHT. Name every known damage class before spending GPU time.
+    #
+    # Damage in a source file otherwise surfaces as a generation failure
+    # twenty minutes in, and reads like a model problem. Daisy Miller died at
+    # chunk 2 of 22 because its apostrophes had been stripped - "She s got to
+    # give me some candy" - and 17 of the 28 public-domain novels carry the
+    # same damage. index18 needed five separate fixes before it would generate
+    # at all. None of that was visible when the user picked the file.
+    preflight = preflight_source(book_content)
+    for line in preflight["messages"]:
+        print(line)
+    book_content = preflight["text"]
+
+    source_unicode = audit_unicode_text(book_content)
+    print(f"Source scripts: {', '.join(source_unicode['scripts']) or 'none'}; "
+          f"NFC normalized: {source_unicode['is_nfc']}")
+    # Unsafe control characters stay a hard refusal: they are never legitimate
+    # prose and can break downstream parsing.
+    if source_unicode["unsafe_controls"]:
+        print("Error: source contains unsafe control characters; "
+              f"details={source_unicode}")
+        sys.exit(1)
+    # Replacement characters are graded rather than absolute. A file decoded
+    # with the wrong codec loses every non-ASCII character, and index18 - one
+    # of the four gold-annotated books - was excluded from every measurement
+    # because of 6,662 of them, 1.40% of the file. Deterministic repair brings
+    # that to 0.26%, and the remainder is genuinely ambiguous: accented
+    # letters, ellipses and dashes that no rule and no model resolved reliably.
+    #
+    # Refusing at any count meant a repaired book was as unusable as a corrupt
+    # one. The threshold sits between the two, so it still refuses the raw file
+    # and now accepts the repaired one. It is not a claim that stray
+    # replacement characters are harmless - `verbalize_symbols` drops them at
+    # the TTS boundary (goal 5.1), so they never reach the engine either way.
+    replacement_count = source_unicode["replacement_character_count"]
+    replacement_share = replacement_count / max(1, len(book_content))
+    if not replacement_load_is_acceptable(replacement_count, len(book_content)):
+        print(f"Error: source is {replacement_share:.2%} replacement "
+              f"characters ({replacement_count}), above the "
+              f"{MAX_REPLACEMENT_SHARE:.2%} limit.")
+        print(replacement_repair_hint(input_file_path))
+        sys.exit(1)
+    if replacement_count:
+        print(f"WARNING: source carries {replacement_count} replacement "
+              f"characters ({replacement_share:.3%}), under the "
+              f"{MAX_REPLACEMENT_SHARE:.2%} limit. These are positions where "
+              "the original character is unrecoverable; they are dropped "
+              "before synthesis, so affected words will be missing a letter "
+              "or mark in the audio.")
 
     print(f"Read {len(book_content)} characters")
 
-    if args.single_speaker:
-        print(f"Single-speaker mode: attributing all narration to '{args.speaker_name}'")
-        run_single_speaker(book_content, args.speaker_name, args.instruct)
-        return
-
     # Load LLM config
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    config = {}
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load config.json: {e}")
-    else:
+    config_path = get_app_config_path(data_dir, root, app_dir)
+    if not os.path.exists(config_path):
         print("Warning: config.json not found. Using defaults.")
+    try:
+        config = get_generation_config(load_app_config(config_path), args.model)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    llm_config = config.get("llm", {})
+    llm_config = get_active_llm_config(config)
     base_url = llm_config.get("base_url", "http://localhost:11434/v1")
     api_key = llm_config.get("api_key", "local")
-    model_name = llm_config.get("model_name", "richardyoung/qwen3-14b-abliterated:Q8_0")
+    model_name = llm_config["model_name"]
+    llm_mode = config.get("llm_mode", "local")
+
+    # The attribution adapter measured +9.8 cross-book and +14.6 through the
+    # served path, but a server started WITHOUT it answers happily at base
+    # quality and nothing fails. Say so at startup rather than discovering it
+    # in the numbers weeks later - the seed bug was exactly this shape.
+    try:
+        from attribution_adapter import check_adapter, describe
+        ok, detail = check_adapter(config, base_url)
+        print(f"LLM adapter: {describe(config)}")
+        if not ok:
+            print(f"WARNING: {detail}", flush=True)
+    except Exception as exc:                            # noqa: BLE001
+        print(f"WARNING: adapter check failed: {str(exc)[:160]}", flush=True)
 
     # Load custom prompts or use defaults
-    prompts_config = config.get("prompts", {})
+    prompts_config = config.get("prompts") or {}
     system_prompt = prompts_config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     user_prompt_template = prompts_config.get("user_prompt") or DEFAULT_USER_PROMPT
 
+    # WHO IS NARRATING. On two weak first-person PDNC books this took
+    # attribution from 61.7% to 79.4% over 720 gold rows, and generation has
+    # never passed it - the helper existed, nothing called it. It matters most
+    # for exactly the failure seen on mushoku18: a first-person book where the
+    # narrator also speaks aloud, and 70% of dialogue stayed with NARRATOR.
+    #
+    # The name is checked against the book before it is used. A narrator who
+    # never appears in their own book is a typo or the wrong book, and seeding
+    # the roster from it would teach the model a character that is not there.
+    narrator = args.narrator or (config.get("book") or {}).get("narrator")
+    if narrator:
+        try:
+            narrator = get_valid_narrator_name(narrator)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        if not is_narrator_attested(narrator, book_content):
+            print(f"Error: '{narrator}' does not appear in this book often "
+                  f"enough to be its narrator; check the name.")
+            sys.exit(1)
+        system_prompt = add_first_person_awareness(
+            add_narrator_prior(system_prompt, narrator))
+        print(f"First-person narrator: {narrator}")
+
     # Load generation settings
-    generation_config = config.get("generation", {})
-    chunk_size = generation_config.get("chunk_size", 3000)
+    generation_config = config.get("generation") or {}
+    configured_chunk_size = generation_config.get("chunk_size", 3000)
+    try:
+        chunk_size = get_valid_chunk_size(configured_chunk_size, args.chunk_size)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+    if args.chunk_size is not None:
+        print(f"Chunk size overridden via --chunk-size: {configured_chunk_size} -> {chunk_size}")
     max_tokens = generation_config.get("max_tokens", 4096)
     temperature = generation_config.get("temperature", 0.6)
     top_p = generation_config.get("top_p", 0.8)
-    top_k = generation_config.get("top_k", 0)
-    min_p = generation_config.get("min_p", 0)
+    # Default to None (not 0) so an unconfigured sampler is omitted from the
+    # request, while an explicit 0 is preserved and sent through.
+    top_k = generation_config.get("top_k")
+    min_p = generation_config.get("min_p")
     presence_penalty = generation_config.get("presence_penalty", 0.0)
     banned_tokens = generation_config.get("banned_tokens", [])
 
@@ -456,44 +2021,250 @@ def main():
     if banned_tokens:
         print(f"Banned tokens: {banned_tokens}")
 
+    # Self-heal a stale/misconfigured local or remote LM Studio before making
+    # any calls, mirroring review_script.py/find_nicknames.py. This file has
+    # no VRAM watchdog or concurrency wave processing of its own (chunks are
+    # processed strictly sequentially), so only the self-heal call applies
+    # here - is_remote/lm_status aren't needed for anything else in this file.
+    _, lm_status, heal_msg = ensure_ideal_settings(
+        llm_mode, base_url, model_name, ssh_alias=config.get("llm_remote_ssh"), api_key=api_key)
+    print(heal_msg)
+
     # Create OpenAI client with custom base URL
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key
-    )
+    #
+    # A TIMEOUT, BECAUSE WITHOUT ONE A STALLED SERVER STOPS THE WORLD. This
+    # call had none while core._make_llm_client defaults to 60s - two ways to
+    # build the same client, disagreeing (Rule 15). On 2026-08-18 the
+    # unseen_books run held the GPU for two hours having used two SECONDS of
+    # CPU: one request never came back, nothing timed out, and the job sat
+    # sleeping while the queue behind it waited and the deadline passed.
+    #
+    # 600s rather than core's 60s: a generation batch legitimately takes
+    # minutes on a 14B model, and a timeout shorter than the work turns a slow
+    # request into a failed one. What matters is that SOME finite number
+    # exists, so a dead request becomes an error the retry loop can see rather
+    # than a silent hang.
+    client = make_run_client(config, llm_config, llm_timeout_seconds())
 
     # Split into chunks at natural boundaries
     chunks = split_into_chunks(book_content, max_size=chunk_size)
     total_chunks = len(chunks)
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
+    request_preflight = build_book_request_preflight(
+        chunks, system_prompt, user_prompt_template, max_tokens,
+        lm_status.get("context_length"), lm_status.get("parallel"))
+    print(f"Request preflight: worst={request_preflight['worst_predicted_tokens']} tokens, "
+          f"p95={request_preflight['p95_predicted_tokens']}, "
+          f"per-slot={request_preflight['per_slot_context']}, "
+          f"fits={request_preflight['predicted_fits']}; "
+          "unknown future roster/tail context is checked on each actual request")
+
+    response_log = os.path.relpath(get_response_log_path("llm_responses.log"), data_dir)
 
     all_entries = []
+    chunk_times = []
+    start_time = time.monotonic()
+
+    # Sampling/prompt settings are constant across chunks - build once.
+    if args.output_format == "two_step":
+        print("Output format: two_step (annotate freeform, then serialise)")
+    if args.output_format == "lines":
+        from response_codecs import build_line_format_prompt
+        # Raises rather than half-converting: an arm still told to emit JSON
+        # while being parsed as lines would record a format failure that is
+        # really a harness bug.
+        system_prompt = build_line_format_prompt(system_prompt)
+        print("Output format: lines (SPEAKER|INSTRUCT|TEXT)")
+
+    gen_params = LLMGenParams(
+        system_prompt=system_prompt,
+        user_prompt_template=user_prompt_template,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        presence_penalty=presence_penalty,
+        banned_tokens=banned_tokens,
+        context_length=lm_status.get("context_length"),
+        output_format=args.output_format,
+        provider_extra_body=llm_config.get("provider_extra_body"),
+        structured_output=llm_config.get("structured_output", "auto"),
+        api_retry_limit=llm_config.get("api_retry_limit"),
+        retry_initial_delay_seconds=llm_config.get("retry_initial_delay_seconds", 1),
+        retry_multiplier=llm_config.get("retry_multiplier", 2),
+        retry_max_delay_seconds=llm_config.get("retry_max_delay_seconds", 30),
+        retry_jitter=llm_config.get("retry_jitter", 0.2),
+        on_api_exhaustion=llm_config.get("on_api_exhaustion", "fail"),
+    )
+
+    fingerprint = get_generation_fingerprint(
+        book_content, chunks, model_name, base_url, gen_params, chunk_size)
+    initial_binding = get_run_model_binding(client, model_name)
+    if initial_binding["failover_model"] is not None:
+        fingerprint["model_binding"] = initial_binding
+    accepted_chunks = load_generation_checkpoint(output_path, fingerprint)
+    checkpoint_writer = GenerationCheckpointShards(get_generation_checkpoint_path(output_path), fingerprint)
+    if accepted_chunks:
+        print(f"Resuming from generation checkpoint: {len(accepted_chunks)}/{total_chunks} validated chunks.")
+        all_entries = [entry for item in accepted_chunks for entry in item["entries"]]
+
+    context_speakers = {}
+
+    def apply_context_entries(entries):
+        for entry in entries:
+            speaker = entry.get("speaker")
+            if speaker:
+                context_speakers.setdefault(speaker, entry)
+
+    apply_context_entries(all_entries)
+
+    resumed_binding = {"failover_used": any(
+        item.get("model_binding", {}).get("failover_used") is True
+        for item in accepted_chunks)}
+
     for i, chunk in enumerate(chunks, 1):
+        if i <= len(accepted_chunks):
+            continue
         print(f"Processing chunk {i}/{total_chunks} ({len(chunk)} chars)...")
 
-        previous = all_entries if len(all_entries) > 0 else None
-        entries = process_chunk(
-            client, model_name, chunk, i, total_chunks,
+        chunk_start = time.monotonic()
+        previous = None
+        if all_entries:
+            # Keep first-seen identity order and the exact three-entry tail.
+            previous = (all_entries if len(all_entries) <= 3 else
+                        list(context_speakers.values()) + all_entries[-3:])
+        chunk_attempts = []
+        entries, adaptively_split = process_chunk_adaptively(
+            client, model_name, chunk, i, total_chunks, gen_params,
             previous_entries=previous,
-            system_prompt=system_prompt,
-            user_prompt_template=user_prompt_template,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            presence_penalty=presence_penalty,
-            banned_tokens=banned_tokens
+            attempt_observer=chunk_attempts.append,
         )
+        chunk_elapsed = time.monotonic() - chunk_start
+        chunk_times.append(chunk_elapsed)
+
+        if not entries:
+            save_generation_quality_manifest(output_path, build_generation_quality_manifest(
+                "failed", fingerprint, accepted_chunks, source_normalizations,
+                total_chunks=total_chunks, failed_chunk=i,
+                failure="chunk_failed_after_retries", response_log=response_log,
+                model_name=model_name,
+                model_binding=get_run_model_binding(client, model_name, resumed_binding),
+                failed_chunk_attempts=chunk_attempts))
+            print(f"Error: chunk {i}/{total_chunks} failed validation after retries; "
+                  "preserving existing output and validated checkpoint")
+            sys.exit(1)
+
+        quality = validate_chunk_quality(chunk, entries)
+        # process_chunk_adaptively only ever returns entries that either pass the
+        # 0.90 gate or are an exhaustion-time trigram-only near-miss. Re-check the
+        # same condition here (Rule 15) before committing: a hard failure still
+        # aborts the book, a near-miss is accepted and flagged for telemetry.
+        near_miss_accepted = not quality["passed"] and is_trigram_only_near_miss(quality)
+        if not quality["passed"] and not near_miss_accepted:
+            save_generation_quality_manifest(output_path, build_generation_quality_manifest(
+                "failed", fingerprint, accepted_chunks, source_normalizations,
+                total_chunks=total_chunks, failed_chunk=i,
+                failure="post_return_validation_failed", failed_quality=quality,
+                model_name=model_name,
+                model_binding=get_run_model_binding(client, model_name, resumed_binding),
+                response_log=response_log))
+            print(f"Error: chunk {i}/{total_chunks} failed post-return validation; "
+                  "preserving existing output and validated checkpoint")
+            sys.exit(1)
+        if near_miss_accepted:
+            print(f"  Chunk {i}/{total_chunks} accepted as trigram-only near-miss "
+                  f"(ordered_trigram_recall={quality['metrics']['ordered_trigram_recall']})")
         all_entries.extend(entries)
-        print(f"  Got {len(entries)} entries")
+        apply_context_entries(entries)
+        accepted_chunks.append({
+            "chunk_number": i,
+            "source_sha256": fingerprint["chunk_sha256"][i - 1],
+            "entries": entries,
+            "quality": quality,
+            "adaptively_split": adaptively_split,
+            "near_miss_accepted": near_miss_accepted,
+            "attempts": chunk_attempts,
+            "model_binding": get_run_model_binding(client, model_name, resumed_binding),
+        })
+        save_generation_checkpoint(output_path, fingerprint, accepted_chunks, writer=checkpoint_writer)
+        print(f"  Got {len(entries)} entries (chunk took {chunk_elapsed:.0f}s)")
+
+        remaining = total_chunks - i
+        if remaining > 0:
+            avg = sum(chunk_times) / len(chunk_times)
+            eta_sec = avg * remaining
+            if eta_sec < 60:
+                eta_str = f"{eta_sec:.0f}s"
+            elif eta_sec < 3600:
+                eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s"
+            else:
+                eta_str = f"{int(eta_sec // 3600)}h {int((eta_sec % 3600) // 60)}m"
+            elapsed_total = time.monotonic() - start_time
+            print(f"  ETA: ~{eta_str} remaining ({remaining} chunk(s) left, avg {avg:.0f}s/chunk, {elapsed_total:.0f}s elapsed)")
 
     if not all_entries:
         print("Error: No script entries generated")
         sys.exit(1)
 
-    _write_script_output(all_entries)
+    final_repair = build_final_generation_repair(all_entries, book_content)
+    if not final_repair["unresolved"]:
+        all_entries = final_repair["entries"]
+    try:
+        dialogue = apply_dialogue_map(all_entries, book_content)
+        all_entries = dialogue["entries"]
+        if dialogue["convention"]:
+            print(f"Dialogue map: {dialogue['convention']}, "
+                  f"{dialogue['spoken']} spoken lines, "
+                  f"{dialogue['located']}/{len(all_entries)} entries located in the source")
+            if dialogue["speaker_changes"]:
+                print(f"Printed speaker labels: corrected "
+                      f"{len(dialogue['speaker_changes'])} entries from the source")
+        else:
+            print("Dialogue map: no convention detected; entries left unmarked")
+    except Exception as exc:                              # noqa: BLE001
+        print(f"WARNING: dialogue map failed, entries left unmarked: {str(exc)[:160]}")
+    whole_quality = validate_chunk_quality(book_content, all_entries)
+    preflight = audit_script(all_entries, book_content, is_generic_speaker)
+    identity_review = stabilize_speaker_identities(all_entries)["review"]
+    final_manifest = build_generation_quality_manifest(
+        "verified" if passes_final_generation_gate(
+            whole_quality, preflight, final_repair["unresolved"]) else "failed",
+        fingerprint, accepted_chunks, source_normalizations,
+        total_chunks=total_chunks, response_log=response_log,
+        model_name=model_name,
+        model_binding=get_run_model_binding(client, model_name, resumed_binding),
+        source_unicode=source_unicode,
+        request_preflight=request_preflight,
+        whole_book_quality=whole_quality,
+        preflight=preflight,
+        final_repairs={"changes": final_repair["changes"],
+                       "unresolved": final_repair["unresolved"]},
+        speaker_identity_review=identity_review,
+        speaker_consistency=build_speaker_consistency_report(
+            all_entries, identity_review),
+    )
+    save_generation_quality_manifest(output_path, final_manifest)
+    if final_manifest["status"] != "verified":
+        print("Error: final whole-book quality gate failed; preserving existing output and checkpoint")
+        sys.exit(1)
+
+    publish_completed_generation(output_path, all_entries, final_manifest,
+                                 input_file_path, input_sha256)
+    clear_generation_checkpoint(output_path)
+
+    # Only clear chunks when writing to the default annotated_script.json location
+    if args.output is None:
+        chunks_path = os.path.join(data_dir, "chunks.json")
+        if remove_chunk_snapshot(chunks_path):
+            print("Cleared old chunks.json")
+
+    # Summary (check both "speaker" and "type" fields)
+    speakers = set(entry.get("speaker") or entry.get("type") or "UNKNOWN" for entry in all_entries)
+    print(f"\nGenerated {len(all_entries)} script entries")
+    print(f"Speakers found: {', '.join(sorted(speakers))}")
+    print(f"Output saved to: {output_path}")
 
 
 if __name__ == '__main__':

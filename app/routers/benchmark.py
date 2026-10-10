@@ -1,0 +1,238 @@
+"""Benchmark preflight and state routes."""
+
+import asyncio
+import copy
+import json
+import os
+import tempfile
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+
+from benchmark_core import (get_benchmark_preflight_id,
+                            validate_benchmark_manifest)
+from benchmark_environment import (collect_local_environment,
+                                   collect_local_tts_environment,
+                                   collect_cpu_environment,
+                                   collect_thunder_environment,
+                                   collect_thunder_tts_environment,
+                                   is_baseline_stale,
+                                   load_environment_baseline,
+                                   save_environment_baseline,
+                                   verify_comparable_environments)
+from benchmark_runner import (run_script_generation_benchmark,
+                              run_dedup_benchmark,
+                              run_lora_training_benchmark,
+                              run_naming_benchmark,
+                              run_persona_generation_benchmark,
+                              run_nickname_detection_benchmark,
+                              run_export_benchmark,
+                              run_dataset_builder_benchmark,
+                              run_preparer_benchmark,
+                              run_profiling_benchmark,
+                              run_script_review_benchmark,
+                              run_tts_generation_benchmark)
+from config_settings import load_app_config
+from core import (CONFIG_PATH, REPORTS_DIR, ROOT_DIR, SCRIPTS_DIR, UPLOADS_DIR,
+                  _init_batch_state, _run_claimed_background_task, check_global_gpu_lock,
+                  claim_gpu_task, reserve_background_task, register_claimed_background_task,
+                  release_gpu_task_claim, process_state)
+
+
+router = APIRouter()
+
+
+class BenchmarkPreflightRequest(BaseModel):
+    manifest: dict
+
+
+class BenchmarkStartRequest(BenchmarkPreflightRequest):
+    preflight_id: str
+
+
+def _get_model_name(config, target):
+    profile = config.get("llm_remote" if target == "thunder" else "llm_local") or {}
+    model_name = profile.get("model_name") or (config.get("llm") or {}).get("model_name")
+    if not model_name:
+        raise ValueError(f"{target} model is not configured")
+    return model_name
+
+
+ENVIRONMENT_BASELINE_PATH = os.path.join(REPORTS_DIR, "benchmarks", "environment_baselines.json")
+_OTHER_TARGET = {"local": "thunder", "thunder": "local"}
+
+
+def _build_benchmark_preflight(request, config=None):
+    manifest = validate_benchmark_manifest(request.manifest)
+    check_global_gpu_lock("benchmark")
+    if config is None:
+        config = load_app_config(CONFIG_PATH)
+    environments = {}
+    stale_baseline = False
+    is_tts_family = manifest["stage"] in {
+        "tts_generation", "dataset_builder", "voicelab_training",
+        "voicelab_preparer", "voicelab_dedup", "voicelab_profiling"}
+    for target in manifest["targets"]:
+        if manifest["stage"] in {"voicelab_naming", "audacity_export", "m4b_export"}:
+            settings = manifest.get("settings") or {}
+            environments[target] = collect_cpu_environment(
+                ROOT_DIR, target, (config.get("llm_remote_ssh") or "").strip()
+                if target == "thunder" else None,
+                remote_root=settings.get("remote_root"),
+                remote_python=settings.get("remote_python") or "python3")
+            continue
+        if is_tts_family:
+            settings = manifest.get("settings") or {}
+            if target == "local":
+                environments[target] = collect_local_tts_environment(
+                    ROOT_DIR, settings.get("local_python")
+                    if manifest["stage"] in {"voicelab_preparer", "voicelab_dedup", "voicelab_profiling"} else None)
+            else:
+                environments[target] = collect_thunder_tts_environment(
+                    ROOT_DIR, (config.get("llm_remote_ssh") or "").strip(),
+                    settings.get("remote_root"), settings.get("remote_python"))
+            continue
+        model_name = _get_model_name(config, target)
+        if target == "local":
+            environments[target] = collect_local_environment(ROOT_DIR, model_name)
+        else:
+            ssh_alias = (config.get("llm_remote_ssh") or "").strip()
+            settings = manifest.get("settings") or {}
+            environments[target] = collect_thunder_environment(
+                ROOT_DIR, ssh_alias, model_name, remote_root=settings.get("remote_root"),
+                remote_python=settings.get("remote_python") or "python3")
+    if is_tts_family:
+        # Real callers only ever request one target per preflight, so a
+        # same-call sibling is almost never present - persist each collected
+        # fingerprint and compare against the OTHER target's last known one
+        # instead, or this check would never actually fire in practice.
+        for target, environment in environments.items():
+            save_environment_baseline(target, environment, ENVIRONMENT_BASELINE_PATH)
+            other_baseline = load_environment_baseline(
+                _OTHER_TARGET[target], ENVIRONMENT_BASELINE_PATH)
+            if other_baseline is not None:
+                verify_comparable_environments(environment, other_baseline["environment"])
+                if is_baseline_stale(other_baseline):
+                    stale_baseline = True
+    elif "local" in environments and "thunder" in environments:
+        verify_comparable_environments(environments["local"], environments["thunder"])
+    result = {"manifest": manifest, "environments": environments,
+              "preflight_id": get_benchmark_preflight_id(manifest, environments),
+              "benchmark_state": "ready"}
+    if stale_baseline:
+        result["stale_baseline"] = True
+    return result
+
+
+@router.post("/api/benchmark/preflight")
+async def benchmark_preflight(request: BenchmarkPreflightRequest):
+    try:
+        return await asyncio.to_thread(_build_benchmark_preflight, request)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _build_benchmark_start_preflight(request):
+    config = copy.deepcopy(load_app_config(CONFIG_PATH))
+    return _build_benchmark_preflight(request, config=config), config
+
+
+@router.post("/api/benchmark/start")
+async def benchmark_start(background_tasks: BackgroundTasks,
+                          request: BenchmarkStartRequest):
+    try:
+        preflight, captured_config = await asyncio.to_thread(_build_benchmark_start_preflight, request)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.preflight_id != preflight["preflight_id"]:
+        raise HTTPException(status_code=409,
+                            detail="Benchmark inputs or environment changed; review a fresh preflight.")
+    manifest = preflight["manifest"]
+    if manifest["stage"] not in {"script_generation", "script_review", "persona_generation", "nickname_detection", "tts_generation", "dataset_builder", "voicelab_training", "voicelab_preparer", "voicelab_dedup", "voicelab_profiling", "voicelab_naming", "audacity_export", "m4b_export"} or len(manifest["targets"]) != 1:
+        raise HTTPException(status_code=400,
+                            detail="Benchmark runs require a supported stage and exactly one target.")
+    report_dir = os.path.join(REPORTS_DIR, "benchmarks")
+    os.makedirs(report_dir, exist_ok=True)
+    report_path = os.path.join(report_dir, f"{preflight['preflight_id']}.json")
+    state = process_state["benchmark"]
+    claim_id = reserve_background_task("benchmark")
+    try:
+        _init_batch_state(state, ["Benchmark queued."],
+                          [{"fixture_id": fixture["id"], "status": "pending"}
+                           for fixture in manifest["fixtures"]])
+        state.update({"status": "running", "report_path": report_path})
+
+        def _run_snapshot(config_path):
+            environment = preflight["environments"][manifest["targets"][0]]
+            if manifest["stage"] == "script_generation":
+                run_script_generation_benchmark(
+                    manifest, environment, report_path, state, config_path, UPLOADS_DIR)
+            elif manifest["stage"] == "script_review":
+                run_script_review_benchmark(
+                    manifest, environment, report_path, state, config_path, SCRIPTS_DIR)
+            elif manifest["stage"] == "persona_generation":
+                run_persona_generation_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "nickname_detection":
+                run_nickname_detection_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "tts_generation":
+                run_tts_generation_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "dataset_builder":
+                run_dataset_builder_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "voicelab_training":
+                run_lora_training_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "voicelab_preparer":
+                run_preparer_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "voicelab_dedup":
+                run_dedup_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "voicelab_profiling":
+                run_profiling_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            elif manifest["stage"] == "voicelab_naming":
+                run_naming_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+            else:
+                run_export_benchmark(
+                    manifest, environment, report_path, state, config_path, ROOT_DIR)
+
+        def _run():
+            with tempfile.TemporaryDirectory(prefix="alexandria_benchmark_config_") as directory:
+                config_path = os.path.join(directory, "config.json")
+                fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as config_file:
+                    json.dump(captured_config, config_file)
+                _run_snapshot(config_path)
+
+        register_claimed_background_task(background_tasks, "benchmark", claim_id, _run_claimed_background_task, "benchmark", _run)
+        return {"status": "started", "report_path": report_path,
+                "preflight_id": preflight["preflight_id"]}
+    except BaseException:
+        release_gpu_task_claim("benchmark", claim_id, pending_only=True)
+        state["status"] = "failed"
+        raise
+
+
+@router.post("/api/benchmark/cancel")
+async def benchmark_cancel():
+    state = process_state["benchmark"]
+    if not state["running"]:
+        raise HTTPException(status_code=400, detail="No benchmark is currently running.")
+    state["cancel"] = True
+    state["logs"].append("Cancellation requested; waiting for the current model call.")
+    return {"status": "cancel queued"}
+
+
+@router.get("/api/benchmark/status")
+async def benchmark_status():
+    state = process_state["benchmark"]
+    return {key: value for key, value in state.items()
+            if key not in {"process", "processes"}}

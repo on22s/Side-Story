@@ -1,0 +1,51 @@
+"""Pure path resolution shared by Voice Lab's router and profiler script."""
+
+import hashlib
+import os
+import posixpath
+import re
+import sys
+
+VOICE_LAB_SCRIPTS = frozenset({
+    "audit_voice_datasets.py", "voice_analysis.py", "batch_train_lora.py",
+    "evaluate_lora.py", "voice_profiler.py", "name_voices.py",
+})
+
+
+def get_voicelab_python(config, default_python=None) -> str:
+    """Resolve saved interpreter strings, including explicit empty values."""
+    if isinstance(config, dict) and isinstance(config.get("rocm_python"), str):
+        return config["rocm_python"]
+    if default_python is not None:
+        return default_python
+    return os.environ.get("ALEXANDRIA_ROCM_PYTHON", sys.executable)
+
+
+def get_voice_lab_script_path(root_dir: str, filename: str, *, remote=False) -> str:
+    """Return a shipped stage path using local or remote Linux path semantics."""
+    if filename not in VOICE_LAB_SCRIPTS:
+        raise ValueError(f"Unknown Voice Lab script: {filename}")
+    if remote:
+        return posixpath.join(root_dir, "tools", "voice_lab", filename)
+    return os.path.join(os.path.abspath(root_dir), "tools", "voice_lab", filename)
+
+
+def get_profiler_paths(root_dir: str, data_dir: str | None = None) -> dict[str, str]:
+    """Return checkout-local defaults for the Voice Lab profiling stage."""
+    root = os.path.abspath(root_dir)
+    data = os.path.abspath(data_dir or root)
+    models_dir = os.path.join(data, "lora_models")
+    return {
+        "manifest": os.path.join(models_dir, "manifest.json"),
+        "model": os.path.join(root, "Qwen2.5-14B-Instruct-Q6_K.gguf"),
+        "output_csv": os.path.join(models_dir, "voice_profiles.csv"),
+    }
+
+
+def get_deduped_zip_name(narrator: str, zip_name: str) -> str:
+    """Return a readable, collision-resistant flat filename for one narrator ZIP."""
+    stem, extension = os.path.splitext(zip_name)
+    safe_narrator = re.sub(r"[^A-Za-z0-9._-]+", "_", narrator).strip("._") or "narrator"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "dataset"
+    identity = hashlib.sha256(f"{narrator}\0{zip_name}".encode("utf-8")).hexdigest()[:10]
+    return f"{safe_narrator}__{safe_stem}__{identity}{extension.lower()}"

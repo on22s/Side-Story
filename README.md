@@ -8,6 +8,8 @@ English | [中文](README_CN.md)
 
 Transform any book or novel into a fully-voiced audiobook using AI-powered script annotation and text-to-speech. Features a built-in Qwen3-TTS engine with batch processing and a browser-based editor for fine-tuning every line before final export.
 
+This lean fork brings the application improvements from [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) into `alexandria-audiobook-nya`. The everyday install stays focused on audiobook production; native Voice Lab and Preparer dependencies are an optional second install. Research datasets, experiment campaigns, and machine-specific model launchers are not required.
+
 ## Example: [sample.mp3](https://github.com/user-attachments/files/25276110/sample.mp3)
 
 
@@ -19,9 +21,12 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ### AI-Powered Pipeline
 - **Local & Cloud LLM Support** - Use any OpenAI-compatible API (LM Studio, Ollama, OpenAI, etc.)
-- **Automatic Script Annotation** - LLM parses text into JSON with speakers, dialogue, and TTS instruct directions
+- **Three-Pass Script Annotation** - Separate segmentation, speaker attribution, and delivery instructions, with editable prompt presets and surrounding-text context
+- **Resumable Generation** - Pause, save snapshots, resume failed runs, and process batches of books
+- **Provider Profiles** - Separate local/remote settings, request timeouts and retries, custom provider options, and optional failover
 - **LLM Script Review** - Optional second LLM pass that fixes common annotation errors: strips attribution tags from dialogue, splits misattributed narration/dialogue, merges over-split narrator entries, and validates instruct fields
 - **Persona Generation** - LLM analyzes the script to create voice descriptions for each character, then generates reference audio via VoiceDesign and assigns clone voices automatically — one click to go from script to fully-voiced cast
+- **Reusable Voices & Series Casts** - Save voices to a library, apply a cast across books, and change character style over a timeline
 - **Speaker Aliases** - Map multiple speaker names to the same voice (e.g. "YOUNG ELENA" → "ELENA") so variants share a single voice configuration
 - **Smart Chunking** - Groups consecutive lines by speaker (up to 500 chars) for natural flow
 - **Context Preservation** - Passes character roster and last 3 script entries between chunks for name and style continuity
@@ -42,7 +47,9 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Natural Pauses** - Configurable silence between speakers (default 500ms) and same-speaker segments (default 250ms)
 
 ### Web UI Editor
-- **Streamlined Interface** - 5-step core pipeline (Setup, Script, Voices, Editor, Result) plus advanced tools (Designer, Dataset, Training)
+- **Streamlined Interface** - 5-step core pipeline (Setup, Script, Voices, Editor, Result) plus advanced tools
+- **System Health & Run Reports** - GPU/disk status, task diagnostics, and run history
+- **Quality Checks** - Text-integrity checks and voice-drift checks before export
 - **Chunk Editor** - Edit speaker, text, and instruct for any line
 - **Selective Regeneration** - Re-render individual chunks without regenerating everything
 - **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
@@ -54,7 +61,8 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Combined Audiobook** - Single MP3 with all voices and natural pauses
 - **Individual Voicelines** - Separate MP3 per line for DAW editing (Audacity, etc.)
 - **Audacity Export** - One-click zip with per-speaker WAV tracks, LOF project file, and labels for automatic multi-track import into Audacity
-- **M4B Audiobook** - Chaptered M4B (AAC) with per-chunk or auto-detected chapter markers for audiobook players (Audiobookshelf, Apple Books, VLC, etc.)
+- **M4B Audiobook** - Chaptered M4B (AAC) with title/author/narrator metadata, cover art, and chapter markers
+- **Chapter Export** - Export individual chapters with filename templates and readiness checks
 
 ## Requirements
 
@@ -76,7 +84,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 |-----|-----|--------|-------------------|-------|
 | **NVIDIA** | Windows | Full support | Driver 550+ (CUDA 12.8) | Flash attention included for faster encoding |
 | **NVIDIA** | Linux | Full support | Driver 550+ (CUDA 12.8) | Flash attention + triton included |
-| **AMD** | Linux | Full support | ROCm 6.3+ | ROCm optimizations applied automatically |
+| **AMD** | Linux | Supported | ROCm 7.0-compatible system | Installer pins torch 2.10 + ROCm 7.0; upstream tested RX 9070 XT. Check compatibility for older cards |
 | **AMD** | Windows | CPU only | N/A | GPU acceleration is not supported — the app runs in CPU mode. For GPU acceleration with AMD, use Linux |
 | **Apple Silicon** | macOS | CPU only | N/A | MPS acceleration is not currently supported. Functional but slow |
 | **Intel** | macOS | CPU only | N/A | |
@@ -90,16 +98,28 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 ### Option A: Pinokio (Recommended)
 
 1. Install [Pinokio](https://pinokio.computer/) if you haven't already
-2. Open Alexandria on Pinokio: **[Install via Pinokio](https://beta.pinokio.co/apps/github-com-finrandojin-alexandria-audiobook)**
-   - Or manually: in Pinokio, click **Download** and paste `https://github.com/Finrandojin/alexandria-audiobook`
-3. Click **Install** to set up dependencies
+2. In Pinokio, click **Download** and paste `https://github.com/on22s/alexandria-audiobook-nya`
+3. Click **Install** to create `app/env`, install platform-correct PyTorch first, and constrain subsequent runtime dependencies to that build
 4. Click **Start** to launch the web interface
+
+Fresh environments use CPython 3.10 for the NVIDIA attention wheels. Existing environments are preserved; optional attention wheels report a compatibility error if the environment uses another Python version.
+
+#### Optional Voice Lab / Preparer dependencies
+
+For audiobook-to-dataset preparation or native Voice Lab profiling, stop the app and choose **Install Voice Tools (Optional)** in Pinokio. This separate installer:
+
+- builds `llama-cpp-python` for CUDA, HIP, Metal, or CPU as appropriate;
+- creates an isolated `preparer_env` on every platform, with its own PyTorch constraints;
+- fetches the pinned whisper.cpp source and model, verifies them, and builds the selected backend;
+- installs speaker diarization only on Linux AMD, whose current PyTorch pin meets pyannote 4’s `torch>=2.8` requirement. Other platform pins do not, so do not add pyannote to `app/env`.
+
+Native builds need CMake and a working C/C++ toolchain, plus the matching CUDA/ROCm SDK for GPU builds. This adds download time and disk use. Configure the relevant model and interpreter paths in the tools before use. Diarization additionally needs a Hugging Face token and acceptance of the [Community-1 model terms](https://huggingface.co/pyannote/speaker-diarization-community-1). The core audiobook pipeline does not need this optional install.
 
 ### Option B: Google Colab (No Install Required)
 
 No GPU or wrong OS? Run Alexandria on a free T4 GPU in your browser:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Finrandojin/alexandria-audiobook/blob/main/alexandria_colab.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
 
 Requires a free [ngrok account](https://dashboard.ngrok.com/signup) for the web UI tunnel. See the notebook for full instructions.
 
@@ -108,12 +128,27 @@ Requires a free [ngrok account](https://dashboard.ngrok.com/signup) for the web 
 For integration into automated pipelines or server deployments:
 
 ```bash
-git clone https://github.com/Finrandojin/alexandria-audiobook.git
-cd alexandria-audiobook
+git clone https://github.com/on22s/alexandria-audiobook-nya.git
+cd alexandria-audiobook-nya
 docker compose up --build
 ```
 
-Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. User data (uploads, voice configs, trained LoRA adapters, audio output) persists via bind mounts to the project directory.
+Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. User data persists via bind mounts to the project directory. The default image installs the audiobook runtime; it does not build the optional native Voice Tools or create `preparer_env`.
+
+#### Docker data and upgrades
+
+- Back up `data/` before upgrading. Keep the same project directory and existing Docker model-cache volume.
+- New mutable state uses `ALEXANDRIA_DATA_DIR=/alexandria/runtime`, mounted from `./data/runtime`.
+- Existing host folders (`data/uploads`, `data/scripts`, `data/designed_voices`, `data/clone_voices`, `data/lora_models`, `data/lora_datasets`, `data/dataset_builder`, and `data/output`) remain mounted at the corresponding runtime subdirectories. No host-data move is needed.
+- Legacy container paths such as `/alexandria/scripts`, `/alexandria/voicelines`, and `/alexandria/app/uploads` are symlinks to those locations.
+- WebUI settings keep this fork’s `ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json`, backed by `./data/config`. Keep that mount when customizing Compose.
+- If using `docker run` instead, persist both the runtime directory and the config directory yourself.
+
+#### Network security
+
+Compose publishes only `127.0.0.1:4200`; the container binds `0.0.0.0` for Docker forwarding. Authentication is off by default. Before exposing the host port, using a tunnel, or adding a reverse proxy, set `ALEXANDRIA_AUTH_PASSWORD` in the container environment (and optionally `ALEXANDRIA_AUTH_USERNAME`, default `alexandria`). Use HTTPS for access beyond a trusted local network.
+
+For a domain, set `ALEXANDRIA_ALLOWED_HOSTS` to the hostname. If a separate web origin needs API access, set `ALEXANDRIA_ALLOWED_ORIGINS` to that exact origin. Host/origin checks do not replace authentication. Never bake credentials into the image or commit them to Compose.
 
 ## First Launch — What to Expect
 
@@ -177,7 +212,7 @@ For common issues and solutions, see [Troubleshooting](https://github.com/Finran
 
 ## Quick Start
 
-The interface is split into a **5-step core pipeline** (green tabs, numbered) and **advanced tools** (blue tabs, unnumbered). You only need the core pipeline to produce an audiobook.
+The interface is split into a **5-step core pipeline** (numbered tabs) and **advanced tools**. You only need the core pipeline to produce an audiobook.
 
 ### Core Pipeline
 
@@ -187,12 +222,14 @@ Configure your LLM connection and TTS engine. At minimum you need:
 - **LLM API Key**: Your API key (use `local` for local servers)
 - **LLM Model Name**: The model to use (e.g., `qwen2.5-14b`)
 - **TTS Mode**: `local` (built-in, recommended) — loads models directly, no external server needed
+- Choose the local or remote provider profile, and set **Runs on this machine's GPU?** accurately so script and audio tasks share the GPU safely
 - Click **Save Configuration** when done
 
 **Step 2 — Script**
 - Select your book file (.txt, .md, or .epub) using the file picker — it uploads automatically
 - Click **Generate Annotated Script** — this sends the book to your LLM to split it into annotated chunks with speaker labels and voice directions
 - *(Optional)* Click **Review Script** if the generated script has issues — this runs a second LLM pass to fix speaker misattributions or formatting problems
+- Use **Pause**, **Save snapshot**, or **Resume failed run** for longer jobs; batch mode handles several books
 - You can save the script for later use with the Save feature below
 
 **Step 3 — Voices**
@@ -207,6 +244,7 @@ Each character detected in the script gets a voice card. For each speaker:
 - Click **Render Pending** to generate audio for all chunks in batch
 - Listen to individual chunks or click **Play Sequence** to preview in order
 - Edit any chunk's text, speaker, or instruct inline and regenerate it individually
+- Check **Text integrity** and **Check Voices** when reviewing the result
 - When satisfied, click **Merge All** to combine everything into the final audiobook
 
 **Step 5 — Result**
@@ -220,6 +258,9 @@ These tabs are for power users who want more control over voice creation:
 - **Designer** — Create new voices from text descriptions (e.g., "A warm elderly woman with a gentle raspy voice"). Save them to use as clone references in the Voices tab
 - **Dataset** — Build LoRA training datasets interactively, one sample at a time with audio preview
 - **Training** — Train LoRA adapters on voice datasets to create persistent voice identities that follow instruct directions
+- **Preparer** — Align audiobook audio with source text to build training pairs; install the optional Voice Tools first
+- **Voice Lab** — Inspect voice datasets, train adapters, and profile/name voices; native stages need the optional dependencies and configured model paths
+- **Reports** — Inspect run history, artifacts, and diagnostics
 
 ## Web Interface
 
@@ -399,7 +440,7 @@ A 273-chunk audiobook (~54 minutes of audio) generates in approximately 16 minut
 
 ### ROCm (AMD GPU) Notes
 
-> **Linux only.** AMD GPU acceleration requires ROCm 6.3+ on Linux. AMD GPUs on Windows run in CPU mode — see [GPU Compatibility](#gpu-compatibility).
+> **Linux only.** The installer currently pins PyTorch 2.10 with ROCm 7.0. Check that your GPU and driver support this stack before installing. AMD GPUs on Windows run in CPU mode — see [GPU Compatibility](#gpu-compatibility).
 
 Alexandria automatically applies ROCm-specific optimizations when running on AMD GPUs:
 - **MIOpen fast-find mode** - Prevents workspace allocation failures that cause slow GEMM fallback
@@ -446,6 +487,8 @@ Vocalizations are written as real pronounceable text that the TTS speaks directl
 
 ## Output Files
 
+`ALEXANDRIA_DATA_DIR` can move mutable application state to a separate directory. Docker sets it to `/alexandria/runtime`; the bind mounts above preserve existing host data. `ALEXANDRIA_CONFIG_PATH` independently controls the settings file.
+
 **Final Audiobook:**
 - `cloned_audiobook.mp3` - Combined audiobook with natural pauses
 
@@ -483,7 +526,7 @@ Each WAV track is padded to the same total duration with silence where other spe
 
 ## API Reference
 
-Alexandria exposes a REST API for programmatic access:
+Alexandria exposes a REST API for programmatic access. The examples below assume a local instance without authentication; when the password gate is enabled, pass HTTP Basic credentials (for example, `curl -u alexandria:your-password ...`). API keys are redacted from configuration responses:
 
 ### Configuration
 ```bash
@@ -631,11 +674,6 @@ curl -X DELETE http://127.0.0.1:4200/api/voice_design/delete/voice_id_here
 # Upload a training dataset (ZIP with WAV + metadata.jsonl)
 curl -X POST http://127.0.0.1:4200/api/lora/upload_dataset \
   -F "file=@dataset.zip" -F "name=my_voice"
-
-# Generate a dataset from Voice Designer description
-curl -X POST http://127.0.0.1:4200/api/lora/generate_dataset \
-  -H "Content-Type: application/json" \
-  -d '{"name": "warm_voice", "description": "A warm male voice", "texts": ["Hello.", "Goodbye."]}'
 
 # List uploaded datasets
 curl http://127.0.0.1:4200/api/lora/datasets
@@ -907,7 +945,9 @@ LLM prompts are stored in plain-text files at the project root, split into syste
 ```
 Alexandria/
 ├── app/
-│   ├── app.py                 # FastAPI server
+│   ├── app.py                 # FastAPI server and startup
+│   ├── routers/               # API route modules
+│   ├── core.py                # Shared config, task, and runtime helpers
 │   ├── tts.py                 # TTS engine (local + external backends)
 │   ├── train_lora.py          # LoRA training subprocess script
 │   ├── generate_script.py     # LLM script annotation
@@ -928,7 +968,10 @@ Alexandria/
 ├── lora_models/               # Trained LoRA adapters (gitignored)
 ├── default_prompts.txt        # LLM prompts for script generation
 ├── review_prompts.txt         # LLM prompts for script review
-├── install.js                 # Pinokio installer
+├── install.js                 # Lean Pinokio runtime installer
+├── install-voice-tools.js      # Optional native Voice Lab / Preparer installer
+├── tools/voice_lab/            # Voice processing helpers
+├── data/                      # Docker bind mounts (gitignored)
 ├── start.js                   # Pinokio launcher
 ├── reset.js                   # Reset script
 ├── pinokio.js                 # Pinokio UI config
@@ -946,5 +989,7 @@ Alexandria/
 MIT
 
 ### Third-Party Licenses
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled runtime assets and their notices.
 
 - [qwen_tts](https://github.com/Qwen/Qwen3-TTS) — Apache License 2.0, Copyright Alibaba Qwen Team

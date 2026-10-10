@@ -1,0 +1,608 @@
+import json
+import logging
+import os
+import signal
+import uuid
+from typing import List, Optional
+
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, SecretStr, model_validator
+
+from core import (
+    BASE_DIR,
+    CONFIG_PATH,
+    PREPARER_OUTPUT_DIR,
+    PREPARER_SCRIPT_PATH,
+    ROOT_DIR,
+    UPLOADS_DIR,
+    _load_voicelab_config,
+    _revalidate_voicelab_paths,
+    _run_claimed_background_task,
+    _save_upload_limited,
+    _send_signal_tree,
+    _stream_subprocess_to_logs,
+    _validate_voicelab_path,
+    check_disk_space,
+    check_global_gpu_lock,
+    claim_gpu_task, reserve_background_task, register_claimed_background_task,
+    release_gpu_task_claim,
+    process_state,
+)
+from utils import secure_filename
+from preparer_numeric_settings import (validate_preparer_numeric_booleans,
+                                       validate_preparer_numeric_settings)
+from preparer_enrichment_settings import validate_preparer_enrichment_settings
+
+
+router = APIRouter()
+logger = logging.getLogger("AlexandriaUI")
+
+
+def publish_preparer_uploads(staged, schedule):
+    """Publish claimed uploads together; restore prior files if scheduling fails."""
+    backups = {}
+    published = []
+    try:
+        for final_path, tmp_path in staged.items():
+            if os.path.exists(final_path):
+                backup = f"{final_path}.previous.{uuid.uuid4().hex}"
+                os.replace(final_path, backup)
+                backups[final_path] = backup
+            try:
+                os.replace(tmp_path, final_path)
+            except BaseException:
+                if final_path in backups:
+                    os.replace(backups.pop(final_path), final_path)
+                raise
+            published.append(final_path)
+        schedule()
+    except BaseException:
+        for final_path in reversed(published):
+            os.remove(final_path)
+            if final_path in backups:
+                os.replace(backups.pop(final_path), final_path)
+        raise
+    finally:
+        for tmp_path in staged.values():
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception("Could not remove staged preparer upload %s", tmp_path)
+    for backup in backups.values():
+        try:
+            os.remove(backup)
+        except OSError:
+            logger.exception("Could not remove prior preparer upload %s", backup)
+
+PREPARER_ENV_PYTHON = os.path.join(
+    ROOT_DIR,
+    "preparer_env",
+    "Scripts" if os.name == "nt" else "bin",
+    "python.exe" if os.name == "nt" else "python",
+)
+
+
+class PreparerQualityConfig(BaseModel):
+    min_confidence: float = 0.85
+    min_snr: int = 25
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_numeric_booleans(cls, values):
+        if isinstance(values, dict):
+            validate_preparer_numeric_booleans(values)
+        return values
+
+    @model_validator(mode="after")
+    def validate_numeric_settings(self):
+        validate_preparer_numeric_settings(self.model_dump())
+        return self
+
+
+class PreparerConfig(PreparerQualityConfig):
+    audio_filename: str
+    source_filename: Optional[str] = None
+    output_filename: str = "alexandria_dataset.zip"
+    model: Optional[str] = None
+    fallback_model: Optional[str] = None
+    source_threshold: float = 0.65
+    keep_unaligned: bool = False
+    chunk_size: float = 10.0
+    lang: str = "en"
+    resume: bool = False
+    skip_annotation: bool = False
+    source_start: Optional[int] = None
+    source_start_text: Optional[str] = None
+    no_auto_anchor: bool = False
+    # Optimization: LLM annotation batch size (3 = ~25% faster)
+    batch_size: int = 1
+    # LLM enrichment
+    enrich_with_llm: bool = False
+    allow_cpu_fallback: bool = False
+    llm_model_path: Optional[str] = None
+    enrich_speaker_attribution: bool = False
+    enrich_narration_style: bool = False
+    enrich_emotional_tone: bool = False
+    diarize: bool = False
+    auto_detect_speakers: bool = False
+    hf_token: Optional[SecretStr] = None
+    # Quality filtering
+    min_chunk_duration: float = 2.0
+
+class BatchPreparerTask(BaseModel):
+    audio_filename: str
+    output_filename: str
+
+class BatchPreparerRequest(PreparerQualityConfig):
+    tasks: List[BatchPreparerTask] = Field(min_length=1)
+    lang: str = "en"
+    diarize: bool = False
+    auto_detect_speakers: bool = False
+    hf_token: Optional[SecretStr] = None
+
+
+# ── Preparer ─────────────────────────────────────────────────────────────────
+
+def _resolve_preparer_interpreter() -> str:
+    """Return the interpreter to run the preparer with, or raise 503.
+
+    Prefer the preparer's isolated environment. The Voice Lab interpreter is
+    retained as a compatibility fallback for installations that predate it.
+    """
+    override = os.environ.get("ALEXANDRIA_PREPARER_PYTHON", "")
+    interpreter = override or (
+        PREPARER_ENV_PYTHON
+        if os.path.isfile(PREPARER_ENV_PYTHON)
+        else _load_voicelab_config()["rocm_python"]
+    )
+    if not os.path.exists(PREPARER_SCRIPT_PATH):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Preparer script not found at {PREPARER_SCRIPT_PATH}.",
+        )
+    if not os.path.isfile(interpreter):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Preparer needs an interpreter with torch and llama-cpp; not "
+                f"found: {interpreter or PREPARER_ENV_PYTHON}. Re-run Install "
+                f"to create preparer_env."
+            ),
+        )
+    _validate_voicelab_path(interpreter, "preparer_python")
+    return interpreter
+
+
+def get_preparer_diarization_args(diarize: bool,
+                                  auto_detect_speakers: bool) -> List[str]:
+    if diarize:
+        return ["--diarize"]
+    if auto_detect_speakers:
+        return ["--auto-detect-speakers"]
+    return []
+
+
+def get_preparer_subprocess_env(hf_token: Optional[SecretStr]) -> dict:
+    env = os.environ.copy()
+    if hf_token:
+        env["HF_TOKEN"] = hf_token.get_secret_value()
+    return env
+
+
+def ensure_preparer_diarization_token(diarize: bool,
+                                      auto_detect_speakers: bool,
+                                      hf_token: Optional[SecretStr]) -> None:
+    if ((diarize or auto_detect_speakers)
+            and not hf_token and not os.environ.get("HF_TOKEN")):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Speaker diarization requires a Hugging Face token with "
+                "Community-1 access."
+            ),
+        )
+
+
+@router.post("/api/preparer/start")
+async def preparer_start(
+    background_tasks: BackgroundTasks,
+    config_json: str = Form(...),
+    audio_file: UploadFile = File(...),
+    source_file: Optional[UploadFile] = File(None),
+):
+    """Upload audio (and optionally a source EPUB/TXT) and run the preparer
+    to generate a voice training dataset."""
+    try:
+        config = PreparerConfig(**json.loads(config_json))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid config: {e}")
+    if config.skip_annotation:
+        raise HTTPException(status_code=400, detail="Skip annotation is not implemented.")
+    if config.enrich_with_llm:
+        if not config.llm_model_path:
+            raise HTTPException(status_code=400, detail="LLM model path is required for enrichment.")
+        try:
+            validate_preparer_enrichment_settings(config.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    ensure_preparer_diarization_token(
+        config.diarize, config.auto_detect_speakers, config.hf_token)
+
+    interpreter = _resolve_preparer_interpreter()
+    check_global_gpu_lock("preparer")
+
+    has_space, free_gb = check_disk_space(ROOT_DIR, 2.0)
+    if not has_space:
+        raise HTTPException(status_code=400, detail=f"Insufficient disk space ({free_gb} GB free, 2 GB required).")
+
+    audio_filename = secure_filename(config.audio_filename)
+    if not audio_filename:
+        raise HTTPException(status_code=400, detail="Invalid audio filename")
+    output_filename = secure_filename(config.output_filename)
+    if not output_filename:
+        raise HTTPException(status_code=400, detail="Invalid output filename")
+    # Claim, stage, then publish. Two overlapping starts with the same filename
+    # used to overwrite each other's upload before either held the task. The
+    # published name stays `<filename>`: the batch route looks uploads up by
+    # that name and a re-run of the same book replaces its previous copy
+    # instead of leaving another 20 GB file behind.
+    audio_path = os.path.join(UPLOADS_DIR, audio_filename)
+    source_path = None
+    if source_file is not None:
+        source_filename = secure_filename(config.source_filename or source_file.filename)
+        if not source_filename:
+            raise HTTPException(status_code=400, detail="Invalid source filename")
+        source_path = os.path.join(UPLOADS_DIR, source_filename)
+        if os.path.normcase(source_path) == os.path.normcase(audio_path):
+            raise HTTPException(status_code=400, detail="Audio and source uploads must use different filenames.")
+    staged = {audio_path: f"{audio_path}.upload.{uuid.uuid4().hex}"}
+    claim_id = reserve_background_task("preparer")
+    try:
+        await _save_upload_limited(audio_file, staged[audio_path], 20 * 1024**3)
+        if source_file is not None:
+            staged[source_path] = f"{source_path}.upload.{uuid.uuid4().hex}"
+            await _save_upload_limited(source_file, staged[source_path], 512 * 1024**2)
+    except BaseException:
+        try:
+            for tmp_path in staged.values():
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+        finally:
+            release_gpu_task_claim("preparer", claim_id, pending_only=True)
+        raise
+
+    def _run():
+        state = process_state["preparer"]
+        state["running"] = True
+        state["logs"] = []
+        state["status"] = "running"
+        state["output_file"] = None
+        state["artifacts"] = []
+        state["process"] = None
+
+        # Re-validate immediately before exec, not just synchronously above -
+        # background_tasks.add_task defers this whole closure until after the
+        # HTTP response is sent, leaving a window where preparer_python (or a
+        # model/fallback_model/llm_model_path pointed inside an
+        # upload/generated-content directory) could be repointed before the
+        # subprocess below actually starts.
+        e = _revalidate_voicelab_paths(
+            (interpreter, "preparer_python"),
+            (config.model, "model"),
+            (config.fallback_model, "fallback_model"),
+            (config.llm_model_path, "llm_model_path"),
+        )
+        if e:
+            state["status"] = "failed"
+            state["running"] = False
+            state["logs"].append(f"Aborted: {e.detail}")
+            return
+
+        cmd = [interpreter, "-u", PREPARER_SCRIPT_PATH,
+               "--audio", audio_path,
+               "--output", os.path.join(PREPARER_OUTPUT_DIR, output_filename),
+               "--lang", config.lang,
+               "--min-confidence", str(config.min_confidence),
+               "--min-snr", str(config.min_snr),
+               "--chunk-size", str(config.chunk_size),
+               "--min-chunk-duration", str(config.min_chunk_duration),
+               "--batch-size", str(config.batch_size)]
+        if config.resume:
+            cmd.append("--resume")
+        if config.model:
+            cmd.extend(["--model", config.model])
+        if config.fallback_model:
+            cmd.extend(["--fallback-model", config.fallback_model])
+        # Source-alignment options only make sense with a source file.
+        if source_path:
+            cmd.extend(["--source", source_path,
+                        "--source-threshold", str(config.source_threshold)])
+            if config.keep_unaligned:
+                cmd.append("--keep-unaligned")
+            if config.source_start is not None:
+                cmd.extend(["--source-start", str(config.source_start)])
+            if config.source_start_text:
+                cmd.extend(["--source-start-text", config.source_start_text])
+            if config.no_auto_anchor:
+                cmd.append("--no-auto-anchor")
+        if config.enrich_with_llm:
+            cmd.append("--enrich-with-llm")
+            if config.allow_cpu_fallback:
+                cmd.append("--allow-cpu-fallback")
+            if config.llm_model_path:
+                cmd.extend(["--llm-model-path", config.llm_model_path])
+            if config.enrich_speaker_attribution:
+                cmd.append("--enrich-speaker-attribution")
+            if config.enrich_narration_style:
+                cmd.append("--enrich-narration-style")
+            if config.enrich_emotional_tone:
+                cmd.append("--enrich-emotional-tone")
+        cmd.extend(get_preparer_diarization_args(
+            config.diarize, config.auto_detect_speakers))
+
+        rc, _ = _stream_subprocess_to_logs(
+            cmd, BASE_DIR, state,
+            env=get_preparer_subprocess_env(config.hf_token))
+
+        if state.get("cancel"):
+            state["status"] = "cancelled"
+            state["logs"].append("Preparer cancelled.")
+        elif rc == 0:
+            state["status"] = "done"
+            state["output_file"] = output_filename
+            state["artifacts"] = [{
+                "artifact_path": os.path.join(PREPARER_OUTPUT_DIR, output_filename),
+                "kind": "voice_dataset",
+                "source_paths": [path for path in (audio_path, source_path) if path],
+                "config_path": CONFIG_PATH,
+            }]
+            state["logs"].append("Preparer completed successfully.")
+        else:
+            state["status"] = "failed"
+            state["logs"].append(f"Preparer failed (exit code {rc}).")
+
+        state["running"] = False
+        state["process"] = None
+
+    try:
+        publish_preparer_uploads(
+            staged, lambda: register_claimed_background_task(
+                background_tasks, "preparer", claim_id, _run_claimed_background_task, "preparer", _run))
+    except BaseException:
+        release_gpu_task_claim("preparer", claim_id, pending_only=True)
+        raise
+    return {"status": "started"}
+
+
+def _apply_preparer_cancel(task_name, idle_detail):
+    state = process_state[task_name]
+    if not state["running"]:
+        raise HTTPException(status_code=400, detail=idle_detail)
+    state["cancel"] = True
+    proc = state.get("process")
+    if proc and proc.poll() is None:
+        try:
+            _send_signal_tree(proc, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    return {"status": "cancel_requested"}
+
+
+@router.post("/api/preparer/cancel")
+async def preparer_cancel():
+    return _apply_preparer_cancel("preparer", "No preparer is currently running.")
+
+
+@router.get("/api/preparer/list")
+async def preparer_list_outputs():
+    """List completed dataset ZIP files available for download."""
+    files = []
+    if not os.path.exists(PREPARER_OUTPUT_DIR):
+        return {"files": files}
+    for fname in sorted(os.listdir(PREPARER_OUTPUT_DIR)):
+        if not fname.lower().endswith(".zip"):
+            continue
+        fpath = os.path.join(PREPARER_OUTPUT_DIR, fname)
+        try:
+            entry = {
+                "filename": fname,
+                "size_mb": round(os.path.getsize(fpath) / (1024 * 1024), 1),
+                "modified": os.path.getmtime(fpath),
+            }
+        except OSError:
+            # File vanished between listdir and stat (concurrent delete) - skip it.
+            continue
+        files.append(entry)
+    return {"files": files}
+
+
+@router.get("/api/preparer/download/{filename:path}")
+async def preparer_download(filename: str):
+    """Download a generated dataset ZIP."""
+    root = os.path.realpath(PREPARER_OUTPUT_DIR)
+    file_path = os.path.realpath(os.path.join(PREPARER_OUTPUT_DIR, filename))
+    if not file_path.startswith(root + os.sep) and file_path != root:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    if not file_path.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only dataset ZIP files can be downloaded.")
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(file_path, media_type="application/zip", filename=os.path.basename(file_path))
+
+
+@router.post("/api/preparer/batch/start")
+async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: BackgroundTasks):
+    """Process previously uploaded audio files sequentially."""
+    return await _start_preparer_batch(request, background_tasks)
+
+
+@router.post("/api/preparer/batch/upload_start")
+async def preparer_batch_upload_start(
+    background_tasks: BackgroundTasks,
+    config_json: str = Form(...),
+    audio_files: List[UploadFile] = File(...),
+):
+    """Reserve the batch before staging and publishing selected files."""
+    try:
+        request = BatchPreparerRequest(**json.loads(config_json))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid config: {exc}") from exc
+    return await _start_preparer_batch(request, background_tasks, audio_files)
+
+
+async def _start_preparer_batch(request, background_tasks, audio_files=None):
+    """Use one admission, upload-publication and dispatch path for both clients."""
+    ensure_preparer_diarization_token(
+        request.diarize, request.auto_detect_speakers, request.hf_token)
+    interpreter = _resolve_preparer_interpreter()
+    check_global_gpu_lock("batch_preparer")
+
+    has_space, free_gb = check_disk_space(ROOT_DIR, 5.0)
+    if not has_space:
+        raise HTTPException(status_code=400, detail=f"Insufficient disk space ({free_gb} GB free, 5 GB recommended).")
+
+    staged = {}
+    if audio_files is not None:
+        if len(audio_files) != len(request.tasks):
+            raise HTTPException(status_code=400, detail="Each batch task requires one audio upload.")
+        names = set()
+        for task, upload in zip(request.tasks, audio_files):
+            filename = secure_filename(task.audio_filename)
+            if not filename or filename != secure_filename(upload.filename):
+                raise HTTPException(status_code=400, detail="Batch task and audio upload filenames must match.")
+            key = os.path.normcase(filename)
+            if key in names:
+                raise HTTPException(status_code=400, detail="Batch audio uploads must use distinct filenames.")
+            names.add(key)
+    claim_id = reserve_background_task("batch_preparer")
+    if audio_files is not None:
+        try:
+            for task, upload in zip(request.tasks, audio_files):
+                path = os.path.join(UPLOADS_DIR, secure_filename(task.audio_filename))
+                staged[path] = f"{path}.upload.{uuid.uuid4().hex}"
+                await _save_upload_limited(upload, staged[path], 20 * 1024**3)
+        except BaseException:
+            try:
+                for tmp_path in staged.values():
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+            finally:
+                release_gpu_task_claim("batch_preparer", claim_id, pending_only=True)
+            raise
+
+    def _run():
+        state = process_state["batch_preparer"]
+        state["running"] = True
+        state["logs"] = [f"Starting batch of {len(request.tasks)} tasks..."]
+        state["tasks"] = [{"audio": t.audio_filename, "status": "pending"} for t in request.tasks]
+        state["current_task_idx"] = -1
+
+        existing_outputs = set()
+        if os.path.exists(PREPARER_OUTPUT_DIR):
+            existing_outputs = {e.name for e in os.scandir(PREPARER_OUTPUT_DIR) if e.is_file()}
+
+        for i, task in enumerate(request.tasks):
+            if state["cancel"]:
+                state["logs"].append("Batch cancelled.")
+                break
+
+            # Re-validate before EVERY subprocess launch, not just once before
+            # the loop - this batch makes many sequential launches all reusing
+            # the same captured `interpreter`, and background_tasks.add_task's
+            # deferral means even an up-front check only proves the path was
+            # valid when the request was *received*, not at each later launch.
+            # A single pre-loop check (the original version of this fix) left
+            # tasks 2..N unprotected against a config change made after task 1
+            # had already started - exactly the race this exists to close.
+            e = _revalidate_voicelab_paths((interpreter, "preparer_python"))
+            if e:
+                state["logs"].append(f"Aborted: {e.detail}")
+                state["tasks"][i]["status"] = "failed"
+                break
+
+            state["current_task_idx"] = i
+            state["tasks"][i]["status"] = "running"
+
+            audio_filename = secure_filename(task.audio_filename)
+            audio_path = os.path.join(UPLOADS_DIR, audio_filename) if audio_filename else None
+            if not audio_path or not os.path.exists(audio_path):
+                state["logs"].append(f"[{i+1}/{len(request.tasks)}] Skipping — audio not found: {task.audio_filename}")
+                state["tasks"][i]["status"] = "failed"
+                continue
+
+            state["logs"].append(f"--- [{i+1}/{len(request.tasks)}] {task.audio_filename} ---")
+
+            # Sanitize output filename to prevent path traversal
+            safe_output = secure_filename(task.output_filename)
+            if not safe_output:
+                state["logs"].append(f"[{i+1}] Skipping — invalid output filename: {task.output_filename}")
+                state["tasks"][i]["status"] = "failed"
+                continue
+
+            # Ensure unique filename across directory and current batch
+            base, ext = os.path.splitext(safe_output)
+            candidate = safe_output
+            counter = 1
+            while candidate in existing_outputs:
+                if counter > 1000:
+                    state["logs"].append(f"[{i+1}] Skipping — too many filename collisions for: {safe_output}")
+                    state["tasks"][i]["status"] = "failed"
+                    candidate = None
+                    break
+                candidate = f"{base}_{counter}{ext}"
+                counter += 1
+            if candidate is None:
+                continue
+            existing_outputs.add(candidate)
+            safe_output = candidate
+
+            cmd = [interpreter, "-u", PREPARER_SCRIPT_PATH,
+                   "--audio", audio_path,
+                   "--output", os.path.join(PREPARER_OUTPUT_DIR, safe_output),
+                   "--lang", request.lang,
+                   "--min-confidence", str(request.min_confidence),
+                   "--min-snr", str(request.min_snr)]
+            cmd.extend(get_preparer_diarization_args(
+                request.diarize, request.auto_detect_speakers))
+
+            rc, _ = _stream_subprocess_to_logs(
+                cmd, BASE_DIR, state, log_prefix=f"[{i+1}] ",
+                env=get_preparer_subprocess_env(request.hf_token))
+
+            if state.get("cancel"):
+                state["tasks"][i]["status"] = "cancelled"
+                break
+            elif rc == 0:
+                state["tasks"][i]["status"] = "done"
+                state["logs"].append(f"[{i+1}] Done: {task.audio_filename}")
+            else:
+                state["tasks"][i]["status"] = "failed"
+                state["logs"].append(f"[{i+1}] Failed (exit {rc}): {task.audio_filename}")
+
+        state["running"] = False
+        state["logs"].append("Batch processing finished.")
+
+    try:
+        schedule = lambda: register_claimed_background_task(
+            background_tasks, "batch_preparer", claim_id, _run_claimed_background_task, "batch_preparer", _run)
+        if staged:
+            publish_preparer_uploads(staged, schedule)
+        else:
+            schedule()
+    except BaseException:
+        if claim_id is not None:
+            release_gpu_task_claim("batch_preparer", claim_id, pending_only=True)
+        raise
+    finally:
+        for tmp_path in staged.values():
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    return {"status": "started", "task_count": len(request.tasks)}
+
+
+@router.post("/api/preparer/batch/cancel")
+async def preparer_batch_cancel():
+    return _apply_preparer_cancel("batch_preparer", "No batch preparer is currently running.")

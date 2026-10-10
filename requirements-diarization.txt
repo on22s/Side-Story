@@ -1,0 +1,15 @@
+# Optional speaker-diarization dependencies for
+# alexandria_preparer_rocm_compatible.py (--diarize / --auto-detect-speakers).
+#
+# Install into the SAME environment that runs the preparer (`preparer_env`),
+# NOT app/env or Voice Lab's separately configured rocm_python:
+#   preparer_env/bin/python -m pip install -r requirements-diarization.txt
+#
+# pyannote.audio 4 requires torch>=2.8. Verify that interpreter already has a
+# compatible ROCm torch/torchaudio pair before installing. Do not allow pip to
+# replace ROCm torch with the default CUDA wheels.
+#
+# Community-1 is gated: the HF token used with --hf-token/HF_TOKEN must have
+# accepted its terms at:
+# https://huggingface.co/pyannote/speaker-diarization-community-1
+pyannote.audio>=4,<5

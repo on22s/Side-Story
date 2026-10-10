@@ -40,3 +40,17 @@ pinokio.json
 torch.js
 icon.png
 lora.md
+
+# Keep cloud images lean and free of local environments/data
+preparer_env/
+models/
+whisper.cpp/
+data/
+ab_test_runtime/
+reports/
+app/test_api.py
+!icon.png
+
+# Preserve license notices shipped with the runtime assets
+!THIRD_PARTY_NOTICES.md
+!app/static/vendor/**/LICENSE*

@@ -1,70 +1,118 @@
 import os
+from core import llm_timeout_seconds
 import sys
 import json
+import copy
 import time
 import re
+import unicodedata
 import argparse
 import shutil
 import tempfile
-from openai import OpenAI
+import hashlib
+from contextlib import nullcontext
+from book_state_transaction import (ensure_book_state, get_book_snapshot,
+                                    require_book_snapshot_current, get_book_snapshot_token)
+from config_settings import load_app_config
+from llm_provider import make_run_client
+from generate_script import (LLMGenParams, call_llm_for_object, split_failed_chunk,
+                             ensure_run_request_params)
 
-from tts import TTSEngine, sanitize_filename
-from utils import atomic_json_write as _atomic_json_write
+from tts import TTSEngine, sanitize_filename, voice_is_set, VERSION_OVERLAY_EXCLUDED
+from utils import atomic_json_write as _atomic_json_write, safe_load_json, extract_json_object, get_runtime_data_dir, get_app_config_path, character_voice_seed, file_lock
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
+from persona_validation import (validate_persona_payload, get_reference_samples,
+                               validate_compiled_persona_payload)
+from speaker_traits import (find_state_target, get_entry_speaker, get_persona_state_targets, get_persona_state_entries,
+                            get_state_version_identity, is_narrator_label, is_state_version_current)
+from speaker_identity import (is_speaker_merge_allowed, resolve_speaker_label,
+                              get_validated_alias_graph, get_safe_alias_proposals)
+from lmstudio_settings import (ensure_ideal_settings, get_active_llm_config,
+                               get_effective_max_tokens)
 
 
-def extract_json_object(text):
-    # Find first JSON object in text
-    start = text.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    end = None
-    for i, ch in enumerate(text[start:], start):
-        if esc:
-            esc = False
-            continue
-        if ch == '\\':
-            esc = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-    if end is None:
-        return None
-    obj_text = text[start:end]
-    try:
-        return json.loads(obj_text)
-    except Exception:
-        return None
+HONORIFIC_RE = re.compile(r'^(mr|mrs|ms|miss|dr|prof|sir|lady|lord)\.?\s+')
 
 
-def normalize_speaker_name(name):
+def normalize_speaker_name(name, strip_honorifics=True):
+    """Fold a speaker label for comparison.
+
+    TWO KINDS OF FOLDING, AND THEY ARE NOT EQUALLY SAFE. Case and punctuation
+    can always be folded: no two characters are distinguished by capitalisation
+    alone, and the live config relies on this - EMILIA/Emilia, REINHARD/
+    Reinhard and nine other pairs are one character each.
+
+    An HONORIFIC is different. For a married couple it is the only
+    distinguishing token, and stripping it merged MR. BENNET with MRS. BENNET
+    in Pride and Prejudice - along with the Hilberys, the Allens, the Halls and
+    the Van der Luydens, six of twenty-eight books. Three characters resolved
+    to one voice and nothing failed.
+
+    `scoring.normalize` reached this conclusion for the evaluation path and
+    folds punctuation only, commenting "this must not merge distinct
+    characters". This is the production path catching up. The default is kept
+    for callers doing loose alias heuristics; `_resolve_to_canonical` decides
+    per roster whether stripping is safe.
+    """
     if not isinstance(name, str):
         return ""
-    s = name.strip().lower()
-    # Remove common honorifics and punctuation for alias heuristics
-    s = re.sub(r'^(mr|mrs|ms|miss|dr|prof|sir|lady|lord)\.?\s+', '', s)
-    s = re.sub(r'[^a-z0-9\s]', '', s)
+    s = unicodedata.normalize("NFC", name.strip().lower())
+    if strip_honorifics:
+        s = HONORIFIC_RE.sub('', s)
+    s = ''.join(c for c in s if c.isalnum() or c.isspace()
+                or unicodedata.category(c).startswith('M'))
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
 
-def _token_jaccard(a: str, b: str) -> float:
-    """Jaccard similarity on normalized name tokens."""
-    norm_a = normalize_speaker_name(a)
-    norm_b = normalize_speaker_name(b)
+def get_exact_alias_match(speaker, existing_names):
+    """Return a shared exact identity match with protected labels preserved."""
+    if not speaker:
+        return None
+    allowed = [name for name in existing_names
+               if speaker.strip().casefold() == name.strip().casefold()
+               or is_speaker_merge_allowed(speaker, name)]
+    return resolve_speaker_label(speaker, allowed)
+
+
+def honorifics_are_distinguishing(allowed):
+    """True when stripping honorifics would merge two entries of this roster.
+
+    Checked against the ACTUAL roster rather than assumed, because the answer
+    differs per book: Pride and Prejudice has both Bennets, most books have
+    neither.
+
+    A collision only counts when KEEPING the honorific resolves it. The first
+    version returned True on any post-normalization duplicate, which included
+    pure case variants - the live config's EMILIA/Emilia and
+    NOT-SATELLA/Not-Satella. Those collide with honorifics kept too, since case
+    folding always applies, so honorifics buy nothing there; the book just paid
+    stricter matching for every one of its characters.
+    """
+    stripped_seen, intact_seen = set(), set()
+    collided = set()
+    for name in allowed or ():
+        stripped = normalize_speaker_name(name, strip_honorifics=True)
+        intact = normalize_speaker_name(name, strip_honorifics=False)
+        if not stripped:
+            continue
+        if stripped in stripped_seen and intact not in intact_seen:
+            collided.add(stripped)
+        stripped_seen.add(stripped)
+        intact_seen.add(intact)
+    return bool(collided)
+
+
+def _token_jaccard(a: str, b: str, strip_honorifics=True) -> float:
+    """Jaccard similarity on normalized name tokens.
+
+    Takes the same honorific decision as its caller. With it stripped,
+    'Miss Darcy' and 'MR DARCY' both reduce to {darcy} and score 1.0 - which
+    is how a third character resolved onto the first Darcy in the roster even
+    after step 1 was fixed.
+    """
+    norm_a = normalize_speaker_name(a, strip_honorifics=strip_honorifics)
+    norm_b = normalize_speaker_name(b, strip_honorifics=strip_honorifics)
     if not norm_a or not norm_b:
         return 0.0
     tokens_a = set(norm_a.split())
@@ -81,32 +129,55 @@ def _resolve_to_canonical(raw_name: str, allowed: list, threshold=0.4) -> str | 
 
     Tries:
     1. Exact match after normalization.
-    2. Substring match after normalization.
-    3. Token Jaccard similarity.
+    2. Substring match with word boundary checks (not just any substring).
+    3. Token Jaccard similarity with higher threshold.
     """
     if not raw_name:
         return None
 
-    norm_raw = normalize_speaker_name(raw_name)
+    # If two roster entries differ ONLY by honorific, stripping it would merge
+    # them - so for that roster, keep the honorific everywhere in this call.
+    # Deciding per roster rather than globally keeps loose matching for the
+    # books that need it, which is most of them.
+    keep = honorifics_are_distinguishing(allowed)
+    allowed = [name for name in allowed
+               if raw_name.strip().casefold() == name.strip().casefold()
+               or is_speaker_merge_allowed(raw_name, name)]
+    norm = lambda n: normalize_speaker_name(n, strip_honorifics=not keep)
+
+    norm_raw = norm(raw_name)
     if not norm_raw:
         return None
 
     # Step 1: Exact match after normalization
     for name in allowed:
-        if normalize_speaker_name(name) == norm_raw:
+        if norm(name) == norm_raw:
             return name
 
-    # Step 2: Substring match (either raw is in name, or name is in raw)
+    # Step 2: Substring match with word boundaries (avoid 'john' matching 'johnson')
+    pattern_raw_in_name = re.compile(r'\b' + re.escape(norm_raw) + r'\b')
     for name in allowed:
-        norm_name = normalize_speaker_name(name)
-        if norm_name and (norm_name in norm_raw or norm_raw in norm_name):
+        norm_name = norm(name)
+        if not norm_name:
+            continue
+        # Only match if one is a complete word within the other
+        # Use word boundary regex to avoid partial matches like john/johnson
+        if pattern_raw_in_name.search(norm_name) or re.search(r'\b' + re.escape(norm_name) + r'\b', norm_raw):
             return name
 
-    # Step 3: Token Jaccard similarity
+        # Short prefix/nickname match (e.g. 'ann' vs 'anna', len diff <= 2).
+        # Require both names to have at least 3 chars so short names/initials
+        # ('al', 'jo') don't spuriously match unrelated longer names ('allan', 'jonathan').
+        if len(norm_raw) >= 3 and len(norm_name) >= 3:
+            if (norm_name.startswith(norm_raw) and len(norm_name) - len(norm_raw) <= 2) or \
+               (norm_raw.startswith(norm_name) and len(norm_raw) - len(norm_name) <= 2):
+                return name
+
+    # Step 3: Token Jaccard similarity with higher threshold
     best_name = None
     best_score = 0.0
     for name in allowed:
-        score = _token_jaccard(raw_name, name)
+        score = _token_jaccard(raw_name, name, strip_honorifics=not keep)
         if score > best_score:
             best_score = score
             best_name = name
@@ -117,7 +188,25 @@ def _resolve_to_canonical(raw_name: str, allowed: list, threshold=0.4) -> str | 
     return None
 
 
-_NARRATOR_LABELS = frozenset({"NARRATOR", "NARRATION", "NARRATIVE"})
+
+
+DEFAULT_CONTEXT_LINES = 8
+
+
+def get_persona_context_limit(context_lines):
+    """Normalize the documented sample count using the existing CLI bound."""
+    return max(1, min(int(context_lines or DEFAULT_CONTEXT_LINES), 200))
+
+
+def select_persona_context(lines, narrator_context, context_lines=DEFAULT_CONTEXT_LINES):
+    """-> (sample_text, intro_blob) for the persona prompt: the first
+    `context_lines` spoken lines and up to as many narrator lines (#522 12.1:
+    10 / 25 / 50 / 100 or custom, from the Voices tab)."""
+    n = get_persona_context_limit(context_lines)
+    sample_text = "\n".join(lines[:n])
+    intro = narrator_context[:n]
+    intro_blob = "\n".join(intro) if intro else "(No nearby narrator intro lines found.)"
+    return sample_text, intro_blob
 
 
 def _collect_narrator_context(script, speaker, window=4):
@@ -125,7 +214,7 @@ def _collect_narrator_context(script, speaker, window=4):
 
     - Scans both before and after each appearance.
     - Looks at all appearances, not just the first.
-    - Accepts any speaker labels in _NARRATOR_LABELS.
+    - Accepts the supported narrator labels.
     """
     context_lines = []
     seen_lines = set()
@@ -148,7 +237,7 @@ def _collect_narrator_context(script, speaker, window=4):
             entry = script[j]
             entry_speaker = _entry_speaker(entry).upper()
             entry_text = _entry_text(entry)
-            if entry_speaker in _NARRATOR_LABELS and entry_text:
+            if is_narrator_label(entry_speaker) and entry_text:
                 if entry_text not in seen_lines:
                     seen_lines.add(entry_text)
                     context_lines.append(entry_text)
@@ -158,7 +247,214 @@ def _collect_narrator_context(script, speaker, window=4):
     return context_lines
 
 
-def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
+def _persona_params(system_prompt, context_length, llm_config, max_tokens, temperature):
+    llm_config = llm_config or {}
+    return LLMGenParams(
+        system_prompt=system_prompt, user_prompt_template="", max_tokens=max_tokens,
+        temperature=temperature, context_length=context_length,
+        provider_extra_body=llm_config.get("provider_extra_body"),
+        structured_output=llm_config.get("structured_output", "auto"),
+        api_retry_limit=llm_config.get("api_retry_limit"),
+        retry_initial_delay_seconds=llm_config.get("retry_initial_delay_seconds", 1),
+        retry_multiplier=llm_config.get("retry_multiplier", 2),
+        retry_max_delay_seconds=llm_config.get("retry_max_delay_seconds", 30),
+        retry_jitter=llm_config.get("retry_jitter", 0.2),
+        on_api_exhaustion=llm_config.get("on_api_exhaustion", "fail"),
+    )
+
+
+def _persona_attempt_observer(record):
+    """Keep shared retry diagnostics visible in the persona process log."""
+    print(json.dumps({"persona_attempt": record}, ensure_ascii=False), flush=True)
+
+
+
+PERSONA_GROUNDING_RULES = (
+    " Unknown, unspecified, not reported, or not stated never means absent, neutral, normal, or"
+    " lacking. Omit statements about unknown traits entirely. Preserve conflicting age values "
+    "separately from conflicting accent values. Do not pair facts from separate source IDs or "
+    "observations unless one source explicitly establishes that connection. Avoid unsupported "
+    "negative claims and no-indication statements. A concise persona may contain fewer than two"
+    " sentences when evidence is sparse.\nUse only supported speaker traits. Do not infer age or"
+    " accent from names, occupation, setting, or statements about other people. Omit unknown "
+    "age/accent; unspecified accent does not mean neutral or no accent. Preserve explicitly "
+    "requested voice-design choices as choices, not source facts. If observations conflict, "
+    "preserve that uncertainty. Keep supported delivery cues, including situation-dependent "
+    "changes. Copy ref_text exactly from one supplied reference_sample or sample line; do not "
+    "paraphrase, combine samples, or invent dialogue. Return one JSON object with description "
+    "and a single ref_text string."
+)
+
+PERSONA_CUE_INSTRUCTIONS = (
+    "\nUse the source-indexed entries as independent evidence. Their list positions do not "
+    "establish relationships between facts. Describe age uncertainty and accent uncertainty "
+    "independently. Unknown accent must be omitted; never say the voice lacks an accent or has "
+    "a neutral accent. Keep ALL explicit delivery variations supported by these entries, "
+    "including shouting when stated. Do not add statements about traits that are not reported. "
+    "Description length is a maximum guideline, not a requirement to fill missing information."
+)
+
+
+class PersonaContextRecoveryError(RuntimeError):
+    """Selected evidence could not be recovered on the active runtime."""
+
+
+def is_persona_network_runtime(client, llm_mode, llm_config):
+    """Read endpoint classification from the serving profile or shared dispatch."""
+    from llm_provider import FailoverClient
+    from lmstudio_settings import is_remote_llm
+    if isinstance(client, FailoverClient):
+        profile = client.ensure_active_runtime_profile()
+        if profile is not None:
+            return profile["is_remote"]
+    return is_remote_llm(llm_mode, (llm_config or {}).get("base_url", ""))
+
+
+def request_persona_with_evidence(client, model_name, system_prompt, build_prompt,
+                                  evidence, params, label, max_prompt_chars=None, validate_object=None,
+                                  ensure_prompt=None, build_minimal_source_prompt=None,
+                                  unknown_context_prompt_chars=None, allow_unknown_network_context=False,
+                                  llm_mode="local", llm_config=None):
+    """Preserve fixed instructions and recover selected evidence in smaller calls."""
+    validate = validate_object or validate_persona_payload
+
+    def fits(prompt):
+        if max_prompt_chars is None:
+            return True
+        runtime_params = ensure_run_request_params(client, params)
+        context = getattr(runtime_params, 'context_length', None)
+        limit = max_prompt_chars
+        if (not context and unknown_context_prompt_chars is not None
+                and not (allow_unknown_network_context
+                         and is_persona_network_runtime(client, llm_mode, llm_config))):
+            limit = min(limit, unknown_context_prompt_chars)
+        if len(prompt) > limit:
+            return False
+        if context:
+            from lmstudio_settings import TokenBudgetError
+            budget = getattr(runtime_params, 'max_tokens', 600)
+            try:
+                return get_effective_max_tokens(
+                    budget, context, [{'content': system_prompt}, {'content': prompt}],
+                    getattr(runtime_params, 'hard_max_tokens', None), scale_to_context=False) >= budget
+            except TokenBudgetError:
+                return False
+        return True
+
+    def get_groups(parts, builder):
+        # Balance serialized request sizes, preserving item order inside each batch.
+        if ensure_prompt is not None:
+            ensure_prompt(lambda: builder([]), fits)
+        if not fits(builder([])):
+            raise PersonaContextRecoveryError(label + ': fixed instructions exceed active budget')
+        if any(not fits(builder([part])) for part in parts):
+            return None
+        import math
+        base = len(builder([]))
+        capacity = max(1, (max_prompt_chars or len(builder(parts))) - base)
+        count = max(2, math.ceil(max(0, len(builder(parts)) - base) / capacity))
+        indexed = sorted(enumerate(parts), key=lambda pair: len(builder([pair[1]])), reverse=True)
+        while count <= len(parts):
+            groups = [[] for _ in range(count)]
+            for pair in indexed:
+                candidates = [i for i, group in enumerate(groups)
+                              if fits(builder([v for _, v in sorted(group + [pair])]))]
+                if not candidates:
+                    break
+                target = min(candidates, key=lambda i: len(builder([v for _, v in groups[i]])))
+                groups[target].append(pair)
+            else:
+                return [[v for _, v in sorted(group)] for group in groups if group]
+            count += 1
+        return None
+
+    def request(prompt):
+        attempts = []
+
+        def observe(attempt):
+            attempts.append(attempt)
+            _persona_attempt_observer(attempt)
+
+        result = call_llm_for_object(
+            client, model_name, system_prompt, prompt, params, label=label,
+            validate_object=validate, max_retries=2, attempt_observer=observe)
+        exhausted_context = ((getattr(client, "switched", False)
+            or (allow_unknown_network_context
+                and is_persona_network_runtime(client, llm_mode, llm_config))) and any(
+            attempt.get("error_category") == "context_budget"
+            or attempt.get("finish_reason") == "length" for attempt in attempts))
+        return result, exhausted_context
+
+    def merge(drafts):
+        if len(drafts) == 1:
+            return drafts[0]
+
+        def build_merge(values):
+            return (build_prompt([]) + "\n\nSupported partial persona drafts (not new source text):\n"
+                    + json.dumps(values, ensure_ascii=False)
+                    + "\nCombine all supported observations into one concise persona. "
+                      "Keep ref_text from one draft. Return description and ref_text only.")
+
+        prompt = build_merge(drafts)
+        if len(drafts) == 2 and ensure_prompt is not None:
+            prompt = ensure_prompt(lambda: build_merge(drafts), fits)
+        result = request(prompt)[0] if fits(prompt) else None
+        if isinstance(result, dict):
+            return validate(result)
+        if len(drafts) <= 2:
+            raise PersonaContextRecoveryError(label + ": recovered drafts cannot be combined safely")
+        if ensure_prompt is not None:
+            largest_pair = sorted(drafts, key=lambda draft: len(json.dumps(
+                draft, ensure_ascii=False)), reverse=True)[:2]
+            ensure_prompt(lambda: build_merge(largest_pair), fits)
+        groups = get_groups(drafts, build_merge) if max_prompt_chars is not None else None
+        if groups is None:
+            middle = len(drafts) // 2
+            groups = [drafts[:middle], drafts[middle:]]
+        reduced = [merge(group) for group in groups]
+        if len(json.dumps(reduced)) >= len(json.dumps(drafts)):
+            raise PersonaContextRecoveryError(label + ": recovered drafts did not shrink")
+        return merge(reduced)
+
+    def recover(parts, required=False):
+        if ensure_prompt is not None:
+            ensure_prompt(lambda: build_prompt([]), fits)
+        prompt = build_prompt(parts)
+        if (not fits(prompt) and ensure_prompt is not None
+                and build_minimal_source_prompt is not None
+                and fits(build_minimal_source_prompt(parts))):
+            prompt = ensure_prompt(lambda: build_prompt(parts), fits)
+        elif len(parts) <= 1 and ensure_prompt is not None:
+            prompt = ensure_prompt(lambda: build_prompt(parts), fits)
+        if not fits(prompt):
+            result, exhausted_context = None, True
+        else:
+            result, exhausted_context = request(prompt)
+        if isinstance(result, dict):
+            return validate(result)
+        if not exhausted_context:
+            if required:
+                raise PersonaContextRecoveryError(label + ": an evidence request failed")
+            return result
+        if len(parts) > 1:
+            groups = get_groups(parts, build_prompt) if max_prompt_chars is not None else None
+            if groups is None:
+                middle = len(parts) // 2
+                groups = [parts[:middle], parts[middle:]]
+        elif parts:
+            kind, text = parts[0]
+            fragments = split_failed_chunk(text)
+            groups = [[(kind, fragment)] for fragment in fragments]
+        else:
+            groups = []
+        if not groups:
+            raise PersonaContextRecoveryError(label + ": fixed instructions or minimum evidence exceed active context")
+        return merge([recover(group, required=True) for group in groups])
+
+    return recover(list(evidence))
+
+def _resolve_aliases_batch(client, model_name, speakers_info, existing_names,
+                           context_length=None, llm_config=None, comparison_names=None):
     """Resolve aliases for all speakers in a single one-shot LLM call.
 
     speakers_info is a dict:
@@ -174,6 +470,8 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
     if not speakers_info:
         return {}
 
+    comparison_names = list(dict.fromkeys(comparison_names if comparison_names is not None
+                                         else list(speakers_info) + list(existing_names)))
     prompt_items = []
     for speaker, info in speakers_info.items():
         samples = "\n".join(f"  - {line}" for line in info["sample_lines"][:3])
@@ -185,7 +483,7 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
         )
 
     formatted_speakers = "\n\n---\n\n".join(prompt_items)
-    candidates = "\n".join(f"- {name}" for name in existing_names) if existing_names else "(none)"
+    candidates = "\n".join(f"- {name}" for name in comparison_names) if comparison_names else "(none)"
 
     prompt = (
         "You are an expert audiobook production assistant specializing in character identification.\n"
@@ -197,7 +495,7 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
         "2. For each input speaker label, specify its resolved canonical name.\n"
         "3. If a speaker is unique and has no other aliases, its canonical name should just be itself.\n"
         "4. You can also map a speaker label to one of the existing configured characters listed below if it is a match.\n\n"
-        f"Existing configured characters:\n{candidates}\n\n"
+        f"Comparison character labels (script and configured):\n{candidates}\n\n"
         "Return ONLY one JSON object where keys are the original input speaker labels, and values are their resolved canonical names.\n"
         "Example shape:\n"
         "{\n"
@@ -209,16 +507,51 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
     )
 
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": "You are a precise casting director. You output ONLY valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=max(1500, len(speakers_info) * 80),
-        )
-        result = extract_json_object(response.choices[0].message.content.strip())
+        messages = [
+            {"role": "system", "content": "You are a precise casting director. You output ONLY valid JSON."},
+            {"role": "user", "content": prompt}
+        ]
+        params = _persona_params(messages[0]["content"], context_length, llm_config,
+                                 max(1500, len(speakers_info) * 80), 0.1)
+        attempts = []
+
+        def observe(attempt):
+            attempts.append(attempt)
+            _persona_attempt_observer(attempt)
+
+        result = call_llm_for_object(
+            client, model_name, messages[0]["content"], messages[1]["content"], params,
+            label="PERSONA ALIAS RESOLUTION", max_retries=2,
+            attempt_observer=observe)
+        if (not isinstance(result, dict) and getattr(client, "switched", False)
+                and any(attempt.get("error_category") == "context_budget"
+                        or attempt.get("finish_reason") == "length" for attempt in attempts)):
+            targets = list(speakers_info.items())
+            if len(targets) > 1:
+                middle = len(targets) // 2
+                parts = [dict(targets[:middle]), dict(targets[middle:])]
+            else:
+                speaker, info = targets[0]
+                evidence = [("sample_lines", line) for line in info["sample_lines"][:3]]
+                evidence += [("narrator_context", line) for line in info["narrator_context"][:2]]
+                if len(evidence) > 1:
+                    middle = len(evidence) // 2
+                    groups = [evidence[:middle], evidence[middle:]]
+                elif evidence:
+                    kind, text = evidence[0]
+                    texts = split_failed_chunk(text)
+                    groups = [[(kind, part)] for part in (texts or [])]
+                else:
+                    groups = []
+                parts = [{speaker: {kind: [text for field, text in group if field == kind]
+                                   for kind in ("sample_lines", "narrator_context")}}
+                         for group in groups]
+            if parts:
+                proposals = [_resolve_aliases_batch(
+                    client, model_name, part, existing_names, context_length, llm_config,
+                    comparison_names=comparison_names) for part in parts]
+                return get_safe_alias_proposals(proposals, comparison_names)
+
         if isinstance(result, dict):
             # Normalize keys and values to match exact input names casing
             resolved = {}
@@ -239,36 +572,20 @@ def pick_ref_text(lines):
     return next((ln.strip() for ln in lines if ln and ln.strip()), "")
 
 
-def parse_alias_decision(text):
-    parsed = extract_json_object(text)
-    if not parsed:
-        return {
-            "is_alias": False,
-            "alias_of": "",
-            "description": "",
-            "ref_text": "",
-            "reason": "unparseable"
-        }
-    return {
-        "is_alias": bool(parsed.get("is_alias", False)),
-        "alias_of": str(parsed.get("alias_of", "") or "").strip(),
-        "description": str(parsed.get("description", "") or "").strip(),
-        "ref_text": str(parsed.get("ref_text", "") or "").strip(),
-        "reason": str(parsed.get("reason", "") or "").strip()
-    }
-
-
 def _as_list(value):
     if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
+        return [v.strip() for v in value if isinstance(v, str) and v.strip()]
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
 
 
 def _unique_extend(existing, values, limit=80):
+    existing = list(existing[:max(0, limit)])
     seen = {str(v).strip().lower() for v in existing if str(v).strip()}
     for value in _as_list(values):
+        if len(existing) >= limit:
+            break
         key = value.lower()
         if key not in seen:
             existing.append(value)
@@ -279,7 +596,7 @@ def _unique_extend(existing, values, limit=80):
 
 
 def _entry_speaker(entry):
-    return (entry.get("speaker") or entry.get("type") or "").strip()
+    return get_entry_speaker(entry)
 
 
 def _entry_text(entry):
@@ -292,13 +609,6 @@ def _batch_entries(script, batch_size):
         yield start, script[start:start + batch_size]
 
 
-def _json_preview(data, max_chars=12000):
-    text = json.dumps(data, ensure_ascii=False, indent=2)
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n...TRUNCATED..."
-
-
 def _character_ref_path(ref_dir, speaker):
     safe = sanitize_filename(speaker or "unknown")
     return os.path.join(ref_dir, f"{safe}.json")
@@ -306,13 +616,7 @@ def _character_ref_path(ref_dir, speaker):
 
 def _load_character_ref(ref_dir, speaker):
     path = _character_ref_path(ref_dir, speaker)
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
+    default = {
         "name": speaker,
         "aliases": [],
         "features": [],
@@ -322,6 +626,7 @@ def _load_character_ref(ref_dir, speaker):
         "sample_lines": [],
         "observations": [],
     }
+    return safe_load_json(path, default=default)
 
 
 def _append_character_ref(ref_dir, speaker, batch_number, character_data):
@@ -356,7 +661,8 @@ def _build_batch_discovery_prompt(batch_start, batch, allowed_speakers):
         text = _entry_text(entry)
         if not speaker and not text:
             continue
-        lines.append(f"[{batch_start + offset}] {speaker}: {text}")
+        source_index = entry.get("_source_entry_index", batch_start + offset)
+        lines.append(f"[{source_index}] {speaker}: {text}")
 
     allowed = "\n".join(f"- {name}" for name in allowed_speakers) if allowed_speakers else "(none)"
     batch_text = "\n".join(lines)
@@ -383,7 +689,7 @@ def _build_batch_discovery_prompt(batch_start, batch, allowed_speakers):
     )
 
 
-def _fallback_batch_characters(batch):
+def _fallback_batch_characters(batch, batch_start=0):
     by_speaker = {}
     for offset, entry in enumerate(batch):
         speaker = _entry_speaker(entry)
@@ -403,30 +709,54 @@ def _fallback_batch_characters(batch):
         if text and len(data["sample_lines"]) < 3:
             data["sample_lines"].append(text)
         if text and len(data["evidence"]) < 3:
-            data["evidence"].append({"entry_index": offset, "quote": text[:240]})
+            data["evidence"].append({"entry_index": entry.get("_source_entry_index", batch_start + offset), "quote": text[:240]})
     return list(by_speaker.values())
 
 
-def _compile_character_prompt(character_ref, prompt_template=None):
-    compact = {
+def get_selected_character_reference(character_ref, sample_limit=30):
+    return {
         "name": character_ref.get("name", ""),
         "aliases": character_ref.get("aliases", [])[:20],
         "features": character_ref.get("features", [])[:80],
         "personality": character_ref.get("personality", [])[:80],
         "voice_clues": character_ref.get("voice_clues", [])[:80],
         "relationships": character_ref.get("relationships", [])[:60],
-        "sample_lines": character_ref.get("sample_lines", [])[:30],
+        "sample_lines": character_ref.get("sample_lines", [])[:sample_limit],
         "observations": character_ref.get("observations", [])[-30:],
     }
+
+
+def get_source_persona_cues(selected):
+    """Return bounded literal cues with independent source IDs, without rewriting."""
+    items = []
+    omitted_ids = []
+    seen = set()
+    for field in ("voice_clues", "features"):
+        for index, text in enumerate(selected[field]):
+            if not isinstance(text, str) or not text.strip() or (field, text) in seen:
+                continue
+            seen.add((field, text))
+            item = {"id": f"{field}:{index}", "text": text}
+            if len(json.dumps(items + [item], ensure_ascii=False)) <= 4000:
+                items.append(item)
+            else:
+                omitted_ids.append(item["id"])
+    return {"subject": selected["name"], "items": items, "omitted_ids": omitted_ids}
+
+
+def _compile_character_prompt(character_ref, prompt_template=None, reference_text=None, sample_limit=30):
+    if reference_text is None:
+        reference_text = json.dumps(get_selected_character_reference(character_ref, sample_limit),
+                                    ensure_ascii=False, indent=2)
     if prompt_template:
-        return prompt_template.format(character_ref=_json_preview(compact))
+        return prompt_template.format(character_ref=reference_text)
     return (
         "You are compiling an audiobook character reference into a final TTS voice persona.\n"
         "Use only supported observations. The final description should be practical for voice design.\n"
         "Return ONLY one JSON object with keys:\n"
-        "- description: 2-4 sentences covering apparent age/gender if inferable, timbre, accent/dialect, pace, emotional baseline, personality, and delivery guidance.\n"
+        "- description: 2-4 concise sentences using only traits explicitly supported in the reference. Include supported delivery changes. Omit unknown traits rather than supplying defaults.\n"
         "- ref_text: 1-2 representative spoken sentences from the character, or the best available sample line.\n\n"
-        f"Character reference:\n{_json_preview(compact)}"
+        f"Character reference:\n{reference_text}"
     )
 
 
@@ -442,257 +772,771 @@ def _fallback_compiled_persona(character_ref):
     return description, ref_text
 
 
-def _save_generated_preview(root, engine, voice_config, speaker, description, ref_text):
+def _save_generated_preview(root, engine, voice_config, speaker, description, ref_text, book_id=None):
     try:
-        wav_path, sr = engine.generate_voice_design(description=description, sample_text=ref_text)
-        dest_dir = os.path.join(root, "designed_voices")
-        os.makedirs(dest_dir, exist_ok=True)
-        safe = sanitize_filename(speaker)
-        voice_id = f"{safe}_{int(time.time_ns())}"
-        dest_filename = f"{voice_id}_preview.wav"
-        dest_path = os.path.join(dest_dir, dest_filename)
-        try:
-            shutil.copy2(wav_path, dest_path)
-        except Exception as e:
-            print(f"Warning: Could not copy preview for {speaker}: {e}")
-
-        voice_entry = voice_config.get(speaker, {})
-        voice_entry.update({
-            "type": "clone",
-            "ref_audio": os.path.relpath(dest_path, root).replace('\\\\', '/'),
-            "ref_text": ref_text,
-            "description": description,
-            "character_style": description,
-            "seed": -1
-        })
-        voice_config[speaker] = voice_entry
-
-        meta_path = os.path.join(dest_dir, f"{voice_id}_meta.json")
-        _atomic_json_write({"description": description, "ref_text": ref_text, "preview": os.path.relpath(dest_path, root)}, meta_path)
-
-        try:
-            manifest_path = os.path.join(dest_dir, 'manifest.json')
-            manifest = []
-            if os.path.exists(manifest_path):
-                try:
-                    with open(manifest_path, 'r', encoding='utf-8') as mf:
-                        manifest = json.load(mf)
-                except Exception:
-                    manifest = []
-
-            stale_entries = [entry for entry in manifest if entry.get("name") == speaker]
-            manifest = [entry for entry in manifest if entry.get("name") != speaker]
-            for stale in stale_entries:
-                stale_filename = stale.get("filename") or ""
-                if stale_filename:
-                    stale_path = os.path.join(dest_dir, stale_filename)
-                    if os.path.exists(stale_path) and os.path.abspath(stale_path) != os.path.abspath(dest_path):
-                        try:
-                            os.remove(stale_path)
-                        except OSError:
-                            pass
-                stale_meta = stale.get("id")
-                if stale_meta:
-                    stale_meta_path = os.path.join(dest_dir, f"{stale_meta}_meta.json")
-                    if os.path.exists(stale_meta_path):
-                        try:
-                            os.remove(stale_meta_path)
-                        except OSError:
-                            pass
-
-            manifest.append({
-                "id": voice_id,
-                "name": speaker,
-                "description": description,
-                "sample_text": ref_text,
-                "filename": os.path.basename(dest_path)
-            })
-            _atomic_json_write(manifest, manifest_path)
-        except Exception as e:
-            print(f"Warning: could not update manifest for {speaker}: {e}")
-
-        print(f"Persona generated and preview saved for {speaker}: {dest_path}")
-        return True
+        wav_path, _ = engine.generate_voice_design(description=description, sample_text=ref_text)
     except Exception as e:
         print(f"Error generating voice preview for {speaker}: {e}")
         voice_entry = voice_config.get(speaker, {})
-        voice_entry.update({"type": "design", "description": description, "ref_text": ref_text})
+        voice_entry.update({"type": "design", "description": description, "ref_text": ref_text,
+                            "persona_status": "generated"})
         voice_config[speaker] = voice_entry
         return False
 
+    # Persona previews belong to a book, not to the permanent Designer manifest.
+    # Unique generations also preserve references held by saved books/versions.
+    preview_dir = None
+    try:
+        if book_id is None:
+            state = safe_load_json(os.path.join(root, "state.json"), default={})
+            book_id = state.get("active_book_id") or "active_book"
+        book_key = sanitize_filename(book_id) + "_" + hashlib.sha256(
+            str(book_id).encode("utf-8")).hexdigest()[:16]
+        book_dir = os.path.join(root, "designed_voices", "persona", book_key)
+        os.makedirs(book_dir, exist_ok=True)
+        preview_dir = tempfile.mkdtemp(prefix=sanitize_filename(speaker) + "_", dir=book_dir)
+        dest_path = os.path.join(preview_dir, "preview.wav")
+        shutil.copy2(wav_path, dest_path)
+        relative_path = os.path.relpath(dest_path, root).replace('\\', '/')
+        _atomic_json_write({"book_id": book_id, "speaker": speaker,
+                            "description": description, "ref_text": ref_text,
+                            "preview": relative_path}, os.path.join(preview_dir, "meta.json"))
+        voice_entry = copy.deepcopy(voice_config.get(speaker, {}))
+        voice_entry.update({
+            "type": "clone",
+            "persona_status": "generated",
+            "ref_audio": relative_path,
+            "ref_text": ref_text,
+            "description": description,
+            "character_style": description,
+            "seed": character_voice_seed(speaker),
+        })
+        voice_config[speaker] = voice_entry
+    except Exception as e:
+        if preview_dir is not None:
+            shutil.rmtree(preview_dir)
+        print(f"Error saving voice preview for {speaker}: {e}")
+        return False
+    finally:
+        # generate_voice_design creates a unique, temporary Designer preview.
+        # Only that owned file is disposable; existing book references survive.
+        preview_root = os.path.realpath(os.path.join(root, 'designed_voices', 'previews'))
+        generated = os.path.realpath(wav_path)
+        if (os.path.dirname(generated) == preview_root
+                and re.fullmatch(r'preview_[0-9a-f]{32}\.wav', os.path.basename(generated))):
+            try:
+                os.remove(generated)
+            except FileNotFoundError:
+                pass
 
-def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None):
-    ref_dir = os.path.join(root, "persona_refs")
-    os.makedirs(ref_dir, exist_ok=True)
+    print(f"Persona generated and preview saved for {speaker}: {dest_path}")
+    return True
 
-    selected_set = set(selected_speakers)
-    batches = list(_batch_entries(script, args.batch_size))
-    print(f"Advanced persona generation enabled.")
-    print(f"Writing per-character reference files to: {ref_dir}")
-    print(f"Processing {len(script)} script entries in {len(batches)} batches of up to {max(1, int(args.batch_size or 40))}")
 
-    for batch_number, (batch_start, batch) in enumerate(batches, start=1):
-        prompt = _build_batch_discovery_prompt(batch_start, batch, selected_speakers)
-        print(f"Advanced discovery batch {batch_number}/{len(batches)} ({len(batch)} entries)")
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "You produce concise JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=4000,
-            )
-            raw_content = response.choices[0].message.content.strip()
-            parsed = extract_json_object(raw_content)
-            characters = []
-            if isinstance(parsed, dict):
-                if "characters" in parsed and isinstance(parsed["characters"], list):
-                    characters = parsed["characters"]
-                else:
-                    for key, val in parsed.items():
-                        if isinstance(val, dict):
-                            val["name"] = key
-                            characters.append(val)
-            if not characters:
-                print(f"Warning: discovery batch {batch_number} returned no parseable characters; using speaker fallback.")
-                print(f"  LLM response (first 500 chars): {raw_content[:500]}")
-                characters = _fallback_batch_characters(batch)
-        except Exception as e:
-            print(f"Warning: discovery batch {batch_number} failed: {e}; using speaker fallback.")
-            characters = _fallback_batch_characters(batch)
+def _parse_discovered_characters(parsed):
+    """Normalize a discovery LLM response into a list of character dicts.
 
-        for character in characters:
-            if not isinstance(character, dict):
-                continue
-            speaker = str(character.get("name") or character.get("speaker") or character.get("speaker_label") or "").strip()
-            if not speaker:
-                continue
-            
-            # Map raw/fuzzy name to allowed canonical speaker labels
-            canonical_speaker = _resolve_to_canonical(speaker, selected_speakers)
-            if not canonical_speaker:
-                continue
-            
-            character["name"] = canonical_speaker
-            _append_character_ref(ref_dir, canonical_speaker, batch_number, character)
+    Accepts either {"characters": [...]} or a {name: {...}} mapping.
+    """
+    characters = []
+    if isinstance(parsed, dict):
+        if "characters" in parsed and isinstance(parsed["characters"], list):
+            characters = parsed["characters"]
+        else:
+            for key, val in parsed.items():
+                if isinstance(val, dict):
+                    val["name"] = key
+                    characters.append(val)
+    return characters
 
-    print("Compiling character reference files into final voice personas.")
-    for speaker in selected_speakers:
-        ref = _load_character_ref(ref_dir, speaker)
-        if not ref.get("sample_lines"):
-            ref["sample_lines"] = [line for line in samples.get(speaker, [])[:8] if line]
-            _atomic_json_write(ref, _character_ref_path(ref_dir, speaker))
 
-        print(f"Compiling persona for: {speaker}")
-        description = ""
-        ref_text = ""
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt or "You produce concise JSON only."},
-                    {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt)}
-                ],
-                temperature=0.25,
-                max_tokens=600,
-            )
-            parsed = extract_json_object(response.choices[0].message.content.strip())
-            if parsed:
-                description = str(parsed.get("description", "") or "").strip()
-                ref_text = str(parsed.get("ref_text", "") or "").strip()
-        except Exception as e:
-            print(f"Warning: compile failed for {speaker}: {e}")
+_QUOTE_FOLD = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2026": "..."})
 
-        if not description:
-            description, ref_text = _fallback_compiled_persona(ref)
-        if not ref_text:
-            ref_text = pick_ref_text(samples.get(speaker, []))
-        if not ref_text:
-            ref_text = f"{speaker} speaks in a clear, natural voice."
-        if not description:
-            print(f"Warning: Empty compiled description for {speaker}, skipping")
+
+def is_quote_in_text(quote, text):
+    """Is an evidence quote taken from `text`? Tolerates what models do to a
+    quote they copy - straightened or curly quotes, collapsed whitespace, and
+    `...`/`…` elisions (each remaining part must appear, in order) - so real
+    observations are not discarded for punctuation (#1040 review C22)."""
+    def fold(value):
+        return " ".join(str(value or "").translate(_QUOTE_FOLD).split())
+    source = fold(text)
+    parts = [part.strip(" '\"") for part in fold(quote).split("...")]
+    parts = [part for part in parts if part]
+    position = 0
+    for part in parts:
+        found = source.find(part, position)
+        if found < 0:
+            return False
+        position = found + len(part)
+    return bool(parts)
+
+
+def get_discovered_character_name(character):
+    """Read the supported discovery identity fields in their established order."""
+    return str(character.get("name") or character.get("speaker")
+               or character.get("speaker_label") or "").strip()
+
+
+def get_validated_state_discovery(characters, batch, batch_start, allowed_speakers, require_evidence=True):
+    """Reject invented or borrowed dialogue; settled states also require evidence."""
+    sources = {row.get("_source_entry_index", batch_start + offset): row
+               for offset, row in enumerate(batch)}
+    output = []
+    for character in characters:
+        speaker = _resolve_to_canonical(get_discovered_character_name(character), allowed_speakers)
+        if not speaker:
+            continue
+        evidence = [item for item in character.get("evidence", []) if isinstance(item, dict)
+                    and type(item.get("entry_index")) is int and item["entry_index"] in sources
+                    and isinstance(item.get("quote"), str) and item["quote"].strip()
+                    and is_quote_in_text(item["quote"], _entry_text(sources[item["entry_index"]]))]
+        dialogue = [_entry_text(row) for row in batch
+                    if _resolve_to_canonical(_entry_speaker(row), allowed_speakers) == speaker]
+        samples = [line for line in _as_list(character.get("sample_lines", []))
+                   if any(is_quote_in_text(line, text) if require_evidence else line in text for text in dialogue)]
+        if require_evidence and not evidence:
+            fallback = next((row for row in _fallback_batch_characters(batch, batch_start)
+                             if row["name"] == speaker), None)
+            if fallback:
+                output.append(fallback)
+            continue
+        output.append({**character, "name": speaker, "evidence": evidence, "sample_lines": samples})
+    return output
+
+
+def _discover_batch_characters(client, model_name, prompt, batch, batch_number,
+                               context_length=None, llm_config=None, batch_start=0,
+                               allowed_speakers=None):
+    """Run one discovery LLM call for a batch, falling back to speaker stubs on
+    an empty/unparseable response or an API error. Returns a list of characters.
+    """
+    try:
+        messages = [{"role": "system", "content": "You produce concise JSON only."},
+                    {"role": "user", "content": prompt}]
+        params = _persona_params(messages[0]["content"], context_length, llm_config, 4000, 0.2)
+        attempts = []
+
+        def observe(attempt):
+            attempts.append(attempt)
+            _persona_attempt_observer(attempt)
+
+        parsed = call_llm_for_object(
+            client, model_name, messages[0]["content"], messages[1]["content"], params,
+            label=f"PERSONA DISCOVERY {batch_number}", max_retries=2,
+            attempt_observer=observe)
+        characters = _parse_discovered_characters(parsed)
+        if (not characters and allowed_speakers is not None
+                and getattr(client, "switched", False)
+                and any(attempt.get("error_category") == "context_budget"
+                        or attempt.get("finish_reason") == "length" for attempt in attempts)):
+            if len(batch) > 1:
+                middle = len(batch) // 2
+                parts = [(batch_start, batch[:middle]), (batch_start + middle, batch[middle:])]
+            elif batch:
+                texts = split_failed_chunk(_entry_text(batch[0]))
+                parts = [(batch_start, [{**batch[0], "text": text}]) for text in (texts or [])]
+            else:
+                parts = []
+            if parts:
+                characters = []
+                for start, rows in parts:
+                    part_prompt = _build_batch_discovery_prompt(start, rows, allowed_speakers)
+                    characters.extend(_discover_batch_characters(
+                        client, model_name, part_prompt, rows, batch_number,
+                        context_length, llm_config, batch_start=start,
+                        allowed_speakers=allowed_speakers))
+                return characters
+        characters = get_validated_state_discovery(
+            characters, batch, batch_start,
+            allowed_speakers if allowed_speakers is not None else list(dict.fromkeys(
+                _entry_speaker(row) for row in batch if _entry_speaker(row))),
+            require_evidence=any("_source_entry_index" in row for row in batch))
+        if not characters:
+            print(f"Warning: discovery batch {batch_number} returned no parseable characters; using speaker fallback.")
+            characters = _fallback_batch_characters(batch, batch_start)
+        return characters
+    except Exception as e:
+        print(f"Warning: discovery batch {batch_number} failed: {e}; using speaker fallback.")
+        return _fallback_batch_characters(batch, batch_start)
+
+
+def _write_batch_character_refs(ref_dir, characters, selected_speakers, batch_number):
+    """Resolve discovered character names to canonical speakers and append each
+    one's evidence to its per-character reference file.
+    """
+    for character in characters:
+        if not isinstance(character, dict):
+            continue
+        speaker = get_discovered_character_name(character)
+        if not speaker:
             continue
 
-        voice_entry = voice_config.get(speaker, {})
-        voice_entry["persona_ref"] = os.path.relpath(_character_ref_path(ref_dir, speaker), root).replace('\\\\', '/')
-        voice_config[speaker] = voice_entry
-        _save_generated_preview(root, engine, voice_config, speaker, description, ref_text)
-        time.sleep(0.5)
+        # Map raw/fuzzy name to allowed canonical speaker labels
+        canonical_speaker = _resolve_to_canonical(speaker, selected_speakers)
+        if not canonical_speaker:
+            continue
+
+        character["name"] = canonical_speaker
+        _append_character_ref(ref_dir, canonical_speaker, batch_number, character)
+
+
+def _compile_persona(client, model_name, engine, voice_config, root, ref_dir, speaker,
+                     samples, system_prompt, advanced_prompt, context_length=None,
+                     llm_config=None, book_id=None, preview_saver=None, context_lines=DEFAULT_CONTEXT_LINES, reference_chars=12000,
+                     allow_unknown_network_context=False, llm_mode="local"):
+    """Compile one speaker's accumulated reference data into a final persona
+    (description + ref_text) and generate its preview audio. A supplied
+    preview_saver handles this call only; production uses its usual saver.
+    """
+    ref = _load_character_ref(ref_dir, speaker)
+    sample_limit = 30  # Keep the existing bound for discovered reference lines.
+    if not ref.get("sample_lines"):
+        sample_limit = get_persona_context_limit(context_lines)
+        ref["sample_lines"] = [line for line in samples.get(speaker, [])[:sample_limit] if line]
+        _atomic_json_write(ref, _character_ref_path(ref_dir, speaker))
+
+    print(f"Compiling persona for: {speaker}")
+    description = ""
+    ref_text = ""
+    try:
+        messages = [{"role": "system", "content": system_prompt or "You produce concise JSON only."},
+                    {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt, sample_limit=sample_limit)}]
+        messages[0]["content"] += PERSONA_GROUNDING_RULES
+        params = _persona_params(messages[0]["content"], context_length, llm_config, 600, 0.25)
+        selected = get_selected_character_reference(ref, sample_limit)
+        source_cues = get_source_persona_cues(selected)
+        reference_samples = get_reference_samples(selected)
+        if not reference_samples:
+            raise PersonaContextRecoveryError("No safe source dialogue sample for persona compilation")
+        reference_sample = next((line for line in reference_samples if len(line) >= 12), reference_samples[0])
+
+        def validate_compiled(payload):
+            return validate_compiled_persona_payload(payload, reference_samples)
+        evidence = []
+        for field, value in selected.items():
+            if field == "name":
+                continue
+            for item in value:
+                evidence.append((field, json.dumps(item, ensure_ascii=False)))
+
+        shared_context = {"voice_clues": [], "personality": []}
+        include_cue_context = True
+        for field in shared_context:
+            for item in selected[field][:8]:
+                candidate = {key: list(values) for key, values in shared_context.items()}
+                candidate[field].append(item)
+                if len(json.dumps(candidate, ensure_ascii=False)) <= 1000:
+                    shared_context = candidate
+
+        def build_prompt(parts, repeat_context=True):
+            payload = {"name": selected["name"]}
+            if parts != evidence:
+                payload["partial_evidence"] = True
+                if repeat_context:
+                    payload["shared_voice_context"] = shared_context
+            try:
+                for field, text in parts:
+                    payload.setdefault(field, []).append(json.loads(text))
+            except json.JSONDecodeError:
+                # A single oversized item may be split by context recovery.
+                # Keep its fragments as escaped text inside a valid outer object.
+                payload = {"name": selected["name"], "selected_reference_fragments": [
+                    {"field": field, "text": text} for field, text in parts]}
+            payload["reference_sample"] = reference_sample
+            if repeat_context and include_cue_context:
+                payload["source_cue_ledger"] = source_cues
+            reference = json.dumps(payload, ensure_ascii=False)
+            return (_compile_character_prompt(ref, advanced_prompt, reference_text=reference,
+                                              sample_limit=sample_limit)
+                    + (PERSONA_CUE_INSTRUCTIONS if repeat_context and include_cue_context else ""))
+
+        def ensure_repeated_context(builder, fits):
+            nonlocal shared_context, reference_sample, include_cue_context
+            prompt = builder()
+            # Only shrink optional copies. All source items and draft text
+            # remain in the bounded recovery requests.
+            while not fits(prompt):
+                if any(shared_context.values()):
+                    shared_context = {field: [] for field in shared_context}
+                elif source_cues.get('omitted_ids'):
+                    source_cues['omitted_count'] = len(source_cues.pop('omitted_ids'))
+                elif source_cues['items']:
+                    source_cues.pop('omitted_ids', None)
+                    source_cues['items'].pop()
+                    source_cues['omitted_count'] = source_cues.get('omitted_count', 0) + 1
+                elif include_cue_context:
+                    include_cue_context = False
+                else:
+                    shorter = next((line for line in get_reference_samples(
+                        selected, max_chars=max(12, len(reference_sample) // 2))
+                        if reference_sample.startswith(line) and len(line) < len(reference_sample)), None)
+                    if shorter is None:
+                        break
+                    reference_sample = shorter
+                    if shorter not in reference_samples:
+                        reference_samples.append(shorter)
+                prompt = builder()
+            return prompt
+
+        # Bound each source request without cutting serialized JSON or losing its tail.
+        # Oversized evidence is processed in smaller calls by the existing recovery path.
+        base_prompt_chars = len(_compile_character_prompt(
+            ref, advanced_prompt, reference_text=json.dumps({"name": selected["name"]},
+                                                          ensure_ascii=False),
+            sample_limit=sample_limit))
+        parsed = request_persona_with_evidence(
+            client, model_name, messages[0]["content"], build_prompt,
+            evidence, params, f"PERSONA COMPILE {speaker}",
+            max_prompt_chars=base_prompt_chars + reference_chars,
+            unknown_context_prompt_chars=base_prompt_chars + 12000,
+            allow_unknown_network_context=allow_unknown_network_context,
+            llm_mode=llm_mode, llm_config=llm_config,
+            validate_object=validate_compiled, ensure_prompt=ensure_repeated_context,
+            build_minimal_source_prompt=lambda parts: build_prompt(parts, repeat_context=False))
+        if not isinstance(parsed, dict):
+            raise PersonaContextRecoveryError("Persona compilation exhausted retries without a validated result")
+        if isinstance(parsed, dict):
+            try:
+                validated = validate_compiled(parsed)
+                description, ref_text = validated["description"], validated["ref_text"]
+            except ValueError as exc:
+                raise PersonaContextRecoveryError("Persona sample validation failed") from exc
+    except PersonaContextRecoveryError:
+        raise
+    except Exception as e:
+        raise PersonaContextRecoveryError(f"Persona compilation failed for {speaker}: {e}") from e
+
+    if not description:
+        description, ref_text = _fallback_compiled_persona(ref)
+    if not ref_text:
+        ref_text = pick_ref_text(samples.get(speaker, []))
+    if not ref_text:
+        ref_text = f"{speaker} speaks in a clear, natural voice."
+    if not description:
+        print(f"Warning: Empty compiled description for {speaker}, skipping")
+        return False
+
+    voice_entry = voice_config.get(speaker, {})
+    voice_entry["persona_ref"] = os.path.relpath(_character_ref_path(ref_dir, speaker), root).replace('\\', '/')
+    voice_config[speaker] = voice_entry
+    save_preview = preview_saver if preview_saver is not None else _save_generated_preview
+    if book_id is None:
+        saved = save_preview(root, engine, voice_config, speaker, description, ref_text)
+    else:
+        saved = save_preview(root, engine, voice_config, speaker, description, ref_text, book_id=book_id)
+    return saved
+
+
+def get_recovered_persona(voice_entry, age_group):
+    """Select a compatible saved persona without relabelling another age."""
+    requested = age_group.strip()
+    selected = voice_entry
+    if requested:
+        versions = voice_entry.get("versions")
+        if isinstance(versions, dict) and isinstance(versions.get(requested), dict):
+            selected = versions[requested]
+            if selected.get("age_group", requested) != requested:
+                raise ValueError(f"Saved persona version does not match age group {requested}")
+        elif requested not in (voice_entry.get("active_version"), voice_entry.get("age_group")):
+            raise ValueError(f"No recovered persona for age group {requested}; generate that version first")
+    recovered = copy.deepcopy(voice_entry)
+    recovered.update(validate_persona_payload(selected))
+    if requested:
+        recovered["active_version"] = requested
+        recovered["age_group"] = requested
+    return recovered
+
+
+def _run_advanced_speaker_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None, context_length=None, llm_config=None, book_id=None):
+    selected_speakers = list(selected_speakers)
+    failures = []
+    recovered_speaker = getattr(args, "recovered_speaker", "")
+    if recovered_speaker in selected_speakers and isinstance(voice_config.get(recovered_speaker), dict):
+        try:
+            recovered = get_recovered_persona(voice_config[recovered_speaker], getattr(args, "age_group", ""))
+            voice_config[recovered_speaker] = recovered
+            print(f"Using recovered persona for {recovered_speaker}; skipping discovery and compilation.")
+            if not _save_generated_preview(root, engine, voice_config, recovered_speaker,
+                                           recovered["description"], recovered["ref_text"], book_id=book_id):
+                failures.append(recovered_speaker)
+        except Exception as error:
+            print(f"Recovered persona failed for {recovered_speaker}: {error}")
+            failures.append(recovered_speaker)
+        selected_speakers.remove(recovered_speaker)
+    if not selected_speakers:
+        return failures
+    if book_id is None:
+        state = safe_load_json(os.path.join(root, "state.json"), default={})
+        book_id = state.get("active_book_id") or "active_book"
+    book_refs_dir = os.path.join(root, "persona_refs", sanitize_filename(book_id))
+    os.makedirs(book_refs_dir, exist_ok=True)
+    # A fresh run owns fresh references. Saved books and concurrent generations
+    # may still point at previous files, so never delete or reuse their directory.
+    ref_dir = tempfile.mkdtemp(prefix="generation_", dir=book_refs_dir)
+
+    batch_size = max(1, int(args.batch_size or 40))
+    batch_count = (len(script) + batch_size - 1) // batch_size
+    batches = _batch_entries(script, batch_size)
+    print(f"Advanced persona generation enabled.")
+    print(f"Writing per-character reference files to: {ref_dir}")
+    print(f"Processing {len(script)} script entries in {batch_count} batches of up to {max(1, int(args.batch_size or 40))}")
+
+    # Phase 1: discover characters batch-by-batch, accumulating per-character refs.
+    for batch_number, (batch_start, batch) in enumerate(batches, start=1):
+        prompt = _build_batch_discovery_prompt(batch_start, batch, selected_speakers)
+        print(f"Advanced discovery batch {batch_number}/{batch_count} ({len(batch)} entries)")
+        characters = _discover_batch_characters(
+            client, model_name, prompt, batch, batch_number, context_length, llm_config,
+            batch_start=batch_start, allowed_speakers=selected_speakers)
+        _write_batch_character_refs(ref_dir, characters, selected_speakers, batch_number)
+
+    # Phase 2: compile each speaker's refs into a final persona + preview.
+    print("Compiling character reference files into final voice personas.")
+    for speaker in selected_speakers:
+        try:
+            if _compile_persona(client, model_name, engine, voice_config, root, ref_dir,
+                                speaker, samples, system_prompt, advanced_prompt, context_length,
+                                llm_config, book_id=book_id,
+                                context_lines=getattr(args, "context_lines", DEFAULT_CONTEXT_LINES),
+                                reference_chars=getattr(args, "persona_reference_chars", 12000),
+                                allow_unknown_network_context=getattr(args, "persona_allow_unknown_network_context", False),
+                                llm_mode=getattr(args, "llm_mode", "local")) is False:
+                failures.append(speaker)
+        except Exception as error:
+            print(f"Unhandled error for {speaker}: {error}")
+            failures.append(speaker)
+    return failures
+
+
+class StatePublisher:
+    """Publishes each completed state persona as soon as it exists.
+
+    `base` is the baseline the final save diffs against: it advances only by
+    what was published, so a user's edits or deletions made to other targets
+    while a state was generating are kept. A publication writes ONLY the
+    completed character and no alias proposals - alias merges are committed
+    by the final save, so a cancelled run commits none (#1040 review C19).
+    Only that character's entry is copied (C26)."""
+
+    def __init__(self, path, initial, book_snapshot):
+        self.path, self.base, self.book_snapshot = path, copy.deepcopy(initial), book_snapshot
+
+    def publish(self, generated, speaker, version_id):
+        # Only the completed character's entry is offered for writing; other
+        # characters' in-progress work waits for the final save.
+        current = save_generated_voice_config(self.path, {speaker: generated[speaker]}, self.base, [speaker], {},
+                                              book_snapshot=self.book_snapshot)
+        # Refresh only the completed target's version baseline. A user may
+        # have edited/deleted a later target while this one was generating.
+        previous_versions = copy.deepcopy(self.base.get(speaker, {}).get("versions") or {})
+        completed = current.get(speaker, {}).get("versions", {}).get(version_id)
+        if completed is not None:
+            previous_versions[version_id] = copy.deepcopy(completed)
+        else:
+            previous_versions.pop(version_id, None)
+        refreshed = dict(self.base)
+        if speaker in current:
+            refreshed[speaker] = {**copy.deepcopy(current[speaker]), "versions": previous_versions}
+        else:
+            refreshed.pop(speaker, None)
+        self.base = refreshed
+        return current
+
+
+def get_requested_speakers(args):
+    """The speakers a run is limited to: the exact --speaker (names may hold
+    commas, #1040 review C20) or the comma-separated --speakers list."""
+    if getattr(args, "speaker", ""):
+        return {args.speaker.strip()}
+    return {s.strip() for s in (getattr(args, "speakers", "") or "").split(",") if s.strip()}
+
+
+def get_pending_state_targets(script, speaker, voice, new_only=False, version_id="", *, state_targets=None):
+    targets = (get_persona_state_targets(script) if state_targets is None else state_targets).get(speaker, [])
+    if version_id:
+        targets = [target for target in targets if target["version_id"] == version_id]
+        if not targets:
+            raise ValueError("The selected character state is no longer in the script")
+    if new_only:
+        saved = (voice or {}).get("versions", {})
+        targets = [target for target in targets if not voice_is_set(saved.get(target["version_id"]))
+                   or not is_state_version_current(saved.get(target["version_id"]), target)]
+    return targets
+
+
+def get_initialized_state_base_voice(voice, state):
+    """Initialize an unset base without importing state candidate bookkeeping."""
+    return {**voice, **{key: copy.deepcopy(value) for key, value in state.items()
+                      if key not in VERSION_OVERLAY_EXCLUDED
+                      or key in {"age_group", "persona_status", "voice_status"}}}
+
+
+def run_advanced_persona_generation(script, selected_speakers, samples, voice_config,
+                                   client, model_name, engine, root, args, **options):
+    """Compile isolated settled-state evidence into versions of a COPY of
+    `voice_config`. -> (failures, voice_config): the caller's dict is never
+    mutated (Rule 17, #1040 review C24)."""
+    voice_config = copy.deepcopy(voice_config)
+    publish = options.pop("state_publisher", None)
+    all_targets = options.pop("state_targets", None)
+    if all_targets is None:
+        all_targets = get_persona_state_targets(script)
+    window = max(1, int(getattr(args, "narration_window", 4) or 4),
+                 get_persona_context_limit(getattr(args, "context_lines", DEFAULT_CONTEXT_LINES)) // 2)
+    failures = []
+    regular = []
+    for speaker in selected_speakers:
+        if speaker not in all_targets or getattr(args, "age_group", ""):
+            regular.append(speaker)
+            continue
+        voice = copy.deepcopy(voice_config.get(speaker) or {})
+        targets = get_pending_state_targets(script, speaker, voice,
+                    getattr(args, "new_only", False), getattr(args, "state_version", ""), state_targets=all_targets)
+        # Completed states may remain after the user clears only the base.
+        first = all_targets[speaker][0]
+        saved_first = voice.get("versions", {}).get(first["version_id"])
+        if (not voice_is_set(voice) and voice_is_set(saved_first)
+                and saved_first.get("persona_state") == first):
+            voice = get_initialized_state_base_voice(voice, saved_first)
+            voice_config[speaker] = copy.deepcopy(voice)
+        print(f"State personas for {speaker}: {len(targets)} targets")
+        for number, target in enumerate(targets, 1):
+            version_id = target["version_id"]
+            print(f"State {number}/{len(targets)}: {speaker} · {target['gender']} · {target['age_group']} · segment {target['state_number']}")
+            entries = get_persona_state_entries(script, target, narration_window=window)
+            state_samples = {speaker: [_entry_text(row) for row in entries
+                                      if _entry_speaker(row) == speaker]}
+            # Never import another state's compiled observations or preview.
+            state_config = {speaker: copy.deepcopy(voice.get("versions", {}).get(version_id) or {})}
+            state_args = copy.copy(args)
+            state_args.age_group = ""
+            state_args.recovered_speaker = (getattr(args, "recovered_speaker", "")
+                                            if getattr(args, "state_version", "") == version_id else "")
+            state_options = dict(options)
+            # Everything inserted here is later run through str.format: escape
+            # braces in every script-derived value, not only the name (C21).
+            def literal(value):
+                return str(value).replace("{", "{{").replace("}", "}}")
+            state_options["advanced_prompt"] = (options.get("advanced_prompt") or PERSONA_ADVANCED_PROMPT) + (
+                f"\nThis evidence is exclusively {literal(speaker)}'s settled {literal(target['gender'])}, "
+                f"{literal(target['age_group'])} state. Use only its supplied lines; do not mix other ages or states.\n")
+            try:
+                failed = _run_advanced_speaker_generation(entries, [speaker], state_samples,
+                    state_config, client, model_name, engine, root, state_args, **state_options)
+            except Exception as error:
+                print(f"State persona failed for {speaker}/{version_id}: {error}")
+                failed = [speaker]
+            if failed:
+                failures.append(f"{speaker}/{version_id}")
+                continue
+            generated = state_config[speaker]
+            generated.update(get_state_version_identity(target))
+            generated.pop("active_candidate", None)
+            generated["persona_status"] = "generated"
+            generated["voice_status"] = "generated"
+            voice.setdefault("versions", {})[version_id] = generated
+            if target["state_number"] == 1 and not voice_is_set(voice):
+                voice = get_initialized_state_base_voice(voice, generated)
+            voice_config[speaker] = copy.deepcopy(voice)
+            if publish is not None:
+                voice_config = copy.deepcopy(publish(voice_config, speaker, version_id))
+                if speaker not in voice_config:
+                    raise ValueError("Character removed during state persona generation")
+                voice = copy.deepcopy(voice_config[speaker])
+    if regular:
+        failures.extend(_run_advanced_speaker_generation(script, regular, samples,
+            voice_config, client, model_name, engine, root, args, **options))
+    return failures, voice_config
 
 
 # _atomic_json_write imported from utils
 
 
+def get_validated_voice_alias_map(voice_config):
+    """Return the validated alias graph from a voice configuration."""
+    if not isinstance(voice_config, dict):
+        raise ValueError("voice configuration must be an object")
+    return get_validated_alias_graph({
+        speaker: voice["alias_of"] for speaker, voice in voice_config.items()
+        if isinstance(voice, dict) and voice.get("alias_of") not in (None, "")})
+
+
+def save_generated_voice_config(path, generated, initial, roster, alias_proposals, book_snapshot=None):
+    """Publish generated changes while preserving newer human edits."""
+    book_guard = ensure_book_state(os.path.dirname(path)) if book_snapshot is not None else nullcontext()
+    with book_guard, file_lock(path):
+        if book_snapshot is not None:
+            require_book_snapshot_current(os.path.dirname(path), book_snapshot)
+        current = safe_load_json(path, default=None) if os.path.exists(path) else {}
+        existing_aliases = get_validated_voice_alias_map(current)
+        merged = copy.deepcopy(current)
+        missing = object()
+        for speaker, value in generated.items():
+            before = initial.get(speaker, missing)
+            latest = current.get(speaker, missing)
+            if before is not missing and latest is missing:
+                continue  # A human removed this entry during generation.
+            if isinstance(value, dict):
+                if latest is missing:
+                    if speaker in alias_proposals:
+                        continue
+                    merged[speaker] = {key: copy.deepcopy(item) for key, item in value.items()
+                                       if key != "alias_of"}
+                elif isinstance(before, dict) and isinstance(latest, dict):
+                    for field in set(before) | set(value):
+                        if field == "alias_of" or (speaker in alias_proposals and field == "seed"):
+                            continue
+                        if field == "versions" and isinstance(value.get(field), dict):
+                            previous = before.get(field) or {}
+                            current_versions = latest.get(field) or {}
+                            for version_id, version in value[field].items():
+                                old_version = previous.get(version_id, missing)
+                                if version != old_version and current_versions.get(version_id, missing) == old_version:
+                                    merged[speaker].setdefault(field, {})[version_id] = copy.deepcopy(version)
+                                elif version != old_version:
+                                    print(f"[skip] {speaker}/{version_id}: version changed during generation")
+                            continue
+                        old = before.get(field, missing)
+                        new = value.get(field, missing)
+                        if new != old and latest.get(field, missing) == old:
+                            if new is missing:
+                                merged[speaker].pop(field, None)
+                            else:
+                                merged[speaker][field] = copy.deepcopy(new)
+            elif latest == before and value != before:
+                merged[speaker] = copy.deepcopy(value)
+        proposals = {}
+        for speaker, canonical in alias_proposals.items():
+            if current.get(speaker, missing) != initial.get(speaker, missing):
+                print(f"  [skip] alias proposal for '{speaker}': voice entry changed during generation")
+                continue
+            proposals[speaker] = canonical
+        accepted = get_safe_alias_proposals([proposals], list(roster) + list(merged), existing_aliases)
+        for speaker, canonical in accepted.items():
+            voice = merged.setdefault(speaker, {})
+            voice["alias_of"] = canonical
+            voice.setdefault("seed", generated.get(speaker, {}).get("seed", -1))
+        get_validated_voice_alias_map(merged)
+        if merged != current or not os.path.exists(path):
+            _atomic_json_write(merged, path)
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate personas for speakers in annotated script")
-    parser.add_argument("--new-only", action="store_true", help="Process only speakers missing from voice_config.json")
+    parser.add_argument("--new-only", action="store_true", help="Only speakers without a voice yet (tts.voice_is_set)")
     parser.add_argument("--alias-check", action="store_true", help="Use LLM + heuristics to decide alias_of vs truly new character")
     parser.add_argument("--advanced", action="store_true", help="Batch the full script into per-character reference files before compiling voice personas")
     parser.add_argument("--batch-size", type=int, default=40, help="Script entries per advanced discovery batch")
     parser.add_argument("--speakers", default="", help="Optional comma-separated speaker allowlist")
+    parser.add_argument("--speaker", default="", help="One exact speaker name (may contain commas); used by the app")
+    parser.add_argument("--book-token", default="", help="Expected active-book identity for targeted generation")
+    parser.add_argument("--state-version", default="", help="Regenerate one settled state version from its own evidence")
+    parser.add_argument("--age-group", default="", help="Optional age profile to store as a separate voice version")
+    parser.add_argument("--recovered-speaker", default="", help="Use the saved persona for this speaker and resume preview generation")
     parser.add_argument("--narration-window", type=int, default=4, help="How many preceding narrator lines to include as intro context")
+    parser.add_argument("--context-lines", type=int, default=DEFAULT_CONTEXT_LINES,
+                        help="Sample spoken lines per character fed to the persona prompt; the narrator window grows to half of it")
     args = parser.parse_args()
+    if args.state_version:
+        if args.age_group:
+            parser.error("--state-version cannot be combined with --age-group")
+        args.advanced = True
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    script_path = os.path.join(root, "annotated_script.json")
-    voice_config_path = os.path.join(root, "voice_config.json")
-    app_config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    app_dir = os.path.dirname(__file__)
+    data_dir = get_runtime_data_dir(root)
+    script_path = os.path.join(data_dir, "annotated_script.json")
+    voice_config_path = os.path.join(data_dir, "voice_config.json")
+    app_config_path = get_app_config_path(data_dir, root, app_dir)
 
     if not os.path.exists(script_path):
         print(f"Error: {script_path} not found. Generate script first.")
         sys.exit(1)
 
-    with open(script_path, "r", encoding="utf-8") as f:
-        script = json.load(f)
+    with ensure_book_state(data_dir), file_lock(voice_config_path):
+        book_snapshot = get_book_snapshot(data_dir)
+    if args.book_token and get_book_snapshot_token(book_snapshot) != args.book_token:
+        raise ValueError("Active book changed before persona generation started")
+    script = json.loads(book_snapshot["script_bytes"])
+    state_targets = get_persona_state_targets(script) if args.advanced or args.state_version else {}
+    requested = get_requested_speakers(args)
+    if args.state_version:
+        if not any(find_state_target(state_targets, speaker, args.state_version) for speaker in requested):
+            raise ValueError("Character state changed before persona generation started")
 
     # Collect sample lines per speaker + first-appearance narrator context
     samples = {}
-    first_index = {}
-    for i, entry in enumerate(script):
+    for entry in script:
         speaker = _entry_speaker(entry)
         if not speaker:
             continue
         samples.setdefault(speaker, []).append(entry.get("text", "").strip())
-        if speaker not in first_index:
-            first_index[speaker] = i
 
     narrator_context = {}
-    window = max(1, int(args.narration_window or 4))
+    context_lines = get_persona_context_limit(args.context_lines)
+    window = max(1, int(args.narration_window or 4), context_lines // 2)
     for speaker in samples.keys():
         narrator_context[speaker] = _collect_narrator_context(script, speaker, window)
 
-    # Load LLM config
-    config = {}
-    if os.path.exists(app_config_path):
-        try:
-            with open(app_config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load app/config.json: {e}")
+    # Load existing voice_config (preserve other fields)
+    voice_config = copy.deepcopy(book_snapshot["voices"])
+    original_aliases = get_validated_voice_alias_map(voice_config)
+    initial_voice_config = copy.deepcopy(voice_config)
 
-    llm_cfg = config.get("llm", {})
+    selected_speakers = list(samples.keys())
+    if args.new_only:
+        selected_speakers = [s for s in selected_speakers if not voice_is_set(voice_config.get(s))
+                             or (args.advanced and get_pending_state_targets(script, s, voice_config.get(s), True, state_targets=state_targets))]
+    if requested:
+        selected_speakers = [s for s in selected_speakers if s in requested]
+
+    if not selected_speakers:
+        print("No speakers to process.")
+        return
+
+    if args.advanced:
+        selected_speakers = [speaker for speaker in selected_speakers
+                             if resolve_speaker_label(speaker, original_aliases) is None]
+        if not selected_speakers:
+            print("No unique speakers to process; existing aliases are preserved.")
+            return
+
+    # Load LLM config
+    config = load_app_config(app_config_path)
+
+    llm_cfg = get_active_llm_config(config)
     base_url = llm_cfg.get("base_url", "http://localhost:11434/v1")
     api_key = llm_cfg.get("api_key", "local")
     model_name = llm_cfg.get("model_name", "richardyoung/qwen3-14b-abliterated:Q8_0")
+    llm_mode = config.get("llm_mode", "local")
 
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    # Self-heal a stale/misconfigured local or remote LM Studio before making
+    # any calls, mirroring review_script.py/find_nicknames.py. This file has
+    # no VRAM watchdog or concurrency wave processing of its own (personas
+    # are generated sequentially per speaker/batch), so only the self-heal
+    # call applies here.
+    _, lm_status, heal_msg = ensure_ideal_settings(
+        llm_mode, base_url, model_name, ssh_alias=config.get("llm_remote_ssh"), api_key=api_key)
+    print(heal_msg)
+
+    client = make_run_client(config, llm_cfg, llm_timeout_seconds())
 
     # Load persona prompts from config, fall back to defaults
-    prompts_cfg = config.get("prompts", {})
+    prompts_cfg = config.get("prompts") or {}
+    args.persona_reference_chars = prompts_cfg.get("persona_reference_chars", 12000)
+    args.persona_allow_unknown_network_context = prompts_cfg.get("persona_allow_unknown_network_context", False)
+    args.llm_mode = llm_mode
     persona_system = prompts_cfg.get("persona_system_prompt") or PERSONA_SYSTEM_PROMPT
     persona_user = prompts_cfg.get("persona_user_prompt") or PERSONA_USER_PROMPT
     persona_advanced = prompts_cfg.get("persona_advanced_prompt") or PERSONA_ADVANCED_PROMPT
-
-    # Load existing voice_config (preserve other fields)
-    voice_config = {}
-    if os.path.exists(voice_config_path):
-        try:
-            with open(voice_config_path, "r", encoding="utf-8") as f:
-                voice_config = json.load(f)
-        except Exception:
-            voice_config = {}
+    age_instruction = ""
+    if args.age_group.strip():
+        age_instruction = (f"\nCreate this persona for the character's {args.age_group.strip()} age profile; "
+                           "keep the same identity while adapting apparent age and delivery.\n")
+        persona_user = persona_user + age_instruction
+        persona_advanced = persona_advanced + age_instruction
 
     # Disable compile_codec for persona previews: compilation overhead
     # outweighs benefit for single generations, and subprocess context
@@ -701,60 +1545,21 @@ def main():
     tts_cfg["compile_codec"] = False
     engine = TTSEngine({"tts": tts_cfg})
 
-    selected_speakers = list(samples.keys())
-    if args.new_only:
-        selected_speakers = [s for s in selected_speakers if s not in voice_config]
-    if args.speakers.strip():
-        allow = {s.strip() for s in args.speakers.split(",") if s.strip()}
-        selected_speakers = [s for s in selected_speakers if s in allow]
-
-    if not selected_speakers:
-        print("No speakers to process.")
-        return
-
-    if args.advanced:
-        run_advanced_persona_generation(
-            script=script,
-            selected_speakers=selected_speakers,
-            samples=samples,
-            voice_config=voice_config,
-            client=client,
-            model_name=model_name,
-            engine=engine,
-            root=root,
-            args=args,
-            system_prompt=persona_system,
-            advanced_prompt=persona_advanced,
-        )
-        try:
-            _atomic_json_write(voice_config, voice_config_path)
-            print(f"Updated voice_config saved to {voice_config_path}")
-        except Exception as e:
-            print(f"Failed to save voice_config.json: {e}")
-        return
 
     print(f"Processing {len(selected_speakers)} speakers")
 
-    # Step 1: Pre-process with exact heuristic + high-confidence fuzzy matching
+    # Step 1: Pre-process exact normalized aliases only. Similar names can be
+    # distinct people (for example NITA and NITA'S DAD), so fuzzy identity
+    # decisions remain behind the explicit alias-check workflow below.
     resolved_aliases = {}
     remaining_speakers = []
 
     for speaker in selected_speakers:
         existing_names = [n for n in voice_config.keys() if n != speaker]
-        # Fast heuristic exact check
-        norm_self = normalize_speaker_name(speaker)
-        heuristic_alias = ""
-        for candidate in existing_names:
-            if normalize_speaker_name(candidate) == norm_self and norm_self:
-                heuristic_alias = candidate
-                break
-
-        if not heuristic_alias and existing_names:
-            # High-confidence fuzzy check
-            heuristic_alias = _resolve_to_canonical(speaker, existing_names, threshold=0.8)
+        heuristic_alias = get_exact_alias_match(speaker, existing_names)
 
         if heuristic_alias:
-            print(f"Fast heuristic/fuzzy alias detected: {speaker} -> {heuristic_alias}")
+            print(f"Exact-name alias detected: {speaker} -> {heuristic_alias}")
             resolved_aliases[speaker] = heuristic_alias
         else:
             remaining_speakers.append(speaker)
@@ -766,6 +1571,7 @@ def main():
         # Split remaining speakers into chunks of 25 to prevent context/output token exhaustion
         chunk_size = 25
         batch_mapping = {}
+        batch_proposals = []
         
         for idx in range(0, len(remaining_speakers), chunk_size):
             chunk = remaining_speakers[idx:idx + chunk_size]
@@ -780,27 +1586,30 @@ def main():
             existing_configured = list(voice_config.keys()) + list(batch_mapping.values())
             
             print(f"Resolving alias batch {idx//chunk_size + 1} ({len(chunk)} speakers)...")
-            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured)
-            batch_mapping.update(chunk_mapping)
-
-        # Build case-insensitive normalized lookup mapping to survive LLM key casing changes
-        normalized_mapping = {}
-        for k, v in batch_mapping.items():
-            if k and v:
-                normalized_mapping[normalize_speaker_name(k)] = v
+            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured,
+                                                   lm_status.get("context_length"), llm_cfg,
+                                                   comparison_names=list(voice_config) + selected_speakers)
+            batch_proposals.append(chunk_mapping)
+            batch_mapping = get_safe_alias_proposals(
+                batch_proposals, list(voice_config) + selected_speakers, original_aliases, flatten=False)
 
         for speaker in remaining_speakers:
-            norm_speaker = normalize_speaker_name(speaker)
-            resolved_name = normalized_mapping.get(norm_speaker, speaker)
+            llm_key = get_exact_alias_match(speaker, batch_mapping)
+            resolved_name = batch_mapping.get(llm_key) or speaker
             if resolved_name != speaker:
                 # LLM identified this as an alias!
                 all_possible = list(voice_config.keys()) + remaining_speakers
-                canonical_target = _resolve_to_canonical(resolved_name, all_possible, threshold=0.6)
+                canonical_target = get_exact_alias_match(resolved_name, all_possible)
                 if canonical_target and canonical_target != speaker:
                     print(f"Batch LLM alias detected: {speaker} -> {canonical_target}")
                     resolved_aliases[speaker] = canonical_target
                 else:
                     print(f"Batch LLM mapped '{speaker}' to '{resolved_name}' but couldn't resolve canonical spelling. Treating as new.")
+
+    raw_aliases = dict(resolved_aliases)
+    resolved_aliases = get_safe_alias_proposals(
+        [resolved_aliases], list(voice_config) + selected_speakers, original_aliases)
+    final_alias_proposals = {speaker: raw_aliases[speaker] for speaker in resolved_aliases}
 
     # Apply all resolved aliases to voice_config
     for speaker, alias_target in resolved_aliases.items():
@@ -812,17 +1621,63 @@ def main():
         voice_config[speaker] = voice_entry
 
     # Step 3: Generate personas for remaining truly unique speakers
-    unique_speakers = [s for s in remaining_speakers if s not in resolved_aliases]
+    unique_speakers = [s for s in remaining_speakers
+                       if s not in resolved_aliases
+                       and resolve_speaker_label(s, original_aliases) is None]
     print(f"Generating personas for {len(unique_speakers)} unique speakers...")
+
+    if args.advanced:
+        publisher = StatePublisher(voice_config_path, initial_voice_config, book_snapshot)
+
+        failures, voice_config = run_advanced_persona_generation(
+            script=script,
+            selected_speakers=unique_speakers,
+            samples=samples,
+            voice_config=voice_config,
+            client=client,
+            model_name=model_name,
+            engine=engine,
+            root=data_dir,
+            args=args,
+            system_prompt=persona_system,
+            advanced_prompt=persona_advanced,
+            context_length=lm_status.get("context_length"),
+            llm_config=llm_cfg,
+            book_id=book_snapshot["book_id"],
+            state_publisher=publisher.publish,
+            state_targets=state_targets,
+        )
+        if args.age_group.strip():
+            for speaker in unique_speakers:
+                if speaker in failures:
+                    continue
+                current = voice_config.get(speaker)
+                if not isinstance(current, dict):
+                    continue
+                snapshot = {k: v for k, v in current.items()
+                            if k not in {"versions", "candidates", "active_version", "active_candidate"}}
+                snapshot["age_group"] = args.age_group.strip()
+                current.setdefault("versions", {})[args.age_group.strip()] = snapshot
+        try:
+            save_generated_voice_config(voice_config_path, voice_config,
+                                        publisher.base, samples.keys(), final_alias_proposals, book_snapshot=book_snapshot)
+            print(f"Updated voice_config saved to {voice_config_path}")
+        except Exception as e:
+            print(f"Failed to save voice_config.json: {e}")
+            raise
+        if failures:
+            raise RuntimeError("Persona generation failed for: " + ", ".join(failures))
+        return
+
+    failures = []
 
     for speaker in unique_speakers:
         lines = samples.get(speaker, [])
         try:
             print(f"Generating persona for: {speaker} ({len(lines)} lines samples)")
 
-            sample_text = "\n".join(lines[:8])
-            intro_ctx = narrator_context.get(speaker, [])
-            intro_blob = "\n".join(intro_ctx) if intro_ctx else "(No nearby narrator intro lines found.)"
+            sample_text, intro_blob = select_persona_context(
+                lines, narrator_context.get(speaker, []), context_lines)
 
             user_prompt = persona_user.format(
                 speaker=speaker,
@@ -830,26 +1685,45 @@ def main():
                 sample_lines=sample_text
             )
 
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": persona_system},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=400,
-            )
+            messages = [
+                {"role": "system", "content": persona_system},
+                {"role": "user", "content": user_prompt}
+            ]
+            recovered = (speaker == args.recovered_speaker and
+                         isinstance(voice_config.get(speaker), dict))
+            if recovered:
+                parsed = get_recovered_persona(voice_config[speaker], args.age_group)
+                voice_config[speaker] = parsed
+                print(f"Using recovered persona for {speaker}; skipping the LLM request.")
+            else:
+                params = _persona_params(messages[0]["content"], lm_status.get("context_length"),
+                                         llm_cfg, 400, 0.3)
+                evidence = [("sample_lines", line) for line in lines[:context_lines]]
+                evidence += [("narrator_context", line) for line in
+                             narrator_context.get(speaker, [])[:context_lines]]
 
-            text = response.choices[0].message.content.strip()
-            parsed = extract_json_object(text)
+                def build_prompt(parts):
+                    return persona_user.format(
+                        speaker=speaker,
+                        narrator_context="\n".join(text for kind, text in parts
+                                                  if kind == "narrator_context")
+                        or "(No nearby narrator intro lines found.)",
+                        sample_lines="\n".join(text for kind, text in parts if kind == "sample_lines"))
+
+                parsed = request_persona_with_evidence(
+                    client, model_name, messages[0]["content"], build_prompt, evidence,
+                    params, f"PERSONA {speaker}")
             description = ""
             ref_text = ""
-            if parsed:
-                description = str(parsed.get("description", "") or "").strip()
-                ref_text = str(parsed.get("ref_text", "") or "").strip()
+            if isinstance(parsed, dict):
+                try:
+                    validated = validate_persona_payload(parsed)
+                    description, ref_text = validated["description"], validated["ref_text"]
+                except ValueError as exc:
+                    print(f"Warning: persona integrity check failed for {speaker}: {exc}")
 
             if not description:
-                print(f"Warning: LLM did not return parseable JSON for {speaker}. Response preview:\n{text[:300]}")
+                print(f"Warning: LLM did not return a valid persona for {speaker}; using fallback.")
                 # Fallback to compiled fallback persona
                 description, ref_text = _fallback_compiled_persona({
                     "name": speaker,
@@ -860,19 +1734,32 @@ def main():
                 ref_text = pick_ref_text(lines)
 
             # Generate and save voice preview
-            _save_generated_preview(root, engine, voice_config, speaker, description, ref_text)
-
-            time.sleep(0.5)
+            if not _save_generated_preview(data_dir, engine, voice_config, speaker, description, ref_text,
+                                           book_id=book_snapshot["book_id"]):
+                failures.append(speaker)
+                continue
+            if args.age_group.strip() and isinstance(voice_config.get(speaker), dict):
+                current = voice_config[speaker]
+                snapshot = {k: v for k, v in current.items()
+                            if k not in {"versions", "candidates", "active_version", "active_candidate"}}
+                snapshot["age_group"] = args.age_group.strip()
+                current.setdefault("versions", {})[args.age_group.strip()] = snapshot
 
         except Exception as e:
             print(f"Unhandled error for {speaker}: {e}")
+            failures.append(speaker)
 
     # Persist voice_config
     try:
-        _atomic_json_write(voice_config, voice_config_path)
+        save_generated_voice_config(voice_config_path, voice_config,
+                                    initial_voice_config, samples.keys(), final_alias_proposals, book_snapshot=book_snapshot)
         print(f"Updated voice_config saved to {voice_config_path}")
     except Exception as e:
         print(f"Failed to save voice_config.json: {e}")
+        raise
+
+    if failures:
+        raise RuntimeError("Persona generation failed for: " + ", ".join(failures))
 
 
 if __name__ == '__main__':

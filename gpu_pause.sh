@@ -1,0 +1,223 @@
+#!/bin/bash
+# Hold the GPU queue so the card can be used for something else.
+#
+# WHY A FLAG AND NOT A KILL. The queue is hours long and every job in it is
+# resumable - measure_respellings skips terms it already has, the re-gate skips
+# adapters whose artifact exists, replay skips finished artifacts. So the cheap
+# way to free the card is to stop STARTING work, not to destroy work in flight.
+#
+# PAUSING DOES NOT FREE VRAM BY ITSELF. A job already running keeps the card
+# until it exits. `status` reports what is still resident so the difference
+# between "queue is held" and "card is free" is visible rather than assumed -
+# a paused queue with a job still running looks identical to a free card if
+# you only check the flag.
+#
+# Usage:
+#   ./gpu_pause.sh on          hold the queue; the running job finishes
+#   ./gpu_pause.sh on --now    also interrupt the running job (see below)
+#   ./gpu_pause.sh off         release the queue
+#   ./gpu_pause.sh status      flag state, running job, VRAM in use
+#
+# --now IS NOT THE DEFAULT, deliberately. Chains skip a stage whose artifact
+# already exists, and several jobs write their artifact incrementally as a
+# checkpoint. Interrupting one leaves a partial artifact that a later run reads
+# as finished. Interrupting is safe for the jobs that key their work per item;
+# it is not universally safe, so it is opt-in and says so.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")" && pwd)"
+FLAG="${GPU_PAUSE_FLAG:-$REPO/ab_test_runtime/logs/gpu_paused}"
+QLOG="${GPU_QLOG:-$REPO/ab_test_runtime/logs/gpu_jobq.log}"
+
+stamp() { date -u +%FT%TZ; }
+source "$REPO/run_chains/lib/gpu_pending.sh" || exit 4
+source "$REPO/run_chains/lib/gpu_queue_log.sh" || exit 4
+
+vram_used_mib() {
+    local output value selector
+    if output=$(timeout 5 rocm-smi --showmeminfo vram 2>/dev/null); then
+        value=$(printf '%s\n' "$output" | awk '
+            tolower($0) ~ /total used memory/ && $NF ~ /^[0-9]+$/ {sum+=$NF; seen=1}
+            END {if (seen) printf "%d", sum/1048576; else exit 1}')
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+    selector="${CUDA_VISIBLE_DEVICES:-${NVIDIA_VISIBLE_DEVICES:-}}"
+    local -a args=(--query-gpu=memory.used --format=csv,noheader,nounits)
+    if [ -n "$selector" ] && [ "$selector" != "all" ]; then
+        args=(-i "$selector" "${args[@]}")
+    fi
+    output=$(timeout 5 nvidia-smi "${args[@]}" 2>/dev/null) || return 1
+    printf '%s\n' "$output" | awk '
+        /^[[:space:]]*[0-9]+[[:space:]]*$/ {sum+=$1; seen=1; next}
+        {invalid=1}
+        END {if (seen && !invalid) print sum; else exit 1}'
+}
+
+running_job() {
+    # The job that currently holds the lock: the last START in the queue log
+    # with no matching terminal marker after it, CONFIRMED against a live
+    # process before it is reported.
+    #
+    # The log alone is a record of what was SUPPOSED to happen. On 2026-08-17
+    # the e_row_e arm finished - artifact complete, 400 of 400, and the next
+    # arm queued one second later - and no OK or FAILED line was ever written.
+    # Cause still unknown. The consequence was not: `status` went on reporting
+    # a finished job as running for 24 minutes, so "the card is still busy"
+    # was false, and a paused-for-gaming user was told to keep waiting for
+    # nothing. A missing marker must degrade to "cannot tell", never to a
+    # confident wrong answer.
+    local name
+    name=$(logged_job)
+    [ -n "$name" ] && job_is_live "$name" && echo "$name"
+    return 0
+}
+
+logged_job() {
+    get_logged_queue_job
+}
+
+job_is_live() {
+    [ -n "$(job_pids "$1")" ]
+}
+
+job_pids() {
+    local wanted="$1" proc pid index
+    local -a argv
+    for proc in /proc/[0-9]*; do
+        pid=${proc##*/}
+        [ "$pid" = "$$" ] || [ "$pid" = "$PPID" ] && continue
+        [ -r "$proc/cmdline" ] || continue
+        mapfile -d '' -t argv < "$proc/cmdline" 2>/dev/null || continue
+        for ((index=0; index + 1 < ${#argv[@]}; index++)); do
+            if [ "${argv[index]##*/}" = "gpu_job.sh" ] \
+                    && [ "${argv[index + 1]}" = "$wanted" ]; then
+                printf '%s\n' "$pid"
+                break
+            fi
+        done
+    done
+}
+
+case "${1:-status}" in
+  on)
+    mkdir -p "$(dirname "$FLAG")"
+    date -u +%FT%TZ > "$FLAG"
+    append_queue_log "$(stamp) PAUSED   queue held by gpu_pause" || exit 8
+    echo "queue paused: no further job will START until 'gpu_pause.sh off'."
+    job=$(running_job)
+    if [ -n "$job" ]; then
+        if [ "${2:-}" = "--now" ]; then
+            echo "stopping the running job '$job' (SIGTERM; gpu_job.sh escalates to KILL after 20s)."
+            echo "WARNING: a job that writes its artifact incrementally may"
+            echo "leave a partial file that a later chain reads as finished."
+            # SIGTERM, not SIGINT. Every chain is launched with nohup/& from a
+            # non-interactive shell, which starts it with SIGINT ignored; the
+            # wrapper and the setsid'd job inherit that (SigIgn bit 1 on both,
+            # measured 2026-09-14), and a shell cannot trap a signal it entered
+            # ignoring. So `kill -INT` reached nothing, this script wrote
+            # INTERRUPTED at once, and the job ran to completion and logged OK
+            # 28s later. The wrapper's TERM trap stops the process group and
+            # writes the terminal line itself (STOPPED/KILLED, then INTERRUPTED
+            # rc=143) - one owner for the marker - so this side only signals
+            # and waits for the wrapper to be gone.
+            mapfile -t pids < <(job_pids "$job")
+            signalled=0
+            for pid in "${pids[@]}"; do
+                if kill -TERM "$pid" 2>/dev/null; then
+                    signalled=1
+                fi
+            done
+            if [ "$signalled" != "1" ]; then
+                echo "could not stop '$job'; no signal was delivered." >&2
+                exit 3
+            fi
+            waited=0
+            while [ "$waited" -lt 45 ] && job_is_live "$job"; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if job_is_live "$job"; then
+                echo "'$job' is still alive ${waited}s after SIGTERM; check '$QLOG'." >&2
+                exit 3
+            fi
+            echo "'$job' stopped after ${waited}s; its terminal line is in the queue log."
+        else
+            echo "'$job' is still running and keeps the card until it exits."
+            echo "run 'gpu_pause.sh status' to see when VRAM is actually free,"
+            echo "or 'gpu_pause.sh on --now' to interrupt it."
+        fi
+    fi
+    ;;
+  off)
+    rm -f "$FLAG"
+    append_queue_log "$(stamp) RESUMED  queue released by gpu_pause" || exit 8
+    echo "queue released; waiting jobs will start on their next check."
+    ;;
+  status)
+    if [ -f "$FLAG" ]; then
+        echo "queue: PAUSED since $(cat "$FLAG" 2>/dev/null)"
+    else
+        echo "queue: running"
+    fi
+    job=$(running_job)
+    echo "running job: ${job:-none}"
+    if [ -n "$job" ]; then
+        progress_dir="${GPU_PROGRESS_DIR:-$(dirname "$QLOG")/progress}"
+        progress_python="${GPU_OWNER_PYTHON:-$(command -v python3)}"
+        progress_owners=()
+        while IFS= read -r pid; do
+            token=$(get_pending_process_token "$pid" 2>/dev/null) || continue
+            progress_owners+=("$pid=$token")
+        done < <(job_pids "$job")
+        if [ -x "$progress_python" ] && [ -f "$REPO/app/gpu_progress.py" ]; then
+            "$progress_python" "$REPO/app/gpu_progress.py" "$progress_dir" "$job" "${progress_owners[@]}" \
+                || echo "ETA: unavailable (progress reader failed)"
+        else
+            echo "ETA: unavailable (progress reader unavailable)"
+        fi
+    fi
+    # WHAT IS WAITING, not just what is running. Until gpu_job.sh wrote pending
+    # markers there was no way to ask this: queued jobs are blocked processes
+    # and a chain that died left the same evidence as one patiently waiting -
+    # the confusion behind two idle stretches on 2026-08-18. task-spooler has
+    # `ts -l` for exactly this; these markers are the small version.
+    pending_dir="${GPU_PENDING_DIR:-$REPO/ab_test_runtime/logs/pending}"
+    if [ -d "$pending_dir" ]; then
+        for marker in "$pending_dir"/*; do
+            [ -e "$marker" ] || continue
+            marker_name=$(cut -f1 "$marker" 2>/dev/null)
+            marker_pid=$(cut -f2 "$marker" 2>/dev/null)
+            # A marker whose process is gone is a LIE, and saying so is the
+            # point: it means a chain died holding a place in the queue.
+            if is_pending_marker_live "$marker"; then
+                [ "$marker_name" = "$job" ] || echo "  waiting: $marker_name (pid $marker_pid)"
+            else
+                echo "  STALE:   $marker_name (pid $marker_pid identity is stale or unverified; chain may have died)"
+            fi
+        done
+    fi
+    logged=$(logged_job)
+    if [ -z "$job" ] && [ -n "$logged" ]; then
+        # Say which of the two sources disagreed rather than picking one
+        # silently: the log is what was supposed to happen, the process table
+        # is what is happening.
+        echo "note: the queue log's last START is '$logged' with no result"
+        echo "      line, but no such process exists - it finished without"
+        echo "      being recorded. The card is free."
+    fi
+    used=$(vram_used_mib)
+    echo "VRAM in use: ${used:-unknown} MiB"
+    if [ -f "$FLAG" ] && [ -n "$job" ]; then
+        echo
+        echo "NOTE: paused but '$job' still holds the card. The queue is held;"
+        echo "the GPU is not free until that job exits."
+    fi
+    ;;
+  *)
+    echo "usage: gpu_pause.sh [on [--now] | off | status]" >&2
+    exit 2
+    ;;
+esac

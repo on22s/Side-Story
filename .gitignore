@@ -79,3 +79,13 @@ preparer_output/
 # Docker persistent data
 data/
 
+
+# Mutable runtime data and optional local model environments
+data/
+preparer_env/
+models/
+whisper.cpp/
+*.gguf
+ab_test_runtime/
+reports/
+app/torch-constraints.txt

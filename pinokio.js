@@ -1,6 +1,3 @@
-const fs = require('fs')
-const path = require('path')
-
 module.exports = {
   version: "5.0",
   title: "Alexandria",
@@ -10,6 +7,7 @@ module.exports = {
     // Check running states
     let running = {
       install: info.running("install.js"),
+      voiceTools: info.running("install-voice-tools.js"),
       start: info.running("start.js"),
       reset: info.running("reset.js"),
       update: info.running("update.js")
@@ -25,6 +23,15 @@ module.exports = {
         icon: "fa-solid fa-plug",
         text: "Installing",
         href: "install.js"
+      }]
+    }
+
+    if (running.voiceTools) {
+      return [{
+        default: true,
+        icon: "fa-solid fa-plug",
+        text: "Installing Voice Tools",
+        href: "install-voice-tools.js"
       }]
     }
 
@@ -97,6 +104,10 @@ module.exports = {
       icon: "fa-solid fa-plug",
       text: "Reinstall",
       href: "install.js"
+    }, {
+      icon: "fa-solid fa-microphone",
+      text: "Install Voice Tools (Optional)",
+      href: "install-voice-tools.js"
     }, {
       icon: "fa-solid fa-rotate-left",
       text: "Reset",

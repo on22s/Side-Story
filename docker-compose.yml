@@ -2,25 +2,26 @@ services:
   alexandria:
     build: .
     ports:
-      - "4200:4200"
+      # Keep the unauthenticated default local to this host.
+      - "127.0.0.1:4200:4200"
     environment:
-      # Store WebUI settings on a mounted volume so they survive container restarts
+      # Preserve the fork's settings path across image upgrades and restarts.
       - ALEXANDRIA_CONFIG_PATH=/alexandria/config/config.json
     volumes:
-      # Persist HuggingFace model cache (~3.5 GB per model, downloaded on first use)
+      # Model weights download on first use.
       - hf_cache:/root/.cache/huggingface
-      # Persist user data
-      - ./data/uploads:/alexandria/app/uploads
-      - ./data/designed_voices:/alexandria/designed_voices
-      - ./data/clone_voices:/alexandria/clone_voices
-      - ./data/lora_models:/alexandria/lora_models
-      - ./data/lora_datasets:/alexandria/lora_datasets
-      - ./data/dataset_builder:/alexandria/dataset_builder
-      - ./data/scripts:/alexandria/scripts
-      # Persist WebUI settings (OpenAI endpoint, prompts, TTS mode, etc.)
+      # Persist every mutable artifact, including state and voice libraries.
+      - ./data/runtime:/alexandria/runtime
+      # Preserve existing host data paths; no copying/moving is required.
+      - ./data/uploads:/alexandria/runtime/uploads
+      - ./data/designed_voices:/alexandria/runtime/designed_voices
+      - ./data/clone_voices:/alexandria/runtime/clone_voices
+      - ./data/lora_models:/alexandria/runtime/lora_models
+      - ./data/lora_datasets:/alexandria/runtime/lora_datasets
+      - ./data/dataset_builder:/alexandria/runtime/dataset_builder
+      - ./data/scripts:/alexandria/runtime/scripts
+      - ./data/output:/alexandria/runtime/voicelines
       - ./data/config:/alexandria/config
-      # Persist audiobook output
-      - ./data/output:/alexandria/voicelines
     deploy:
       resources:
         reservations:
