@@ -2,7 +2,7 @@ const path = require("path")
 
 // Include child installers too: their shells have independent script groups.
 const writerScripts = [
-  "start.js", "install-voice-tools.js",
+  "start.js", "start_llm.js", "install-voice-tools.js",
   "install.js", "torch.js", "llama_cpp.js", "reset.js", "update.js"
 ]
 

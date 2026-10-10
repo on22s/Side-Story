@@ -133,13 +133,28 @@ For multiple explicitly paired books, `corpus_alignment_prescan.py` validates in
 
 The Docker image includes the scripts but does not install native Voice Tools. Use a separately prepared interpreter via `ALEXANDRIA_PREPARER_PYTHON` for preparation; ordinary audiobook generation is unaffected.
 
+#### Local LLM launchers and runtime diagnostics
+
+After **Install Voice Tools (Optional)**, Pinokio's **Start LLM** actions serve the selected GGUF from the checkout root and update the local LLM profile. Model weights are not downloaded automatically. Reset and Update stop this server before changing files.
+
+For an independently installed native `llama-server` on Linux, `start_llama_server.sh` and `ensure_llama_server.sh` retain verified model/adapter identity and lifecycle locking. Set `LLAMA_BIN`, `LLAMA_MODEL`, and optionally `LLAMA_PORT`/`LLAMA_LOG` explicitly for your installation; these helpers do not install the native binary or models.
+
+Additional production-support CLIs, using the app environment:
+
+- `app/env/bin/python app/analyze_generation_attempts.py --json` summarizes saved generation quality manifests.
+- `app/env/bin/python app/repair_source_llm.py --help` explains source-repair proposals. The default is report-only (it still contacts your configured LLM); writing repaired output requires `--apply`.
+- `app/env/bin/python app/tts_vram_benchmark.py --help` explains custom/clone voice GPU batch and codec tuning. Running a sweep loads real models and consumes GPU time.
+- `app/env/bin/python tools/backfill_adapter_digests.py --root /path/to/adapters` audits missing provenance digests. It is dry-run unless `--apply` is specified; it never replaces mismatched existing digests or claims historical training verification.
+
+On Windows use `app\env\Scripts\python.exe`; in Docker use `python` for these four Python CLIs. The standalone native server shell launchers are intended for a prepared Linux checkout, not the base Docker image.
+
 ### Option B: Google Colab (No Install Required)
 
 No GPU or wrong OS? Run Alexandria on a free T4 GPU in your browser:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
 
-Requires a free [ngrok account](https://dashboard.ngrok.com/signup) for the web UI tunnel. See the notebook for full instructions.
+The notebook uses Google Drive persistence and Colab's built-in inline port forwarding; no ngrok account is needed. See the notebook for full instructions.
 
 ### Option C: Docker (NVIDIA GPU)
 
