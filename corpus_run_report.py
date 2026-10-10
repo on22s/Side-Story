@@ -166,6 +166,7 @@ def save_corpus_report(index, output_dir):
 def run_corpus(repo, pairs_path, output_dir, model, fallback):
     if not isinstance(model, str) or not model.strip():
         raise ValueError('--model is required when running --pairs')
+    fallback = fallback or None
     pairs = json.loads(pairs_path.read_text(encoding='utf-8'))
     if not isinstance(pairs, list):
         raise ValueError('pairs must be a JSON array')
