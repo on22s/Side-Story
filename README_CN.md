@@ -37,7 +37,7 @@
 
 > The rain stopped just before dawn. A small bird landed on the garden gate. By the time the kettle sang, the sky was bright.
 
-这是随文档提供的原创文本，适用仓库的 MIT 许可。示例没有对话，只需要旁白。此处刻意使用同一份英文文本和 Ryan，方便对照截图；处理中文书籍时再改为对应语言和声音。
+这是随文档提供的原创文本，适用仓库的 MIT 许可。示例没有对话，只需要旁白。此处刻意使用同一份英文文本和 Ryan，方便对照中英文步骤；处理中文书籍时再改为对应语言和声音。
 
 1. **Setup（设置）**：按[LLM 设置](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)连接已运行的 LLM，点击 **Test Connection**，再点击 **Save Configuration**；测试本身不会保存设置。选择 **TTS Mode → Local Model (built in)**、**Device → Auto (best available)**、**TTS Language → English**。准确设置 **Runs on this machine's GPU?**，修改后再保存。成功检查点：连接测试通过，并收到配置保存确认。
 2. **Script（脚本）**：在 **Select Book/Novel (Text, Markdown, or EPUB)** 选取示例，文件会自动上传。可选旁白字段留空。点击 **Generate Annotated Script**。成功检查点：生成结束，三句话均被保留，条目为旁白；分段数量可能不同。
