@@ -773,12 +773,15 @@ def get_lora_dataset_path(dataset_id):
 async def lora_delete_dataset(dataset_id: str):
     """Delete an uploaded dataset."""
     dataset_dir = get_lora_dataset_path(dataset_id)
-    if not os.path.isdir(dataset_dir):
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    if process_state["lora_training"]["running"]:
-        raise HTTPException(status_code=409, detail="Wait for LoRA training to finish before deleting datasets")
-
-    shutil.rmtree(dataset_dir)
+    # Voice Lab also reads these datasets.  Claim atomically rather than only
+    # inspecting this process's LoRA flag; foreign server leases count too.
+    claim_id = claim_gpu_task("lora_training")
+    try:
+        if not os.path.isdir(dataset_dir):
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        shutil.rmtree(dataset_dir)
+    finally:
+        release_gpu_task_claim("lora_training", claim_id)
     logger.info(f"LoRA dataset deleted: {dataset_id}")
     return {"status": "deleted", "dataset_id": dataset_id}
 
