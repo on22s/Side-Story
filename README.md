@@ -6,7 +6,7 @@ Turn a book into a multi-voice audiobook. Alexandria combines AI script annotati
 
 **[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting) · [Full user guide](https://github.com/on22s/alexandria-audiobook-nya/wiki)**
 
-English | [中文](README_CN.md)
+English | [中文](README_CN.md) | [日本語](README_JA.md)
 
 ## At a glance
 

@@ -6,7 +6,7 @@
 
 **[安装](#安装) · [快速入门](#快速入门) · [可选声音工具](#可选-voice-lab--preparer-依赖) · [常见问题](#常见问题) · [完整中文指南](https://github.com/on22s/alexandria-audiobook-nya/wiki/Home-zh-CN)**
 
-[English](README.md) | 中文
+[English](README.md) | 中文 | [日本語](README_JA.md)
 
 ## 主要功能
 
