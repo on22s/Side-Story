@@ -17,7 +17,7 @@ RUN python -c "import importlib.metadata as m, pathlib; names={'torch','torchvis
 COPY app/ /alexandria/app/
 COPY default_prompts*.txt review_prompts.txt persona_prompts.txt pronunciation.json /alexandria/
 COPY *.py /alexandria/
-COPY gpu_job.sh gpu_pause.sh /alexandria/
+COPY gpu_job.sh gpu_pause.sh run_with_restart.sh /alexandria/
 COPY run_chains/lib/ /alexandria/run_chains/lib/
 COPY tools/voice_lab/ /alexandria/tools/voice_lab/
 COPY builtin_lora/ /alexandria/builtin_lora/

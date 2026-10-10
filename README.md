@@ -115,6 +115,24 @@ For audiobook-to-dataset preparation or native Voice Lab profiling, stop the app
 
 Native builds need CMake and a working C/C++ toolchain, plus the matching CUDA/ROCm SDK for GPU builds. This adds download time and disk use. Configure the relevant model and interpreter paths in the tools before use. Diarization additionally needs a Hugging Face token and acceptance of the [Community-1 model terms](https://huggingface.co/pyannote/speaker-diarization-community-1). The core audiobook pipeline does not need this optional install.
 
+#### Command-line preparation and review
+
+The production command-line tools are included too. Run these commands from the checkout root after **Install Voice Tools (Optional)**. On Windows, replace `preparer_env/bin/python` with `preparer_env\Scripts\python.exe`.
+
+- Prepare a folder of audiobooks with matching EPUB/TXT sources:
+  `preparer_env/bin/python alexandria_batch_processor.py --folder /path/to/audio --source-folder /path/to/books --model /path/to/model.gguf`
+- Review and approve corrections to an extracted dataset against its source:
+  `preparer_env/bin/python alexandria_compare.py --help`
+- Check the core app environment: `python env_doctor.py`. Add `--voice-tools` to check the optional environments, or `--json` for machine-readable output.
+- Download a standalone legacy Whisper-base Transformers bundle for offline use:
+  `preparer_env/bin/python download_model.py`. This downloads Whisper weights to `models/whisper-base`; it does not download a GGUF LLM or replace the current whisper.cpp setup.
+
+On Linux, `bash run_with_restart.sh --audio /path/to/book.wav --source /path/to/book.epub --model /path/to/model.gguf --output /path/to/dataset.zip` adds bounded retries and checkpoint resume while retaining the shared GPU lock. It prefers `preparer_env/bin/python`; set `ALEXANDRIA_PREPARER_PYTHON` to use another prepared interpreter. `MAX_RETRIES` and `BACKOFF_SECONDS` control the retry limit and delay.
+
+For multiple explicitly paired books, `corpus_alignment_prescan.py` validates initial alignment and `corpus_run_report.py` runs preparation and reports verified output receipts. Both accept `--repo`, `--pairs`, and `--output-dir` (see `--help`); new report runs require `--model`, with an optional `--fallback`. The pairs file is a JSON array of `{ "audio": "/path/book.wav", "source": "/path/book.epub", "output_name": "book.zip" }` objects. These launch the Linux restart wrapper, so they need the same optional environment. No research corpora are bundled.
+
+The Docker image includes the scripts but does not install native Voice Tools. Use a separately prepared interpreter via `ALEXANDRIA_PREPARER_PYTHON` for preparation; ordinary audiobook generation is unaffected.
+
 ### Option B: Google Colab (No Install Required)
 
 No GPU or wrong OS? Run Alexandria on a free T4 GPU in your browser:

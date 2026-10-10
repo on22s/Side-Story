@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# run_with_restart.sh — auto-resume wrapper for alexandria_preparer / batch.
+#
+# Why: a 60-hour LLM annotation run can crash for many reasons (driver hiccup,
+# OOM, power blip, accidental Ctrl-C, my-Claude-session-ran-out-of-credits-
+# halfway-through-helping-you). The preparer already writes a per-segment
+# checkpoint after every chunk, so the only thing missing was a process
+# supervisor that re-launches with --resume until the run completes cleanly.
+#
+# Usage:
+#   ./run_with_restart.sh <preparer-args...>
+#
+# Examples:
+#   ./run_with_restart.sh \
+#     --audio "/home/fakemitch/Desktop/audiobook.wav" \
+#     --model models/Qwen2.5-14B-Instruct-Q6_K.gguf \
+#     --source "/home/fakemitch/Desktop/books/book.epub" \
+#     --output "/home/fakemitch/Desktop/output.zip"
+#
+# Behaviour:
+#   - First attempt: runs without --resume (fresh start).
+#   - Every subsequent attempt: adds --resume so the preparer picks up where
+#     the previous attempt's checkpoint left off.
+#   - Exits successfully when the preparer exits 0.
+#   - Bails out after MAX_RETRIES non-zero exits in a row (default 20),
+#     so a hard configuration error doesn't make this loop forever.
+#   - Logs each attempt to stdout with a timestamp so you can see in the
+#     terminal scrollback what happened across restarts.
+#   - SIGINT (Ctrl-C) propagates to the preparer; pressing Ctrl-C TWICE
+#     within 5 s breaks out of the loop completely (otherwise the wrapper
+#     would restart after a single Ctrl-C).
+#
+# Notes:
+#   - Run this in a tmux/screen session so closing your terminal doesn't kill
+#     the wrapper: `tmux new -s prep './run_with_restart.sh <args>'`
+#   - The preparer's source-marker check protects against accidentally
+#     resuming into a different audio file's progress — see docs/guides/PREPARER_GUIDE.md.
+
+set -u
+shopt -s -o pipefail
+
+MAX_RETRIES=${MAX_RETRIES:-20}
+BACKOFF_SECONDS=${BACKOFF_SECONDS:-10}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+GPU_WRAPPER="$SCRIPT_DIR/gpu_job.sh"
+if [[ ! -f "$GPU_WRAPPER" ]]; then
+    echo "ERROR: GPU lock wrapper not found at $GPU_WRAPPER" >&2
+    exit 2
+fi
+if [[ "${ALEXANDRIA_GPU_LOCK_HELD:-}" != 1 ]]; then
+    exec bash "$GPU_WRAPPER" preparer-restart bash "$SCRIPT_DIR/run_with_restart.sh" "$@"
+fi
+bash "$GPU_WRAPPER" --check-lock-owner "${ALEXANDRIA_GPU_LOCK_PID:-}" || exit $?
+
+PREPARER="$SCRIPT_DIR/alexandria_preparer_rocm_compatible.py"
+# Match the optional install; retain the old app environment as a fallback.
+PYTHON="${ALEXANDRIA_PREPARER_PYTHON:-$SCRIPT_DIR/preparer_env/bin/python}"
+if [[ -z "${ALEXANDRIA_PREPARER_PYTHON:-}" && ! -x "$PYTHON" ]]; then
+    PYTHON="$SCRIPT_DIR/app/env/bin/python"
+fi
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: python not found at $PYTHON" >&2
+    echo "       run Install Voice Tools (Optional), or set ALEXANDRIA_PREPARER_PYTHON" >&2
+    exit 2
+fi
+if [[ ! -f "$PREPARER" ]]; then
+    echo "ERROR: preparer script not found at $PREPARER" >&2
+    exit 2
+fi
+
+CHILD_PGID=""
+stop_preparer_group() {
+    if [[ -z "$CHILD_PGID" ]]; then
+        return 0
+    fi
+    local wrapper_group
+    wrapper_group=$(ps -o pgid= -p "$$") || return 1
+    wrapper_group=${wrapper_group//[[:space:]]/}
+    if [[ ! "$CHILD_PGID" =~ ^[1-9][0-9]*$ || "$CHILD_PGID" == "$wrapper_group" ]]; then
+        echo "REFUSING preparer cleanup: invalid or wrapper-owned process group" >&2
+        return 1
+    fi
+    kill -TERM -- "-$CHILD_PGID" 2>/dev/null || true
+    local waited=0
+    # Match gpu_job.sh's shutdown grace so checkpoint writes can finish.
+    while (( waited < 20 )); do
+        kill -0 -- "-$CHILD_PGID" 2>/dev/null || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill -KILL -- "-$CHILD_PGID" 2>/dev/null || true
+    wait "$CHILD_PGID" 2>/dev/null || true
+    CHILD_PGID=""
+}
+
+cleanup_preparer() {
+    local rc=$?
+    if [[ -n "$CHILD_PGID" ]]; then
+        # Finish cleanup even if another signal arrives during the grace period.
+        trap '' INT TERM HUP
+        stop_preparer_group || return 1
+    fi
+    return "$rc"
+}
+trap cleanup_preparer EXIT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+run_preparer() {
+    # Bash job control gives this child its own group without a setsid fork.
+    set -m
+    "$PYTHON" "$PREPARER" "$@" &
+    CHILD_PGID=$!
+    set +m
+    local rc
+    wait "$CHILD_PGID"
+    rc=$?
+    # A trapped INT interrupts wait before the preparer has necessarily exited.
+    while kill -0 "$CHILD_PGID" 2>/dev/null; do
+        wait "$CHILD_PGID"
+        rc=$?
+    done
+    stop_preparer_group || exit 2
+    return "$rc"
+}
+
+# Detect a double-Ctrl-C so the user has a clean way to abort the whole loop.
+LAST_INT=0
+on_int() {
+    local now
+    now=$(date +%s)
+    if (( now - LAST_INT < 5 )); then
+        echo ""
+        echo "[$(date '+%H:%M:%S')] Two SIGINTs within 5s — breaking out of the restart loop."
+        echo "                 Partial work is preserved in dataset_temp/; rerun with --resume to continue."
+        exit 130
+    fi
+    LAST_INT=$now
+    if [[ -n "$CHILD_PGID" ]]; then
+        kill -INT -- "-$CHILD_PGID" 2>/dev/null || true
+    fi
+    echo ""
+    echo "[$(date '+%H:%M:%S')] SIGINT received — preparer should be shutting down."
+    echo "                 Hit Ctrl-C again within 5s to abort the wrapper too, otherwise it'll restart."
+}
+trap on_int INT
+
+attempt=0
+extra_args=()
+while true; do
+    attempt=$((attempt + 1))
+    if (( attempt > MAX_RETRIES )); then
+        echo ""
+        echo "[$(date '+%H:%M:%S')] ✗ Gave up after $MAX_RETRIES consecutive failures."
+        echo "                 Last preparer log:"
+        # Show the tail of the newest preparer log so the user has an immediate
+        # diagnostic clue without digging.
+        latest_log=$(ls -t "$SCRIPT_DIR/logs/alexandria_preparer_"*.log 2>/dev/null | head -1)
+        if [[ -n "$latest_log" ]]; then
+            echo "                 ${latest_log}"
+            tail -20 "$latest_log" | sed 's/^/                   /'
+        fi
+        exit 1
+    fi
+
+    echo ""
+    echo "─────────────────────────────────────────────────────────────────────"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Attempt $attempt/$MAX_RETRIES"
+    if (( attempt > 1 )); then
+        echo "                       Forcing --resume from previous checkpoint"
+    fi
+    echo "─────────────────────────────────────────────────────────────────────"
+
+    # Build the argv. Pass through everything the user supplied, plus --resume
+    # from the second attempt onward.
+    if (( attempt == 1 )); then
+        run_preparer "$@"
+        rc=$?
+    else
+        # Make --resume idempotent — only add it if the user didn't already
+        # supply it (e.g. they're rerunning after an aborted previous run).
+        already_resume=0
+        for arg in "$@"; do
+            if [[ "$arg" == "--resume" ]]; then
+                already_resume=1
+                break
+            fi
+        done
+        if (( already_resume == 1 )); then
+            run_preparer "$@"
+        else
+            run_preparer "$@" --resume
+        fi
+        rc=$?
+    fi
+
+    if (( rc == 0 )); then
+        echo ""
+        echo "[$(date '+%H:%M:%S')] ✓ Preparer exited cleanly. Done."
+        exit 0
+    fi
+
+    # SIGINT (130) — if user pressed Ctrl-C once, give them 5s to hit it again
+    # and abort. If they didn't, fall through to the normal restart path.
+    if (( rc == 130 )); then
+        echo ""
+        echo "[$(date '+%H:%M:%S')] Preparer was interrupted (exit 130). Restarting in $BACKOFF_SECONDS s..."
+        echo "                 Press Ctrl-C again now to abort the wrapper."
+        sleep "$BACKOFF_SECONDS"
+        continue
+    fi
+
+    # Distinguish clean Python failures from signal-induced crashes:
+    #   < 128  → preparer called sys.exit(N) deliberately. Retrying won't help.
+    #            Examples: wrong audio/source pair, missing model, divergence
+    #            sanity check, schema error. The first run already wrote a log
+    #            with the actionable error message; retrying 20× just buries it.
+    #   >= 128 → killed by signal (137=OOM-kill, 139=segfault, 143=SIGTERM,…).
+    #            These are sometimes transient (driver hiccup, brief OOM), so
+    #            retry with --resume is the right move.
+    if (( rc < 128 )); then
+        echo ""
+        echo "[$(date '+%H:%M:%S')] ✗ Preparer exited $rc (clean Python exit — not retrying)."
+        echo "                 The latest preparer log has the actionable error message."
+        latest_log=$(ls -t "$SCRIPT_DIR/logs/alexandria_preparer_"*.log 2>/dev/null | head -1)
+        if [[ -n "$latest_log" ]]; then
+            echo "                 ${latest_log}"
+        fi
+        exit "$rc"
+    fi
+
+    echo ""
+    echo "[$(date '+%H:%M:%S')] ✗ Preparer killed by signal (exit $rc). Restarting in $BACKOFF_SECONDS s..."
+    sleep "$BACKOFF_SECONDS"
+done
