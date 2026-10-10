@@ -39,7 +39,7 @@ from core import (
 )
 from generation_checkpoint_deltas import load_generation_checkpoint_document
 from generation_checkpoint_shards import get_generation_checkpoint_artifacts
-from editor_poll_snapshot import EditorPollSnapshots
+from editor_poll_snapshot import EditorPollSnapshots, get_snapshot_digest
 from utils import safe_load_json, is_path_inside
 from project import (CHAPTER_EXPORT_DIR, CHAPTER_TEMPLATE_FIELDS,
                      DEFAULT_CHAPTER_TEMPLATE, get_chapter_export_rows, get_index_selection)
@@ -68,6 +68,8 @@ def build_zip_download(members, filename):
 
 
 class ChunkUpdate(BaseModel):
+    expected_book_token: Optional[str] = Field(default=None, min_length=64, max_length=64)
+    expected_uid: Optional[str] = None
     text: Optional[str] = None
     instruct: Optional[str] = None
     speaker: Optional[str] = None
@@ -134,7 +136,8 @@ def _ensure_chunk_status_snapshot(revision):
     with ensure_book_state(root):
         chunks = _ensure_editor_chunks()
         identity = get_editor_book_identity(root)
-        return _editor_poll_snapshots.ensure_snapshot(chunks, identity, revision)
+        return {**_editor_poll_snapshots.ensure_snapshot(chunks, identity, revision),
+                "book_token": get_snapshot_digest(identity)}
 
 
 def get_editor_book_identity(root):
@@ -251,11 +254,26 @@ async def drift_check_endpoint(request: DriftCheckRequest, background_tasks: Bac
     schedule_claimed_background_task(background_tasks, "drift_check", task)
     return {"status": "started", "threshold": threshold, "measured": python_bin is not None}
 
+def apply_guarded_chunk_update(index, update):
+    root = os.path.dirname(SCRIPT_PATH)
+    with ensure_book_state(root):
+        if (update.expected_book_token is not None
+                and update.expected_book_token != get_snapshot_digest(get_editor_book_identity(root))):
+            raise HTTPException(status_code=409, detail="Active book changed; reload the Editor before saving")
+        if update.expected_uid is not None:
+            chunks = project_manager.load_chunks()
+            chunk = next((row for row in chunks if row.get("id") == index), None)
+            if chunk is None or chunk.get("uid") != update.expected_uid:
+                raise HTTPException(status_code=409, detail="Editor row changed; reload before saving")
+        updates = update.model_dump(exclude_unset=True, exclude={"expected_book_token", "expected_uid"})
+        return project_manager.update_chunk(index, updates)
+
+
 @router.post("/api/chunks/{index}")
 async def update_chunk(index: int, update: ChunkUpdate):
     updates = update.model_dump(exclude_unset=True)
     logger.info(f"Updating chunk {index} with data: {updates}")
-    chunk = await asyncio.to_thread(_apply_chunk_edit, project_manager.update_chunk, index, updates)
+    chunk = await asyncio.to_thread(_apply_chunk_edit, apply_guarded_chunk_update, index, update)
     if not chunk:
         raise HTTPException(status_code=404, detail="Chunk not found")
     logger.info(f"Chunk {index} updated, instruct is now: '{chunk.get('instruct', '')}'")

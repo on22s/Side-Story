@@ -1,3 +1,66 @@
+        // Voice roster dropdowns: options are materialized only on interaction.
+        const emptyVoiceRoster = [];
+        let voiceRosterCache = null;
+        let voiceRosterGeneration = 0;
+
+        function ensureVoiceRosterCache() {
+            const names = Array.isArray(window._voicesNames) ? window._voicesNames : emptyVoiceRoster;
+            const book = window._voiceRosterBookToken || '';
+            if (voiceRosterCache?.source === names && voiceRosterCache.book === book) { return voiceRosterCache; }
+            const editorNames = [...new Set(names.map(name => (name || '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+            voiceRosterCache = {source: names, names, nameSet: new Set(names), editorNames,
+                editorSet: new Set(editorNames), book, generation: ++voiceRosterGeneration};
+            return voiceRosterCache;
+        }
+
+        function renderInitialAliasOptions(voice) {
+            const roster = ensureVoiceRosterCache();
+            const alias = voice.config?.alias_of || '';
+            return alias && alias !== voice.name && roster.nameSet.has(alias)
+                ? `<option value="${escapeHtml(alias)}" selected>${escapeHtml(alias)}</option>` : '';
+        }
+
+        function ensureVoiceRosterOptions(select) {
+            const kind = select?.dataset?.voiceRoster;
+            if (kind !== 'speaker' && kind !== 'alias') { return true; }
+            const roster = ensureVoiceRosterCache();
+            if (select.dataset.rosterBook !== roster.book
+                    || (typeof currentBookFilename !== 'undefined' && currentBookFilename !== (window._voiceRosterFilename || ''))) { return false; }
+            if (select.dataset.rosterGeneration === String(roster.generation)) { return true; }
+            const self = kind === 'alias' ? select.closest('.voice-card')?.dataset.voice : null;
+            const names = kind === 'alias' ? roster.names.filter(name => name !== self) : roster.editorNames;
+            const current = kind === 'alias' && select.value === self ? '' : select.value;
+            const fragment = document.createDocumentFragment();
+            const append = (value, label) => {
+                const option = document.createElement('option');
+                option.value = value; option.textContent = label; fragment.appendChild(option);
+            };
+            if (kind === 'alias') { append('', '-- None --'); }
+            if (current && !names.includes(current)) { append(current, `${current} (custom)`); }
+            for (const name of names) { append(name, name); }
+            select.replaceChildren(fragment);
+            select.value = current;
+            select.dataset.rosterGeneration = String(roster.generation);
+            return true;
+        }
+
+        function onVoiceRosterInteraction(event) {
+            const select = event.target.closest?.('select[data-voice-roster]');
+            if (!select || select.disabled) { return; }
+            if (!ensureVoiceRosterOptions(select)) { event.preventDefault(); }
+        }
+
+        for (const id of ['voices-list', 'chunks-table-body']) {
+            const container = document.getElementById(id);
+            if (container && container.dataset.voiceRosterHandlers !== 'true') {
+                for (const type of ['pointerdown', 'focusin', 'keydown']) {
+                    container.addEventListener(type, onVoiceRosterInteraction);
+                }
+                container.dataset.voiceRosterHandlers = 'true';
+            }
+        }
+        // End voice roster dropdowns.
+
         // --- Toast & Confirm utilities ---
         let toastSequence = 0;
         let confirmQueue = Promise.resolve();
@@ -1676,7 +1739,9 @@
         }
 
         let currentBookFilename = '';
+        let bookSelectionGeneration = 0;
         function applyCurrentBookFilename(filename) {
+            bookSelectionGeneration++;
             currentBookFilename = typeof filename === 'string' ? filename : '';
         }
         function enqueueBookSelection(request, action) {
@@ -4049,6 +4114,7 @@
             return `<span class="badge bg-light text-dark border ms-2" title="Model-inferred from ${Number(traits.lines) || 0} script lines; review against the source">Script estimate: ${escapeHtml(shown)}</span>`;
         }
 
+
         function getVoiceCardMetadata(card) {
             const base = window._voicesByName?.[card.dataset.voice]?.config || {};
             return card.dataset.version ? (base.versions?.[card.dataset.version] || {}) : base;
@@ -4114,7 +4180,9 @@
             }).join('');
         }
 
+
         function createVoiceCard(voice, index) {
+            const roster = ensureVoiceRosterCache();
             const config = voice.config || {};
             const label = voice.display_name || voice.name;
             const voiceType = config.type || 'custom';
@@ -4160,12 +4228,9 @@
                                 </div>
                                 ${voice.version_id ? `<label class="form-label small mt-1">State seed<input class="form-control form-control-sm voice-seed" type="number" min="-1" max="4294967295" aria-label="${escapeHtml('Seed for ' + label)}" value="${escapeHtml(String(config.seed ?? '-1'))}"></label>` : ''}
                                 <div class="form-text small text-muted mt-1">Alias of:</div>
-                                <select class="form-select form-select-sm alias-select mt-1" ${voice.version_id ? 'disabled' : ''} aria-label="${escapeHtml('Alias target for ' + label)}">
+                                <select class="form-select form-select-sm alias-select mt-1" data-voice-roster="alias" data-roster-book="${escapeHtml(roster.book)}" ${voice.version_id ? 'disabled' : ''} aria-label="${escapeHtml('Alias target for ' + label)}">
                                     <option value="">-- None --</option>
-                                    ${(() => {
-                                        const names = (window._voicesNames || []).filter(n => n !== voice.name);
-                                        return names.map(n => `<option value="${escapeHtml(n)}" ${config.alias_of === n ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
-                                    })()}
+                                    ${renderInitialAliasOptions(voice)}
                                 </select>
                             </div>
                             <div class="col-md-9">
@@ -4349,25 +4414,33 @@
         async function refreshVoiceMetadata() {
             await flushVoiceSaves();
             const localRevision = voiceSaveQueue.getRevision();
+            const rosterFilename = currentBookFilename;
+            const rosterGeneration = bookSelectionGeneration;
             const snapshot = await API.get('/api/voice_config/snapshot');
-            if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision()) {
+            if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision() || rosterFilename !== currentBookFilename
+                    || rosterGeneration !== bookSelectionGeneration) {
                 throw new Error('Voice edits changed while refreshing. Your edits are still pending; try again.');
             }
             if (!Array.isArray(snapshot.voices) || !/^[0-9a-f]{64}$/.test(snapshot.revision) || !/^[0-9a-f]{64}$/.test(snapshot.book_token)) {
                 throw new Error('Invalid voice snapshot; your voice settings were not replaced.');
             }
             _voiceSaveSnapshot = snapshot;
-            renderVoiceDrafts();
             const voices = snapshot.voices;
             // Cache simple names for alias dropdowns
             window._voicesNames = voices.map(v => v.name);
+            // Roster identity survives script-only edits, but not a book selection.
+            window._voiceRosterBookToken = String(rosterGeneration);
+            window._voiceRosterFilename = rosterFilename;
+            ensureVoiceRosterCache();
             window._voicesByName = Object.fromEntries(voices.map(v => [v.name, v]));
+            renderVoiceDrafts();
             return voices;
         }
 
         let _voiceResourcesRefreshedAt = -Infinity;
         let _voiceCardsRevision = null;
         let _voiceCardsBookToken = null;
+        let _voiceCardsBookGeneration = null;
 
         let _voiceSeedRepairPending = false;
 
@@ -4462,6 +4535,11 @@
             if (!refreshResources && loadVoices.pending) { return loadVoices.pending; }
             const loading = (async () => {
                 await flushVoiceSaves();
+                const localRevision = voiceSaveQueue.getRevision();
+                const refreshBook = currentBookFilename;
+                const selectionRequest = window._existingUploadSelectionRequest;
+                const refreshGeneration = bookSelectionGeneration;
+                let renderSnapshot;
                 const reuseResources = !refreshResources && performance.now() - _voiceResourcesRefreshedAt < 10000;
                 let resourcesComplete = true;
                 const refreshedResources = [];
@@ -4483,14 +4561,21 @@
                     catch (e) { resourcesComplete = false; failedResources.push(path); console.debug(`${label} cache refresh failed`, e); }
                 });
                 const [voices] = await Promise.all([
-                    refreshVoiceMetadata(), ...resources,
+                    refreshVoiceMetadata().then(voices => { renderSnapshot = _voiceSaveSnapshot; return voices; }), ...resources,
                     ...(reuseResources ? [] : [loadCastLibrary().catch(e => { resourcesComplete = false; failedResources.push('/api/voice_library'); console.debug('cast library refresh failed', e); })]),
                 ]);
                 if (!reuseResources) {
                     _voiceResourcesRefreshedAt = resourcesComplete ? performance.now() : -Infinity;
                 }
                 if (reuseResources && _voiceCardsRevision === _voiceSaveSnapshot.revision
-                        && _voiceCardsBookToken === _voiceSaveSnapshot.book_token) {
+                        && _voiceCardsBookToken === _voiceSaveSnapshot.book_token
+                        && _voiceCardsBookGeneration === refreshGeneration) {
+                    return {refreshedResources, failedResources};
+                }
+                if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision()
+                        || selectionRequest !== window._existingUploadSelectionRequest
+                        || refreshBook !== currentBookFilename || refreshGeneration !== bookSelectionGeneration
+                        || renderSnapshot !== _voiceSaveSnapshot) {
                     return {refreshedResources, failedResources};
                 }
                 refreshVoicesScope();
@@ -4507,11 +4592,13 @@
                     container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
                     _voiceCardsRevision = _voiceSaveSnapshot.revision;
                     _voiceCardsBookToken = _voiceSaveSnapshot.book_token;
+                    _voiceCardsBookGeneration = refreshGeneration;
                     return {refreshedResources, failedResources};
                 }
                 container.innerHTML = getVoiceSeedRepairMarkup(_voiceSaveSnapshot) + getStateVoiceCardsMarkup(voices);
                 _voiceCardsRevision = _voiceSaveSnapshot.revision;
                 _voiceCardsBookToken = _voiceSaveSnapshot.book_token;
+                _voiceCardsBookGeneration = refreshGeneration;
                 if (typeof renderPersonaRecoveryTargets === 'function') { renderPersonaRecoveryTargets(); }
                 renderReadyCount();
                 onToggleHideReady();
@@ -6021,6 +6108,11 @@
         }
 
         function enqueueVoiceDraft(voices, recovered = null) {
+            if (!recovered && (!_voiceSaveSnapshot || _voiceCardsBookToken !== _voiceSaveSnapshot.book_token
+                    || _voiceCardsBookGeneration !== bookSelectionGeneration)) {
+                showToast('Wait for this book’s voices to finish loading before editing them.', 'warning');
+                return;
+            }
             const key = _voiceDraftRecord?.key || voiceDraftPrefix +
                 (window.crypto?.randomUUID?.() || Date.now() + '-' + Math.random().toString(36).slice(2));
             const record = { version: 1, key, book_token: _voiceSaveSnapshot.book_token,
@@ -6326,21 +6418,18 @@
         let cachedChunks = []; // Cache to track changes
         let chunkSnapshotRevision = null;
         let chunkSnapshotBook = null;
+        let chunkSnapshotBookToken = null;
         let loadChunksTimer = null; // Pending standalone editor poll
         let chunkRefreshPromise = null;
         let chunkRefreshAgain = false;
         let chunkRefreshForced = false;
 
         function buildSpeakerSelect(chunk) {
-            const current = (chunk.speaker || '').trim();
-            const names = Array.isArray(window._voicesNames) ? window._voicesNames : [];
-            const normalized = [...new Set(names.map(n => (n || '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
-            const options = normalized.map(name => `<option value="${escapeHtml(name)}" ${name === current ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
-            const unknownOption = current && !normalized.includes(current)
-                ? `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (custom)</option>`
-                : '';
-
-            return `<select class="form-select form-select-sm" onchange="updateChunk(${chunk.id}, 'speaker', this.value)">${unknownOption}${options}</select>`;
+            const roster = ensureVoiceRosterCache();
+            const current = (chunk.speaker || '').trim() || roster.editorNames[0] || '';
+            const label = current && !roster.editorSet.has(current) ? `${current} (custom)` : current;
+            const option = current ? `<option value="${escapeHtml(current)}" selected>${escapeHtml(label)}</option>` : '';
+            return `<select class="form-select form-select-sm" data-voice-roster="speaker" data-roster-book="${escapeHtml(roster.book)}" onchange="updateChunk(${chunk.id}, 'speaker', this.value)">${option}</select>`;
         }
 
         // Check if any audio is currently playing
@@ -6567,6 +6656,7 @@
             invalidateEditorIntegrity();
             ++deliveryReviewView;
             try {
+                if (window._voiceRosterStartupPending) { await window._voiceRosterStartupPending; }
                 const chunks = await ensureChunkRefresh(forceFullRedraw);
                 const status = document.getElementById('chunk-load-status');
                 if (status) { status.innerHTML = ''; }
@@ -6614,6 +6704,10 @@
                 chunkSnapshotRevision = null;
                 throw new Error('Editor snapshot is unavailable.');
             }
+            const snapshotBookToken = snapshot.book_token;
+            if (!/^[0-9a-f]{64}$/.test(snapshotBookToken)) {
+                throw new Error('Editor book identity is unavailable; reload before editing.');
+            }
             let chunks;
             if (snapshot.full) {
                 chunks = snapshot.chunks;
@@ -6635,6 +6729,7 @@
                 tbody.innerHTML = '<tr><td colspan="6" class="text-center">No chunks found. Please generate script first.</td></tr>';
                 cachedChunks = [];
                 chunkSnapshotBook = refreshBook;
+                chunkSnapshotBookToken = snapshotBookToken;
                 chunkSnapshotRevision = snapshot.revision;
                 return chunks;
             }
@@ -6657,6 +6752,7 @@
                 });
                 cachedChunks = chunks;
                 chunkSnapshotBook = refreshBook;
+                chunkSnapshotBookToken = snapshotBookToken;
                 chunkSnapshotRevision = snapshot.revision;
 
                 // Continue polling if generating
@@ -6800,6 +6896,7 @@
 
             cachedChunks = chunks;
             chunkSnapshotBook = refreshBook;
+            chunkSnapshotBookToken = snapshotBookToken;
             chunkSnapshotRevision = snapshot.revision;
 
             // If any chunk is generating, poll (without full redraw)
@@ -7037,20 +7134,29 @@
         let chunkEditsRevision = 0;
 
         function applyChunkEdits(id, data) {
+            const book = currentBookFilename;
+            const bookToken = chunkSnapshotBookToken;
+            const uid = cachedChunks.find(chunk => chunk.id === id)?.uid;
+            if (!bookToken || !uid || chunkSnapshotBook !== book) {
+                return Promise.reject(new Error('Reload the Editor before saving this row.'));
+            }
             const previous = pendingChunkEdits.get(id);
             const captured = JSON.parse(JSON.stringify(data));
+            const isCurrent = () => book === currentBookFilename && bookToken === chunkSnapshotBookToken;
             chunkEditsRevision++;
             invalidateEditorIntegrity('Edits awaiting save');
             const request = (async () => {
                 if (previous) { await previous.catch(() => {}); }
                 try {
-                    await API.post(`/api/chunks/${id}`, captured);
+                    if (!isCurrent()) { throw new Error('Active book changed; the old Editor edit was not sent.'); }
+                    await API.post(`/api/chunks/${id}`, {...captured, expected_book_token: bookToken, expected_uid: uid});
+                    if (!isCurrent()) { return; }
                     cachedChunks = cachedChunks.map(chunk => chunk.id === id ? { ...chunk, ...captured } : chunk);
                     // The server can normalize an edit without changing its revision.
                     chunkSnapshotRevision = null;
                     failedChunkEdits.delete(id);
                 } catch (error) {
-                    failedChunkEdits.set(id, error);
+                    if (isCurrent()) { failedChunkEdits.set(id, error); }
                     throw error;
                 }
             })();
