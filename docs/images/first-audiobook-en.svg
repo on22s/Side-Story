@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="240" viewBox="0 0 1200 240" role="img" aria-labelledby="title desc">
+<title id="title">Workflow map · not an application screenshot</title>
+<desc id="desc">1. Setup / Connect + save / Test succeeds → 2. Script / Upload sample / All 3 sentences → 3. Voices / Custom voice: Ryan / Voice saved → 4. Editor / Gen → Render Pending / Every row playable → 5. Result / Merge → Download MP3 / Listen to the file</desc>
+<rect width="1200" height="240" rx="18" fill="#0f172a"/>
+<text x="28" y="36" fill="#cbd5e1" font-size="17" font-family="sans-serif">Workflow map · not an application screenshot</text>
+<rect x="28" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="43" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">1. Setup</text>
+<text x="43" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Connect + save</text>
+<text x="43" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">Test succeeds</text>
+<path d="M 241 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="263" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="278" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">2. Script</text>
+<text x="278" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Upload sample</text>
+<text x="278" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">All 3 sentences</text>
+<path d="M 476 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="498" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="513" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">3. Voices</text>
+<text x="513" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Custom voice: Ryan</text>
+<text x="513" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">Voice saved</text>
+<path d="M 711 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="733" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="748" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">4. Editor</text>
+<text x="748" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Gen → Render Pending</text>
+<text x="748" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">Every row playable</text>
+<path d="M 946 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="968" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="983" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">5. Result</text>
+<text x="983" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Merge → Download MP3</text>
+<text x="983" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">Listen to the file</text>
+</svg>

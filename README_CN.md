@@ -4,7 +4,7 @@
 
 将书籍制作成多角色配音有声书。Alexandria 将 AI 脚本标注、本地 Qwen3-TTS 和浏览器编辑器结合起来，让你为角色分配声音、试听并修改单独的语音片段，最后导出整本有声书。
 
-**[安装](#安装) · [快速入门](#快速入门) · [可选声音工具](#可选-voice-lab--preparer-依赖) · [常见问题](#常见问题) · [完整使用指南（英文）](https://github.com/on22s/alexandria-audiobook-nya/wiki)**
+**[安装](#安装) · [快速入门](#快速入门) · [可选声音工具](#可选-voice-lab--preparer-依赖) · [常见问题](#常见问题) · [完整中文指南](https://github.com/on22s/alexandria-audiobook-nya/wiki/Home-zh-CN)**
 
 [English](README.md) | 中文
 
@@ -33,65 +33,34 @@
 
 ## 快速入门
 
-### 第 1 步 — Setup（设置）
+**第一个目标：三句英文旁白、一个 Ryan 预置声音、一份检查过的 MP3。** 先用[原创示例文本](docs/samples/first-audiobook.txt)走通流程，再处理整本书。打开文件后点击 **Download raw file**，或将下面的文字保存为 UTF-8 编码的 `first-audiobook.txt`。
 
-自动标注模式需要配置 LLM 连接及 TTS 引擎：
+> The rain stopped just before dawn. A small bird landed on the garden gate. By the time the kettle sang, the sky was bright.
 
-- **LLM Base URL**：LM Studio 通常为 `http://localhost:1234/v1`，Ollama 为 `http://localhost:11434/v1`。
-- **LLM API Key**：服务所需的密钥；本地服务可填写 `local`。
-- **LLM Model Name**：填写服务实际提供的准确模型 ID。
-- **TTS Mode**：推荐 `local`，直接加载内置模型，无需外部 TTS 服务。
-- 选择本地或远程服务配置，并准确设置 **Runs on this machine's GPU?**，以便脚本和音频任务安全共用 GPU。
-- 完成后点击 **Save Configuration**。
+这是随文档提供的原创文本，适用仓库的 MIT 许可。示例没有对话，只需要旁白。此处刻意使用同一份英文文本和 Ryan，方便对照截图；处理中文书籍时再改为对应语言和声音。
 
-没有 API 服务时，可选择手动传输模式，在 Script 标签页复制请求、粘贴模型回复。此模式不使用 API 地址；长书需要多次人工操作。
+1. **Setup（设置）**：按[LLM 设置](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)连接已运行的 LLM，点击 **Test Connection**，再点击 **Save Configuration**；测试本身不会保存设置。选择 **TTS Mode → Local Model (built in)**、**Device → Auto (best available)**、**TTS Language → English**。准确设置 **Runs on this machine's GPU?**，修改后再保存。成功检查点：连接测试通过，并收到配置保存确认。
+2. **Script（脚本）**：在 **Select Book/Novel (Text, Markdown, or EPUB)** 选取示例，文件会自动上传。可选旁白字段留空。点击 **Generate Annotated Script**。成功检查点：生成结束，三句话均被保留，条目为旁白；分段数量可能不同。
+3. **Voices（声音）**：在旁白卡片选择 **Custom voice → Ryan**，角色风格留空，等待 **saved**。成功检查点：Ryan 保持选中，没有未保存更改警告。
+4. **Editor（编辑器）**：先点击第一行的 **Gen** 并试听。效果正常后点击 **Render Pending**。成功检查点：每行均有可播放的音频，没有失败或未完成的行。**Text integrity** 只比较保存的文本和原文，不检查实际发音；仍需听辨漏读和重复。
+5. **Editor → Result（结果）**：点击 **Merge All**，阅读原文比对确认；遇到意外差异先取消并修正。在 **Result** 试听，点击 **Download MP3**。成功检查点：下载文件可以打开，三句话完整且顺序正确。合并可能跳过缺失或损坏的片段后仍生成文件，请查看日志。
 
-### 第 2 步 — Script（脚本）
+![五步流程示意图（不是应用截图）](docs/images/first-audiobook-zh-CN.svg)
 
-- 用文件选择器选取 `.txt`、`.md` 或 `.epub`，文件会自动上传。
-- 点击 **Generate Annotated Script**。自动模式会将书籍发送给所配置的 LLM，生成带说话人标签和演绎指令的片段。
-- 如有需要，点击 **Review Script**，让 LLM 再次检查说话人归属和格式等问题。
-- 长任务可使用快照和续跑功能；批处理可处理多本书。Windows 不支持暂停，可使用 Cancel 取消后再点击 Generate，从检查点继续。
-- 使用保存功能保留脚本，便于下次加载。
+*流程图仅标明操作顺序和检查点，不代表实际生成结果。*
 
-### 第 3 步 — Voices（声音）
+**某一步失败时，先停在该步排查。** 连接问题见 [LLM 设置](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)；首次 TTS 下载或报错请查看 Pinokio 的 **Terminal** 和[常见问题](https://github.com/on22s/alexandria-audiobook-nya/wiki/Troubleshooting-zh-CN)。缺少权重时，首次生成会下载，耗时可能比后续生成更长。
 
-脚本中的每个角色都会有一张声音卡片：
+远程 LLM 会收到标注文本，外部 TTS 会收到合成输入。只处理有权使用的书籍与声音。**Save Current 不是完整备份**：不保留仅在 Editor 中修改的片段、音频或导出文件。切换书籍前请[备份当前工作](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups-zh-CN)。
 
-- 选择 Custom Voice（预置声音，最易上手）、Clone Voice、LoRA Voice、Voice Design 或 Character Ensemble。外部 TTS 模式支持预置声音和克隆；Voice Design 与 LoRA 需要本地 TTS。
-- Custom Voice 提供 9 个预设：Aiden、Dylan、Eric、Ono_anna、Ryan、Serena、Sohee、Uncle_fu、Vivian。可设置角色风格，例如“沉稳的旁白语调”。
-- **Generate Personas**：让 LLM 分析脚本，为角色生成声音描述、参考音频，并分配克隆声音。**Advanced** 可调整发现角色时的批量大小；通过 **Apply to** 选择只处理尚未分配声音的角色，或重新生成全部角色；运行前确认范围，整书生成前请先试听。
-- **Alias of**：将多个名字映射到同一角色的声音，例如“年轻的艾琳娜” → “艾琳娜”。别名会沿引用链解析，并检测循环引用。
-- 更改会自动保存。详细说明见 [Voices 指南（英文）](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices)。
+### 完成第一份 MP3 之后
 
-克隆声音需要干净的参考音频及其准确转录文本。导入参考片段需通过应用的 3–30 秒时长、音频质量和使用权确认检查。克隆模式不使用 `instruct` 演绎指令；LoRA 模式则结合训练得到的声音身份与指令控制。随应用附带 LoRA 预设清单，适配器权重按需从 Hugging Face 下载。
-
-### 第 4 步 — Editor（编辑器）
-
-- 点击 **Render Pending** 生成待处理片段。
-- 试听单个片段，或用 **Play Sequence** 顺序播放。
-- 直接编辑文本、说话人或 `instruct`，再单独重新生成。
-- 检查 **Text integrity**（文本完整性）和 **Check Voices**（声音检查）。
-- 确认无误后点击 **Merge All** 合并有声书。
-
-**Render Pending** 会自动选择处理方式：本地 TTS 使用批量生成，外部 TTS 使用并行请求。主界面没有独立的 Standard / Batch (Fast) 切换按钮。Custom、Clone、LoRA 支持本地批量生成；Voice Design 和 Ensemble 按顺序生成。先用小批量测试，再按显存余量调整 **Parallel Workers** 和 **Max Items/Batch**。
-
-### 第 5 步 — Result（结果）
-
-- 在浏览器中试听成品，下载合并后的 MP3。
-- 导出 **M4B**（AAC），填写书名、作者、朗读者等元数据，并嵌入封面与章节标记。默认从脚本标题识别章节；启用 **Per-chunk chapters** 可让每个片段成为一章。
-- **Export to Audacity** 会导出按说话人分轨的 WAV 压缩包。解压后用 Audacity 打开 `project.lof`，再通过 File → Import → Labels 导入 `labels.txt`。
-
-各说话人轨道使用静音补齐到相同长度，同时播放即可还原时间线。M4B 播放器需支持 AAC 和内嵌章节标记；部分播放器的支持有限。
-
-### 高级工具（可选）
-
-- **Designer**：通过文字描述创建声音，试听并保存到声音库，供克隆参考使用。
-- **Dataset**：逐条构建 LoRA 训练样本，设置文本与情绪/风格，支持预览、批量生成及取消后保留已完成样本。
-- **Training**：训练 LoRA 适配器。可导入包含 24 kHz 单声道 WAV 与 `metadata.jsonl` 的 ZIP；元数据使用 `audio_filepath` 和 `text` 字段。按数据与硬件调整训练参数，先用未参与训练的句子验证效果。
-- **Preparer**：将有声书音频与原文对齐，生成训练配对；需先安装可选 Voice Tools。
-- **Voice Lab**：检查数据集、训练适配器、分析声音特征并命名；原生处理阶段需要可选依赖及正确的模型路径。
-- **Reports**：查看运行历史、产物与诊断信息。
+- [图文步骤与恢复方法](https://github.com/on22s/alexandria-audiobook-nya/wiki/First-Audiobook-zh-CN)
+- [手动 LLM 模式及其他服务](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)
+- [更多声音、别名、角色描述、克隆及 LoRA](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices-zh-CN)
+- [审校、检查点与长书](https://github.com/on22s/alexandria-audiobook-nya/wiki/Scripts-and-Review-zh-CN)
+- [M4B、章节与 Audacity 导出](https://github.com/on22s/alexandria-audiobook-nya/wiki/Rendering-and-Export-zh-CN)
+- [Designer、Dataset、Training、Preparer、Voice Lab 与 Reports](https://github.com/on22s/alexandria-audiobook-nya/wiki/Optional-Voice-Tools-zh-CN)
 
 <details>
 <summary>更多功能</summary>

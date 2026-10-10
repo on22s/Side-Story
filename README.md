@@ -33,57 +33,34 @@ The launcher creates `app/env` with CPython 3.10 on a fresh install and installs
 
 ## Quick Start
 
-The interface is split into a **5-step core pipeline** (numbered tabs) and **advanced tools**. You only need the core pipeline to produce an audiobook.
+**First goal: one short English narration, one Ryan preset, one checked MP3.** Use this [original three-sentence sample](docs/samples/first-audiobook.txt) before uploading a whole book. Open the file and use **Download raw file**, or copy its text into a UTF-8 file named `first-audiobook.txt`.
 
-### Core Pipeline
+> The rain stopped just before dawn. A small bird landed on the garden gate. By the time the kettle sang, the sky was bright.
 
-**Step 1 — Setup**
-For automatic annotation, configure your LLM connection and TTS engine:
-- **LLM Base URL**: `http://localhost:1234/v1` (LM Studio) or `http://localhost:11434/v1` (Ollama)
-- **LLM API Key**: Your API key (use `local` for local servers)
-- **LLM Model Name**: The exact model ID served by your provider
-- **TTS Mode**: `local` (built-in, recommended) — loads models directly, no external server needed
-- Choose the local or remote provider profile, and set **Runs on this machine's GPU?** accurately so script and audio tasks share the GPU safely
-- Click **Save Configuration** when done
+The sample is original text supplied with these docs under the repository's MIT license. It contains no dialogue, so you can learn the workflow with just a narrator.
 
-Without an API server, choose manual transport and copy/paste the requests and replies through the Script tab. The API address is ignored in that mode.
+1. **Setup:** connect an already running LLM using [LLM Setup](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup). Use **Test Connection**, then **Save Configuration**; testing alone does not save. Set **TTS Mode → Local Model (built in)**, **Device → Auto (best available)**, and **TTS Language → English**. Set **Runs on this machine's GPU?** accurately. Save again after edits. Checkpoint: the connection test succeeds and the configuration save is confirmed.
+2. **Script:** choose the sample under **Select Book/Novel (Text, Markdown, or EPUB)**; it uploads automatically. Leave the optional narrator field blank. Click **Generate Annotated Script**. Checkpoint: generation finishes, the three sentences are preserved, and the resulting entries are narration. The number of chunks can vary.
+3. **Voices:** on the narrator card, choose **Custom voice → Ryan**. Leave character style empty. Wait for **saved**. Checkpoint: Ryan remains selected with no unsaved-change warning.
+4. **Editor:** use **Gen** on the first row and listen. If it sounds right, click **Render Pending**. Checkpoint: every sample row has playable audio; no row is failed or unfinished. **Text integrity** checks saved text against source, not spoken audio, so listen for missing or repeated words too.
+5. **Editor → Result:** click **Merge All**. Read the source-text confirmation; cancel and fix unexpected differences. In **Result**, play the result and click **Download MP3**. Checkpoint: the downloaded file opens and contains all three sentences, in order. A merge can still create a file after skipping missing/corrupt chunks: check its logs.
 
-**Step 2 — Script**
-- Select your book file (.txt, .md, or .epub) using the file picker — it uploads automatically
-- Click **Generate Annotated Script** — automatic mode sends the book to your configured LLM to produce chunks with speaker labels and voice directions
-- *(Optional)* Click **Review Script** if the generated script has issues — this runs a second LLM pass to fix speaker misattributions or formatting problems
-- Use snapshots and resume controls for longer jobs; batch mode handles several books. Pause is unavailable on Windows; Cancel followed by Generate can resume checkpoints
-- You can save the script for later use with the Save feature below
+![Five-step workflow map, not an application screenshot](docs/images/first-audiobook-en.svg)
 
-**Step 3 — Voices**
-Each character detected in the script gets a voice card. For each speaker:
-- Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, Voice Design, or Character Ensemble. External TTS mode supports Custom Voice and Clone; Voice Design and LoRA require local TTS
-- For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
-- **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. Review the generated voices before rendering the book
-- **Speaker Aliases** — Use the "Alias of" dropdown on any voice card to map a speaker to another character's voice (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
-- Changes save automatically — see [Voices](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices) for guidance on each type
+*The map shows the sequence and checkpoints; it is not evidence of a completed generation.*
 
-**Step 4 — Editor**
-- Click **Render Pending** to generate audio for all chunks in batch
-- Listen to individual chunks or click **Play Sequence** to preview in order
-- Edit any chunk's text, speaker, or instruct inline and regenerate it individually
-- Check **Text integrity** and **Check Voices** when reviewing the result
-- When satisfied, click **Merge All** to combine everything into the final audiobook
+**If a step fails, stop there.** For a connection failure, return to [LLM Setup](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup). For first-run TTS downloads or errors, check Pinokio's **Terminal** and [Troubleshooting](https://github.com/on22s/alexandria-audiobook-nya/wiki/Troubleshooting). The first voice render downloads weights if absent; it may take longer than later renders.
 
-**Step 5 — Result**
-- Listen to the finished audiobook in the browser
-- Download as MP3, or click **Export to Audacity** for per-speaker WAV tracks
+Remote LLMs receive annotation text; external TTS receives synthesis inputs. Use books and voices you have permission to process. **Save Current is not a full backup:** it does not preserve Editor-only chunk edits, audio, or exports. [Back up active work](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups) before switching books.
 
-### Advanced Tools (Optional)
+### After your first MP3
 
-These tabs are for power users who want more control over voice creation:
-
-- **Designer** — Create new voices from text descriptions (e.g., "A warm elderly woman with a gentle raspy voice"). Save them to use as clone references in the Voices tab
-- **Dataset** — Build LoRA training datasets interactively, one sample at a time with audio preview
-- **Training** — Train LoRA adapters on voice datasets to create persistent voice identities that follow instruct directions
-- **Preparer** — Align audiobook audio with source text to build training pairs; install the optional Voice Tools first
-- **Voice Lab** — Inspect voice datasets, train adapters, and profile/name voices; native stages need the optional dependencies and configured model paths
-- **Reports** — Inspect run history, artifacts, and diagnostics
+- [Illustrated walkthrough and recovery](https://github.com/on22s/alexandria-audiobook-nya/wiki/First-Audiobook)
+- [Manual LLM transport and other providers](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup)
+- [More voices, aliases, personas, cloning, and LoRA](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices)
+- [Review, checkpoints, and longer books](https://github.com/on22s/alexandria-audiobook-nya/wiki/Scripts-and-Review)
+- [M4B, chapters, and Audacity export](https://github.com/on22s/alexandria-audiobook-nya/wiki/Rendering-and-Export)
+- [Designer, Dataset, Training, Preparer, Voice Lab, and Reports](https://github.com/on22s/alexandria-audiobook-nya/wiki/Optional-Voice-Tools)
 
 <details>
 <summary>Detailed features</summary>

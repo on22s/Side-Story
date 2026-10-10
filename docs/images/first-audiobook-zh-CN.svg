@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="240" viewBox="0 0 1200 240" role="img" aria-labelledby="title desc">
+<title id="title">流程示意图 · 不是应用截图</title>
+<desc id="desc">1. Setup / 连接并保存 / 测试通过 → 2. Script / 上传示例 / 保留全部三句话 → 3. Voices / Custom voice: Ryan / 声音已保存 → 4. Editor / Gen → Render Pending / 每行均可播放 → 5. Result / 合并并下载 MP3 / 试听下载的文件</desc>
+<rect width="1200" height="240" rx="18" fill="#0f172a"/>
+<text x="28" y="36" fill="#cbd5e1" font-size="17" font-family="sans-serif">流程示意图 · 不是应用截图</text>
+<rect x="28" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="43" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">1. Setup</text>
+<text x="43" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">连接并保存</text>
+<text x="43" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">测试通过</text>
+<path d="M 241 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="263" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="278" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">2. Script</text>
+<text x="278" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">上传示例</text>
+<text x="278" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">保留全部三句话</text>
+<path d="M 476 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="498" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="513" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">3. Voices</text>
+<text x="513" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Custom voice: Ryan</text>
+<text x="513" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">声音已保存</text>
+<path d="M 711 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="733" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="748" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">4. Editor</text>
+<text x="748" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">Gen → Render Pending</text>
+<text x="748" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">每行均可播放</text>
+<path d="M 946 134 h 15 m -6 -5 l 6 5 -6 5" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<rect x="968" y="60" width="208" height="151" rx="12" fill="#1e293b" stroke="#475569"/>
+<text x="983" y="91" fill="#93c5fd" font-size="22" font-weight="bold" font-family="sans-serif">5. Result</text>
+<text x="983" y="129" fill="#f8fafc" font-size="15" font-family="sans-serif">合并并下载 MP3</text>
+<text x="983" y="181" fill="#a7f3d0" font-size="16" font-family="sans-serif">试听下载的文件</text>
+</svg>
