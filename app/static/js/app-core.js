@@ -1743,6 +1743,8 @@
         function applyCurrentBookFilename(filename) {
             bookSelectionGeneration++;
             currentBookFilename = typeof filename === 'string' ? filename : '';
+            // A reloaded script can change even when its filename stays the same.
+            window.resetSpeakerLabelReview?.();
         }
         function enqueueBookSelection(request, action) {
             const previous = window._existingUploadSelectionPending || Promise.resolve();
@@ -1752,6 +1754,10 @@
                 return action();
             })();
             window._existingUploadSelectionPending = pending;
+            const clearPending = () => {
+                if (window._existingUploadSelectionPending === pending) { window._existingUploadSelectionPending = null; }
+            };
+            pending.then(clearPending, clearPending);
             return pending;
         }
         function getCurrentBookName(fallback = 'book') {

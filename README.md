@@ -267,6 +267,8 @@ Upload a text file (.txt, .md, or .epub) and generate the annotated script. EPUB
 
 **Review Script** checks speaker assignments, narration/dialogue boundaries, and delivery directions while preserving source text. Consecutive-narrator merging is optional and off by default. Review the result rather than assuming every annotation was corrected.
 
+**Speaker-label suggestions** compares a stopped-run snapshot with a saved provisional reference, then lets you inspect bounded model judgments and explicitly apply one alias at a time. See [Speaker-label review](docs/speaker-label-review.md).
+
 Review prompts can be edited in Setup or through their file defaults in `review_prompts.txt`; the runtime’s text-preservation validation still applies.
 
 ### Voices Tab
