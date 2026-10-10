@@ -194,7 +194,7 @@ Composeはホストの `127.0.0.1:4200` のみ公開し、コンテナー内は�
 
 通常の配置では `app/config.json`、作業中JSON、`app/uploads/`、`scripts/`、`voicelines/`、出力、声ライブラリー、データセット、アダプター、関連チェックポイントを保持します。カスタムデータ／設定先も含めます。[詳細な保存一覧](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups-ja-JP)を参照してください。
 
-**Resetは作業中スクリプト、チャンク、現在の声設定／状態、行音声、結合MP3、既定設定を削除します。** 再利用ライブラリーは保持しますが完全な作業バックアップにはなりません。一般的な修復として使わないでください。
+**Resetは作業中スクリプト、チャンク、現在の声設定／状態、行音声、結合MP3、既定設定を削除します。** 再利用ライブラリーは保持しますが完全な作業バックアップにはなりません。Resetの削除対象はチェックアウト内の既定パスです。独自のデータ／設定ディレクトリーまで消去されるとは限りません。一般的な修復として使わないでください。
 
 <details>
 <summary>タブごとの使い方</summary>
@@ -440,7 +440,7 @@ NyaはAA2の研究からも知見を得ています。以下は実験や評価�
 - 話者比較のきっかけとなったBookNLPベースライン。David BammanとBookNLP貢献者の文学NLP研究にも感謝します。 [Drew Thomasson / VoxNovel](https://github.com/DrewThomasson/VoxNovel) · [David Bamman and the BookNLP contributors](https://github.com/booknlp/booknlp)
 - AA2で検討した重み付き声混合。WhiskeyCoderの独立したQwen3-TTSチャンク長の知見も比較に使われました。 [nazdridoy](https://github.com/nazdridoy/kokoro-tts) · [WhiskeyCoder](https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter)
 - PDNC注釈者、RiQuAのSean PapayとSebastian Padó、DraCorコミュニティによる、AA2話者研究で使った注釈付き文学資料。 [Krishnapriya Vishnubhotla, Adam Hammond, and Graeme Hirst](https://aclanthology.org/2022.lrec-1.628/) · [Sean Papay and Sebastian Padó](https://aclanthology.org/2020.lrec-1.104/) · [DraCor](https://dracor.org/)
-- AA2の構文フレーム実験で検討した引用話者の分類。Frank RudziczらBookNLP-OG共著者による一貫した話者割り当て比較にも感謝します。 [David K. Elson and Kathleen R. McKeown](https://www.cs.columbia.edu/~delson/pubs/AAAI10-ElsonMcKeown.pdf) · [Frank Rudzicz and the BookNLP-OG coauthors](https://arxiv.org/abs/2307.03734)
+- AA2の構文フレーム実験で検討した引用話者の分類。Frank RudziczらBookNLP-OG共著者によるエンドツーエンドの話者割り当て比較にも感謝します。 [David K. Elson and Kathleen R. McKeown](https://www.cs.columbia.edu/~delson/pubs/AAAI10-ElsonMcKeown.pdf) · [Frank Rudzicz and the BookNLP-OG coauthors](https://arxiv.org/abs/2307.03734)
 - AA2で調べた音声モデル設計のアイデア。CosyVoiceはNyaの実行時依存関係ではありません。 [CosyVoice team](https://github.com/QwenAudio/CosyVoice)
 - LibriVoxの読み手、Project Gutenbergと青空文庫のボランティア、LJSpeech、Hi-Fi TTS、AISHELL-3、Kokoro Speech Dataset制作者による、研究比較の人の朗読と原文。 [LibriVox](https://librivox.org/) · [Project Gutenberg](https://www.gutenberg.org/) · [Aozora Bunko](https://www.aozora.gr.jp/) · [LJSpeech](https://keithito.com/LJ-Speech-Dataset/) · [Hi-Fi TTS](https://www.openslr.org/109/) · [AISHELL-3](https://www.openslr.org/93/) · [Kokoro Speech Dataset](https://mozilladatacollective.com/datasets/cmmknsho4014wmf087kvq5rc6)
 - 同じ場面の人物同士の声の対比と、一貫した人物の声についての実務的な考え方。第三者通知にも配役の参考資料を記録しています。 [Jay Myers](https://www.jaymyersvoiceover.com/blog-ideas/how-audiobook-narrators-make-characters-sound-distinct-believable-and-consistent) · [Malk Williams](https://www.linkedin.com/pulse/character-voices-audiobooks-7-key-considerations-malk-williams) · [Third-Party Notices](THIRD_PARTY_NOTICES.md#research-and-industry-practice-consulted)
