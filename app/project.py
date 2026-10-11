@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import zipfile
+import tempfile
 import io
 import re
 import time
@@ -572,16 +573,27 @@ class ProjectManager:
         # Phase 4 — Zip everything
         _log("Writing zip archive...")
         zip_path = os.path.join(self.root_dir, "audacity_export.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("project.lof", lof_content)
-            zf.writestr("labels.txt", labels_content)
+        # Keep this invocation's staging file beside the destination so replacement
+        # stays on one filesystem. Publish only after the ZIP closes successfully.
+        staged_fd, staged_zip = tempfile.mkstemp(
+            prefix=".audacity-export-", suffix=".zip", dir=self.root_dir)
+        try:
+            os.close(staged_fd)
+            with zipfile.ZipFile(staged_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("project.lof", lof_content)
+                zf.writestr("labels.txt", labels_content)
 
-            for i, speaker in enumerate(speakers_ordered):
-                _log(f"Encoding WAV {i+1}/{len(speakers_ordered)}: {speaker}...")
-                safe_name = sanitize_filename(speaker)
-                wav_buffer = io.BytesIO()
-                speaker_tracks[speaker].export(wav_buffer, format="wav")
-                zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
+                for i, speaker in enumerate(speakers_ordered):
+                    _log(f"Encoding WAV {i+1}/{len(speakers_ordered)}: {speaker}...")
+                    safe_name = sanitize_filename(speaker)
+                    wav_buffer = io.BytesIO()
+                    speaker_tracks[speaker].export(wav_buffer, format="wav")
+                    zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
+            os.replace(staged_zip, zip_path)
+        finally:
+            # Never scan for or remove another invocation's staging files.
+            if os.path.exists(staged_zip):
+                os.remove(staged_zip)
 
         _log("Audacity export complete.")
         return True, zip_path
