@@ -424,7 +424,7 @@ class ProjectManager:
         )
 
     def _load_chunks_with_audio(self):
-        """Load chunks and pair each with its AudioSegment. Returns list of (chunk, segment)."""
+        """Return (loaded chunk/segment pairs, count of missing or undecodable chunks)."""
         chunks = self.load_chunks()
         result = []
         for chunk in chunks:
@@ -439,10 +439,10 @@ class ProjectManager:
                 result.append((chunk, segment))
             except Exception as e:
                 print(f"Error loading audio segment {path}: {e}")
-        return result
+        return result, len(chunks) - len(result)
 
     def merge_audio(self, cancel_check=None):
-        chunks_with_audio = self._load_chunks_with_audio()
+        chunks_with_audio, skipped = self._load_chunks_with_audio()
         if not chunks_with_audio:
             return False, "No audio segments found"
 
@@ -466,6 +466,8 @@ class ProjectManager:
         output_path = os.path.join(self.root_dir, output_filename)
         final_audio.export(output_path, format="mp3", bitrate="128k")
 
+        if skipped:
+            return True, f"{output_filename} ({skipped} chunk(s) skipped — missing/corrupt audio)"
         return True, output_filename
 
     def export_audacity(self, progress_callback=None):
@@ -475,7 +477,7 @@ class ProjectManager:
             if progress_callback:
                 progress_callback(msg)
 
-        chunks_with_audio = self._load_chunks_with_audio()
+        chunks_with_audio, skipped = self._load_chunks_with_audio()
         if not chunks_with_audio:
             return False, "No audio segments found"
 
@@ -584,6 +586,8 @@ class ProjectManager:
                 zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
 
         _log("Audacity export complete.")
+        if skipped:
+            return True, f"{zip_path} ({skipped} chunk(s) skipped — missing/corrupt audio)"
         return True, zip_path
 
     def merge_m4b(self, per_chunk_chapters=False, metadata=None):
@@ -599,7 +603,7 @@ class ProjectManager:
             tuple: (success: bool, message: str)
         """
         metadata = metadata or {}
-        chunks_with_audio = self._load_chunks_with_audio()
+        chunks_with_audio, skipped = self._load_chunks_with_audio()
         if not chunks_with_audio:
             return False, "No audio segments found"
 
@@ -682,6 +686,8 @@ class ProjectManager:
                     except OSError:
                         pass
 
+        if skipped:
+            return True, f"audiobook.m4b ({skipped} chunk(s) skipped — missing/corrupt audio)"
         return True, "audiobook.m4b"
 
     @staticmethod

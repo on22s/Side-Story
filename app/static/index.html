@@ -3025,15 +3025,20 @@
                         const status = await API.get('/api/status/m4b_export');
                         if (!status.running) {
                             clearInterval(poll);
-                            if (status.logs.some(l => l.includes("complete"))) {
-                                statusEl.innerHTML = '<span class="text-success"><i class="fas fa-check me-1"></i>Done!</span>';
+                            const completion = status.logs.find(l => l.startsWith("Export complete:"));
+                            if (completion) {
+                                const hasSkippedAudio = completion.includes("chunk(s) skipped");
+                                const statusClass = hasSkippedAudio ? "text-warning" : "text-success";
+                                statusEl.innerHTML = `<span class="${statusClass}"><i class="fas fa-check me-1"></i>${escapeHtml(completion)}</span>`;
                                 const a = document.createElement('a');
                                 a.href = `/api/audiobook_m4b?t=${Date.now()}`;
                                 a.download = 'audiobook.m4b';
                                 document.body.appendChild(a);
                                 a.click();
                                 document.body.removeChild(a);
-                                setTimeout(() => { statusEl.innerHTML = ''; }, 5000);
+                                if (!hasSkippedAudio) {
+                                    setTimeout(() => { statusEl.innerHTML = ''; }, 5000);
+                                }
                             } else {
                                 const lastLog = status.logs[status.logs.length - 1] || 'Unknown error';
                                 statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(lastLog)}</span>`;
