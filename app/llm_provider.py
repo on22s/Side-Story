@@ -132,11 +132,12 @@ def classify_llm_error(error):
     status_code = getattr(error, "status_code", None)
     message = str(error)
     lowered = message.lower()
-    if any(token in lowered for token in ("safety", "policy", "content filter", "nsfw")):
-        return {"category": "content_policy", "status_code": status_code, "retryable": False}
     body = getattr(error, "body", None)
     details = body.get("error", body) if isinstance(body, dict) else {}
     code = details.get("code") if isinstance(details, dict) else None
+    refusal_codes = ("content_filter", "content_policy_violation", "safety_violation", "refusal")
+    if isinstance(details, dict) and any(details.get(field) in refusal_codes for field in ("code", "type")):
+        return {"category": "content_policy", "status_code": status_code, "retryable": False}
     if status_code in (400, 413) and (code == "context_length_exceeded" or any(
             token in lowered for token in ("context window exceeded", "maximum context length",
                                             "exceeds the context window"))):
@@ -146,9 +147,15 @@ def classify_llm_error(error):
     if isinstance(status_code, int) and 500 <= status_code <= 599:
         return {"category": "server_error", "status_code": status_code, "retryable": True}
     error_type = type(error).__name__.lower()
-    if "timeout" in error_type or "timeout" in lowered:
+    if "timeout" in error_type:
         return {"category": "timeout", "status_code": status_code, "retryable": True}
-    if "connection" in error_type or "connect" in lowered:
+    if "connection" in error_type:
+        return {"category": "connection_error", "status_code": status_code, "retryable": True}
+    if any(token in lowered for token in ("safety", "policy", "content filter", "nsfw")):
+        return {"category": "content_policy", "status_code": status_code, "retryable": False}
+    if "timeout" in lowered:
+        return {"category": "timeout", "status_code": status_code, "retryable": True}
+    if "connect" in lowered:
         return {"category": "connection_error", "status_code": status_code, "retryable": True}
     return {"category": "api_error", "status_code": status_code, "retryable": True}
 

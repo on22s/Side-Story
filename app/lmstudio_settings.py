@@ -521,6 +521,8 @@ def get_remote_lmstudio_status(ssh_alias, model_name, timeout=20, port=None):
 
 _remote_status_cache = {}  # native/runtime identity tuples -> (timestamp, status_dict)
 _local_status_cache_epoch = 0
+_remote_status_cache_epoch = 0
+_remote_status_alias_epochs = WeakValueDictionary()
 _REMOTE_STATUS_CACHE_TTL = 10  # seconds - shorter than the UI's 30s poll interval
 _remote_status_cache_lock = threading.Lock()  # protects _remote_status_cache itself (fast dict ops only)
 _remote_status_key_locks = WeakValueDictionary()  # waiting/fetching callers own strong references
@@ -539,6 +541,22 @@ def is_local_status_cache_key(key):
     return len(key) == 5 and key[-1] == "local-ui"
 
 
+class _RemoteStatusAliasEpoch:
+    pass
+
+
+def _status_cache_epoch_locked(key):
+    """Capture an alias token retained only while its probes are in flight."""
+    if is_local_status_cache_key(key):
+        return _local_status_cache_epoch
+    alias = key[0]
+    token = _remote_status_alias_epochs.get(alias)
+    if token is None:
+        token = _RemoteStatusAliasEpoch()
+        _remote_status_alias_epochs[alias] = token
+    return _remote_status_cache_epoch, token
+
+
 def _prune_expired_remote_status_cache_locked(now):
     """Remove expired observations; callers hold the cache mutex."""
     local_now = time.monotonic()
@@ -555,9 +573,9 @@ def ensure_remote_status_cache_entry(key):
         return deepcopy(_remote_status_cache.get(key))
 
 
-def save_remote_status_cache(key, status):
+def save_remote_status_cache(key, status, cache_epoch=None):
     """Store a copied observation without retaining expired other keys."""
-    save_runtime_status_cache(key, status, None)
+    save_runtime_status_cache(key, status, cache_epoch)
 
 
 def get_remote_lmstudio_status_cached(ssh_alias, model_name, timeout=20):
@@ -586,8 +604,10 @@ def get_remote_lmstudio_status_cached(ssh_alias, model_name, timeout=20):
         cached = ensure_remote_status_cache_entry(key)
         if cached:
             return cached[1]
+        with _remote_status_cache_lock:
+            epoch = _status_cache_epoch_locked(key)
         status = get_remote_lmstudio_status(ssh_alias, model_name, timeout=timeout)
-        save_remote_status_cache(key, status)
+        save_remote_status_cache(key, status, epoch)
         return deepcopy(status)
 
 
@@ -597,10 +617,11 @@ def get_remote_runtime_status_cached(base_url, ssh_alias, model_name, api_key=No
 
 
 def save_runtime_status_cache(key, status, local_epoch):
-    """Reject a local observation that overlapped a settings invalidation."""
+    """Reject an observation that overlapped a settings invalidation."""
     snapshot = deepcopy(status)
     with _remote_status_cache_lock:
-        if local_epoch is not None and local_epoch != _local_status_cache_epoch:
+        epoch = _status_cache_epoch_locked(key)
+        if local_epoch is not None and local_epoch != epoch:
             return
         now = time.time()
         _prune_expired_remote_status_cache_locked(now)
@@ -634,9 +655,9 @@ def get_runtime_status_cached(llm_mode, base_url, ssh_alias, model_name, api_key
         if cached:
             return cached[1]
         with _remote_status_cache_lock:
-            epoch = _local_status_cache_epoch
+            epoch = _status_cache_epoch_locked(key)
         status = get_current_status(llm_mode, base_url, model_name, ssh_alias, api_key=api_key)
-        save_runtime_status_cache(key, status, None if remote else epoch)
+        save_runtime_status_cache(key, status, epoch)
         return deepcopy(status)
 
 
@@ -649,12 +670,15 @@ def invalidate_remote_status_cache(ssh_alias=None):
     ssh_alias=None clears every cached entry; pass a specific alias to
     clear just that one.
     """
-    global _local_status_cache_epoch
+    global _local_status_cache_epoch, _remote_status_cache_epoch
     with _remote_status_cache_lock:
         if ssh_alias is None:
+            _remote_status_cache_epoch += 1
+            _remote_status_alias_epochs.clear()
             _local_status_cache_epoch += 1
             _remote_status_cache.clear()
         else:
+            _remote_status_alias_epochs.pop(ssh_alias, None)
             for key in [k for k in _remote_status_cache if k[0] == ssh_alias]:
                 del _remote_status_cache[key]
 

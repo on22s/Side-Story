@@ -827,8 +827,12 @@
             chapter_export: ['chapter-export-btn'],
         };
         const taskStartClaims = new Map();
+        const exportStatusGenerations = new Map();
         function claimTaskStart(taskName, initiatingButton = null) {
             if (taskStartClaims.has(taskName)) { return false; }
+            if (['audacity_export', 'm4b_export', 'chapter_export'].includes(taskName)) {
+                exportStatusGenerations.set(taskName, (exportStatusGenerations.get(taskName) || 0) + 1);
+            }
             const ids = Object.hasOwn(taskStartButtons, taskName) ? taskStartButtons[taskName] : [];
             const buttons = ids.map(id => document.getElementById(id)).filter(Boolean);
             if (initiatingButton && !buttons.includes(initiatingButton)) { buttons.push(initiatingButton); }
@@ -6456,7 +6460,7 @@
 
         function _driftBadge(chunk) {
             const d = chunk.drift;
-            if (!d || !d.flagged) { return ''; }
+            if (!d || !d.flagged || chunk.status !== 'done' || !chunk.audio_path) { return ''; }
             const title = `Voice drift: similarity ${d.score} to ${d.reference} (threshold ${d.threshold}). Regenerate with Gen.`;
             return ` <span class="badge bg-warning text-dark drift-badge" title="${escapeHtml(title)}"><i class="fas fa-fingerprint me-1"></i>drift ${d.score}</span>`;
         }
@@ -6513,7 +6517,7 @@
                 const oldDrift = tr.querySelector('.drift-badge');
                 if (oldDrift) { oldDrift.remove(); }
                 badge.insertAdjacentHTML('afterend', _driftBadge(chunk));
-                tr.classList.toggle('drift-flagged', !!(chunk.drift && chunk.drift.flagged));
+                tr.classList.toggle('drift-flagged', !!_driftBadge(chunk));
             }
             applyDriftFilter();
 
@@ -7465,6 +7469,8 @@
             const config = exports[taskName];
             if (!config) { throw new Error('Unknown export task'); }
             claimTaskStart(taskName);
+            const generation = (exportStatusGenerations.get(taskName) || 0) + 1;
+            exportStatusGenerations.set(taskName, generation);
             const statusEl = document.getElementById(config.statusId);
             const cancelBtn = config.cancelId ? document.getElementById(config.cancelId) : null;
             statusEl.textContent = 'Exporting...';
@@ -7494,7 +7500,11 @@
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
-                        setTimeout(() => { statusEl.innerHTML = ''; }, 5000);
+                        setTimeout(() => {
+                            if (exportStatusGenerations.get(taskName) === generation && !taskStartClaims.has(taskName)) {
+                                statusEl.innerHTML = '';
+                            }
+                        }, 5000);
                     }
                 },
             });
@@ -7696,8 +7706,11 @@
             }).join('') + '</ol>';
         }
         async function loadChapterExports() {
+            const request = ++chapterPreviewRequest;
+            const book = currentBookFilename;
             try {
                 const m = await API.get('/api/chapter_exports');
+                if (request !== chapterPreviewRequest || book !== currentBookFilename) { return; }
                 if (Array.isArray(m.chapters)) { renderChapterList(m.chapters, true); }
             } catch (e) { /* nothing exported yet */ }
         }
