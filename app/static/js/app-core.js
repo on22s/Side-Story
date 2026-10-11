@@ -6466,7 +6466,7 @@
 
         function _driftBadge(chunk) {
             const d = chunk.drift;
-            if (!d || !d.flagged) { return ''; }
+            if (!d || !d.flagged || chunk.status !== 'done' || !chunk.audio_path) { return ''; }
             const title = `Voice drift: similarity ${d.score} to ${d.reference} (threshold ${d.threshold}). Regenerate with Gen.`;
             return ` <span class="badge bg-warning text-dark drift-badge" title="${escapeHtml(title)}"><i class="fas fa-fingerprint me-1"></i>drift ${d.score}</span>`;
         }
@@ -6523,7 +6523,7 @@
                 const oldDrift = tr.querySelector('.drift-badge');
                 if (oldDrift) { oldDrift.remove(); }
                 badge.insertAdjacentHTML('afterend', _driftBadge(chunk));
-                tr.classList.toggle('drift-flagged', !!(chunk.drift && chunk.drift.flagged));
+                tr.classList.toggle('drift-flagged', !!_driftBadge(chunk));
             }
             applyDriftFilter();
 
@@ -7482,7 +7482,14 @@
             return status.result?.status === 'done' && typeof status.result.message === 'string';
         }
 
+        const exportStatusClearTimers = new Map();
+        function retainExportStatus(taskName) {
+            clearTimeout(exportStatusClearTimers.get(taskName));
+            exportStatusClearTimers.delete(taskName);
+        }
+
         function pollExport(taskName) {
+            retainExportStatus(taskName);
             const exports = {
                 audacity_export: { statusId: 'audacity-status', url: '/api/export_audacity', filename: 'audacity_export.zip' },
                 m4b_export: { statusId: 'm4b-status', cancelId: 'm4b-cancel-btn', url: '/api/audiobook_m4b', filename: 'audiobook.m4b' },
@@ -7520,7 +7527,10 @@
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
-                        setTimeout(() => { statusEl.innerHTML = ''; }, 5000);
+                        exportStatusClearTimers.set(taskName, setTimeout(() => {
+                            exportStatusClearTimers.delete(taskName);
+                            statusEl.innerHTML = '';
+                        }, 5000));
                     }
                 },
             });
@@ -7528,6 +7538,7 @@
 
         window.exportAudacity = async () => {
             if (!claimTaskStart('audacity_export')) { return; }
+            retainExportStatus('audacity_export');
             const statusEl = document.getElementById('audacity-status');
             statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Exporting...</span>';
 
@@ -7709,7 +7720,9 @@
                 require_ready: document.getElementById('chapter-require-ready').checked
             };
         }
+        let chapterListRevision = 0;
         function renderChapterList(rows, exported) {
+            chapterListRevision += 1;
             const el = document.getElementById('chapter-list');
             document.getElementById('chapter-zip-link').style.display = exported && rows.some(r => r.exists) ? '' : 'none';
             if (!rows.length) { el.innerHTML = `<span class="text-muted">${exported ? 'No exported chapter files found.' : 'No chapter files would be written.'}</span>`; return; }
@@ -7722,8 +7735,12 @@
             }).join('') + '</ol>';
         }
         async function loadChapterExports() {
+            const revision = chapterListRevision;
+            const request = ++chapterPreviewRequest;
+            const book = currentBookFilename;
             try {
                 const m = await API.get('/api/chapter_exports');
+                if (request !== chapterPreviewRequest || revision !== chapterListRevision || book !== currentBookFilename) { return; }
                 if (Array.isArray(m.chapters)) { renderChapterList(m.chapters, true); }
             } catch (e) { /* nothing exported yet */ }
         }
@@ -7755,6 +7772,7 @@
         });
         document.getElementById('chapter-export-btn').addEventListener('click', async () => {
             if (!claimTaskStart('chapter_export')) { return; }
+            retainExportStatus('chapter_export');
             chapterPreviewRequest += 1;
             const statusEl = document.getElementById('chapter-status');
             const cancelBtn = document.getElementById('chapter-cancel-btn');
@@ -7818,6 +7836,7 @@
 
         window.exportM4B = async () => {
             if (!claimTaskStart('m4b_export')) { return; }
+            retainExportStatus('m4b_export');
             const statusEl = document.getElementById('m4b-status');
             const perChunk = document.getElementById('m4b-per-chunk').checked;
             statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Exporting M4B...</span>';
