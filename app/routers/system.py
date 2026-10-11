@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import traceback
+from device_utils import normalize_device
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
@@ -232,7 +233,28 @@ def _get_torch():
 _gpu_stats_cache = {"data": None, "timestamp": 0}
 _GPU_STATS_CACHE_TTL = 5  # seconds
 
-def _gpu_stats_via_rocm_smi():
+def get_configured_gpu_index():
+    """Use the generation device for diagnostics and automatic configuration."""
+    try:
+        device = normalize_device((load_app_config(CONFIG_PATH).get("tts") or {}).get("device", "auto"))
+        if device in ("cpu", "mps"):
+            return None
+        if device.startswith("cuda:"):
+            return int(device.split(":", 1)[1])
+        torch = _get_torch()
+        return torch.cuda.current_device() if torch is not None and torch.cuda.is_available() else 0
+    except (TypeError, ValueError, RuntimeError, AttributeError) as error:
+        logger.warning("GPU statistics unavailable for configured device: %s", error)
+        return None
+
+def get_rocm_card(data, index):
+    if not isinstance(data, dict) or len(data) != 1 or index != 0:
+        return None  # Avoid guessing physical/logical ordinals across multiple cards.
+    card = data.get(f"card{index}")
+    return card if isinstance(card, dict) else None
+
+
+def _gpu_stats_via_rocm_smi(index=0):
     """VRAM/util from rocm-smi when torch can't see the GPU (e.g. a CUDA-only
     torch build on an AMD box). Returns the same dict shape as get_gpu_stats(),
     or None on any rocm-smi failure (missing binary, timeout, bad/empty JSON)."""
@@ -240,7 +262,7 @@ def _gpu_stats_via_rocm_smi():
                              rocm_smi_path="/opt/rocm/bin/rocm-smi", timeout=2)
     if not data:
         return None
-    for card_data in data.values():
+    for card_data in [get_rocm_card(data, index)]:
         if not isinstance(card_data, dict):
             continue
         total_b = card_data.get("VRAM Total Memory (B)")
@@ -260,36 +282,40 @@ def _gpu_stats_via_rocm_smi():
         return stats
     return None
 
-def get_gpu_stats():
+def get_gpu_stats(index=None):
     """Get current GPU memory and utilization stats with caching."""
+    global _gpu_stats_cache
     now = time.time()
+    if index is None:
+        index = get_configured_gpu_index()
+    if index is None:
+        return None
 
     # Return cached stats if still fresh
-    if (now - _gpu_stats_cache["timestamp"]) < _GPU_STATS_CACHE_TTL:
-        return _gpu_stats_cache["data"]
-
+    cached = _gpu_stats_cache
+    if (cached.get("device_index") == index and
+            (now - cached["timestamp"]) < _GPU_STATS_CACHE_TTL):
+        return cached["data"]
     torch = _get_torch()
     if torch is None or not torch.cuda.is_available():
         # torch can't see the GPU (e.g. a CUDA-only build on an AMD box) —
         # fall back to rocm-smi so AMD GPUs are still detected.
-        stats = _gpu_stats_via_rocm_smi()
+        stats = _gpu_stats_via_rocm_smi(index)
         if stats is None:
             logger.debug("GPU stats: No GPU available (torch + rocm-smi both failed)")
-        _gpu_stats_cache["data"] = stats
-        _gpu_stats_cache["timestamp"] = now
+        _gpu_stats_cache = {"device_index": index, "data": stats, "timestamp": now}
         return stats
 
     stats = {}
     try:
         # Memory stats (works for both NVIDIA and AMD ROCm)
-        allocated = torch.cuda.memory_allocated() / 1e9  # GB
-        reserved = torch.cuda.memory_reserved() / 1e9    # GB
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
+        allocated = torch.cuda.memory_allocated(index) / 1e9  # GB
+        reserved = torch.cuda.memory_reserved(index) / 1e9    # GB
+        total = torch.cuda.get_device_properties(index).total_memory / 1e9  # GB
 
         if total <= 0:
             logger.warning("GPU stats: Total memory reported as 0, skipping utilization check")
-            _gpu_stats_cache["data"] = None
-            _gpu_stats_cache["timestamp"] = now
+            _gpu_stats_cache = {"device_index": index, "data": None, "timestamp": now}
             return None
 
         stats['allocated_gb'] = allocated
@@ -298,8 +324,7 @@ def get_gpu_stats():
         stats['allocated_percent'] = allocated / total * 100
     except Exception as e:
         logger.debug(f"Could not get GPU memory stats: {e}")
-        _gpu_stats_cache["data"] = None
-        _gpu_stats_cache["timestamp"] = now
+        _gpu_stats_cache = {"device_index": index, "data": None, "timestamp": now}
         return None
 
     # Utilization via rocm-smi is a separate, independent try - same reason
@@ -310,7 +335,7 @@ def get_gpu_stats():
     try:
         data = run_rocm_smi_json(["--showuse"], rocm_smi_path="/opt/rocm/bin/rocm-smi", timeout=2)
         if data is not None:
-            for card_data in data.values():
+            for card_data in [get_rocm_card(data, index)]:
                 if not isinstance(card_data, dict):
                     continue
                 stats['utilization_percent'] = _rocm_smi_utilization(card_data)
@@ -321,15 +346,15 @@ def get_gpu_stats():
         logger.debug(f"Could not get GPU utilization via rocm-smi: {e}")
 
     # Cache the result
-    _gpu_stats_cache["data"] = stats
-    _gpu_stats_cache["timestamp"] = now
+    _gpu_stats_cache = {"device_index": index, "data": stats, "timestamp": now}
     return stats
 
 
 @router.get("/api/system/stats")
 def get_system_stats():
     """Return GPU memory, disk, and basic hardware statistics."""
-    gpu = get_gpu_stats()
+    gpu_index = get_configured_gpu_index()
+    gpu = get_gpu_stats(gpu_index) if gpu_index is not None else None
     has_space, free_gb = check_disk_space(ROOT_DIR, 1.0)
 
     cpu_count = os.cpu_count()
@@ -348,17 +373,17 @@ def get_system_stats():
     torch_cuda_ok = False
     try:
         torch = _get_torch()
-        if torch is not None and torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
+        if gpu_index is not None and torch is not None and torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(gpu_index)
             torch_cuda_ok = True
     except (RuntimeError, OSError, AttributeError):
         pass
-    if gpu_name is None:
+    if gpu_index is not None and gpu_name is None:
         # torch can't see the GPU — ask rocm-smi for the product name (AMD).
         name_data = run_rocm_smi_json(["--showproductname"],
                                       rocm_smi_path="/opt/rocm/bin/rocm-smi", timeout=2)
         if name_data:
-            for card_data in name_data.values():
+            for card_data in [get_rocm_card(name_data, gpu_index)]:
                 if isinstance(card_data, dict):
                     name = card_data.get("Card Series") or card_data.get("Card Model")
                     if name and name != "N/A":
@@ -371,7 +396,7 @@ def get_system_stats():
     # showing up as "everything is slow" with no clear cause.
     gpu_mismatch = False
     gpu_vendor = None
-    if not torch_cuda_ok:
+    if gpu_index is not None and not torch_cuda_ok:
         has_gpu, gpu_vendor = system_has_gpu()
         gpu_mismatch = has_gpu
 

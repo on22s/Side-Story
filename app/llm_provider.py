@@ -132,11 +132,14 @@ def classify_llm_error(error):
     status_code = getattr(error, "status_code", None)
     message = str(error)
     lowered = message.lower()
-    if any(token in lowered for token in ("safety", "policy", "content filter", "nsfw")):
-        return {"category": "content_policy", "status_code": status_code, "retryable": False}
     body = getattr(error, "body", None)
     details = body.get("error", body) if isinstance(body, dict) else {}
     code = details.get("code") if isinstance(details, dict) else None
+    refusal_tokens = {"content_policy_violation", "content_filter", "safety_violation", "refusal"}
+    if isinstance(details, dict) and any(
+            isinstance(details.get(field), str) and details[field] in refusal_tokens
+            for field in ("code", "type")):
+        return {"category": "content_policy", "status_code": status_code, "retryable": False}
     if status_code in (400, 413) and (code == "context_length_exceeded" or any(
             token in lowered for token in ("context window exceeded", "maximum context length",
                                             "exceeds the context window"))):
@@ -150,6 +153,8 @@ def classify_llm_error(error):
         return {"category": "timeout", "status_code": status_code, "retryable": True}
     if "connection" in error_type or "connect" in lowered:
         return {"category": "connection_error", "status_code": status_code, "retryable": True}
+    if any(token in lowered for token in ("content policy", "content filter", "safety", "nsfw")):
+        return {"category": "content_policy", "status_code": status_code, "retryable": False}
     return {"category": "api_error", "status_code": status_code, "retryable": True}
 
 

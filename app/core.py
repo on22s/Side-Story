@@ -51,8 +51,17 @@ def _warn_corrupted_json(kind: str, path: str, action: str, e: Exception) -> Non
     logger.warning(f"Corrupted {kind} at {path}, {action}: {e}")
 
 
-def _load_manifest(path):
+def _load_manifest(path, *, strict=False):
     """Load a JSON manifest file, returning [] on missing or corrupt file."""
+    if strict:
+        try:
+            with open(path, "r", encoding="utf-8") as source:
+                entries = json.load(source)
+        except FileNotFoundError:
+            return []
+        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+            raise ValueError("Manifest must contain a list of objects")
+        return entries
     entries = safe_load_json(path, default=[])
     valid = [entry for entry in entries if isinstance(entry, dict)]
     if len(valid) != len(entries):
