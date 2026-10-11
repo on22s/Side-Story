@@ -119,7 +119,7 @@
                 started = true;
                 document.getElementById('btn-report-explanation-cancel').style.display = '';
                 _startPolling('report_explanation', () => API.get('/api/status/report_explanation'), {
-                    interval: 1000,
+                    intervalMs: 1000,
                     doneCheck: data => data.run_id !== runId || !data.running,
                     onDone: async data => {
                         reportExplanationPending = false;
@@ -147,6 +147,7 @@
         }
 
         async function onCancelReportExplanation() {
+            if (!reportExplanationRunId) { return; }
             try { await API.post('/api/reports/explanation/cancel', {run_id: reportExplanationRunId}); }
             catch (e) { showActionError('Explanation cancellation is unconfirmed', e, 'Check explanation status before cancelling again; the provider call may still be running.'); }
         }
