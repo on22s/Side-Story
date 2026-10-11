@@ -705,10 +705,36 @@ class ProjectManager:
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk.get("uid")))
             return chunk
 
+    def _get_chunk_edit_voices(self):
+        """Read render inputs without hiding damaged voice data during edits."""
+        try:
+            with open(self.voice_config_path, "r", encoding="utf-8") as source:
+                voices = json.load(source)
+        except FileNotFoundError:
+            voices = {}
+        if not isinstance(voices, dict):
+            raise ValueError("Voice configuration must be an object before changing source indices")
+        return voices
+
+    def _invalidate_shifted_chunk_audio(self, chunks, old_indices):
+        """Retire renders when source-index timelines select different inputs."""
+        if not any(old_indices.get(chunk.get("uid"), index) != index
+                   for index, chunk in enumerate(chunks)):
+            return
+        voices = self._get_chunk_edit_voices()
+        for index, chunk in enumerate(chunks):
+            old_index = old_indices.get(chunk.get("uid"))
+            if old_index is not None and old_index != index and (
+                    self.get_chunk_voice_inputs(voices, chunk, old_index) !=
+                    self.get_chunk_voice_inputs(voices, chunk, index)):
+                chunk.update(status="pending", audio_path=None, error=None, drift=None,
+                             voice_revision=uuid.uuid4().hex)
+
     def insert_chunk(self, after_index):
         """Insert an empty chunk after the given index. Returns the new chunk list."""
         with self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
+            old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
             if not (0 <= after_index < len(chunks)):
                 return None
 
@@ -729,6 +755,7 @@ class ProjectManager:
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
 
+            self._invalidate_shifted_chunk_audio(chunks, old_indices)
             self._save_chunks_locked(chunks, uids_backfilled=True)
             return chunks
 
@@ -736,17 +763,21 @@ class ProjectManager:
         """Delete a chunk at the given index. Returns (deleted_chunk, updated_chunks) or None."""
         with self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
+            old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
             if not (0 <= index < len(chunks)):
                 return None
             if len(chunks) <= 1:
                 return None  # don't allow deleting the last chunk
 
+            voices = self._get_chunk_edit_voices()
             deleted = chunks.pop(index)
+            deleted["_deleted_voice_inputs"] = self.get_chunk_voice_inputs(voices, deleted, index)
 
             # Re-number all IDs
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
 
+            self._invalidate_shifted_chunk_audio(chunks, old_indices)
             self._save_chunks_locked(chunks, uids_backfilled=True)
             return deleted, chunks
 
@@ -759,20 +790,29 @@ class ProjectManager:
             return None
         with self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
+            old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
 
             chunk_data = copy.deepcopy(chunk_data)
             uid = chunk_data.get("uid")
             if uid and any(chunk.get("uid") == uid for chunk in chunks):
                 return None
+            if type(chunk_data.get("id")) is int:
+                old_indices[uid] = chunk_data["id"]
             at_index = max(0, min(at_index, len(chunks)))
             if isinstance(chunk_data, dict):
                 chunk_data.setdefault("uid", _new_chunk_uid())
             chunks.insert(at_index, chunk_data)
+            captured_voice = chunk_data.pop("_deleted_voice_inputs", None)
+            if chunk_data.get("audio_path") and (captured_voice is None or
+                    captured_voice != self.get_chunk_voice_inputs(self._get_chunk_edit_voices(), chunk_data, at_index)):
+                chunk_data.update(status="pending", audio_path=None, error=None, drift=None,
+                                  voice_revision=uuid.uuid4().hex)
 
             # Re-number all IDs
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
 
+            self._invalidate_shifted_chunk_audio(chunks, old_indices)
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk_data.get("uid")))
             return chunks
 
@@ -802,6 +842,7 @@ class ProjectManager:
             if render_changed:
                 chunk["status"] = "pending"
                 chunk["audio_path"] = None
+                chunk["drift"] = None
 
         return self._modify_chunk(index, mutator)
 
@@ -817,7 +858,7 @@ class ProjectManager:
         return self._modify_chunk(index, mutator)
 
     def _update_chunk_fields_by_uid(self, uid, expected_chunk=None, required_status=None,
-                                    audio_source=None, **kwargs):
+                                    audio_source=None, expected_audio=None, expected_related_chunks=None, **kwargs):
         """Conditionally publish to the live UID under one lock, preserving other rows.
 
         Generation compares only captured render inputs. An owned converted temp
@@ -838,6 +879,18 @@ class ProjectManager:
             if expected_chunk is not None and (
                     get_chunk_generation_inputs(chunk) != get_chunk_generation_inputs(expected_chunk)):
                 return None
+            if expected_audio is not None and any(
+                    chunk.get(field) != value for field, value in expected_audio.items()):
+                return None
+            for expected in expected_related_chunks or ():
+                related_uid = expected.get("uid")
+                related = (journal.get_row(related_uid) if journal else
+                           next((row for row in chunks if row.get("uid") == related_uid), None))
+                if related is None or get_chunk_generation_inputs(related) != get_chunk_generation_inputs(expected):
+                    return None
+                if any(related.get(field) != expected.get(field) for field in
+                       ("status", "audio_path", "audio_revision", "voice_revision")):
+                    return None
             if required_status is not None and chunk.get("status") != required_status:
                 return None
             if audio_source is not None:

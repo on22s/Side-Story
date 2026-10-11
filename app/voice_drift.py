@@ -12,6 +12,7 @@ this repo: it never substitutes a weaker metric when ECAPA is unavailable
 (the run is reported as NOT MEASURED, like the identity gate's rc=2), and it
 never treats "no opinion" as "pass".
 """
+import copy
 import math
 import os
 import tempfile
@@ -244,6 +245,12 @@ def _check_voice_drift_batch(chunks, voice_config, root_dir, python_bin, thresho
                     continue
                 results.append({"index": index, "uid": uid, "score": round(value, 4),
                                 "flagged": value < threshold, "reference": label})
+    for result in results:
+        captured = chunks_by_uid.get(result.get("uid"))
+        result["captured_chunk"] = copy.deepcopy(captured) if captured is not None else None
+        reference = str(result.get("reference", ""))
+        if reference.startswith("chunk:"):
+            result["captured_reference"] = copy.deepcopy(chunks_by_uid.get(reference[6:]))
     results.sort(key=lambda r: r["index"])
     return {"results": results, "error": None}
 
@@ -266,13 +273,27 @@ def apply_drift_results(project_manager, results, threshold):
         if not uid:
             missing.append(f"index {r.get('index', '?')} (no UID)")
             continue
-        updated = project_manager._update_chunk_fields_by_uid(uid, drift=drift)
+        captured = r.get("captured_chunk")
+        if not isinstance(captured, dict):
+            missing.append(f"{uid} (no captured inputs)")
+            continue
+        related = []
+        if str(r.get("reference", "")).startswith("chunk:"):
+            reference = r.get("captured_reference")
+            if not isinstance(reference, dict):
+                missing.append(f"{uid} (no captured reference)")
+                continue
+            related.append(reference)
+        updated = project_manager._update_chunk_fields_by_uid(
+            uid, expected_chunk=captured, required_status="done", expected_related_chunks=related,
+            expected_audio={field: captured.get(field) for field in
+                            ("audio_path", "audio_revision", "voice_revision")}, drift=drift)
         if updated is not None:
             applied += 1
             flagged += int(bool(r["flagged"]))
         else:
             missing.append(str(uid))
     if missing:
-        raise ValueError(f"Voice-drift targets disappeared or have no UID: {', '.join(missing)}; "
+        raise ValueError(f"Voice-drift targets changed, disappeared or have no captured inputs: {', '.join(missing)}; "
                          f"persisted {applied}/{len(results)} results ({flagged} flagged)")
     return flagged
