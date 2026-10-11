@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import zipfile
+import tempfile
 import io
 import re
 import time
@@ -684,15 +685,22 @@ class ProjectManager:
 
         # Phase 4 — Zip everything
         zip_path = os.path.join(self.root_dir, "audacity_export.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("project.lof", lof_content)
-            zf.writestr("labels.txt", labels_content)
+        # Publish only a fully closed archive. Each call owns its staging
+        # directory, so a failed or concurrent export cannot clobber another
+        # call's work or the previous successful download.
+        with tempfile.TemporaryDirectory(
+                prefix=".audacity-export-", dir=self.root_dir) as staging_dir:
+            staged_zip = os.path.join(staging_dir, "audacity_export.zip")
+            with zipfile.ZipFile(staged_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("project.lof", lof_content)
+                zf.writestr("labels.txt", labels_content)
 
-            for speaker in speakers_ordered:
-                safe_name = sanitize_filename(speaker)
-                wav_buffer = io.BytesIO()
-                speaker_tracks[speaker].export(wav_buffer, format="wav")
-                zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
+                for speaker in speakers_ordered:
+                    safe_name = sanitize_filename(speaker)
+                    wav_buffer = io.BytesIO()
+                    speaker_tracks[speaker].export(wav_buffer, format="wav")
+                    zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
+            os.replace(staged_zip, zip_path)
 
         return True, zip_path
 
