@@ -1243,7 +1243,7 @@
                             </div>
                             <details class="mb-3" open>
                                 <summary class="text-muted small">Script generation: how much of the book the AI reads at once</summary>
-                                <div class="form-text mb-2">Turning a book into a script happens in three steps, for one book or a batch alike: <strong>1</strong> split the text into narration and spoken lines, <strong>2</strong> decide who says each line, <strong>3</strong> write a delivery note for each line. The settings below control how much text the AI sees in steps 1 and 2. The defaults are what this project's published accuracy numbers were measured with; change them to trade speed for context.</div>
+                                <div class="form-text mb-2">Turning a book into a script happens in three steps, for one book or a batch alike: <strong>1</strong> split the text into narration and spoken lines, <strong>2</strong> decide who says each line, <strong>3</strong> write a delivery note for each line. The settings below control how much text the AI sees in all three steps. The defaults are what this project's published accuracy numbers were measured with; change them to trade speed for context.</div>
                                 <div class="row g-2 mt-1">
                                     <div class="col-md-4">
                                         <label class="form-label small mb-1" for="tp-chunk-size">Step 1: text per request (characters)</label>
@@ -1259,6 +1259,11 @@
                                         <label class="form-label small mb-1" for="tp-attribute-context-chars">Step 2: extra text around each request (characters, each side)</label>
                                         <input type="number" class="form-control form-control-sm" id="tp-attribute-context-chars" min="0" max="1000000" step="500" value="2000">
                                         <div class="form-text">Also show the AI this much of the book before and after the lines it is deciding on, for context only (it is told not to assign speakers to it). 0 = off. Every 1,000 characters adds roughly 300 tokens to each request, so it costs time (and money on paid APIs). Whether it improves accuracy is being measured; see RECIPES.md.</div>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label small mb-1" for="tp-instruct-context-chars">Step 3: extra text around each request (characters, each side)</label>
+                                        <input type="number" class="form-control form-control-sm" id="tp-instruct-context-chars" min="0" max="1000000" step="500" value="0">
+                                        <div class="form-text">Zero adds no extra prose. Adds contiguous text outside the request's first and last target, beyond boundary entries already supplied as context. Text is clipped at the character limit. Sparse targets retain their immediate neighbours in the request. The full prompt must fit the model's input and context limits; delivery quality has not been measured.</div>
                                     </div>
                                     <div class="col-md-4">
                                         <label class="form-label small mb-1" for="tp-attribute-target-chars">Step 2: text per request (characters)</label>
@@ -1284,6 +1289,14 @@
                                             <option value="llm">Model only</option>
                                         </select>
                                         <div class="form-text"><strong>Quote marks first</strong> uses the quote marks where the text makes it clear which parts are speech and asks the model about the rest. <strong>Quote marks only</strong> never asks the model: anything inside quote marks is dialogue, everything else is narration. <strong>Quote-aware</strong> is the same deterministic split but treats strongly signalled quoted terms (for example, “known as X”) as narration. <strong>Model only</strong> always asks the model.</div>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label small mb-1" for="tp-pass1-format">Step 1: model output format</label>
+                                        <select class="form-select form-select-sm" id="tp-pass1-format">
+                                            <option value="ordinary" selected>Full text (default)</option>
+                                            <option value="compact">Compact labels (experimental)</option>
+                                        </select>
+                                        <div class="form-text">Only affects chunks the quote marks don't settle. <strong>Compact labels</strong> sends numbered sentences and asks the model for a label per sentence instead of rewriting the text; if a reply is unusable or fails the fidelity check, that chunk falls back to <strong>Full text</strong> automatically. In testing (#744) it used fewer output tokens and failed fewer chunks on messy formats, but scored a little lower on clean single-quote books. Changing this restarts an unfinished book instead of resuming it.</div>
                                     </div>
                                     <div class="col-md-4">
                                         <label class="form-label small mb-1">Fidelity gate controls</label>
@@ -1620,6 +1633,12 @@
                             <input class="form-check-input" type="checkbox" id="script-strip-front-matter" checked>
                             <label class="form-check-label small" for="script-strip-front-matter">
                                 Strip known translator front matter &mdash; remove non-story boilerplate (translator's notes, tables of contents) some compiled web-novel uploads include, before it's sent to the LLM.
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="script-literal-source-preserving">
+                            <label class="form-check-label small" for="script-literal-source-preserving">
+                                Preserve source words through annotation and review. Speech preparation may expand numbers and symbols later.
                             </label>
                         </div>
 

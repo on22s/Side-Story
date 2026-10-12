@@ -106,6 +106,7 @@ PromptVariant = Literal[
 # "Quote marks first, model for the rest (recommended)", quotes as "Quote marks only", lexical as
 # "Quote-aware", llm as "Model only". The stored values must not change without a migration.
 SegmentationMode = Literal["auto", "quotes", "lexical", "llm"]
+Pass1Format = Literal["ordinary", "compact"]
 
 
 class ThreePassModelProfile(BaseModel):
@@ -115,6 +116,7 @@ class ThreePassModelProfile(BaseModel):
     instruct_temperature: Optional[float] = Field(default=None, ge=0, le=2)
     segment_output_ratio: Optional[float] = Field(default=None, ge=1.25, le=6.0)
     segmentation: Optional[SegmentationMode] = None
+    pass1_format: Optional[Pass1Format] = None
 
 
 class GenerationConfig(BaseModel):
@@ -144,6 +146,7 @@ class GenerationConfig(BaseModel):
     # Zero retains the saved line-based behavior; positive values opt in.
     three_pass_attribute_target_chars: int = Field(default=0, ge=0, le=1000000)
     three_pass_instruct_target_chars: int = Field(default=0, ge=0, le=1000000)
+    three_pass_instruct_context_chars: int = Field(default=0, ge=0, le=1000000)
     # Which way the attribution question is asked (attribution_prompt_variants;
     # measured results per variant in RECIPES.md). michel2_full since
     # 2026-09-19, when Muse's cell (90.5 vs michel2 86.6) made it the winner
@@ -152,6 +155,8 @@ class GenerationConfig(BaseModel):
     # whatever it holds; only a fresh one gets the new default.
     three_pass_attribute_prompt_variant: PromptVariant = "michel2_full"
     three_pass_segmentation: SegmentationMode = "auto"
+    # #744 opt-in: compact labels with per-chunk fallback to full text
+    three_pass_pass1_format: Pass1Format = "ordinary"
     three_pass_quoted_must_be_spoken: bool = True
     three_pass_unquoted_must_be_narrator: bool = True
     # Pass 2: when a batch runs out of retries and the ONLY failures are a

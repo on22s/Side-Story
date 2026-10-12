@@ -5,6 +5,7 @@ import uuid
 from collections import defaultdict, deque
 
 from project import CHUNK_GENERATION_FIELDS, get_chunk_text_key, group_into_chunks
+from literal_policy import CHUNK_POLICY_KEY, ensure_literal_chunk, get_literal_policy
 
 
 BASIC_FIELDS = ("speaker", "text", "instruct", "pause_after")
@@ -39,8 +40,11 @@ def get_delivery_retry_chunks(before, after, chunks):
                 for field in BASIC_FIELDS)
             for group, chunk in zip(old_groups, chunks)):
         raise ValueError("Editor text or delivery changed; review those edits before retrying delivery.")
+    policy = get_literal_policy(before)
+    for chunk in chunks:
+        ensure_literal_chunk(chunk, policy)
     if any(any(field in chunk for field in CHUNK_GENERATION_FIELDS
-               if field not in BASIC_FIELDS) for chunk in chunks):
+               if field not in (*BASIC_FIELDS, CHUNK_POLICY_KEY)) for chunk in chunks):
         raise ValueError("Editor voice/style overrides need manual delivery review; retry would replace them.")
 
     def key(group):

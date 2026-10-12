@@ -1722,13 +1722,16 @@
             'tp-attribute-context-chars': 'three_pass_attribute_context_chars',
             'tp-attribute-target-chars': 'three_pass_attribute_target_chars',
             'tp-instruct-target-chars': 'three_pass_instruct_target_chars',
+            'tp-instruct-context-chars': 'three_pass_instruct_context_chars',
             'tp-segment-output-ratio': 'three_pass_segment_output_ratio',
             'tp-segment-temperature': 'three_pass_segment_temperature',
             'tp-attribute-temperature': 'three_pass_attribute_temperature',
             'tp-instruct-temperature': 'three_pass_instruct_temperature',
             'tp-segmentation': 'three_pass_segmentation', 'context-rescue-retries': 'context_rescue_retries',
+            'tp-pass1-format': 'three_pass_pass1_format',
         };
         function applyGenerationSettings(g) {
+            document.getElementById('tp-instruct-context-chars').value = g.three_pass_instruct_context_chars ?? 0;
             if (g.chunk_size != null) { legacyChunkSize = g.chunk_size; }
             for (const [id, key] of Object.entries(generationControlFields)) {
                 if (g[key] != null) { document.getElementById(id).value = g[key]; }
@@ -2073,6 +2076,7 @@
                     three_pass_attribute_batch_size: getNumFieldValue('tp-attribute-batch-size', 25, true),
                     three_pass_attribute_target_chars: getNumFieldValue('tp-attribute-target-chars', 0, true),
                     three_pass_instruct_target_chars: getNumFieldValue('tp-instruct-target-chars', 0, true),
+                    three_pass_instruct_context_chars: getNumFieldValue('tp-instruct-context-chars', 0, true),
                     three_pass_attribute_context_chars: getNumFieldValue('tp-attribute-context-chars', 0, true),
                     three_pass_attribute_prompt_variant: (selectedPromptPreset() || {}).variant || 'michel2_full',
                     three_pass_segment_output_ratio: getNumFieldValue('tp-segment-output-ratio', 3.0),
@@ -2080,6 +2084,7 @@
                     three_pass_attribute_temperature: getNumFieldValue('tp-attribute-temperature', 0.1),
                     three_pass_instruct_temperature: getNumFieldValue('tp-instruct-temperature', 0.1),
                     three_pass_segmentation: document.getElementById('tp-segmentation').value || 'auto',
+                    three_pass_pass1_format: document.getElementById('tp-pass1-format').value || 'ordinary',
                     three_pass_quoted_must_be_spoken: document.getElementById('tp-quoted-must-be-spoken').checked,
                     three_pass_unquoted_must_be_narrator: document.getElementById('tp-unquoted-must-be-narrator').checked,
                     three_pass_keep_whole_batch: document.getElementById('tp-keep-whole-batch').checked,
@@ -2330,6 +2335,7 @@
                 }
                 const result = await API.post('/api/generate_script/preflight', {
                     strip_front_matter: _isStripFrontMatterChecked(),
+                    ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     first_person_narrator: document.getElementById('script-first-person-narrator').value.trim() || null
                 });
                 const job = result.job_id;
@@ -2406,6 +2412,7 @@
             try {
                 await API.post('/api/generate_script', {
                     strip_front_matter: _isStripFrontMatterChecked(),
+                    ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     first_person_narrator:
                         document.getElementById('script-first-person-narrator').value.trim() || null,
                     start_over: startOver,
@@ -3009,6 +3016,7 @@
                 await API.post('/api/generate_script/batch/start', {
                     tasks, collision_policy: collisionPolicy,
                     strip_front_matter: _isStripFrontMatterChecked(),
+                    ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     build_cast_lists: document.getElementById('script-batch-build-cast-lists').checked
                 });
                 started = true;
@@ -3102,6 +3110,10 @@
         }
         function _isReviewForceChecked() {
             const cb = document.getElementById('review-force-rerun');
+            return cb ? cb.checked : false;
+        }
+        function _isLiteralSourcePreservingChecked() {
+            const cb = document.getElementById('script-literal-source-preserving');
             return cb ? cb.checked : false;
         }
         function _isStripFrontMatterChecked() {
