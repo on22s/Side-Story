@@ -128,9 +128,20 @@ def test_save_config_roundtrip():
     original = r.json()
     shared["original_config"] = original
 
+    # Missing active profile must still be refused without altering config.
+    invalid = {**original, "llm_mode": "local", "llm_local": None}
+    assert_status(post("/api/config", json=invalid), 400)
+    unchanged = get("/api/config")
+    assert_status(unchanged, 200)
+    if unchanged.json() != original:
+        raise TestFailure("Rejected config changed persisted settings")
+
     # Build test config with modified language
     test_config = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": {**original.get("tts", {}), "language": "_test_roundtrip_lang"},
         "prompts": original.get("prompts"),
         "generation": original.get("generation"),
@@ -168,6 +179,9 @@ def test_save_config_roundtrip():
     # Restore original
     restore = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": original.get("tts", {"mode": "external", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": original.get("prompts"),
         "generation": original.get("generation"),
@@ -184,6 +198,9 @@ def test_save_pause_config_roundtrip():
     # Save with custom pause values
     test_config = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": {
             **original.get("tts", {}),
             "pause_between_speakers_ms": 1000,
@@ -212,6 +229,9 @@ def test_save_pause_config_roundtrip():
     # Restore original
     restore = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": original.get("tts", {"mode": "external", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": original.get("prompts"),
         "generation": original.get("generation"),
@@ -245,6 +265,9 @@ def test_save_review_prompts_roundtrip():
     # Save config with custom review prompts
     test_config = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": {
             **(original.get("prompts") or {}),
@@ -269,6 +292,9 @@ def test_save_review_prompts_roundtrip():
     # Restore original
     restore = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": original.get("prompts"),
         "generation": original.get("generation"),
@@ -285,6 +311,9 @@ def test_save_persona_prompts_roundtrip():
     # Save config with custom persona prompts
     test_config = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": {
             **(original.get("prompts") or {}),
@@ -312,6 +341,9 @@ def test_save_persona_prompts_roundtrip():
     # Restore original
     restore = {
         "llm": original["llm"],
+        "llm_mode": original["llm_mode"],
+        "llm_local": original["llm_local"],
+        "llm_remote": original.get("llm_remote"),
         "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": original.get("prompts"),
         "generation": original.get("generation"),
@@ -640,6 +672,8 @@ def test_delete_chunk():
     # Save deleted chunk for restore test
     shared["deleted_chunk"] = data["deleted"]
     shared["deleted_chunk_index"] = idx
+    assert_key(data, "undo_token")
+    shared["deleted_undo_token"] = data["undo_token"]
 
 
 def test_delete_chunk_invalid():
@@ -655,16 +689,25 @@ def test_restore_chunk():
     assert_status(r, 200)
     before_count = len(r.json())
 
-    r = post("/api/chunks/restore", json={
-        "chunk": shared["deleted_chunk"],
-        "at_index": shared["deleted_chunk_index"]
-    })
+    payload = {"chunk": shared["deleted_chunk"],
+               "at_index": shared["deleted_chunk_index"]}
+    assert_status(post("/api/chunks/restore", json=payload), 409)
+    assert_status(post("/api/chunks/restore", json={**payload, "undo_token": "invalid-test-token"}), 409)
+    payload["undo_token"] = shared["deleted_undo_token"]
+    r = post("/api/chunks/restore", json=payload)
     assert_status(r, 200)
     data = r.json()
     if data.get("status") != "ok":
         raise TestFailure(f"Expected status=ok, got {data}")
     if data.get("total") != before_count + 1:
         raise TestFailure(f"Expected total={before_count + 1}, got {data.get('total')}")
+
+    # Receipt is single-use; rejected replay must not append another chunk.
+    assert_status(post("/api/chunks/restore", json=payload), 409)
+    restored = get("/api/chunks")
+    assert_status(restored, 200)
+    if len(restored.json()) != before_count + 1:
+        raise TestFailure("Rejected undo replay changed the chunk count")
 
     # Clean up: delete the restored chunk so we leave chunks as we found them
     delete(f"/api/chunks/{shared['deleted_chunk_index']}")
@@ -675,10 +718,15 @@ def test_restore_chunk():
 def test_status_known_tasks():
     task_names = [
         "script", "audio", "audacity_export",
-        "review", "lora_training", "dataset_gen", "dataset_builder",
+        "review", "lora_training", "dataset_builder",
         "persona",
         "preparer", "batch_preparer"
     ]
+    discovered = get("/api/status")
+    assert_status(discovered, 200)
+    if not set(task_names).issubset(discovered.json()):
+        raise TestFailure("Supported Nya tasks missing from status discovery")
+    assert_status(get("/api/status/dataset_gen"), 404)
     for name in task_names:
         r = get(f"/api/status/{name}")
         assert_status(r, 200, msg=f"task={name}")
@@ -826,19 +874,52 @@ def test_clone_voices_delete_404():
 
 
 def test_clone_voices_upload_and_delete():
-    # Create a minimal WAV file (44-byte header + silence)
+    # Standard-library synthetic signals test import validation, not cloning.
+    # This fixture contains tones, no human voice or private audio.
+    import io
+    import math
     import struct
-    sample_rate = 16000
-    num_samples = 16000  # 1 second
-    data_size = num_samples * 2
-    wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
-        b'RIFF', 36 + data_size, b'WAVE',
-        b'fmt ', 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
-        b'data', data_size)
-    wav_bytes = wav_header + b'\x00' * data_size
+    import wave
 
-    files = {"file": (f"{TEST_PREFIX}clone_test.wav", wav_bytes, "audio/wav")}
-    r = requests.post(f"{BASE_URL}/api/clone_voices/upload", files=files)
+    def signal(seconds, silent=False):
+        stream = io.BytesIO()
+        with wave.open(stream, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"".join(struct.pack("<h", 0 if silent else
+                int(10000 * math.sin(2 * math.pi * 220 * i / 16000)))
+                for i in range(int(seconds * 16000))))
+        return stream.getvalue()
+
+    transcript = "[Synthetic test tones; no speech]"
+    fields = {"ref_text": transcript, "rights_confirmed": "true",
+              "source_title": "Generated test-only sine signal",
+              "rights_basis": "Generated locally by this test; no human voice or third-party recording."}
+    wav_bytes = signal(4)
+    def upload(audio, form):
+        return requests.post(f"{BASE_URL}/api/clone_voices/upload",
+            files={"file": (f"{TEST_PREFIX}clone_test.wav", audio, "audio/wav")},
+            data=form, timeout=30)
+
+    before = get("/api/clone_voices/list")
+    assert_status(before, 200)
+    before_ids = {entry["id"] for entry in before.json()}
+    for audio, form, expected in (
+            (wav_bytes, {}, "ref_text"),
+            (wav_bytes, {"ref_text": transcript}, "rights_confirmed"),
+            (signal(1), fields, "Reference clip refused"),
+            (signal(4, silent=True), fields, "Reference clip refused")):
+        refused = upload(audio, form)
+        assert_status(refused, 400)
+        if expected not in refused.json().get("detail", ""):
+            raise TestFailure(f"Wrong clone-input refusal: {refused.json()}")
+    current = get("/api/clone_voices/list")
+    assert_status(current, 200)
+    if {entry["id"] for entry in current.json()} != before_ids:
+        raise TestFailure("Rejected clone uploads changed the manifest")
+
+    r = upload(wav_bytes, fields)
     assert_status(r, 200)
     data = r.json()
     assert_key(data, "voice_id")
@@ -848,7 +929,11 @@ def test_clone_voices_upload_and_delete():
     # Verify it appears in list
     r = get("/api/clone_voices/list")
     assert_status(r, 200)
-    found = any(v["id"] == voice_id for v in r.json())
+    imported = next((v for v in r.json() if v["id"] == voice_id), None)
+    found = imported is not None
+    if imported is not None and (imported.get("ref_text") != transcript
+            or imported.get("rights_basis") != fields["rights_basis"]):
+        raise TestFailure("Clone transcript/rights provenance did not persist")
     if not found:
         raise TestFailure(f"Uploaded voice {voice_id} not found in list")
 
