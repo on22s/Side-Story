@@ -1,10 +1,12 @@
 <img src="icon.png" alt="Alexandria logo" width="160" />
 
-# Alexandria Audiobook Nya
+# Side Story
+
+*Formerly Alexandria Audiobook Nya.*
 
 Turn a book into a multi-voice audiobook. Alexandria combines AI script annotation, local Qwen3-TTS, and a browser editor so you can assign characters, listen, fix individual lines, and export the finished book.
 
-**[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting) · [Full user guide](https://github.com/on22s/alexandria-audiobook-nya/wiki)**
+**[Install](#installation) · [Make your first audiobook](#quick-start) · [Optional voice tools](#optional-voice-lab--preparer-dependencies) · [Troubleshooting](#troubleshooting) · [Full user guide](https://github.com/on22s/Side-Story/wiki)**
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
@@ -23,7 +25,7 @@ Start with the five numbered tabs: **Setup → Script → Voices → Editor → 
 ### Pinokio (recommended)
 
 1. Install [Pinokio](https://pinokio.computer/).
-2. Choose **Download** and paste `https://github.com/on22s/alexandria-audiobook-nya`.
+2. Choose **Download** and paste `https://github.com/on22s/Side-Story`.
 3. Click **Install**, then **Start** and **Open Web UI**.
 4. Follow [Quick Start](#quick-start) to connect your LLM and make a short test audiobook.
 
@@ -39,7 +41,7 @@ The launcher creates `app/env` with CPython 3.10 on a fresh install and installs
 
 The sample is original text supplied with these docs under the repository's MIT license. It contains no dialogue, so you can learn the workflow with just a narrator.
 
-1. **Setup:** connect an already running LLM using [LLM Setup](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup). Use **Test Connection**, then **Save Configuration**; testing alone does not save. Set **TTS Mode → Local Model (built in)**, **Device → Auto (best available)**, and **TTS Language → English**. Set **Runs on this machine's GPU?** accurately. Save again after edits. Checkpoint: the connection test succeeds and the configuration save is confirmed.
+1. **Setup:** connect an already running LLM using [LLM Setup](https://github.com/on22s/Side-Story/wiki/LLM-Setup). Use **Test Connection**, then **Save Configuration**; testing alone does not save. Set **TTS Mode → Local Model (built in)**, **Device → Auto (best available)**, and **TTS Language → English**. Set **Runs on this machine's GPU?** accurately. Save again after edits. Checkpoint: the connection test succeeds and the configuration save is confirmed.
 2. **Script:** choose the sample under **Select Book/Novel (Text, Markdown, or EPUB)**; it uploads automatically. Leave the optional narrator field blank. Click **Generate Annotated Script**. Checkpoint: generation finishes, the three sentences are preserved, and the resulting entries are narration. The number of chunks can vary.
 3. **Voices:** on the narrator card, choose **Custom voice → Ryan**. Leave character style empty. Wait for **saved**. Checkpoint: Ryan remains selected with no unsaved-change warning.
 4. **Editor:** use **Gen** on the first row and listen. If it sounds right, click **Render Pending**. Checkpoint: every sample row has playable audio; no row is failed or unfinished. **Text integrity** checks saved text against source, not spoken audio, so listen for missing or repeated words too.
@@ -49,18 +51,18 @@ The sample is original text supplied with these docs under the repository's MIT 
 
 *The map shows the sequence and checkpoints; it is not evidence of a completed generation.*
 
-**If a step fails, stop there.** For a connection failure, return to [LLM Setup](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup). For first-run TTS downloads or errors, check Pinokio's **Terminal** and [Troubleshooting](https://github.com/on22s/alexandria-audiobook-nya/wiki/Troubleshooting). The first voice render downloads weights if absent; it may take longer than later renders.
+**If a step fails, stop there.** For a connection failure, return to [LLM Setup](https://github.com/on22s/Side-Story/wiki/LLM-Setup). For first-run TTS downloads or errors, check Pinokio's **Terminal** and [Troubleshooting](https://github.com/on22s/Side-Story/wiki/Troubleshooting). The first voice render downloads weights if absent; it may take longer than later renders.
 
-Remote LLMs receive annotation text; external TTS receives synthesis inputs. Use books and voices you have permission to process. **Save Current is not a full backup:** it does not preserve Editor-only chunk edits, audio, or exports. [Back up active work](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups) before switching books.
+Remote LLMs receive annotation text; external TTS receives synthesis inputs. Use books and voices you have permission to process. **Save Current is not a full backup:** it does not preserve Editor-only chunk edits, audio, or exports. [Back up active work](https://github.com/on22s/Side-Story/wiki/Updates-and-Backups) before switching books.
 
 ### After your first MP3
 
-- [Illustrated walkthrough and recovery](https://github.com/on22s/alexandria-audiobook-nya/wiki/First-Audiobook)
-- [Manual LLM transport and other providers](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup)
-- [More voices, aliases, personas, cloning, and LoRA](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices)
-- [Review, checkpoints, and longer books](https://github.com/on22s/alexandria-audiobook-nya/wiki/Scripts-and-Review)
-- [M4B, chapters, and Audacity export](https://github.com/on22s/alexandria-audiobook-nya/wiki/Rendering-and-Export)
-- [Designer, Dataset, Training, Preparer, Voice Lab, and Reports](https://github.com/on22s/alexandria-audiobook-nya/wiki/Optional-Voice-Tools)
+- [Illustrated walkthrough and recovery](https://github.com/on22s/Side-Story/wiki/First-Audiobook)
+- [Manual LLM transport and other providers](https://github.com/on22s/Side-Story/wiki/LLM-Setup)
+- [More voices, aliases, personas, cloning, and LoRA](https://github.com/on22s/Side-Story/wiki/Voices)
+- [Review, checkpoints, and longer books](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review)
+- [M4B, chapters, and Audacity export](https://github.com/on22s/Side-Story/wiki/Rendering-and-Export)
+- [Designer, Dataset, Training, Preparer, Voice Lab, and Reports](https://github.com/on22s/Side-Story/wiki/Optional-Voice-Tools)
 
 <details>
 <summary>Detailed features</summary>
@@ -185,7 +187,7 @@ On Windows use `app\env\Scripts\python.exe`; in Docker use `python` for these fo
 
 The included notebook installs and launches the app in a Colab runtime. GPU availability and session limits depend on Colab:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/Side-Story/blob/main/alexandria_colab.ipynb)
 
 The notebook uses Google Drive persistence and Colab's built-in inline port forwarding; no ngrok account is needed. See the notebook for full instructions.
 
@@ -194,8 +196,8 @@ The notebook uses Google Drive persistence and Colab's built-in inline port forw
 For integration into automated pipelines or server deployments:
 
 ```bash
-git clone https://github.com/on22s/alexandria-audiobook-nya.git
-cd alexandria-audiobook-nya
+git clone https://github.com/on22s/Side-Story.git
+cd Side-Story
 docker compose up --build
 ```
 
@@ -243,9 +245,9 @@ Configure connections to your LLM and TTS engine.
 - **Mode** - `local` (built-in engine) or `external` (connect to Gradio server)
 - **Device** - Start with `auto`; the UI also exposes CUDA device choices and CPU. The backend accepts MPS when available
 - **Language** - TTS synthesis language: English (default), Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto (let the model detect)
-- **Parallel Workers** - Outer local batch size, or concurrent external requests per server; higher values use more resources
+- **Parallel Workers** - Outer local batch size, or concurrent external requests per server; higher values use more resources. **Auto-configure** sets 4 on 12–20 GB cards (measured on an RX 9070 XT: about 23% faster than 2, same Whisper recall, passed a listening check)
 - **Batch Seed** - Seed for local batched Custom/Clone/LoRA generation; it does not override every voice path
-- **Compile Codec** - Optional `torch.compile` optimization; adds warmup and depends on your hardware/software stack
+- **Compile Codec** - Currently has no effect: the pinned TTS library (qwen-tts 0.1.1) decodes outside the compiled code, so render speed is unchanged. Leave it off
 - **Sub-batching** - Split batches by text length to reduce wasted GPU compute on padding (enabled by default)
 - **Max Items/Batch** - Hard cap on local sub-batches; 0 uses the VRAM estimate. Memory/manual limits still apply with length-based sub-batching disabled
 - **Min Sub-batch Size** - Minimum chunks per sub-batch before allowing a split (default: 4)
@@ -257,6 +259,8 @@ Configure connections to your LLM and TTS engine.
 - **Generation Settings** - Chunk size and max tokens for LLM responses
 - **LLM Sampling Parameters** - Temperature, Top P, Top K, Min P, and Presence Penalty
 - **Banned Tokens** - Comma-separated list of tokens to ban from LLM output; this is not a universal reasoning-mode switch
+- **Step 1: model output format** - *Full text* (default) or *Compact labels* (experimental). Compact labels sends numbered sentences and asks only for a label per sentence; any chunk whose compact answer is unusable falls back to full text. It only affects chunks the quote marks don't settle
+- **Step 3: extra text around each request** - Read-only surrounding text added to delivery-note requests, in characters per side (0–1,000,000; default 0). Step 3 no longer repeats lines that are already in the same request. No quality gain was measured at 4,000 characters, so leave it at 0 unless you are testing; values above 20,000 need a known model context
 - **Prompt Customization** - Separate generation-pass presets plus review/persona prompts. See [Prompt Customization](#prompt-customization); save the form to persist edits
 
 ### Script Tab
@@ -269,7 +273,9 @@ Upload a text file (.txt, .md, or .epub) and generate the annotated script. EPUB
 
 **Speaker-label suggestions** compares a stopped-run snapshot with a saved provisional reference, then lets you inspect bounded model judgments and explicitly apply one alias at a time. See [Speaker-label review](docs/speaker-label-review.md).
 
-Review prompts can be edited in Setup or through their file defaults in `review_prompts.txt`; the runtime’s text-preservation validation still applies.
+Review prompts can be edited in Setup or through their file defaults in `review_prompts.txt`; the runtime’s text-preservation validation still applies. If the GPU is already full when review starts, review stops at once with a message instead of retrying; free the memory (for example, unload the model holding it) and start review again.
+
+**Preserve source words** (a checkbox before generating) keeps every source word, in order, through annotation and review, and refuses to publish a script or render a chunk whose words changed. Speech preparation may still expand numbers and symbols later. It is off by default; see [Literal source policy](docs/literal_source_policy.md).
 
 ### Voices Tab
 After script generation, voices are automatically loaded from the annotated script. For each speaker:
@@ -363,7 +369,7 @@ Download your completed audiobook as MP3, export as **M4B** with chapter markers
 
 ## Performance and GPU tuning
 
-Start with small batches and measure on your own hardware. Local batch rendering and optional **Compile Codec** can improve throughput, but compilation adds warmup and may be unsuitable for a particular stack. Reduce **Parallel Workers** or **Max Items/Batch** after an out-of-memory error. Leave headroom if the LLM and TTS share a GPU.
+Start with small batches and measure on your own hardware. Local batch rendering improves throughput; **Auto-configure** picks a batch size for your card. **Compile Codec** currently has no effect, so leave it off. Reduce **Parallel Workers** or **Max Items/Batch** after an out-of-memory error. Leave headroom if the LLM and TTS share a GPU.
 
 On AMD/Linux, check the actual GPU/ROCm combination before changing packages. Do not copy device-specific power-profile commands or replace the installer’s PyTorch pins blindly. For a controlled local measurement, see `app/tts_vram_benchmark.py --help`; a sweep loads real models and consumes GPU time. No throughput figure here is a promise for your system.
 
@@ -501,8 +507,8 @@ If the model emits reasoning instead of the requested answer, use that provider/
 - For clone voices, verify reference audio exists and transcript is accurate
 
 ### Slow batch generation
-- Try **Compile Codec** in Setup if your stack supports it; compare performance after warmup
-- Increase **Parallel Workers** (batch size) if VRAM allows
+- Run **Auto-configure** in Setup, or increase **Parallel Workers** (batch size) if VRAM allows
+- **Compile Codec** currently has no effect; turning it on does not speed up rendering
 - **Render Pending** selects local batch generation automatically
 - On AMD, check the full error and the installed ROCm/PyTorch build; not every MIOpen warning has the same cause
 
@@ -586,13 +592,13 @@ Alexandria/
 
 ## Acknowledgements
 
-Alexandria Nya builds on work, ideas, bug reports, and testing shared by many people. Thank you to the original Alexandria community and to everyone helping improve the forks.
+Side Story builds on work, ideas, bug reports, and testing shared by many people. Thank you to the original Alexandria community and to everyone helping improve the forks.
 
 ### Application, contributions, and testing
 
 - [Finrandojin](https://github.com/Finrandojin/alexandria-audiobook): the original Alexandria Audiobook application and the downloadable [Alexandria voice presets](https://huggingface.co/Finrandojin/Alexandria).
 - [Ayush Naphade](https://github.com/aayushnaphade): persona generation, speaker alias resolution, and contextual script review ([upstream PR #42](https://github.com/Finrandojin/alexandria-audiobook/pull/42)). His related project is [Lily](https://lily.rayoneai.in/).
-- [Michii / on22s](https://github.com/on22s): the [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) improvements carried into Nya, including the upstream System Health Dashboard, cross-platform subprocess runner, and Voice Training Dataset Preparer ([#45](https://github.com/Finrandojin/alexandria-audiobook/pull/45), [#46](https://github.com/Finrandojin/alexandria-audiobook/pull/46), [#47](https://github.com/Finrandojin/alexandria-audiobook/pull/47)).
+- [Michii / on22s](https://github.com/on22s): the [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) improvements carried into Side Story, including the upstream System Health Dashboard, cross-platform subprocess runner, and Voice Training Dataset Preparer ([#45](https://github.com/Finrandojin/alexandria-audiobook/pull/45), [#46](https://github.com/Finrandojin/alexandria-audiobook/pull/46), [#47](https://github.com/Finrandojin/alexandria-audiobook/pull/47)).
 - [REFLEXGAMING007](https://github.com/REFLEXGAMING007): detailed feature proposals, reproduction cases, and repeated testing that shaped the forks' manual LLM workflow, snapshots, incremental personas, editable prompts, and character-state voices ([manual generation](https://github.com/on22s/alexandria-audiobook2/issues/593), [snapshots](https://github.com/on22s/alexandria-audiobook2/issues/600), [incremental updates](https://github.com/on22s/alexandria-audiobook2/issues/602), [prompt editing](https://github.com/on22s/alexandria-audiobook2/issues/634), [state personas](https://github.com/on22s/alexandria-audiobook2/issues/866)).
 
 - [Alchemist-Production](https://github.com/Alchemist-Production): the original Web UI, Audio Editor, and chunk-management work integrated into upstream Alexandria ([integration](https://github.com/Finrandojin/alexandria-audiobook/commit/1667edc237418fbf9e819bfb4294b14209da9c27), [editor](https://github.com/Finrandojin/alexandria-audiobook/commit/717f89161b36ced57c97cea5b729be95b3cba39e)).
@@ -618,9 +624,9 @@ Alexandria Nya builds on work, ideas, bug reports, and testing shared by many pe
 
 ### Forks and ideas carried into the app
 
-- [cjdell](https://github.com/cjdell/alexandria-audiobook): the AMD APU precision fix that informed Nya's fp32 model-loading path ([port](https://github.com/on22s/alexandria-audiobook2/pull/573)).
+- [cjdell](https://github.com/cjdell/alexandria-audiobook): the AMD APU precision fix that informed Side Story's fp32 model-loading path ([port](https://github.com/on22s/alexandria-audiobook2/pull/573)).
 - [XinchaoGou](https://github.com/XinchaoGou/alexandria-audiobook): OpenAI reasoning-model request handling and environment-referenced API keys, plus ideas for reasoning controls, clone-reference validation, external TTS server pools, and rolling story context ([ports](https://github.com/on22s/alexandria-audiobook2/pull/574), [reasoning controls](https://github.com/on22s/alexandria-audiobook2/pull/530), [reference validation](https://github.com/on22s/alexandria-audiobook2/pull/531), [server pools](https://github.com/on22s/alexandria-audiobook2/pull/532)).
-- [Darkkingwill](https://github.com/Darkkingwill/alexandria-audiobook): MP3 bitrate findings and ideas for cancellable merging, export progress, model selection, and remembered tabs, independently rebuilt in AA2 and carried into Nya ([bitrate](https://github.com/on22s/alexandria-audiobook2/pull/533), [interface improvements](https://github.com/on22s/alexandria-audiobook2/pull/534)).
+- [Darkkingwill](https://github.com/Darkkingwill/alexandria-audiobook): MP3 bitrate findings and ideas for cancellable merging, export progress, model selection, and remembered tabs, independently rebuilt in AA2 and carried into Side Story ([bitrate](https://github.com/on22s/alexandria-audiobook2/pull/533), [interface improvements](https://github.com/on22s/alexandria-audiobook2/pull/534)).
 - [shangyuok](https://github.com/shangyuok/alexandria-audiobook-gg): the idea of configurable TTS generation-token limits, implemented together with matching memory estimates ([implementation](https://github.com/on22s/alexandria-audiobook2/pull/60)).
 - [dudarenok-maker / Castwright](https://github.com/dudarenok-maker/Castwright): ideas for remembering a cast across books and checking rendered voice consistency, implemented independently in Alexandria ([series memory](https://github.com/on22s/alexandria-audiobook2/pull/524), [voice checks](https://github.com/on22s/alexandria-audiobook2/pull/525)).
 - [Gaspard Michel, Elena V. Epure, Romain Hennequin, and Christophe Cerisara](https://aclanthology.org/2025.naacl-short.62/): the quotation-attribution research behind the `michel` prompt family, adapted into Alexandria's own prompts and surrounding-context handling ([implementation](app/attribution_prompt_variants.py)).
@@ -628,7 +634,7 @@ Alexandria Nya builds on work, ideas, bug reports, and testing shared by many pe
 <details>
 <summary>Research influences and shared resources</summary>
 
-Nya also benefits from the research behind AA2. These credits include experiments and evaluation resources; they do not mean every experiment, dataset, or model is included in the Nya runtime.
+Side Story also benefits from the research behind AA2. These credits include experiments and evaluation resources; they do not mean every experiment, dataset, or model is included in the Side Story runtime.
 
 - [Xiao Zhang / buddies](https://github.com/buddies/alexandria-audiobook): per-line instruction vocabulary and experiments separating stable voice identity from delivery instructions. The lexicon was ported into AA2's research tools; the resulting comparisons informed the voice-identity work ([audit](https://github.com/on22s/alexandria-audiobook2/pull/601), [voice changes](https://github.com/on22s/alexandria-audiobook2/pull/603)).
 - [p0n1](https://github.com/p0n1/epub_to_audiobook): punctuation priorities adapted for AA2's quotation-aware chunking experiment.
@@ -637,7 +643,7 @@ Nya also benefits from the research behind AA2. These credits include experiment
 - [nazdridoy](https://github.com/nazdridoy/kokoro-tts): weighted voice-blending ideas explored in AA2; [WhiskeyCoder](https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter) for independent Qwen3-TTS chunk-length findings used as a comparison.
 - [Krishnapriya Vishnubhotla, Adam Hammond, and Graeme Hirst](https://aclanthology.org/2022.lrec-1.628/) and the PDNC annotators; [Sean Papay and Sebastian Padó](https://aclanthology.org/2020.lrec-1.104/) for RiQuA; and the [DraCor](https://dracor.org/) community: annotated literary resources used in AA2's attribution research.
 - [David K. Elson and Kathleen R. McKeown](https://www.cs.columbia.edu/~delson/pubs/AAAI10-ElsonMcKeown.pdf): quotation-attribution categories explored in AA2's syntactic-frame experiments; [Frank Rudzicz and the BookNLP-OG coauthors](https://arxiv.org/abs/2307.03734) for end-to-end attribution comparisons.
-- The [CosyVoice team](https://github.com/QwenAudio/CosyVoice): speech-model design ideas studied in AA2; CosyVoice is not a Nya runtime dependency.
+- The [CosyVoice team](https://github.com/QwenAudio/CosyVoice): speech-model design ideas studied in AA2; CosyVoice is not a Side Story runtime dependency.
 - [LibriVox](https://librivox.org/) readers, [Project Gutenberg](https://www.gutenberg.org/) and [Aozora Bunko](https://www.aozora.gr.jp/) volunteers, and the creators of [LJSpeech](https://keithito.com/LJ-Speech-Dataset/), [Hi-Fi TTS](https://www.openslr.org/109/), [AISHELL-3](https://www.openslr.org/93/), and the [Kokoro Speech Dataset](https://mozilladatacollective.com/datasets/cmmknsho4014wmf087kvq5rc6): human readings and source texts used for research comparisons.
 - [Jay Myers](https://www.jaymyersvoiceover.com/blog-ideas/how-audiobook-narrators-make-characters-sound-distinct-believable-and-consistent), [Malk Williams](https://www.linkedin.com/pulse/character-voices-audiobooks-7-key-considerations-malk-williams), and the casting guidance recorded in [Third-Party Notices](THIRD_PARTY_NOTICES.md#research-and-industry-practice-consulted): practical ideas about consistent character voices and contrast between characters who share scenes.
 
