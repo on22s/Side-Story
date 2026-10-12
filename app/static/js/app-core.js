@@ -2335,6 +2335,7 @@
                 }
                 const result = await API.post('/api/generate_script/preflight', {
                     strip_front_matter: _isStripFrontMatterChecked(),
+                    ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     first_person_narrator: document.getElementById('script-first-person-narrator').value.trim() || null
                 });
                 const job = result.job_id;
@@ -2411,6 +2412,7 @@
             try {
                 await API.post('/api/generate_script', {
                     strip_front_matter: _isStripFrontMatterChecked(),
+                    ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     first_person_narrator:
                         document.getElementById('script-first-person-narrator').value.trim() || null,
                     start_over: startOver,
@@ -3014,6 +3016,7 @@
                 await API.post('/api/generate_script/batch/start', {
                     tasks, collision_policy: collisionPolicy,
                     strip_front_matter: _isStripFrontMatterChecked(),
+                    ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     build_cast_lists: document.getElementById('script-batch-build-cast-lists').checked
                 });
                 started = true;
@@ -3107,6 +3110,10 @@
         }
         function _isReviewForceChecked() {
             const cb = document.getElementById('review-force-rerun');
+            return cb ? cb.checked : false;
+        }
+        function _isLiteralSourcePreservingChecked() {
+            const cb = document.getElementById('script-literal-source-preserving');
             return cb ? cb.checked : false;
         }
         function _isStripFrontMatterChecked() {
