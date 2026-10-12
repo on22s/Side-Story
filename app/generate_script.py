@@ -619,6 +619,8 @@ class LLMGenParams:
     # pass-1 mode (three_pass_generate.SEGMENTATION_MODES); the single-pass
     # path never pre-segments, so "llm" here
     segmentation: str = "llm"
+    # #744 pass-1 output format (three_pass_generate.PASS1_FORMATS)
+    pass1_format: str = "ordinary"
     reasoning_allowance: int = 0
     # Completed model calls observed in this three-pass run. Until one has been
     # seen, a reasoning model's allowance is unknown, so Pass 2/3 requests stay
