@@ -50,6 +50,8 @@ from three_pass_generate import (build_attribute_request,
                                  build_three_pass_request_preflight,
                                  get_three_pass_preflight_capacity,
                                  get_context_rescue_windows,
+                                 is_three_pass_context_required,
+                                 validate_instruct_context_chars,
                                  apply_segment_gate_controls,
                                  default_instruct,
                                  read_source_text,
@@ -1444,6 +1446,14 @@ def build_recovery_detail(checkpoint):
             label = lambda e: e.get("type")
         else:
             sys_prompt, user_prompt = build_instruct_request(entries, LLMGenParams())
+            # API-error attempts retain the actual dispatched request, including
+            # custom templates, surround and retry feedback. Do not reconstruct
+            # that request using today's settings or default prompts.
+            request = last.get("request") or {}
+            if (isinstance(request, dict)
+                    and isinstance(request.get("system_prompt"), str)
+                    and isinstance(request.get("user_prompt"), str)):
+                sys_prompt, user_prompt = request["system_prompt"], request["user_prompt"]
             label = lambda e: e.get("speaker")
         unit = {"failed_chunk": None, "chunks_total": None,
                 "batch_indices": failed.get("indices") or [],
@@ -2276,9 +2286,10 @@ def get_batch_script_sizing_identity(text, settings, context_windows, context_le
               "context_windows": get_context_rescue_windows(context_windows),
               "prompts": [load_segment_prompts(), load_attribute_prompts(),
                           load_instruct_prompts()]}
-    if (settings.get("attribute_target_chars") or settings.get("instruct_target_chars")
-            or settings.get("chunk_size", 0) > 30000
-            or settings.get("attribute_context_chars", 0) > 20000):
+    if is_three_pass_context_required(
+            settings.get("chunk_size", 0), settings.get("attribute_context_chars", 0),
+            settings.get("attribute_target_chars", 0), settings.get("instruct_target_chars", 0),
+            settings.get("instruct_context_chars", 0)):
         inputs["context_length"] = context_length
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False,
                                     allow_nan=False).encode("utf-8")).hexdigest()
@@ -2521,21 +2532,25 @@ def get_prepared_batch_script_jobs(request):
         config = load_app_config(CONFIG_PATH)
         settings = resolve_three_pass_generation_settings(config)
         context_windows = (config.get("generation") or {}).get("context_rescue_windows")
+        admission = get_three_pass_admission_context(config, settings)
+        context, refusal = admission
+        if refusal:
+            raise ValueError(refusal)
         prepared = []
         for job in jobs:
             identity = get_batch_script_source_identity(job["input_path"])
             text, normalizations = _read_and_validate_batch_script_source(job)
             if get_batch_script_source_identity(job["input_path"]) != identity:
                 raise ValueError(f"Source changed while preparing: {job['filename']}")
-            sizing_identity = get_batch_script_sizing_identity(text, settings, context_windows)
+            sizing_identity = get_batch_script_sizing_identity(text, settings, context_windows, context)
             report = build_three_pass_request_preflight(
-                text, settings, 0, 1, context_windows=context_windows)
+                text, settings, context, 1, context_windows=context_windows)
             prepared.append({**job, "prepared_source": {
                 "identity": identity, "text": text, "normalizations": normalizations,
                 "preflight": {
                     "identity": sizing_identity,
                     "report": {key: value for key, value in report.items() if key != "requests"}}}})
-        refusal = three_pass_refusal(prepared)
+        refusal = three_pass_refusal(prepared, config=config, settings=settings, admission=admission)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if refusal:
@@ -2828,6 +2843,19 @@ async def get_delivery_review():
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def get_delivery_retry_instruct_context(snapshot):
+    """Use generation provenance, never today's optional prose setting."""
+    name = Path(three_pass_manifest_path("annotated_script.json")).as_posix()
+    raw = snapshot["artifacts"].get(name)
+    manifest = json.loads(raw) if raw is not None else {}
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("telemetry", {}), dict):
+        raise ValueError("Invalid generation context provenance; delivery retry was not started.")
+    # Legacy generations predate this optional control and have no surround.
+    chars = manifest.get("telemetry", {}).get("instruct_context_chars", 0)
+    validate_instruct_context_chars(chars)
+    return chars
+
+
 def start_delivery_retry(background_tasks, request):
     from delivery_review import (ensure_delivery_review_snapshot, get_delivery_retry_chunks,
                                  apply_delivery_retry)
@@ -2842,6 +2870,7 @@ def start_delivery_retry(background_tasks, request):
     if not count:
         raise HTTPException(status_code=409, detail="No fallback delivery instructions need retrying.")
     get_delivery_retry_chunks(snapshot["entries"], snapshot["entries"], snapshot["chunks"])
+    instruct_context_chars = get_delivery_retry_instruct_context(snapshot)
     config = copy.deepcopy(load_app_config(CONFIG_PATH))
 
     def run():
@@ -2863,10 +2892,13 @@ def start_delivery_retry(background_tasks, request):
                 model, ssh_alias=config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
             state["logs"].append(message)
             check_cancel()
-            params = get_three_pass_run_params(config, status, llm.get("reasoning_effort"))
+            generation_settings = resolve_three_pass_generation_settings(config)
+            generation_settings["instruct_context_chars"] = instruct_context_chars
+            params = get_three_pass_run_params(config, status, llm.get("reasoning_effort"), generation_settings)
             client = make_run_client(config, llm, llm_timeout_seconds())
             after = retry_delivery_instructions(client, model, snapshot["entries"], params,
-                                               cancel_check=check_cancel)
+                                               cancel_check=check_cancel,
+                                               instruct_context_chars=generation_settings["instruct_context_chars"])
             prompt_digest = hashlib.sha256(json.dumps([
                 params.instruct_system_prompt, params.instruct_user_prompt_template],
                 ensure_ascii=False).encode("utf-8")).hexdigest()
@@ -2875,7 +2907,8 @@ def start_delivery_retry(background_tasks, request):
                               "created_at": time.time(), "prompt_sha256": prompt_digest,
                               "configured_params": {"max_tokens": params.max_tokens,
                                   "context_length": params.context_length,
-                                  "instruct_temperature": params.instruct_temperature}})
+                                  "instruct_temperature": params.instruct_temperature,
+                                  "instruct_context_chars": generation_settings["instruct_context_chars"]}})
             state["logs"].append(f"Delivery retry saved; {info['count']} entries still need review.")
         except RuntimeError:
             if not state.get("cancel"):
