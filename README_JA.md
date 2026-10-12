@@ -1,10 +1,12 @@
 <img src="icon.png" alt="Alexandriaのロゴ" width="160" />
 
-# Alexandria Audiobook Nya
+# Side Story
+
+*旧名：Alexandria Audiobook Nya*
 
 本を複数の声で読むオーディオブックにします。AIによるスクリプトへの注釈付け、ローカルQwen3-TTS、ブラウザー編集を組み合わせ、人物に声を割り当て、聴き、行ごとに修正し、完成した本を書き出せます。
 
-**[インストール](#installation) · [初めての作成](#quick-start) · [任意の音声ツール](#optional-tools) · [問題の切り分け](#troubleshooting) · [日本語ユーザーガイド](https://github.com/on22s/alexandria-audiobook-nya/wiki/Home-ja-JP)**
+**[インストール](#installation) · [初めての作成](#quick-start) · [任意の音声ツール](#optional-tools) · [問題の切り分け](#troubleshooting) · [日本語ユーザーガイド](https://github.com/on22s/Side-Story/wiki/Home-ja-JP)**
 
 [English](README.md) | [中文](README_CN.md) | 日本語
 
@@ -24,7 +26,7 @@
 ### Pinokio（推奨）
 
 1. [Pinokio](https://pinokio.computer/)をインストールします。
-2. **Download** に `https://github.com/on22s/alexandria-audiobook-nya` を貼り付けます。
+2. **Download** に `https://github.com/on22s/Side-Story` を貼り付けます。
 3. **Install**、完了後に **Start → Open Web UI** を選びます。
 4. [初回手順](#quick-start)でLLMを接続し、短い音声を試します。
 
@@ -41,7 +43,7 @@
 
 サンプルはこのリポジトリのMITライセンスで提供するオリジナルで、会話がないため語り手だけで学べます。日本語版でも初回は同じ英語サンプルと言語設定を使います。
 
-1. **Setup：** [LLM設定](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-ja-JP)で起動済みLLMに接続します。**Test Connection** の後に **Save Configuration** を押します。テストだけでは保存されません。**TTS Mode → Local Model (built in)**、**Device → Auto (best available)**、**TTS Language → English** を選び、**Runs on this machine's GPU?** を正しく設定して保存します。**確認：接続テストと設定保存が成功。**
+1. **Setup：** [LLM設定](https://github.com/on22s/Side-Story/wiki/LLM-Setup-ja-JP)で起動済みLLMに接続します。**Test Connection** の後に **Save Configuration** を押します。テストだけでは保存されません。**TTS Mode → Local Model (built in)**、**Device → Auto (best available)**、**TTS Language → English** を選び、**Runs on this machine's GPU?** を正しく設定して保存します。**確認：接続テストと設定保存が成功。**
 2. **Script：** **Select Book/Novel (Text, Markdown, or EPUB)** でサンプルを選ぶと自動アップロードされます。任意の語り手欄は空のまま **Generate Annotated Script**。**確認：生成完了、3文保持、地の文の項目になっていること。チャンク数は変わる場合があります。**
 3. **Voices：** 語り手カードで **Custom voice → Ryan**。キャラクタースタイルは空のまま **saved** を待ちます。**確認：Ryanが選択され未保存警告がないこと。**
 4. **Editor：** 最初の行を **Gen** で生成して試聴し、よければ **Render Pending**。**確認：全行が再生可能で失敗／未完了がないこと。Text integrityは保存本文の照合で、実音声は検査しません。脱落や繰り返しも聴きます。**
@@ -51,18 +53,18 @@
 
 *図は操作順と確認点を示し、生成成功の証拠ではありません。各確認点は上に日本語で記載しています。*
 
-**失敗したらその段階で止めてください。** 接続は[LLM設定](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-ja-JP)、初回TTS取得やエラーはPinokioの **Terminal** と[問題の切り分け](https://github.com/on22s/alexandria-audiobook-nya/wiki/Troubleshooting-ja-JP)を確認します。最初は重み取得で長くかかる場合があります。
+**失敗したらその段階で止めてください。** 接続は[LLM設定](https://github.com/on22s/Side-Story/wiki/LLM-Setup-ja-JP)、初回TTS取得やエラーはPinokioの **Terminal** と[問題の切り分け](https://github.com/on22s/Side-Story/wiki/Troubleshooting-ja-JP)を確認します。最初は重み取得で長くかかる場合があります。
 
-外部LLMには注釈用本文、外部TTSには生成入力が送られます。利用権限のある本と声を使います。**Save Currentは完全なバックアップではなく、Editorだけの編集、音声、出力を保持しません。** 切り替え前に[作業を保存](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups-ja-JP)します。
+外部LLMには注釈用本文、外部TTSには生成入力が送られます。利用権限のある本と声を使います。**Save Currentは完全なバックアップではなく、Editorだけの編集、音声、出力を保持しません。** 切り替え前に[作業を保存](https://github.com/on22s/Side-Story/wiki/Updates-and-Backups-ja-JP)します。
 
 ### 最初のMP3の後に
 
-- [初回の詳しい手順と回復](https://github.com/on22s/alexandria-audiobook-nya/wiki/First-Audiobook-ja-JP)
-- [手動LLMと他の接続先](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-ja-JP)
-- [声、別名、ペルソナ、クローン、LoRA](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices-ja-JP)
-- [レビュー、チェックポイント、長い本](https://github.com/on22s/alexandria-audiobook-nya/wiki/Scripts-and-Review-ja-JP)
-- [M4B、章、Audacity](https://github.com/on22s/alexandria-audiobook-nya/wiki/Rendering-and-Export-ja-JP)
-- [Designer、Dataset、Training、Preparer、Voice Lab、Reports](https://github.com/on22s/alexandria-audiobook-nya/wiki/Optional-Voice-Tools-ja-JP)
+- [初回の詳しい手順と回復](https://github.com/on22s/Side-Story/wiki/First-Audiobook-ja-JP)
+- [手動LLMと他の接続先](https://github.com/on22s/Side-Story/wiki/LLM-Setup-ja-JP)
+- [声、別名、ペルソナ、クローン、LoRA](https://github.com/on22s/Side-Story/wiki/Voices-ja-JP)
+- [レビュー、チェックポイント、長い本](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review-ja-JP)
+- [M4B、章、Audacity](https://github.com/on22s/Side-Story/wiki/Rendering-and-Export-ja-JP)
+- [Designer、Dataset、Training、Preparer、Voice Lab、Reports](https://github.com/on22s/Side-Story/wiki/Optional-Voice-Tools-ja-JP)
 
 <details>
 <summary>詳しい機能</summary>
@@ -89,7 +91,7 @@
 - 独自データによるBaseモデルのLoRA学習、声の同一性と読み方指示の組み合わせ。
 - 付属LoRAカタログ。重みは必要時にHugging Faceから取得します。
 - サンプルごとの本文、感情、試聴を持つDataset Builder。
-- 可変バッチ数、任意の `torch.compile` codec最適化（効果と準備時間は環境依存）。
+- 可変バッチ数。**Compile Codec** は現在効果がありません（固定版のqwen-tts 0.1.1ではデコードがコンパイル対象外のため）。
 - 原文の発声表現を本文として保持し、読み方を別に追加。
 - 話者変更時500 ms、同話者250 msを初期値とする可変休止。
 
@@ -160,7 +162,7 @@ Windowsは `app\env\Scripts\python.exe`、Dockerはこの4つのPython CLIに `p
 
 ### Google Colab
 
-[![Colabで開く](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
+[![Colabで開く](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/Side-Story/blob/main/alexandria_colab.ipynb)
 
 付属ノートブックはColabに導入・起動し、Google Driveへの保存とColab内蔵のインラインポート転送を使います。ngrokアカウントは不要です。GPU利用可否とセッション制限はColabに依存し、詳細はノートブックを参照します。
 
@@ -169,8 +171,8 @@ Windowsは `app\env\Scripts\python.exe`、Dockerはこの4つのPython CLIに `p
 [Docker](https://docs.docker.com/get-docker/)と[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)が必要です。
 
 ```bash
-git clone https://github.com/on22s/alexandria-audiobook-nya.git
-cd alexandria-audiobook-nya
+git clone https://github.com/on22s/Side-Story.git
+cd Side-Story
 docker compose up --build
 ```
 
@@ -192,7 +194,7 @@ Composeはホストの `127.0.0.1:4200` のみ公開し、コンテナー内は�
 
 **Update** 前に保存・バックアップしてください。書き込み処理停止、コード取得、基本再導入を行いますが、中断回復は保証しません。任意依存が変われば停止後にVoice Toolsを再導入します。
 
-通常の配置では `app/config.json`、作業中JSON、`app/uploads/`、`scripts/`、`voicelines/`、出力、声ライブラリー、データセット、アダプター、関連チェックポイントを保持します。カスタムデータ／設定先も含めます。[詳細な保存一覧](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups-ja-JP)を参照してください。
+通常の配置では `app/config.json`、作業中JSON、`app/uploads/`、`scripts/`、`voicelines/`、出力、声ライブラリー、データセット、アダプター、関連チェックポイントを保持します。カスタムデータ／設定先も含めます。[詳細な保存一覧](https://github.com/on22s/Side-Story/wiki/Updates-and-Backups-ja-JP)を参照してください。
 
 **Resetは作業中スクリプト、チャンク、現在の声設定／状態、行音声、結合MP3、既定設定を削除します。** 再利用ライブラリーは保持しますが完全な作業バックアップにはなりません。Resetの削除対象はチェックアウト内の既定パスです。独自のデータ／設定ディレクトリーまで消去されるとは限りません。一般的な修復として使わないでください。
 
@@ -203,15 +205,17 @@ Composeはホストの `127.0.0.1:4200` のみ公開し、コンテナー内は�
 
 LLMとTTSを設定します。TTSの **Mode** はlocal/external、**Device** はまずautoです。UIはCUDAとCPU、バックエンドは利用可能なMPSも受け付けます。**Language** は上記10言語／Auto、既定はEnglishです。
 
-**Parallel Workers** は外側ローカルバッチまたはサーバーごとの外部並列数。**Batch Seed** はローカルCustom/Clone/LoRA用で全経路への上書きではありません。**Compile Codec** は任意のtorch.compileです。**Sub-batching** は初期状態で有効で長さ別に分けpaddingの無駄を減らします。**Max Items/Batch** は上限、0はVRAM推定。長さ別分割が無効でもメモリー／手動上限は適用されます。**Min Sub-batch Size** は初期4、**Length Ratio** は初期5。休止は話者変更500 ms、同話者250 msです。
+**Parallel Workers** は外側ローカルバッチまたはサーバーごとの外部並列数。**Auto-configure** は12〜20 GBのGPUで4を設定します（RX 9070 XTの実測で2より約23%速く、Whisper再現率は同等、試聴確認済み）。**Batch Seed** はローカルCustom/Clone/LoRA用で全経路への上書きではありません。**Compile Codec** は現在効果がないため無効のままにします。**Sub-batching** は初期状態で有効で長さ別に分けpaddingの無駄を減らします。**Max Items/Batch** は上限、0はVRAM推定。長さ別分割が無効でもメモリー／手動上限は適用されます。**Min Sub-batch Size** は初期4、**Length Ratio** は初期5。休止は話者変更500 ms、同話者250 msです。
 
-高度な設定はchunk size、回答max tokens、Temperature、Top P、Top K、Min P、Presence Penalty、カンマ区切り **Banned Tokens**、段階別プロンプトとレビュー／ペルソナです。禁止トークンは万能な推論停止ではありません。[プロンプト編集](#prompt-customization)後は保存します。
+高度な設定はchunk size、回答max tokens、Temperature、Top P、Top K、Min P、Presence Penalty、カンマ区切り **Banned Tokens**、段階別プロンプトとレビュー／ペルソナです。禁止トークンは万能な推論停止ではありません。[プロンプト編集](#prompt-customization)後は保存します。**Step 1: model output format** は *Full text*（既定）か *Compact labels*（試験的）。後者は番号付きの文にラベルだけを返させ、使えない回答のチャンクは全文方式に戻ります（引用符で決まらないチャンクのみ）。**Step 3: extra text around each request** は読み方指示の要求に加える読み取り専用の前後文（片側0〜1,000,000文字、既定0）。Step 3は同じ要求内の行を重複送信しなくなりました。4,000文字で品質向上は測定されなかったため、試験以外は0のままにします。20,000文字を超える値にはモデルのcontext長が必要です。
 
 ## Script
 
-TXT/MD/EPUBを取り込みます。EPUBはアップロード時にテキストへ変換します。LLMはNARRATOR／人物の識別、原文の発声表現を含む本文保持、読み方をJSONにします。**Review Script** は話者・地の文／会話・指示を再確認します。連続する語り手の結合は任意で既定無効です。人の点検が必要です。
+TXT/MD/EPUBを取り込みます。EPUBはアップロード時にテキストへ変換します。LLMはNARRATOR／人物の識別、原文の発声表現を含む本文保持、読み方をJSONにします。**Review Script** は話者・地の文／会話・指示を再確認します。連続する語り手の結合は任意で既定無効です。人の点検が必要です。レビュー開始時にGPUメモリーが既に満杯なら、再試行せずすぐ停止してメッセージを表示します。メモリーを空けて（例：保持しているモデルをアンロード）から再開します。
 
-**Speaker-label suggestions** は停止中のスナップショットと保存済み暫定参照を比較し、回数制限付きモデル判断を確認して別名を1件ずつ明示適用できます。[公開ガイド（英語）](docs/speaker-label-review.md)と[日本語wiki](https://github.com/on22s/alexandria-audiobook-nya/wiki/Scripts-and-Review-ja-JP)を参照してください。レビューの既定プロンプトはreview_prompts.txtで、本文保持の実行時検証は編集後も働きます。
+**Preserve source words**（生成前のチェックボックス）は原文の語を順番どおり注釈とレビューで保持し、語が変わったスクリプトの公開やチャンクの音声化を拒否します。数字や記号の読み上げ展開は後の音声準備で行われます。既定は無効です。[Literal source policy（英語）](docs/literal_source_policy.md)を参照してください。
+
+**Speaker-label suggestions** は停止中のスナップショットと保存済み暫定参照を比較し、回数制限付きモデル判断を確認して別名を1件ずつ明示適用できます。[公開ガイド（英語）](docs/speaker-label-review.md)と[日本語wiki](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review-ja-JP)を参照してください。レビューの既定プロンプトはreview_prompts.txtで、本文保持の実行時検証は編集後も働きます。
 
 ## Voices
 
@@ -235,7 +239,7 @@ ResultはMP3、章マーカー付きAAC M4B、話者別Audacity WAVを取得し�
 
 ## 性能とGPU調整
 
-小さいバッチから自分の環境で計測します。Compile Codecは改善する場合もありますが準備が増え、構成によって不向きです。メモリー不足後はParallel Workers／Max Items/Batchを下げ、共有LLMにも余裕を残します。AMD/Linuxは実GPU／ROCmを確認し、他人の電力設定やPyTorch変更を無条件にコピーしません。`app/tts_vram_benchmark.py --help` の実測はモデルとGPU時間を消費します。速度の保証値はありません。
+小さいバッチから自分の環境で計測します。**Auto-configure** がGPUに合うバッチ数を選びます。Compile Codecは現在効果がないため無効のままにします。メモリー不足後はParallel Workers／Max Items/Batchを下げ、共有LLMにも余裕を残します。AMD/Linuxは実GPU／ROCmを確認し、他人の電力設定やPyTorch変更を無条件にコピーしません。`app/tts_vram_benchmark.py --help` の実測はモデルとGPU時間を消費します。速度の保証値はありません。
 
 <details>
 <summary>スクリプト形式、出力ファイル、API</summary>
@@ -321,13 +325,13 @@ instructは口調と読み方の短い指示です。既定のdelivery段階は�
 - **スクリプト失敗：** 起動、到達性、正確なモデル名を確認し、JSONが苦手なら別のモデルを短く試します。
 - **重み取得失敗／遅い：** TTSはモデルごと約3.5 GBで初回Hugging Faceから取得します。英語版はネットワーク制限時の例として `HF_ENDPOINT=https://hf-mirror.com`、Pinokioのstart.jsの `env: { HF_ENDPOINT: "https://hf-mirror.com" }` を記載しています。ミラーは信頼先を変更するため自分で確認し、信頼できない先へトークンを送らないでください。レート制限には[Hugging Face](https://huggingface.co/join)の許可されたHF_TOKENを使えます。中断取得はアプリ再起動で再開できます。
 - **TTS失敗：** ターミナルの最初のモデル／生成エラー、空きメモリー、バッチ上限、外部Gradio起動とURL、voice_config.json、参照音声と正確な本文を確認します。
-- **バッチが遅い：** 対応環境でCompile Codec準備後を比較。VRAMがあればParallel Workersを調整。Render Pendingは自動バッチです。AMDは実エラーとROCm/PyTorchを調べ、MIOpen警告をすべて同じ原因と扱いません。
+- **バッチが遅い：** SetupでAuto-configureを実行するか、VRAMがあればParallel Workersを上げます。Compile Codecは現在効果がありません。Render Pendingは自動バッチです。AMDは実エラーとROCm/PyTorchを調べ、MIOpen警告をすべて同じ原因と扱いません。
 - **メモリー不足：** Parallel Workersを下げ、他GPU処理を閉じ、必要なら遅い `device: cpu` を試します。
 - **428 bytesなどの小さい／破損MP3：** FFmpegのlibmp3lame不足なら行出力はWAVになり得ますが、結合にはMP3 encoderが必要です。英語版の修復例は `conda install -c conda-forge ffmpeg`、またはシステム版を使うための `conda remove ffmpeg`。実際の環境と使用実体を確認して選びます。検査は `ffmpeg -encoders 2>/dev/null | grep mp3`（POSIX）、Windowsは `ffmpeg -encoders`。
 - **音声品質：** ノイズのない正確な参照。取り込みは3～30秒・品質検査・権利確認。Customの別seedも試します。
 - **文字化け：** 既知の問題は原本を変えずメモリー内で修復する場合があります。未解決は報告され、入力UTF-8を確認します。
 
-詳しくは[日本語wiki](https://github.com/on22s/alexandria-audiobook-nya/wiki/Troubleshooting-ja-JP)を参照します。
+詳しくは[日本語wiki](https://github.com/on22s/Side-Story/wiki/Troubleshooting-ja-JP)を参照します。
 
 <a id="prompt-customization"></a>
 ## プロンプト編集
@@ -390,7 +394,7 @@ Alexandria/
 
 ## 謝辞
 
-Alexandria Nyaは多くの人の成果、アイデア、不具合報告、試験に支えられています。元のAlexandriaコミュニティと各フォークの改善に協力した皆さんに感謝します。
+Side Storyは多くの人の成果、アイデア、不具合報告、試験に支えられています。元のAlexandriaコミュニティと各フォークの改善に協力した皆さんに感謝します。
 
 ### アプリ、貢献、試験
 

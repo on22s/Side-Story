@@ -1,10 +1,12 @@
 <img src="icon.png" alt="Alexandria 标志" width="160" />
 
-# Alexandria Audiobook Nya
+# Side Story
+
+*原名：Alexandria Audiobook Nya*
 
 将书籍制作成多角色配音有声书。Alexandria 将 AI 脚本标注、本地 Qwen3-TTS 和浏览器编辑器结合起来，让你为角色分配声音、试听并修改单独的语音片段，最后导出整本有声书。
 
-**[安装](#安装) · [快速入门](#快速入门) · [可选声音工具](#可选-voice-lab--preparer-依赖) · [常见问题](#常见问题) · [完整中文指南](https://github.com/on22s/alexandria-audiobook-nya/wiki/Home-zh-CN)**
+**[安装](#安装) · [快速入门](#快速入门) · [可选声音工具](#可选-voice-lab--preparer-依赖) · [常见问题](#常见问题) · [完整中文指南](https://github.com/on22s/Side-Story/wiki/Home-zh-CN)**
 
 [English](README.md) | 中文 | [日本語](README_JA.md)
 
@@ -23,7 +25,7 @@
 ### Pinokio（推荐）
 
 1. 安装 [Pinokio](https://pinokio.computer/)。
-2. 点击 **Download**，粘贴 `https://github.com/on22s/alexandria-audiobook-nya`。
+2. 点击 **Download**，粘贴 `https://github.com/on22s/Side-Story`。
 3. 点击 **Install**，完成后依次点击 **Start** 和 **Open Web UI**。
 4. 按[快速入门](#快速入门)配置 LLM，先用一小段文本试做有声书。
 
@@ -39,7 +41,7 @@
 
 这是随文档提供的原创文本，适用仓库的 MIT 许可。示例没有对话，只需要旁白。此处刻意使用同一份英文文本和 Ryan，方便对照中英文步骤；处理中文书籍时再改为对应语言和声音。
 
-1. **Setup（设置）**：按[LLM 设置](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)连接已运行的 LLM，点击 **Test Connection**，再点击 **Save Configuration**；测试本身不会保存设置。选择 **TTS Mode → Local Model (built in)**、**Device → Auto (best available)**、**TTS Language → English**。准确设置 **Runs on this machine's GPU?**，修改后再保存。成功检查点：连接测试通过，并收到配置保存确认。
+1. **Setup（设置）**：按[LLM 设置](https://github.com/on22s/Side-Story/wiki/LLM-Setup-zh-CN)连接已运行的 LLM，点击 **Test Connection**，再点击 **Save Configuration**；测试本身不会保存设置。选择 **TTS Mode → Local Model (built in)**、**Device → Auto (best available)**、**TTS Language → English**。准确设置 **Runs on this machine's GPU?**，修改后再保存。成功检查点：连接测试通过，并收到配置保存确认。
 2. **Script（脚本）**：在 **Select Book/Novel (Text, Markdown, or EPUB)** 选取示例，文件会自动上传。可选旁白字段留空。点击 **Generate Annotated Script**。成功检查点：生成结束，三句话均被保留，条目为旁白；分段数量可能不同。
 3. **Voices（声音）**：在旁白卡片选择 **Custom voice → Ryan**，角色风格留空，等待 **saved**。成功检查点：Ryan 保持选中，没有未保存更改警告。
 4. **Editor（编辑器）**：先点击第一行的 **Gen** 并试听。效果正常后点击 **Render Pending**。成功检查点：每行均有可播放的音频，没有失败或未完成的行。**Text integrity** 只比较保存的文本和原文，不检查实际发音；仍需听辨漏读和重复。
@@ -49,18 +51,18 @@
 
 *流程图仅标明操作顺序和检查点，不代表实际生成结果。*
 
-**某一步失败时，先停在该步排查。** 连接问题见 [LLM 设置](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)；首次 TTS 下载或报错请查看 Pinokio 的 **Terminal** 和[常见问题](https://github.com/on22s/alexandria-audiobook-nya/wiki/Troubleshooting-zh-CN)。缺少权重时，首次生成会下载，耗时可能比后续生成更长。
+**某一步失败时，先停在该步排查。** 连接问题见 [LLM 设置](https://github.com/on22s/Side-Story/wiki/LLM-Setup-zh-CN)；首次 TTS 下载或报错请查看 Pinokio 的 **Terminal** 和[常见问题](https://github.com/on22s/Side-Story/wiki/Troubleshooting-zh-CN)。缺少权重时，首次生成会下载，耗时可能比后续生成更长。
 
-远程 LLM 会收到标注文本，外部 TTS 会收到合成输入。只处理有权使用的书籍与声音。**Save Current 不是完整备份**：不保留仅在 Editor 中修改的片段、音频或导出文件。切换书籍前请[备份当前工作](https://github.com/on22s/alexandria-audiobook-nya/wiki/Updates-and-Backups-zh-CN)。
+远程 LLM 会收到标注文本，外部 TTS 会收到合成输入。只处理有权使用的书籍与声音。**Save Current 不是完整备份**：不保留仅在 Editor 中修改的片段、音频或导出文件。切换书籍前请[备份当前工作](https://github.com/on22s/Side-Story/wiki/Updates-and-Backups-zh-CN)。
 
 ### 完成第一份 MP3 之后
 
-- [图文步骤与恢复方法](https://github.com/on22s/alexandria-audiobook-nya/wiki/First-Audiobook-zh-CN)
-- [手动 LLM 模式及其他服务](https://github.com/on22s/alexandria-audiobook-nya/wiki/LLM-Setup-zh-CN)
-- [更多声音、别名、角色描述、克隆及 LoRA](https://github.com/on22s/alexandria-audiobook-nya/wiki/Voices-zh-CN)
-- [审校、检查点与长书](https://github.com/on22s/alexandria-audiobook-nya/wiki/Scripts-and-Review-zh-CN)
-- [M4B、章节与 Audacity 导出](https://github.com/on22s/alexandria-audiobook-nya/wiki/Rendering-and-Export-zh-CN)
-- [Designer、Dataset、Training、Preparer、Voice Lab 与 Reports](https://github.com/on22s/alexandria-audiobook-nya/wiki/Optional-Voice-Tools-zh-CN)
+- [图文步骤与恢复方法](https://github.com/on22s/Side-Story/wiki/First-Audiobook-zh-CN)
+- [手动 LLM 模式及其他服务](https://github.com/on22s/Side-Story/wiki/LLM-Setup-zh-CN)
+- [更多声音、别名、角色描述、克隆及 LoRA](https://github.com/on22s/Side-Story/wiki/Voices-zh-CN)
+- [审校、检查点与长书](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review-zh-CN)
+- [M4B、章节与 Audacity 导出](https://github.com/on22s/Side-Story/wiki/Rendering-and-Export-zh-CN)
+- [Designer、Dataset、Training、Preparer、Voice Lab 与 Reports](https://github.com/on22s/Side-Story/wiki/Optional-Voice-Tools-zh-CN)
 
 <details>
 <summary>更多功能</summary>
@@ -112,11 +114,11 @@ Docker 容器中的 `localhost` 指容器本身，不是宿主机上的 LLM 服�
 
 TTS 权重在首次使用相应变体时下载，通常每个变体约 3.5 GB。CustomVoice、Base/克隆、VoiceDesign 按需加载。下载进度、模型加载及错误详情请查看 Pinokio 的 **Terminal**；等待下载不等于生成已完成。
 
-首次加载、GPU 内核调优和可选 **Compile Codec** 可能增加预热时间。是否更快、快多少取决于硬件和软件栈，不应套用固定的吞吐量或预热时长。
+首次加载和 GPU 内核调优可能增加预热时间。是否更快、快多少取决于硬件和软件栈，不应套用固定的吞吐量或预热时长。**Compile Codec** 目前不起作用（固定版本 qwen-tts 0.1.1 的解码不经过编译代码），请保持关闭。
 
 ### 显存与日志
 
-先用较小的 **Parallel Workers** / **Max Items/Batch**。LLM 和 TTS 共用显卡时留出余量，并关闭其他占用 GPU 的程序。切换声音类型可能需要重新加载模型。出错时先查看 Terminal 和 Reports，记录完整错误，而不是盲目替换 PyTorch 或驱动。
+先用较小的 **Parallel Workers** / **Max Items/Batch**。**Auto-configure** 会在 12–20 GB 显卡上设置为 4（在 RX 9070 XT 上实测比 2 快约 23%，Whisper 召回率相同，并通过试听检查）。LLM 和 TTS 共用显卡时留出余量，并关闭其他占用 GPU 的程序。切换声音类型可能需要重新加载模型。出错时先查看 Terminal 和 Reports，记录完整错误，而不是盲目替换 PyTorch 或驱动。
 
 ## 更新与数据安全
 
@@ -175,15 +177,15 @@ python env_doctor.py
 
 随附 notebook 可在 Colab 中安装、运行应用。GPU 是否可用及会话限制取决于 Colab，不保证免费 GPU 资源。
 
-[![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/alexandria-audiobook-nya/blob/main/alexandria_colab.ipynb)
+[![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/on22s/Side-Story/blob/main/alexandria_colab.ipynb)
 
 notebook 使用 Google Drive 持久化和 Colab 内置页面端口转发，无需 ngrok 账号。完整步骤见 notebook。
 
 ### Docker（NVIDIA GPU）
 
 ```bash
-git clone https://github.com/on22s/alexandria-audiobook-nya.git
-cd alexandria-audiobook-nya
+git clone https://github.com/on22s/Side-Story.git
+cd Side-Story
 docker compose up --build
 ```
 
@@ -203,6 +205,10 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 
 - 在 Setup 的 **Language** 中选择 **Chinese** 或 **Auto**。
 - 在 **Setup → Prompt Settings (Advanced)** 中分别编辑分段（Step 1）、说话人归属（Step 2）、演绎指令（Step 3）、审校及角色提示词。根据中文对话、引号与称谓习惯调整；用 **What the model will see** 查看说话人归属请求。
+- **Step 1: model output format**：*Full text*（默认）或 *Compact labels*（实验性）。后者发送编号句子，只要求模型返回每句的标签；回答不可用的分块会退回全文方式。仅影响无法由引号确定的分块。
+- **Step 3: extra text around each request**：为演绎指令请求添加只读上下文，单侧 0–1,000,000 字符，默认 0。Step 3 不再重复发送同一请求中已有的行。实测 4,000 字符时质量没有可测量的提升，除测试外请保持 0；超过 20,000 字符需要已知的模型上下文长度。
+- **Preserve source words**（生成前的复选框）：在标注和审校中按顺序保留所有原文词语，词语被改动的脚本不会发布、分段不会渲染。数字和符号仍可能在之后的语音准备中展开。默认关闭，详见 [Literal source policy（英文）](docs/literal_source_policy.md)。
+- 审校开始时如果 GPU 显存已满，审校会立即停止并给出提示，而不是反复重试；释放显存（例如卸载占用显存的模型）后再开始。
 - 点击 **Save Configuration** 或 **Save preset and Setup** 才会保存更改。**Reset to Defaults** 只替换表单内容，之后仍需保存。
 - 默认来源为 [app/default_prompts_segment.txt](app/default_prompts_segment.txt)、[app/default_prompts_instruct.txt](app/default_prompts_instruct.txt)、[app/attribution_prompt_variants.py](app/attribution_prompt_variants.py)（默认形态另见 [app/default_prompts_attribute.txt](app/default_prompts_attribute.txt)），以及 [review_prompts.txt](review_prompts.txt) 和 [persona_prompts.txt](persona_prompts.txt)。
 - 根目录的 `default_prompts.txt` 属于旧版单阶段生成器，只改它不会自定义当前的三阶段流程。
@@ -226,7 +232,7 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 
 ### 生成速度慢
 
-首次下载、加载和预热通常较慢。可按当前软硬件支持情况尝试 **Compile Codec**，预热后再比较性能；显存允许时逐步增加批量。**Render Pending** 已会自动选择本地批量处理。AMD 问题请核对完整错误和 ROCm/PyTorch 版本，不能将所有 MIOpen 警告视为同一原因。
+首次下载、加载和预热通常较慢。在 Setup 中运行 **Auto-configure**，或在显存允许时逐步增加批量。**Compile Codec** 目前不起作用，开启它不会加快渲染。**Render Pending** 已会自动选择本地批量处理。AMD 问题请核对完整错误和 ROCm/PyTorch 版本，不能将所有 MIOpen 警告视为同一原因。
 
 ### MP3 文件损坏或很小（428 字节）
 
@@ -311,18 +317,18 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 
 ## 更多文档
 
-- [Nya 使用指南（英文）](https://github.com/on22s/alexandria-audiobook-nya/wiki)：安装、脚本、声音、编辑器、导出及高级工具。
+- [Side Story 使用指南（英文）](https://github.com/on22s/Side-Story/wiki)：安装、脚本、声音、编辑器、导出及高级工具。
 - [English README](README.md)：英文说明及项目结构。
 
 ## 致谢
 
-Alexandria Nya 建立在许多人分享的成果、想法、问题报告和测试反馈之上。感谢最初的 Alexandria 社区，以及所有帮助改进这些分支项目的人。
+Side Story 建立在许多人分享的成果、想法、问题报告和测试反馈之上。感谢最初的 Alexandria 社区，以及所有帮助改进这些分支项目的人。
 
 ### 应用、贡献与测试
 
 - [Finrandojin](https://github.com/Finrandojin/alexandria-audiobook)：创建了最初的 Alexandria Audiobook 应用，并提供可下载的 [Alexandria 声音预设](https://huggingface.co/Finrandojin/Alexandria)。
 - [Ayush Naphade](https://github.com/aayushnaphade)：贡献了角色声音设定生成、说话人别名解析和结合上下文的脚本审校功能（[上游 PR #42](https://github.com/Finrandojin/alexandria-audiobook/pull/42)）。他的相关项目是 [Lily](https://lily.rayoneai.in/)。
-- [Michii / on22s](https://github.com/on22s)：在 [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) 中所作的改进已引入 Nya，包括贡献至上游的系统健康仪表盘、跨平台子进程运行器和语音训练数据集准备工具（[#45](https://github.com/Finrandojin/alexandria-audiobook/pull/45)、[#46](https://github.com/Finrandojin/alexandria-audiobook/pull/46)、[#47](https://github.com/Finrandojin/alexandria-audiobook/pull/47)）。
+- [Michii / on22s](https://github.com/on22s)：在 [Alexandria Audiobook2](https://github.com/on22s/alexandria-audiobook2) 中所作的改进已引入 Side Story，包括贡献至上游的系统健康仪表盘、跨平台子进程运行器和语音训练数据集准备工具（[#45](https://github.com/Finrandojin/alexandria-audiobook/pull/45)、[#46](https://github.com/Finrandojin/alexandria-audiobook/pull/46)、[#47](https://github.com/Finrandojin/alexandria-audiobook/pull/47)）。
 - [REFLEXGAMING007](https://github.com/REFLEXGAMING007)：提供了详细的功能提案、问题复现案例和反复测试，推动了这些分支项目中的手动 LLM 工作流、快照、角色声音设定增量更新、可编辑提示词和角色状态声音等功能的完善（[手动生成](https://github.com/on22s/alexandria-audiobook2/issues/593)、[快照](https://github.com/on22s/alexandria-audiobook2/issues/600)、[增量更新](https://github.com/on22s/alexandria-audiobook2/issues/602)、[提示词编辑](https://github.com/on22s/alexandria-audiobook2/issues/634)、[角色状态声音设定](https://github.com/on22s/alexandria-audiobook2/issues/866)）。
 
 - [Alchemist-Production](https://github.com/Alchemist-Production)：最初的 Web UI、音频编辑器和分块管理工作已集成到上游 Alexandria（[集成](https://github.com/Finrandojin/alexandria-audiobook/commit/1667edc237418fbf9e819bfb4294b14209da9c27)、[编辑器](https://github.com/Finrandojin/alexandria-audiobook/commit/717f89161b36ced57c97cea5b729be95b3cba39e)）。
@@ -348,9 +354,9 @@ Alexandria Nya 建立在许多人分享的成果、想法、问题报告和测�
 
 ### 引入应用的分支成果与想法
 
-- [cjdell](https://github.com/cjdell/alexandria-audiobook)：其 AMD APU 精度修复为 Nya 的 fp32 模型加载路径提供了参考（[移植](https://github.com/on22s/alexandria-audiobook2/pull/573)）。
+- [cjdell](https://github.com/cjdell/alexandria-audiobook)：其 AMD APU 精度修复为 Side Story 的 fp32 模型加载路径提供了参考（[移植](https://github.com/on22s/alexandria-audiobook2/pull/573)）。
 - [XinchaoGou](https://github.com/XinchaoGou/alexandria-audiobook)：贡献了 OpenAI 推理模型请求处理和通过环境变量引用 API 密钥的方式，并提供了推理控制、克隆参考音频验证、外部 TTS 服务器池和滚动故事上下文的想法（[移植](https://github.com/on22s/alexandria-audiobook2/pull/574)、[推理控制](https://github.com/on22s/alexandria-audiobook2/pull/530)、[参考音频验证](https://github.com/on22s/alexandria-audiobook2/pull/531)、[服务器池](https://github.com/on22s/alexandria-audiobook2/pull/532)）。
-- [Darkkingwill](https://github.com/Darkkingwill/alexandria-audiobook)：提供了有关 MP3 比特率的发现，以及可取消合并、导出进度、模型选择和记住标签页的想法；这些功能在 AA2 中独立重新实现后引入 Nya（[比特率](https://github.com/on22s/alexandria-audiobook2/pull/533)、[界面改进](https://github.com/on22s/alexandria-audiobook2/pull/534)）。
+- [Darkkingwill](https://github.com/Darkkingwill/alexandria-audiobook)：提供了有关 MP3 比特率的发现，以及可取消合并、导出进度、模型选择和记住标签页的想法；这些功能在 AA2 中独立重新实现后引入 Side Story（[比特率](https://github.com/on22s/alexandria-audiobook2/pull/533)、[界面改进](https://github.com/on22s/alexandria-audiobook2/pull/534)）。
 - [shangyuok](https://github.com/shangyuok/alexandria-audiobook-gg)：提出了可配置 TTS 生成 token 上限的想法，并与相应的内存估算功能一同实现（[实现](https://github.com/on22s/alexandria-audiobook2/pull/60)）。
 - [dudarenok-maker / Castwright](https://github.com/dudarenok-maker/Castwright)：提供了跨书籍记住角色阵容和检查已生成声音一致性的想法，并在 Alexandria 中独立实现（[系列记忆](https://github.com/on22s/alexandria-audiobook2/pull/524)、[声音检查](https://github.com/on22s/alexandria-audiobook2/pull/525)）。
 - [Gaspard Michel、Elena V. Epure、Romain Hennequin 和 Christophe Cerisara](https://aclanthology.org/2025.naacl-short.62/)：其引语归属研究是 `michel` 系列提示词的基础，并被改编用于 Alexandria 自身的提示词及前后文处理（[实现](app/attribution_prompt_variants.py)）。
@@ -358,7 +364,7 @@ Alexandria Nya 建立在许多人分享的成果、想法、问题报告和测�
 <details>
 <summary>研究参考与共享资源</summary>
 
-Nya 也受益于 AA2 背后的研究。以下致谢涵盖实验和评估资源，并不意味着每项实验、数据集或模型都包含在 Nya 的运行环境中。
+Side Story 也受益于 AA2 背后的研究。以下致谢涵盖实验和评估资源，并不意味着每项实验、数据集或模型都包含在 Side Story 的运行环境中。
 
 - [Xiao Zhang / buddies](https://github.com/buddies/alexandria-audiobook)：提供了逐行指令词汇，以及将稳定的声音身份与表达方式指令分离的实验。该词表被移植到 AA2 的研究工具中，由此产生的对比结果为声音身份相关工作提供了参考（[审查](https://github.com/on22s/alexandria-audiobook2/pull/601)、[声音改进](https://github.com/on22s/alexandria-audiobook2/pull/603)）。
 - [p0n1](https://github.com/p0n1/epub_to_audiobook)：其标点优先级策略经调整后用于 AA2 能识别引语的文本分块实验。
@@ -367,7 +373,7 @@ Nya 也受益于 AA2 背后的研究。以下致谢涵盖实验和评估资源�
 - [nazdridoy](https://github.com/nazdridoy/kokoro-tts)：其声音加权混合的想法在 AA2 中进行了探索；[WhiskeyCoder](https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter)：其独立得出的 Qwen3-TTS 分块长度发现被用作对比参考。
 - [Krishnapriya Vishnubhotla、Adam Hammond 和 Graeme Hirst](https://aclanthology.org/2022.lrec-1.628/) 及 PDNC 标注者；RiQuA 的 [Sean Papay 和 Sebastian Padó](https://aclanthology.org/2020.lrec-1.104/)；以及 [DraCor](https://dracor.org/) 社区：提供了 AA2 引语归属研究所使用的文学标注资源。
 - [David K. Elson 和 Kathleen R. McKeown](https://www.cs.columbia.edu/~delson/pubs/AAAI10-ElsonMcKeown.pdf)：其引语归属类别在 AA2 的句法框架实验中进行了探索；[Frank Rudzicz 和 BookNLP-OG 的共同作者](https://arxiv.org/abs/2307.03734)：为端到端引语归属方法的对比提供了参考。
-- [CosyVoice 团队](https://github.com/QwenAudio/CosyVoice)：AA2 研究了其语音模型设计思路；CosyVoice 并非 Nya 的运行时依赖。
+- [CosyVoice 团队](https://github.com/QwenAudio/CosyVoice)：AA2 研究了其语音模型设计思路；CosyVoice 并非 Side Story 的运行时依赖。
 - [LibriVox](https://librivox.org/) 朗读者、[Project Gutenberg](https://www.gutenberg.org/) 和[青空文库（Aozora Bunko）](https://www.aozora.gr.jp/)志愿者，以及 [LJSpeech](https://keithito.com/LJ-Speech-Dataset/)、[Hi-Fi TTS](https://www.openslr.org/109/)、[AISHELL-3](https://www.openslr.org/93/) 和 [Kokoro Speech Dataset](https://mozilladatacollective.com/datasets/cmmknsho4014wmf087kvq5rc6) 的创建者：提供了用于研究对比的真人朗读和原始文本。
 - [Jay Myers](https://www.jaymyersvoiceover.com/blog-ideas/how-audiobook-narrators-make-characters-sound-distinct-believable-and-consistent)、[Malk Williams](https://www.linkedin.com/pulse/character-voices-audiobooks-7-key-considerations-malk-williams)，以及[第三方声明](THIRD_PARTY_NOTICES.md#research-and-industry-practice-consulted)中记录的配音选角指导：提供了保持角色声音一致性，以及让同场景角色的声音形成对比的实践思路。
 
