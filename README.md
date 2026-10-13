@@ -1,4 +1,4 @@
-<img src="icon.png" alt="Alexandria logo" width="160" />
+<img src="icon.png" alt="Side-Story logo: Small Stories, Big Worlds" width="320" />
 
 # Side Story
 
