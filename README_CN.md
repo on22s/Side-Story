@@ -204,7 +204,7 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 ## 中文书籍与提示词
 
 - 在 Setup 的 **Language** 中选择 **Chinese** 或 **Auto**。
-- 在 **Setup → Prompt Settings (Advanced)** 中分别编辑分段（Step 1）、说话人归属（Step 2）、演绎指令（Step 3）、审校及角色提示词。根据中文对话、引号与称谓习惯调整；用 **What the model will see** 查看说话人归属请求。
+- 在 **Setup → Prompt Settings (Advanced)** 中分别编辑分段（Step 1）、说话人归属（Step 2）、演绎指令（Step 3）、审校及角色提示词。根据中文对话、引号与称谓习惯调整；用 **What the model will see** 查看说话人归属请求。**Attribution prompt** 默认是 `michel2_full`；只询问对话行的 `michel2_spoken` 在 Qwen3-14B（不加适配器）上高 6.5 个百分点，第 2 步约快 3 倍（其他模型尚未测量，适配器请保持训练时的提示词）。可选的仅标签审校（`prompts.review_labels_only`）只返回说话人和语气说明，不重写正文。模型回复记录在 `logs/llm_responses.log`，对应请求在 `logs/llm_responses.requests.log`。把鼠标停在设置旁的 ⓘ 上可看到说明。详见[脚本与审校](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review-zh-CN)。
 - **Step 1: model output format**：*Full text*（默认）或 *Compact labels*（实验性）。后者发送编号句子，只要求模型返回每句的标签；回答不可用的分块会退回全文方式。仅影响无法由引号确定的分块。
 - **Step 3: extra text around each request**：为演绎指令请求添加只读上下文，单侧 0–1,000,000 字符，默认 0。Step 3 不再重复发送同一请求中已有的行。实测 4,000 字符时质量没有可测量的提升，除测试外请保持 0；超过 20,000 字符需要已知的模型上下文长度。
 - **Preserve source words**（生成前的复选框）：在标注和审校中按顺序保留所有原文词语，词语被改动的脚本不会发布、分段不会渲染。数字和符号仍可能在之后的语音准备中展开。默认关闭，详见 [Literal source policy（英文）](docs/literal_source_policy.md)。

@@ -271,6 +271,8 @@ Upload a text file (.txt, .md, or .epub) and generate the annotated script. EPUB
 
 **Review Script** checks speaker assignments, narration/dialogue boundaries, and delivery directions while preserving source text. Consecutive-narrator merging is optional and off by default. Review the result rather than assuming every annotation was corrected.
 
+Setup's **Attribution prompt** chooses how speakers are asked for. `michel2_full` is the default; `michel2_spoken` asks only about the spoken lines and, on Qwen3-14B without an adapter, scored 6.5 points higher with about 3× less step-2 time. Other models are not measured yet, and an attribution adapter should keep the prompt it was trained on. An opt-in **labels-only review** (`prompts.review_labels_only`) returns only speakers and delivery notes and never retypes the text. Every model reply is logged in `logs/llm_responses.log`, with the exact request beside it in `logs/llm_responses.requests.log`. Hover the ⓘ beside any setting for what it does. Details: [Scripts and review](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review), [Troubleshooting](https://github.com/on22s/Side-Story/wiki/Troubleshooting).
+
 **Speaker-label suggestions** compares a stopped-run snapshot with a saved provisional reference, then lets you inspect bounded model judgments and explicitly apply one alias at a time. See [Speaker-label review](docs/speaker-label-review.md).
 
 Review prompts can be edited in Setup or through their file defaults in `review_prompts.txt`; the runtime’s text-preservation validation still applies. If the GPU is already full when review starts, review stops at once with a message instead of retrying; free the memory (for example, unload the model holding it) and start review again.
