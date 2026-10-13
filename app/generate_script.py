@@ -695,6 +695,8 @@ class LLMGenParams:
     request_admission: object = field(default=None, repr=False, compare=False)
     # Explicit literal annotation policy; default speech transformations unchanged.
     literal_source_preserving: bool = False
+    # Experimental review transport; full-text boundary editing remains default.
+    review_labels_only: bool = False
 
 
 
