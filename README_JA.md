@@ -211,7 +211,7 @@ LLMとTTSを設定します。TTSの **Mode** はlocal/external、**Device** は
 
 ## Script
 
-TXT/MD/EPUBを取り込みます。EPUBはアップロード時にテキストへ変換します。LLMはNARRATOR／人物の識別、原文の発声表現を含む本文保持、読み方をJSONにします。**Review Script** は話者・地の文／会話・指示を再確認します。連続する語り手の結合は任意で既定無効です。人の点検が必要です。レビュー開始時にGPUメモリーが既に満杯なら、再試行せずすぐ停止してメッセージを表示します。メモリーを空けて（例：保持しているモデルをアンロード）から再開します。
+TXT/MD/EPUBを取り込みます。EPUBはアップロード時にテキストへ変換します。LLMはNARRATOR／人物の識別、原文の発声表現を含む本文保持、読み方をJSONにします。**Review Script** は話者・地の文／会話・指示を再確認します。連続する語り手の結合は任意で既定無効です。人の点検が必要です。レビュー開始時にGPUメモリーが既に満杯なら、再試行せずすぐ停止してメッセージを表示します。メモリーを空けて（例：保持しているモデルをアンロード）から再開します。Setup の **Attribution prompt** で話者の尋ね方を選べます。既定は `michel2_full` で、会話行だけを尋ねる `michel2_spoken` は Qwen3-14B（アダプターなし）で 6.5 ポイント高く、第 2 段階も約 3 倍速くなりました（他のモデルは未測定、アダプターは学習時のプロンプトのまま）。任意のラベル専用レビュー（`prompts.review_labels_only`）は本文を書き直さず話者と指示だけを返します。モデルの応答は `logs/llm_responses.log`、そのリクエストは `logs/llm_responses.requests.log` に記録されます。各設定の横の ⓘ で説明が見られます。詳細は[スクリプトとレビュー](https://github.com/on22s/Side-Story/wiki/Scripts-and-Review-ja-JP)。
 
 **Preserve source words**（生成前のチェックボックス）は原文の語を順番どおり注釈とレビューで保持し、語が変わったスクリプトの公開やチャンクの音声化を拒否します。数字や記号の読み上げ展開は後の音声準備で行われます。既定は無効です。[Literal source policy（英語）](docs/literal_source_policy.md)を参照してください。
 
