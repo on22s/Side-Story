@@ -94,7 +94,7 @@ class TTSConfig(BaseModel):
 
 PromptVariant = Literal[
     "default", "aliases", "passage", "incremental", "michel", "continuity",
-    "michel2", "michel2_full", "michel2_shot"]
+    "michel2", "michel2_full", "michel2_shot", "michel2_spoken"]
 
 # How pass 1 decides what is speech. "auto": quote marks where the chunk makes
 # them unambiguous, the model for the rest (the behaviour every three-pass
@@ -195,6 +195,7 @@ class PromptConfig(BaseModel):
     attribution_preset: str = Field(default="michel2_full", min_length=1, max_length=80)
     review_system_prompt: Optional[str] = None
     review_user_prompt: Optional[str] = None
+    review_labels_only: bool = False
     persona_system_prompt: Optional[str] = None
     persona_user_prompt: Optional[str] = None
     persona_advanced_prompt: Optional[str] = None
