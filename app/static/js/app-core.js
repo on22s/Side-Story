@@ -6446,6 +6446,7 @@
 
         // --- Editor Tab ---
         let isPlayingSequence = false;
+        let playbackSequenceEpoch = 0;
         let isRenderingAll = false;
         let cachedChunks = []; // Cache to track changes
         let chunkSnapshotRevision = null;
@@ -7087,7 +7088,9 @@
         };
 
         window.playSequence = async () => {
+            const sequenceEpoch = ++playbackSequenceEpoch;
             isPlayingSequence = true;
+            const isCurrentSequence = () => isPlayingSequence && sequenceEpoch === playbackSequenceEpoch;
             const btn = document.getElementById('btn-play-seq');
             btn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
             btn.onclick = stopSequence;
@@ -7097,7 +7100,7 @@
             let skippedCount = 0;
 
             const playNext = () => {
-                if (!isPlayingSequence) { return; }
+                if (!isCurrentSequence()) { return; }
 
                 const audios = Array.from(document.querySelectorAll('.chunk-audio'));
 
@@ -7132,8 +7135,10 @@
                 // would double the skip count and skip over the next track too.
                 let advanced = false;
                 const advanceOnce = (isSkip) => {
-                    if (advanced) { return; }
+                    if (advanced || !isCurrentSequence()) { return; }
                     advanced = true;
+                    audio.onended = null;
+                    audio.onerror = null;
                     if (isSkip) { skippedCount++; }
                     currentIndex++;
                     playNext();
@@ -7162,11 +7167,13 @@
         };
 
         window.stopSequence = () => {
+            playbackSequenceEpoch++;
             isPlayingSequence = false;
             document.querySelectorAll('audio').forEach(a => {
                 a.pause();
                 a.currentTime = 0;
                 a.onended = null;
+                a.onerror = null;
             });
             document.querySelectorAll('tr').forEach(r => r.classList.remove('table-primary'));
 
