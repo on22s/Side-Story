@@ -843,14 +843,34 @@
                 await API._handleError(res);
                 return res.json();
             },
-            post: async (url, data) => {
-                const res = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
+            post: async (url, data, {timeoutMs = null} = {}) => {
+                if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+                    throw new Error('The request deadline must be a positive finite duration.');
+                }
+                const controller = timeoutMs === null ? null : new AbortController();
+                let timer;
+                const request = async () => {
+                    const res = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data),
+                        ...(controller ? {signal: controller.signal} : {}),
+                    });
+                    await API._handleError(res);
+                    return await res.json();
+                };
+                if (!controller) { return request(); }
+                const deadline = new Promise((resolve, reject) => {
+                    timer = setTimeout(() => {
+                        reject(new Error('The voice save timed out. Your edits are retained; the server save could not be confirmed.'));
+                        controller.abort();
+                    }, timeoutMs);
                 });
-                await API._handleError(res);
-                return res.json();
+                try {
+                    return await Promise.race([request(), deadline]);
+                } finally {
+                    clearTimeout(timer);
+                }
             },
             del: async (url) => {
                 const res = await fetch(url, { method: 'DELETE' });
@@ -6225,7 +6245,7 @@
                     revision: _voiceSaveSnapshot.revision,
                     book_token: draft.book_token,
                     voices: draft.voices,
-                });
+                }, {timeoutMs: 60000});
                 if (result.book_token !== draft.book_token || !/^[0-9a-f]{64}$/.test(result.revision)) {
                     throw new Error('The voice save could not be confirmed. Your edits were retained.');
                 }
@@ -6446,6 +6466,7 @@
 
         // --- Editor Tab ---
         let isPlayingSequence = false;
+        let playbackSequenceEpoch = 0;
         let isRenderingAll = false;
         let cachedChunks = []; // Cache to track changes
         let chunkSnapshotRevision = null;
@@ -7087,7 +7108,9 @@
         };
 
         window.playSequence = async () => {
+            const sequenceEpoch = ++playbackSequenceEpoch;
             isPlayingSequence = true;
+            const isCurrentSequence = () => isPlayingSequence && sequenceEpoch === playbackSequenceEpoch;
             const btn = document.getElementById('btn-play-seq');
             btn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
             btn.onclick = stopSequence;
@@ -7097,7 +7120,7 @@
             let skippedCount = 0;
 
             const playNext = () => {
-                if (!isPlayingSequence) { return; }
+                if (!isCurrentSequence()) { return; }
 
                 const audios = Array.from(document.querySelectorAll('.chunk-audio'));
 
@@ -7132,8 +7155,10 @@
                 // would double the skip count and skip over the next track too.
                 let advanced = false;
                 const advanceOnce = (isSkip) => {
-                    if (advanced) { return; }
+                    if (advanced || !isCurrentSequence()) { return; }
                     advanced = true;
+                    audio.onended = null;
+                    audio.onerror = null;
                     if (isSkip) { skippedCount++; }
                     currentIndex++;
                     playNext();
@@ -7162,11 +7187,13 @@
         };
 
         window.stopSequence = () => {
+            playbackSequenceEpoch++;
             isPlayingSequence = false;
             document.querySelectorAll('audio').forEach(a => {
                 a.pause();
                 a.currentTime = 0;
                 a.onended = null;
+                a.onerror = null;
             });
             document.querySelectorAll('tr').forEach(r => r.classList.remove('table-primary'));
 
@@ -7293,8 +7320,10 @@
 
         window.generateChunk = async (id) => {
             try {
+                const context = captureChunkMutation(id);
                 // First, save any pending edits in this row
                 await saveRowEdits(id);
+                if (!context.isCurrent()) { throw new Error('Active book changed; restart rendering for the current book.'); }
 
                 // Skip empty lines
                 const tr = document.querySelector(`tr[data-id="${id}"]`);
@@ -7325,7 +7354,7 @@
                     }
                 }
 
-                await API.post(`/api/chunks/${id}/generate`, {});
+                await API.post(`/api/chunks/${id}/generate?${context.query}`, {});
 
                 // Start polling with incremental updates (no full redraw)
                 setTimeout(() => loadChunks(false), 1000);
@@ -7368,6 +7397,7 @@
         // template). See FIXED.md F-065.
         async function _runBatchRender(endpoint, regenerateAll, { label, describeStart }) {
             const batchBook = currentBookFilename;
+            const batchToken = chunkSnapshotBookToken;
             let rowsMarked = false;
             isRenderingAll = true;
             document.getElementById('btn-batch-fast').style.display = 'none';
@@ -7375,6 +7405,7 @@
             document.getElementById('btn-cancel-render').style.display = 'inline-block';
 
             try {
+                if (!batchToken || chunkSnapshotBook !== batchBook) { throw new Error('Reload the Editor before rendering.'); }
                 const chunks = await ensureEditorRenderSnapshot();
                 await refreshDeliveryReview();
                 let toProcess = (regenerateAll ? chunks : chunks.filter(c => c.status !== 'done'))
@@ -7400,7 +7431,7 @@
                     toProcess = freshChunks.filter(c => c.text && c.text.trim());
                 }
 
-                if (batchBook !== currentBookFilename) {
+                if (batchBook !== currentBookFilename || batchToken !== chunkSnapshotBookToken) {
                     throw new Error('Active book changed; restart rendering for the current book.');
                 }
                 rowsMarked = true;
@@ -7419,7 +7450,10 @@
                     }
                 }
 
-                const response = await API.post(endpoint, { indices });
+                const response = await API.post(endpoint, {
+                    indices, expected_book_token: batchToken,
+                    expected_uids: toProcess.map(chunk => chunk.uid)
+                });
                 console.log(`${label} started: ${describeStart(response)}`);
 
                 // Poll for completion via the shared engine - gets the
@@ -7439,7 +7473,7 @@
                         document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
                         cancelRender(true);
 
-                        if (batchBook !== currentBookFilename) {
+                        if (batchBook !== currentBookFilename || batchToken !== chunkSnapshotBookToken) {
                             showToast('Render finished for a previous book. Open that book to check its audio.', 'warning');
                             return;
                         }

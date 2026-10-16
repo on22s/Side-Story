@@ -9,7 +9,8 @@ import shutil
 import uuid
 import contextlib
 from pathlib import Path
-from book_state_transaction import ensure_book_state, apply_book_state_locked
+from book_state_transaction import (ensure_book_state, apply_book_state_locked,
+                                    get_book_operation_token)
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -24,7 +25,7 @@ from core import (
     UPLOADS_DIR,
     VOICE_CONFIG_PATH,
     _get_saved_book_id,
-    _gpu_lock, ensure_book_switch_allowed,
+    _gpu_lock, ensure_book_switch_allowed, ensure_saved_book_destination_available,
     _require_safe_filename,
     _save_active_book_id,
     _saved_book_meta_path,
@@ -129,6 +130,7 @@ async def list_saved_scripts():
 
 class ScriptSaveRequest(BaseModel):
     name: str
+    expected_book_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 def validate_book_json_bytes(raw, expected_type, status_code, label):
     """Refuse corrupt stored JSON before a book transaction publishes anything."""
@@ -145,12 +147,15 @@ def validate_book_json_bytes(raw, expected_type, status_code, label):
 def _save_script_sync(request):
     safe_name = _require_saved_book_name(request.name)
     dest = os.path.join(SCRIPTS_DIR, f"{safe_name}.json")
-    with ensure_book_state(DATA_DIR), ensure_book_state(SCRIPTS_DIR), contextlib.ExitStack() as locks:
+    with ensure_saved_book_destination_available(dest), ensure_book_state(DATA_DIR), ensure_book_state(SCRIPTS_DIR), contextlib.ExitStack() as locks:
         for path in (dest, SCRIPT_PATH, VOICE_CONFIG_PATH, *_get_saved_book_companions(dest)):
             locks.enter_context(file_lock(path))
         if not os.path.isfile(SCRIPT_PATH):
             raise HTTPException(status_code=404, detail="No annotated script to save. Generate a script first.")
         script_bytes = Path(SCRIPT_PATH).read_bytes()
+        if request.expected_book_token is not None:
+            if get_book_operation_token(DATA_DIR) != request.expected_book_token:
+                raise HTTPException(status_code=409, detail="Active book changed; reopen Save Current before saving")
         validate_book_json_bytes(script_bytes, list, 422, "Active script")
         replacements = {os.path.basename(dest): script_bytes,
             f"{safe_name}.meta.json": json.dumps({"book_id": get_active_book_id() or safe_name}).encode("utf-8")}
