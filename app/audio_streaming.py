@@ -8,7 +8,7 @@ from pydub import AudioSegment
 from pydub.audio_segment import audioop
 
 from audio_pcm_producer import (PCMProducer, is_bounded_pcm_supported,
-                                iter_raw_pcm, iter_default_silence_pcm)
+                                iter_raw_pcm, iter_default_silence_pcm, iter_converted_pcm)
 
 from tts import (ensure_audio_export_active, get_pause_duration_ms,
                  trim_edge_silence)
@@ -38,23 +38,31 @@ def get_pcm_shape(segment):
     return layout, len(segment.raw_data) // (layout[0] * layout[2])
 
 
-def get_promoted_pcm_shape(shape, layout):
+def is_plain_pcm_sequence(segments):
+    """Whether every input has the ordinary native channel-conversion contract."""
+    return all(type(segment) is AudioSegment and get_pcm_shape(segment) is not None
+               for segment in segments)
+
+
+def get_promoted_pcm_shape(shape, layout, *, reject_impossible_channels=False):
     source, frames = shape
     if source[0] != layout[0] and source[0] != 1:
         # Pydub cannot promote a multichannel source to more channels.
+        if reject_impossible_channels:
+            raise ValueError('AudioSegment.set_channels only supports mono-to-multi channel and multi-to-mono channel conversion')
         return None
     if frames and source[1] != layout[1]:
         frames = ((frames - 1) * layout[1]) // source[1] + 1
     return layout, frames
 
 
-def get_joined_pcm_shape(left, right):
+def get_joined_pcm_shape(left, right, *, reject_impossible_channels=False):
     """Mirror builder/Pydub promotion, including fresh-state ratecv rounding."""
     if left is None or right is None:
         return None
     layout = tuple(max(a, b) for a, b in zip(left[0], right[0]))
-    left = get_promoted_pcm_shape(left, layout)
-    right = get_promoted_pcm_shape(right, layout)
+    left = get_promoted_pcm_shape(left, layout, reject_impossible_channels=reject_impossible_channels)
+    right = get_promoted_pcm_shape(right, layout, reject_impossible_channels=reject_impossible_channels)
     if left is None or right is None:
         return None
     return layout, left[1] + right[1]
@@ -89,20 +97,22 @@ def get_streamable_layout(segments):
 
 
 def iter_silence_pcm(duration_ms, layout, cancel_check=None):
-    """Use Pydub's native ratecv, retaining its state across bounded zero blocks."""
+    """Retain silence rounding/state through the shared bounded converter."""
     channels, frame_rate, sample_width = layout
     frames = int(11025 * (duration_ms / 1000.0))
-    state = None
-    while frames > 0:
-        ensure_audio_export_active(cancel_check)
-        count = min(frames, 16384)
-        data = b'\0' * (count * channels * 2)
-        if frame_rate != 11025:
-            data, state = audioop.ratecv(data, 2, channels, 11025, frame_rate, state)
-        if sample_width != 2:
-            data = audioop.lin2lin(data, 2, sample_width)
-        yield data
-        frames -= count
+    if frames <= 0:
+        return
+
+    def iter_zeros():
+        remaining = frames
+        while remaining > 0:
+            ensure_audio_export_active(cancel_check)
+            count = min(remaining, 16384)
+            yield b'\0' * (count * channels * 2)
+            remaining -= count
+
+    check = lambda: ensure_audio_export_active(cancel_check)
+    yield from iter_converted_pcm(iter_zeros(), (channels, 11025, 2), layout, check)
 
 
 def iter_segment_pcm(segment, cancel_check=None):
@@ -120,8 +130,10 @@ def write_combined_wav(segments, speakers, path, pause_ms, same_speaker_pause_ms
     bounded_supported = is_bounded_pcm_supported(segments)
     if len(speakers) != len(segments):
         return None
+    ordinary_pcm = is_plain_pcm_sequence(segments)
     segments = [trim_edge_silence(segment, cancel_check=cancel_check)
                 for segment in segments]
+    ordinary_pcm = ordinary_pcm and is_plain_pcm_sequence(segments)
     shape = get_pcm_shape(segments[0]) if segments else None
     frames = shape[1] if shape is not None else 0
     for index, segment in enumerate(segments[1:], 1):
@@ -136,8 +148,10 @@ def write_combined_wav(segments, speakers, path, pause_ms, same_speaker_pause_ms
         else:
             # Legacy combine appends (gap + segment), then promotes the prefix.
             piece = get_joined_pcm_shape(get_silence_pcm_shape(duration),
-                                         get_pcm_shape(segment))
-            shape = get_joined_pcm_shape(shape, piece)
+                                         get_pcm_shape(segment),
+                                         reject_impossible_channels=ordinary_pcm)
+            shape = get_joined_pcm_shape(shape, piece,
+                                         reject_impossible_channels=ordinary_pcm)
     ensure_audio_export_active(cancel_check)
     ensure_pcm_shape_fits_riff((layout, frames) if layout is not None else shape)
     if layout is None:
@@ -209,10 +223,12 @@ def get_track_wav_plan(entries, total_duration_ms, cancel_check=None):
         # Preserve valid legacy layouts, but count their final promoted PCM
         # before the caller allocates silence or joins the complete track.
         shape = get_pcm_shape(AudioSegment.empty())
+        ordinary_pcm = is_plain_pcm_sequence(segment for segment, _ in entries)
         for kind, value in iter_track_pieces(entries, total_duration_ms, cancel_check):
             piece = (get_pcm_shape(value) if kind == 'audio'
                      else get_silence_pcm_shape(value))
-            shape = get_joined_pcm_shape(shape, piece)
+            shape = get_joined_pcm_shape(shape, piece,
+                                         reject_impossible_channels=ordinary_pcm)
         ensure_audio_export_active(cancel_check)
         ensure_pcm_shape_fits_riff(shape)
         if shape is not None and is_bounded_pcm_supported([segment for segment, _ in entries]):
