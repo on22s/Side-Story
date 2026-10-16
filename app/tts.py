@@ -20,8 +20,9 @@ import numpy as np
 import soundfile as sf
 
 import device_utils
-from adapter_checkpoint_transaction import ensure_adapter_generation_snapshot, get_adapter_generation_sha256
-from lora_evidence import get_file_sha256
+from adapter_checkpoint_transaction import (ensure_adapter_generation_snapshot, get_adapter_generation_sha256,
+                                            get_adapter_serving_metadata)
+from lora_evidence import get_file_sha256, get_tts_model_settings
 from audio_validation import GeneratedAudioError, publish_audio_output
 from speech_text import normalize_for_speech, get_speech_preparation
 from pydub import AudioSegment
@@ -617,8 +618,9 @@ class TTSEngine:
     """
 
     def __init__(self, config):
+        model_settings = get_tts_model_settings(config)
         tts_config = config.get("tts", {})
-        self._mode = tts_config.get("mode", "external")
+        self._mode = model_settings["mode"]
         self._url = tts_config.get("url", "http://127.0.0.1:7860")
         # Each endpoint has one lazily created client per configured worker.
         # Every client keeps its own lock: gradio_client cannot be shared
@@ -626,16 +628,16 @@ class TTSEngine:
         self._external_urls = [u.strip() for u in (tts_config.get("external_urls") or []) if u and u.strip()] or [self._url]
         self._external_timeout = int(tts_config.get("external_timeout_seconds", 300) or 300)
         self._external_parallel_workers = max(1, int(tts_config.get("parallel_workers", 2) or 1))
-        self._device = tts_config.get("device", "auto")
-        self._compile_codec_enabled = tts_config.get("compile_codec", False)
+        self._device = model_settings["device"]
+        self._compile_codec_enabled = model_settings["compile_codec"]
 
         # Cap on generated audio tokens per sequence. One source for both the
         # VRAM estimate and every generate call — if they ever disagree, the
         # estimate under-counts memory per sequence and over-sizes the batch.
-        self._max_new_tokens = tts_config.get("max_new_tokens", 2048)
+        self._max_new_tokens = model_settings["max_new_tokens"]
 
         # Language setting (passed to Qwen3-TTS)
-        self._language = tts_config.get("language", "English")
+        self._language = model_settings["language"]
 
         # Sub-batching config
         self._sub_batch_enabled = tts_config.get("sub_batch_enabled", True)
@@ -1420,6 +1422,12 @@ class TTSEngine:
                 f"{category} voices require local TTS mode; external TTS supports custom and clone voices.")
         return self._mode
 
+    def get_model_settings(self):
+        """Return the actual model settings used by this initialized engine."""
+        return {"mode": self._mode, "device": self._device,
+                "compile_codec": self._compile_codec_enabled,
+                "max_new_tokens": self._max_new_tokens, "language": self._language}
+
     # ── Core generation methods ──────────────────────────────────
 
     def _external_single(self, generate, output_path):
@@ -1824,14 +1832,7 @@ class TTSEngine:
         with ensure_adapter_generation_snapshot(adapter_path) as (snapshot, generation):
             if expected_generation is not None and generation != expected_generation:
                 raise ValueError('Adapter generation changed since benchmark fixture admission')
-            with open(os.path.join(snapshot, 'training_meta.json'), encoding='utf-8') as handle:
-                meta = json.load(handle)
-            if not isinstance(meta, dict) or not isinstance(meta.get('ref_sample_text'), str) or not meta['ref_sample_text'].strip():
-                raise ValueError('ref_sample_text missing from training_meta.json')
-            if 'checkpoint_sha256' in meta and meta['checkpoint_sha256'] != get_file_sha256(os.path.join(snapshot, 'adapter_model.safetensors')):
-                raise ValueError('Adapter metadata does not match its weights')
-            if 'reference_audio_sha256' in meta and meta['reference_audio_sha256'] != get_file_sha256(os.path.join(snapshot, 'ref_sample.wav')):
-                raise ValueError('Adapter metadata does not match its reference audio')
+            meta = get_adapter_serving_metadata(snapshot)
             model = self._init_local_lora(snapshot, generation_sha256=generation, source_adapter_path=adapter_path)
             prompt = self._ensure_lora_prompt(snapshot, model, meta['ref_sample_text'], generation_sha256=generation, source_adapter_path=adapter_path)
             # A provider must not mutate the captured serving evidence while loading.

@@ -17,13 +17,9 @@ from adapter_publication import (CHECKPOINT_SWAP_JOURNAL, get_adapter_bundle_sha
                                  get_adapter_publication_recovery_command, get_adapter_publication_owner,
                                  save_adapter_publication_bytes, sync_adapter_directory,
                                  sync_adapter_tree)
-from lora_evidence import get_file_sha256
+from lora_evidence import GENERATION_FILES, get_adapter_generation_sha256, get_file_sha256
 from utils import file_lock
 from voice_manifest import get_resolved_adapter_path_locked
-
-GENERATION_FILES = ('adapter_config.json', 'adapter_model.safetensors',
-                    'ref_sample.wav', 'training_meta.json')
-
 
 def get_adapter_checkpoint_journal(adapter_dir):
     return get_adapter_checkpoint_generation_journal(adapter_dir)
@@ -204,17 +200,32 @@ def validate_adapter_checkpoint_generation(adapter_dir):
     return meta
 
 
-def get_adapter_generation_sha256(adapter_dir):
-    """Identify the exact served config, weights, reference audio and metadata."""
-    rows = [(name, get_file_sha256(str(Path(adapter_dir) / name))) for name in GENERATION_FILES]
-    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+def get_adapter_serving_metadata(adapter_dir, max_metadata_bytes=None):
+    """Read the serving transcript and verify any declared artifact identities."""
+    adapter = Path(adapter_dir)
+    with (adapter / 'training_meta.json').open('rb') as handle:
+        if max_metadata_bytes is not None and os.fstat(handle.fileno()).st_size > max_metadata_bytes:
+            raise ValueError('Adapter metadata exceeds the byte limit')
+        content = handle.read() if max_metadata_bytes is None else handle.read(max_metadata_bytes + 1)
+    if max_metadata_bytes is not None and len(content) > max_metadata_bytes:
+        raise ValueError('Adapter metadata exceeds the byte limit')
+    meta = json.loads(content.decode('utf-8'))
+    if not isinstance(meta, dict) or not isinstance(meta.get('ref_sample_text'), str) or not meta['ref_sample_text'].strip():
+        raise ValueError('ref_sample_text missing from training_meta.json')
+    if 'checkpoint_sha256' in meta and meta['checkpoint_sha256'] != get_file_sha256(str(adapter / 'adapter_model.safetensors')):
+        raise ValueError('Adapter metadata does not match its weights')
+    if 'reference_audio_sha256' in meta and meta['reference_audio_sha256'] != get_file_sha256(str(adapter / 'ref_sample.wav')):
+        raise ValueError('Adapter metadata does not match its reference audio')
+    return meta
 
 
 @contextlib.contextmanager
-def ensure_adapter_generation_snapshot(adapter_dir):
+def ensure_adapter_generation_snapshot(adapter_dir, *, validate=False):
     """Capture serving bytes under admission, then release before slow model loads."""
     with tempfile.TemporaryDirectory(prefix='alexandria-lora-generation-') as temporary:
         with ensure_adapter_checkpoint(adapter_dir) as adapter:
+            if validate:
+                validate_adapter_checkpoint_generation(adapter)
             generation = get_adapter_generation_sha256(adapter)
             for name in GENERATION_FILES:
                 shutil.copy2(adapter / name, Path(temporary) / name)
