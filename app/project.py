@@ -14,7 +14,8 @@ import logging
 import gc
 import uuid
 from script_repair import EXPLICIT_SILENCE_MS
-from speech_policy import get_spoken_symbol, get_scene_break_text
+from speech_policy import (get_spoken_symbol, get_spoken_word_text,
+                           get_spoken_text_spacing, get_scene_break_text)
 from verbalization import (SET_APART_HINT, classify,
                            extract_delivery_cues, is_pictographic_kana,
                            split_bracketed_spans)
@@ -36,7 +37,8 @@ from tts import (
     voice_category,
     DEFAULT_PAUSE_MS,
     SAME_SPEAKER_PAUSE_MS,
-                 voice_config_for_chunk, resolve_narrator_voice_config)
+                 voice_config_for_chunk, resolve_narrator_voice_config, get_resolved_speaker,
+                 get_chunk_voice_inputs)
 from pydub import AudioSegment
 from audio_assembly import AudioSegmentBuilder
 from audio_streaming import (get_track_wav_plan, write_track_wav, write_combined_wav,
@@ -80,6 +82,12 @@ def get_chapter_reuse_duration(plan, old, wanted, changed_only, out_dir):
 def get_chunk_generation_inputs(chunk):
     """Fields whose changes make a captured render obsolete."""
     return {field: chunk[field] for field in CHUNK_GENERATION_FIELDS if field in chunk}
+
+
+def get_narrator_generation_context(entry):
+    """Copy the supported narrator-selection fields for chunk rebuilding."""
+    return {field: copy.deepcopy(entry[field]) for field in NARRATOR_GENERATION_FIELDS
+            if field in entry}
 
 
 def get_chunk_generation_requests(chunks, indices, admitted_requests=None):
@@ -131,13 +139,15 @@ def _is_structural_text(text, max_length=80):
     return False
 
 
-def _make_chunk(speaker, text, instruct, pause_after=None, source_indices=None):
+def _make_chunk(speaker, text, instruct, pause_after=None, source_indices=None,
+                narrator_context=None):
     """Build a chunk dict, omitting pause_after when None for clean JSON."""
     chunk = {"speaker": speaker, "text": text, "instruct": instruct}
     if pause_after is not None:
         chunk["pause_after"] = pause_after
     if source_indices is not None:
         chunk["source_entry_indices"] = list(source_indices)
+    chunk.update(copy.deepcopy(narrator_context or {}))
     return chunk
 
 
@@ -162,13 +172,15 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
         if classify(char) == "review" or is_pictographic_kana(char, neighbours):
             review.append(char)
     segments, current = [], []
+    has_renderings = False
     for char in text:
         kind = classify(char)
         if kind == "scene_break":
             segments.append("".join(current))
             current = []
         elif kind == "verbalize":
-            current.append(get_spoken_symbol(char))
+            has_renderings = True
+            current.append(get_spoken_word_text(get_spoken_symbol(char)))
         else:
             current.append(char)
     segments.append("".join(current))
@@ -184,6 +196,8 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
             if set_apart:
                 hints = hints + [SET_APART_HINT]
             cleaned = " ".join(cleaned.split()) if cleaned.strip() else ""
+            if has_renderings:
+                cleaned, _ = get_spoken_text_spacing(cleaned)
             if not cleaned:
                 continue
             part = dict(entry)
@@ -301,11 +315,13 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
     current_instruct = script_entries[0].get("instruct", "")
     current_pause_after = script_entries[0].get("pause_after")
     current_indices = script_entries[0].get("_source_entry_indices") if include_source_indices else None
+    current_context = get_narrator_generation_context(script_entries[0])
 
     for entry in script_entries[1:]:
         speaker = get_speaker(entry)
         text = entry.get("text", "")
         instruct = entry.get("instruct", "")
+        narrator_context = get_narrator_generation_context(entry)
 
         # Don't merge structural text (titles, chapter headings, dedications),
         # and never merge past a pending pause: pause_after belongs to the
@@ -314,6 +330,7 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
         # paragraph then played its pause after both sentences instead of
         # between them, which is not audible as a break at all.
         if (speaker == current_speaker and instruct == current_instruct
+                and narrator_context == current_context
                 and current_pause_after is None
                 and not _is_structural_text(current_text)
                 and not _is_structural_text(text)):
@@ -325,21 +342,23 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                 # Last merged entry's pause_after wins
                 current_pause_after = entry.get("pause_after", current_pause_after)
             else:
-                chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after, current_indices))
+                chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after, current_indices, current_context))
                 current_text = text
                 current_indices = entry["_source_entry_indices"] if include_source_indices else None
                 current_instruct = instruct
                 current_pause_after = entry.get("pause_after")
+                current_context = narrator_context
         else:
-            chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after, current_indices))
+            chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after, current_indices, current_context))
             current_speaker = speaker
             current_indices = entry["_source_entry_indices"] if include_source_indices else None
             current_text = text
             current_instruct = instruct
             current_pause_after = entry.get("pause_after")
+            current_context = narrator_context
 
     # Don't forget the last chunk
-    chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after, current_indices))
+    chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after, current_indices, current_context))
 
     bounded = []
     for chunk in chunks:
@@ -661,52 +680,12 @@ class ProjectManager:
         return self._status_journal
 
     def _resolve_alias(self, speaker, voice_config):
-        """Resolve speaker aliases by following `alias_of` chain in voice_config.
-
-        Prevent infinite loops by limiting chain length.
-        Returns the canonical speaker name (string).
-        """
-        if not speaker:
-            return speaker
-        name = speaker
-        seen = set()
-        for _ in range(16):  # Increased from 8 to handle longer alias chains
-            if name in seen:
-                logger.warning(f"Alias cycle detected for speaker '{speaker}': chain visited {seen}")
-                break
-            seen.add(name)
-            entry = voice_config.get(name, {})
-            alias = entry.get('alias_of') or entry.get('alias')
-            if not alias:
-                break
-            # If alias is empty or same, stop
-            if not isinstance(alias, str) or alias.strip() == '' or alias == name:
-                break
-            # Continue resolution
-            name = alias
-        else:
-            # Loop completed without break - chain exceeded limit
-            logger.warning(f"Alias chain for '{speaker}' exceeded 16 iterations; using last resolved name '{name}'")
-        return name
+        """Use the same alias dispatch as single and ensemble generation."""
+        return get_resolved_speaker(speaker, voice_config)
 
     def get_chunk_voice_inputs(self, voices, chunk, index):
         """Read the effective TTS inputs, including aliases and ensemble members."""
-        speaker = self._resolve_alias(chunk.get("speaker"), voices)
-        effective = voice_config_for_chunk(
-            resolve_narrator_voice_config(speaker, voices, chunk), speaker, index)
-        fields = ("type", "voice", "character_style", "default_style", "seed",
-                  "ref_audio", "ref_text", "description", "adapter_id", "adapter_path",
-                  "adapter_generation_sha256", "members")
-        inputs, pending = {}, [speaker]
-        while pending:
-            name = pending.pop()
-            if name in inputs:
-                continue
-            config = effective.get(name) or {}
-            inputs[name] = {field: copy.deepcopy(config.get(field)) for field in fields}
-            if voice_category(config) == "ensemble":
-                pending.extend(member for member in config.get("members") or [] if isinstance(member, str))
-        return inputs
+        return get_chunk_voice_inputs(voices, chunk, index, resolve_alias=self._resolve_alias)
 
     def _apply_voice_timeline_audio_invalidation_locked(self, before, after):
         """Caller holds chunk locks through the subsequent voice-config write.
@@ -1062,7 +1041,8 @@ class ProjectManager:
             # the identity anchor in force at this line (a character can change
             # from a point in the book - tts.active_character_style)
             generation_args = (text, instruct, speaker_to_use,
-                voice_config_for_chunk(voice_config, speaker_to_use, index), temp_path)
+                voice_config_for_chunk(resolve_narrator_voice_config(
+                    speaker_to_use, voice_config, chunk), speaker_to_use, index), temp_path)
             failure = None
             if callable(getattr(engine, "generate_voice_result", None)):
                 result = engine.generate_voice_result(*generation_args)
@@ -2213,9 +2193,7 @@ class ProjectManager:
                     # Preserve narrator-selection metadata through the
                     # project boundary; the TTS engine uses these fields to
                     # resolve focus/chapter/gender strategies per chunk.
-                    for field in NARRATOR_GENERATION_FIELDS:
-                        if field in chunk:
-                            batch_chunk[field] = chunk[field]
+                    batch_chunk.update(get_narrator_generation_context(chunk))
                     batch_chunks.append(batch_chunk)
 
             # Call batch TTS with single seed. If stale-output cleanup rejected
