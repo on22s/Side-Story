@@ -7293,8 +7293,10 @@
 
         window.generateChunk = async (id) => {
             try {
+                const context = captureChunkMutation(id);
                 // First, save any pending edits in this row
                 await saveRowEdits(id);
+                if (!context.isCurrent()) { throw new Error('Active book changed; restart rendering for the current book.'); }
 
                 // Skip empty lines
                 const tr = document.querySelector(`tr[data-id="${id}"]`);
@@ -7325,7 +7327,7 @@
                     }
                 }
 
-                await API.post(`/api/chunks/${id}/generate`, {});
+                await API.post(`/api/chunks/${id}/generate?${context.query}`, {});
 
                 // Start polling with incremental updates (no full redraw)
                 setTimeout(() => loadChunks(false), 1000);
@@ -7368,6 +7370,7 @@
         // template). See FIXED.md F-065.
         async function _runBatchRender(endpoint, regenerateAll, { label, describeStart }) {
             const batchBook = currentBookFilename;
+            const batchToken = chunkSnapshotBookToken;
             let rowsMarked = false;
             isRenderingAll = true;
             document.getElementById('btn-batch-fast').style.display = 'none';
@@ -7375,6 +7378,7 @@
             document.getElementById('btn-cancel-render').style.display = 'inline-block';
 
             try {
+                if (!batchToken || chunkSnapshotBook !== batchBook) { throw new Error('Reload the Editor before rendering.'); }
                 const chunks = await ensureEditorRenderSnapshot();
                 await refreshDeliveryReview();
                 let toProcess = (regenerateAll ? chunks : chunks.filter(c => c.status !== 'done'))
@@ -7400,7 +7404,7 @@
                     toProcess = freshChunks.filter(c => c.text && c.text.trim());
                 }
 
-                if (batchBook !== currentBookFilename) {
+                if (batchBook !== currentBookFilename || batchToken !== chunkSnapshotBookToken) {
                     throw new Error('Active book changed; restart rendering for the current book.');
                 }
                 rowsMarked = true;
@@ -7419,7 +7423,10 @@
                     }
                 }
 
-                const response = await API.post(endpoint, { indices });
+                const response = await API.post(endpoint, {
+                    indices, expected_book_token: batchToken,
+                    expected_uids: toProcess.map(chunk => chunk.uid)
+                });
                 console.log(`${label} started: ${describeStart(response)}`);
 
                 // Poll for completion via the shared engine - gets the
@@ -7439,7 +7446,7 @@
                         document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
                         cancelRender(true);
 
-                        if (batchBook !== currentBookFilename) {
+                        if (batchBook !== currentBookFilename || batchToken !== chunkSnapshotBookToken) {
                             showToast('Render finished for a previous book. Open that book to check its audio.', 'warning');
                             return;
                         }
