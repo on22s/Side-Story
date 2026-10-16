@@ -127,6 +127,29 @@ def merge_provider_extra_body(provider_extra_body, request_extra_body):
     return merged
 
 
+OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens")
+
+
+def get_bounded_output_request(kwargs):
+    """Return request options whose body overrides cannot raise the typed output budget.
+
+    The OpenAI SDK applies extra_body after typed parameters, so a provider or
+    request body carrying max_tokens/max_completion_tokens would otherwise
+    replace the task's checked limit on the wire. Body values may lower it.
+    """
+    body = dict(kwargs.get("extra_body") or {})
+    body_budgets = [body.pop(key) for key in OUTPUT_LIMIT_KEYS if key in body]
+    typed_key = next((key for key in OUTPUT_LIMIT_KEYS if kwargs.get(key) is not None), None)
+    if not body_budgets or typed_key is None:
+        return kwargs
+    for value in body_budgets:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("Request output budget must be a positive integer")
+    result = dict(kwargs, extra_body=body)
+    result[typed_key] = min([kwargs[typed_key]] + body_budgets)
+    return result
+
+
 def classify_llm_error(error):
     """Classify a failed provider request for retry policy and recovery logs."""
     status_code = getattr(error, "status_code", None)
@@ -204,6 +227,7 @@ class _ConfiguredCompletions:
         }
         kwargs["extra_body"] = merge_provider_extra_body(
             provider_extra_body, kwargs.get("extra_body"))
+        kwargs = get_bounded_output_request(kwargs)
         return self._completions.create(*args, **adapt_request_for_reasoning_model(kwargs))
 
     def __getattr__(self, name):

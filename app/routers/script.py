@@ -51,6 +51,7 @@ from three_pass_generate import (build_attribute_request,
                                  get_three_pass_preflight_capacity,
                                  get_context_rescue_windows,
                                  is_three_pass_context_required,
+                                 LARGE_CONTEXT_CHARS,
                                  validate_instruct_context_chars,
                                  apply_segment_gate_controls,
                                  default_instruct,
@@ -2322,12 +2323,7 @@ def get_batch_script_source_preflight(job, text, settings, context, context_wind
 def build_batch_script_preflight(jobs):
     """Build the shared read-only sizing report used by the UI and dispatcher."""
     config = load_app_config(CONFIG_PATH)
-    llm = get_active_llm_config(config)
-    status = get_planned_ideal_settings(
-        config.get("llm_mode", "local"), llm.get("base_url", ""),
-        llm.get("model_name", ""), config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
-    parallel = max(1, int(status.get("parallel") or 1))
-    context = int(status.get("context_length") or 0)
+    parallel, context = get_planned_llm_capacity(config)
     generation = config.get("generation") or {}
     settings = resolve_three_pass_generation_settings(config)
     context_windows = generation.get("context_rescue_windows")
@@ -2375,19 +2371,56 @@ def build_batch_script_preflight(jobs):
 UNQUOTED_BOOK_THRESHOLD = 0.5
 
 
-def three_pass_refusal(jobs):
+def get_planned_llm_capacity(config):
+    """-> (parallel, context_length) the active LLM profile will run with;
+    context_length is 0 when the server does not report it."""
+    llm = get_active_llm_config(config)
+    status = get_planned_ideal_settings(
+        config.get("llm_mode", "local"), llm.get("base_url", ""),
+        llm.get("model_name", ""), config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
+    return max(1, int(status.get("parallel") or 1)), int(status.get("context_length") or 0)
+
+
+def get_three_pass_admission_context(config, settings):
+    """-> (context_length, refusal) for one admission snapshot. Probes model
+    capacity only when the configured request sizes need it."""
+    if not is_three_pass_context_required(
+            settings["chunk_size"], settings["attribute_context_chars"],
+            settings["attribute_target_chars"], settings["instruct_target_chars"],
+            settings["instruct_context_chars"]):
+        return 0, None
+    try:
+        _, context = get_planned_llm_capacity(config)
+    except Exception as error:
+        if settings["instruct_context_chars"] > LARGE_CONTEXT_CHARS:
+            return 0, ("Could not determine model context for Step 3 extra text. "
+                       "Check the endpoint before retrying.")
+        # Preserve the earlier admission deferral for the preexisting controls.
+        print(f"Context admission skipped; the run will check it: {type(error).__name__}: {error}")
+        return 0, None
+    if not context:
+        return 0, ("Larger requests require a known model context. Use a server "
+                   "that reports its loaded context length.")
+    return context, None
+
+
+def three_pass_refusal(jobs, *, config=None, settings=None, admission=None):
     """-> the 400 message that stops a single or batch run before it starts,
     or None. One helper for both routes so they cannot drift (Rule 15):
-    first the output-ceiling check, then the quotes-only check. Needs no
-    server status - only the configured settings and the source text."""
-    config = load_app_config(CONFIG_PATH)
-    settings = resolve_three_pass_generation_settings(config)
+    read runtime context for larger requests, then check output ceilings
+    and quote coverage against the configured settings and source text."""
+    config = load_app_config(CONFIG_PATH) if config is None else config
+    settings = resolve_three_pass_generation_settings(config) if settings is None else settings
     context_windows = (config.get("generation") or {}).get("context_rescue_windows")
+    context, refusal = (get_three_pass_admission_context(config, settings)
+                        if admission is None else admission)
+    if refusal:
+        return refusal
     reports = []
     for job in jobs:
         text, _ = get_validated_batch_script_source(job)
         reports.append((job["filename"], get_batch_script_source_preflight(
-            job, text, settings, 0, context_windows)))
+            job, text, settings, context, context_windows)))
     return (output_ceiling_refusal(settings, reports)
             or unquoted_book_refusal(settings, reports))
 
