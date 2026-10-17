@@ -5,9 +5,8 @@ Thanks for your interest in contributing! Here are a few guidelines to help PRs 
 ## Branch Workflow
 
 - **`main`** is the stable release branch. Users install from `main`.
-- **`dev`** is the integration branch where new features land first.
 
-**All pull requests must target the `dev` branch, not `main`.** PRs targeting `main` will be asked to retarget.
+All pull requests target `main`.
 
 ## PR Guidelines
 
@@ -59,8 +58,8 @@ If your PR modifies or adds API endpoints, add corresponding tests to `test_api.
 
 ## Getting Started
 
-1. Fork the repo and create a feature branch from `dev`
+1. Fork the repo and create a feature branch from `main`
 2. Make your changes
 3. Run `python test_api.py` and verify tests pass
 4. Test manually by restarting the app
-5. Open a PR targeting `dev`
+5. Open a PR targeting `main`
