@@ -45,6 +45,17 @@ from audio_streaming import (get_track_wav_plan, write_track_wav, write_combined
                              get_streamable_layout)
 
 MAX_CHUNK_CHARS = 500
+CHAPTER_HEADING_RE = re.compile(
+    r'^(chapter|part|book|volume|prologue|epilogue|introduction|conclusion|act|section)\b',
+    re.IGNORECASE
+)
+NUMBERED_HEADING_SUFFIX_RE = re.compile(r'\s+(?:[0-9]+|[ivxlcdm]+)[.!?。！？]?$', re.IGNORECASE)
+CHAPTER_CONTEXT_PAIRS = {
+    '(': ')', '[': ']', '{': '}', '<': '>',
+    '“': '”', '‘': '’', '«': '»', '「': '」', '『': '』',
+}
+CHAPTER_CONTEXT_CLOSERS = frozenset(CHAPTER_CONTEXT_PAIRS.values())
+CHAPTER_QUOTE_EDGE_RE = re.compile(r"(?<!\w)['‘]|['’](?!\w)")
 NARRATOR_GENERATION_FIELDS = (
     "focus_speaker", "character_focus", "narrator_version", "chapter_narrator_version",
     "narrator_gender", "focus_gender", "narrator_age_group", "focus_age_group")
@@ -127,10 +138,60 @@ def get_speaker(entry):
     return entry.get("speaker") or entry.get("type") or ""
 
 
+def is_numbered_heading(text):
+    heading = CHAPTER_HEADING_RE.match(text)
+    return bool(heading and NUMBERED_HEADING_SUFFIX_RE.fullmatch(text[heading.end():]))
+
+
+def is_apostrophe(text, position, stack):
+    """True for a ' or ’ that is an apostrophe, not a quote: an elision before a
+    digit ("the '90s") or a word-final possessive ("James'", "dogs’") that has no
+    open single quote to close."""
+    char = text[position]
+    if char not in "'’":
+        return False
+    before = text[position - 1] if position else ""
+    after = text[position + 1] if position + 1 < len(text) else ""
+    before_is_word = bool(before) and (before.isalnum() or before == "_")
+    after_is_word = bool(after) and (after.isalnum() or after == "_")
+    if after.isdigit() and not before_is_word:
+        return True
+    return before_is_word and not after_is_word and not (stack and stack[-1] == char)
+
+
+def is_chapter_line_context_unambiguous(text):
+    """Defer rows with enclosed headings or unbalanced delimiter context."""
+    stack = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if is_numbered_heading(line.strip()) and stack:
+            return False
+        for position, char in enumerate(line, offset):
+            if is_apostrophe(text, position, stack):
+                continue
+            if char in "'‘’" and not CHAPTER_QUOTE_EDGE_RE.match(text, position):
+                continue
+            if char in ('"', "'"):
+                if stack and stack[-1] == char:
+                    stack.pop()
+                else:
+                    stack.append(char)
+            elif char in CHAPTER_CONTEXT_PAIRS:
+                stack.append(CHAPTER_CONTEXT_PAIRS[char])
+            elif char in CHAPTER_CONTEXT_CLOSERS:
+                if not stack or stack[-1] != char:
+                    return False
+                stack.pop()
+        offset += len(line)
+    return not stack
+
+
 def _is_structural_text(text, max_length=80):
     """Check if text is a title, chapter heading, dedication, or other structural fragment."""
     stripped = text.strip()
     if not stripped:
+        return True
+    if is_numbered_heading(stripped):
         return True
     sentence = stripped.rstrip('\"\'”’»」』)）]】')
     # Very short and not a full sentence (no sentence-ending punctuation)
@@ -165,7 +226,11 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
     # box-drawing characters, so it is folded to a scene-break glyph before
     # classification. Done first because each emoji is category So on its own
     # and would otherwise be reported for review one character at a time.
-    text = get_scene_break_text(str(entry.get("text") or ""))
+    original_text = str(entry.get("text") or "")
+    split_chapters = (str(get_speaker(entry)).upper() == "NARRATOR"
+                      and entry.get("spoken") is not True
+                      and is_chapter_line_context_unambiguous(original_text))
+    text = get_scene_break_text(original_text)
     review = []
     for position, char in enumerate(text):
         neighbours = text[max(0, position - 2):position] + text[position + 1:position + 3]
@@ -195,17 +260,23 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
             cleaned, hints = extract_delivery_cues(fragment)
             if set_apart:
                 hints = hints + [SET_APART_HINT]
-            cleaned = " ".join(cleaned.split()) if cleaned.strip() else ""
-            if has_renderings:
-                cleaned, _ = get_spoken_text_spacing(cleaned)
-            if not cleaned:
-                continue
-            part = dict(entry)
-            part["text"] = cleaned
-            if hints:
-                existing = str(part.get("instruct") or "").strip()
-                part["instruct"] = " ".join(filter(None, [existing] + hints))
-            segment_parts.append(part)
+            text_parts = (get_chapter_text_parts(cleaned)
+                          if split_chapters and not set_apart else [cleaned])
+            for part_index, text_part in enumerate(text_parts):
+                cleaned_part = " ".join(text_part.split()) if text_part.strip() else ""
+                if has_renderings:
+                    cleaned_part, _ = get_spoken_text_spacing(cleaned_part)
+                if not cleaned_part:
+                    continue
+                part = dict(entry)
+                # The entry's own pause_after is the silence after the whole entry,
+                # so only its last part carries it (added below), not every part.
+                part.pop("pause_after", None)
+                part["text"] = cleaned_part
+                if hints:
+                    existing = str(part.get("instruct") or "").strip()
+                    part["instruct"] = " ".join(filter(None, [existing] + hints))
+                segment_parts.append(part)
 
         if not segment_parts:
             # A scene break with nothing before it has no audio anchor to
@@ -222,6 +293,9 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
                 scene_break_pause_ms)
         parts.extend(segment_parts)
 
+    if parts and entry.get("pause_after") is not None:
+        parts[-1]["pause_after"] = max(int(parts[-1].get("pause_after") or 0),
+                                       int(entry["pause_after"]))
     return parts, review
 
 
@@ -242,6 +316,30 @@ def log_review_characters(review):
         for character, indexes in sorted(counts.items()))
     logger.warning(
         "Unmapped symbols left in TTS text and needing review: %s", summary)
+
+
+def get_chapter_text_parts(text):
+    """Keep prepared heading lines without isolating nonverbal-only pieces."""
+    parts = []
+    offset = start = 0
+    for line in text.splitlines(keepends=True):
+        if is_numbered_heading(line.strip()):
+            if text[start:offset].strip():
+                parts.append(text[start:offset])
+            parts.append(line)
+            start = offset + len(line)
+        offset += len(line)
+    if not parts:
+        return [text]
+    if text[start:].strip():
+        parts.append(text[start:])
+    joined = []
+    for part in parts:
+        if joined and (is_nonverbal_text(part) or is_nonverbal_text(joined[-1])):
+            joined[-1] += part
+        else:
+            joined.append(part)
+    return joined
 
 
 def get_speakable_entries(script_entries, review_sink=None):
@@ -1445,14 +1543,6 @@ class ProjectManager:
         text = text.replace("\r", " ")  # CRLF (e.g. pasted description) would else corrupt the key=value line
         return text
 
-    # Regex for detecting chapter/section headings in chunk text
-    _HEADING_RE = re.compile(
-        r'^(chapter|part|book|volume|prologue|epilogue|introduction|conclusion|act|section)\b',
-        re.IGNORECASE
-    )
-
-    _HEADING_LABEL_RE = re.compile(r'\s+(?:[0-9]+|[ivxlcdm]+)[.!?。！？]?$', re.IGNORECASE)
-
     def _chapter_groups(self, chunks, per_chunk_chapters):
         """Chapter boundaries from headings and narrator fragments: list of
         (title, first_index, last_index) over `chunks`. The one place chapter
@@ -1467,8 +1557,8 @@ class ProjectManager:
         heading_indices = []
         for i, chunk in enumerate(chunks):
             text = chunk.get("text", "").strip()
-            heading = self._HEADING_RE.match(text)
-            numbered_heading = heading and self._HEADING_LABEL_RE.fullmatch(text[heading.end():])
+            heading = CHAPTER_HEADING_RE.match(text)
+            numbered_heading = is_numbered_heading(text)
             # Preserve explicit headings and unquoted narrator titles, while
             # keeping short dialogue and complete sentences in their chapter.
             if (get_speaker(chunk).upper() == "NARRATOR" and text
