@@ -126,6 +126,9 @@ def get_benchmark_execution_environment(manifest, environment, config):
                 "review_system_prompt", "review_user_prompt")
             prompts = config.get("prompts") or {}
             identity["prompts"] = {key: prompts.get(key) for key in prompt_keys}
+            if stage == "script_review":
+                from completed_review_receipt import REVIEW_ALGORITHM_VERSION
+                identity["review_algorithm"] = REVIEW_ALGORITHM_VERSION
     if stage in {"tts_generation", "dataset_builder"}:
         identity["tts"] = config.get("tts") or {}
     result = copy.deepcopy(environment)
