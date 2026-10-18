@@ -5540,6 +5540,7 @@
             } catch (e) { if (!isCastApplyContextCurrent(context)) { return; } setCastStatus(escapeHtml(getActionErrorMessage("Matching cast voices failed", e, "Check the selected cast and current book, then reopen Apply cast.")), true); renderCastMembers(); return; }
 
             if (!isCastApplyContextCurrent(context)) { return; }
+            context.matchBookToken = res.book_token;
             const pool = _getCastMatchPool();
             const anyMatch = res.proposals.some(p => p.match);
             const rows = _renderCastMatchRows(res.proposals, pool);
@@ -5595,7 +5596,7 @@
             const mapping = _collectCastApplyMapping();
             if (!Object.keys(mapping).length) { setCastStatus('Nothing selected to apply.', true); return; }
             try {
-                const res = await API.post('/api/voice_library/apply', { cast: context.cast, mapping });
+                const res = await API.post('/api/voice_library/apply', { cast: context.cast, mapping, book_token: context.matchBookToken });
                 if (!isCastApplyContextCurrent(context)) { return; }
                 setCastStatus(`<i class="fas fa-check text-success me-1"></i>Applied ${res.count} voice${res.count !== 1 ? 's' : ''}${getCastApplyWarningsHtml(res.warnings)}`);
                 await loadVoices();  // re-render cards with the applied configs
@@ -6879,7 +6880,7 @@
                         `<button class="btn btn-sm btn-primary" onclick="generateChunk(${chunk.id})"><i class="fas fa-play"></i> Gen</button>`;
 
                     return `
-                        <tr data-id="${chunk.id}" class="chunk-row">
+                        <tr data-id="${chunk.id}" data-uid="${escapeHtml(chunk.uid)}" data-book-token="${escapeHtml(snapshot.book_token)}" class="chunk-row">
                             <td class="text-center align-middle" style="white-space:nowrap;">
                                 <button class="chunk-action-btn chunk-toggle-btn" onclick="toggleChunkExpand(this)" title="Expand/collapse"><i class="fas fa-chevron-down"></i></button><button class="chunk-action-btn" onclick="insertChunkAfter(${chunk.id})" title="Insert line below"><i class="fas fa-plus"></i></button><button class="chunk-action-btn" onclick="deleteChunk(${chunk.id})" title="Delete line"><i class="fas fa-trash" style="color:#dc3545;"></i></button><button class="chunk-action-btn" onclick="voiceChangesHere(${chunk.id})" title="Voice changes here: from this line on, this character sounds different (time skip, older)"><i class="fas fa-user-clock"></i></button>
                             </td>
