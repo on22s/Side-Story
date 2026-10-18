@@ -698,6 +698,18 @@ class LLMGenParams:
     literal_source_preserving: bool = False
     # Experimental review transport; full-text boundary editing remains default.
     review_labels_only: bool = False
+    # Pure resolver(params, profile_bound=False), refreshed after profile changes.
+    request_params_resolver: object = field(default=None, repr=False, compare=False)
+    reasoning_reservation: dict = field(default=None, repr=False, compare=False)
+    # Pass 2's user template from a default-shaped attribution preset. Its own
+    # field because user_prompt_template is the Pass 1/3 fallback, and a
+    # {roster}/{batch} template there crashed Pass 1 with KeyError 'roster'.
+    # compare=False: review receipts compare params, and review never sets it.
+    attribute_user_prompt_template: str = field(default=None, compare=False)
+    # Shared live run-capability state, like schema_rejected_by; replace()
+    # callers intentionally see the same endpoint-specific negotiation result.
+    ordered_schema_rejected_by: set = field(default_factory=set, repr=False,
+                                            compare=False)
 
 
 
@@ -740,17 +752,21 @@ def redact_recovery_value(value, key=None):
     return value
 
 
-def get_response_format(params, client):
-    """-> the OpenAI-style response_format for this call, or None."""
+def get_response_format(params, client, *, portable=True):
+    """Return a portable response_format; positional schemas require explicit opt-in."""
     if params.structured_output == "off" or not params.response_schema:
         return None
     if str(getattr(client, "base_url", "")) in getattr(
             params, "schema_rejected_by", set()):
         return None
+    endpoint = str(getattr(client, "base_url", ""))
+    schema = params.response_schema["schema"]
+    if not portable and endpoint not in getattr(params, "ordered_schema_rejected_by", set()):
+        schema = params.response_schema.get("ordered_schema", schema)
     return {"type": "json_schema",
             "json_schema": {"name": params.response_schema.get("name", "entries"),
                             "strict": True,
-                            "schema": params.response_schema["schema"]}}
+                            "schema": schema}}
 
 
 def is_schema_rejection(error):
@@ -764,6 +780,15 @@ def is_schema_rejection(error):
     if status not in (400, 422):
         return False
     text = str(error).lower()
+    # Gateways may prefix an explicit feature rejection with "Invalid schema".
+    # Match the rejected response_format itself before checking schema errors.
+    if re.search(r"response_format(?:\.type|\s+type)?\s+(?:is\s+)?"
+                 r"(?:not supported|unsupported|must be one of|must be ['\"]text['\"])", text):
+        return True
+    if any(marker in text for marker in (
+            "invalid schema", "invalid_json_schema", "json schema error",
+            "schema validation error")) or ("schema" in text and "keyword" in text):
+        return False
     # The second list is what a server says when it refuses the FEATURE, as
     # opposed to a bad schema ("JSON schema error at #: ..."). "must be one
     # of" / "but got" is llama.cpp's own wording for a response_format type it
@@ -776,25 +801,55 @@ def is_schema_rejection(error):
                             "unavailable"))
 
 
+def is_ordered_schema_rejection(error):
+    """A tuple-specific 400/422, not an unrelated malformed schema or API error."""
+    if getattr(error, "status_code", None) not in (400, 422):
+        return False
+    text = str(error).lower()
+    if "schema" not in text and "response_format" not in text:
+        return False
+    if "tuple" in text and any(word in text for word in (
+            "unsupported", "not supported", "not allowed")):
+        return True
+    if "prefixitems" in text and any(word in text for word in ("required", "use", "expected")):
+        return True
+    if "items" not in text:
+        return False
+    return (any(word in text for word in ("array", "list", "dict_type"))
+            and any(word in text for word in ("object", "boolean", "dict_type"))
+            and any(word in text for word in (
+                "expected", "must", "not of type", "should", "got", "dict_type")))
+
+
 def create_completion(client, response_format, schema_rejected_by=None,
-                      run_profile_index=None, request_admission=None, **kwargs):
-    """One completion request; if the server rejects the schema, remember
-    that for its base URL and send the same request free-form."""
+                      run_profile_index=None, request_admission=None,
+                      portable_response_format=None, ordered_schema_rejected_by=None,
+                      **kwargs):
+    """Negotiate positional/portable schemas, then the existing feature fallback."""
     endpoint = str(getattr(client, "base_url", ""))
     if isinstance(client, FailoverClient) and run_profile_index is not None:
         endpoint = client.get_profile_base_url(run_profile_index)
         kwargs["_run_profile_index"] = run_profile_index
         kwargs["_request_admission"] = request_admission
-    if response_format:
+    while response_format:
         try:
             return client.chat.completions.create(response_format=response_format, **kwargs)
         except Exception as error:  # noqa: BLE001 - classified below
+            if portable_response_format and is_ordered_schema_rejection(error):
+                if ordered_schema_rejected_by is not None:
+                    ordered_schema_rejected_by.add(endpoint)
+                print("  positional schema rejected; retaining the portable JSON schema "
+                      "for this server for the rest of this run", flush=True)
+                response_format = portable_response_format
+                portable_response_format = None
+                continue
             if not is_schema_rejection(error):
                 raise
             if schema_rejected_by is not None:
                 schema_rejected_by.add(endpoint)
             print(f"  structured output rejected by the server ({error}); "
                   "sending free-form JSON for the rest of this run", flush=True)
+            break
     return client.chat.completions.create(**kwargs)
 
 
@@ -974,11 +1029,12 @@ def ensure_run_request_params(client, params):
     # Only our explicit wrapper owns runtime-profile switching; ordinary SDK
     # clients and in-process providers retain their existing caller settings.
     from llm_provider import FailoverClient
+    resolver = getattr(params, "request_params_resolver", None)
     if not isinstance(client, FailoverClient):
-        return params
+        return resolver(params) if resolver else params
     profile = client.ensure_active_runtime_profile()
     if profile is None:
-        return params
+        return resolver(params) if resolver else params
     config = profile["config"]
     defaults = LLMGenParams()
     changes = {name: config.get(name, getattr(defaults, name)) for name in (
@@ -986,7 +1042,8 @@ def ensure_run_request_params(client, params):
         "retry_initial_delay_seconds", "retry_multiplier", "retry_max_delay_seconds",
         "retry_jitter", "on_api_exhaustion")}
     changes["context_length"] = profile["context_length"]
-    return replace(params, **changes)
+    resolved = replace(params, **changes)
+    return resolver(resolved, profile_bound=True) if resolver else resolved
 
 
 def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
@@ -1077,7 +1134,7 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
             attempt_prompt = user_prompt
             if retry_feedback:
                 attempt_prompt += ("\n\nYour previous response was rejected by deterministic "
-                                   "quality checks. Return the complete source text exactly once. "
+                                   "quality checks. Return the complete result in the required output format. "
                                    f"Failures: {retry_feedback}")
             messages = base_messages if not retry_feedback else [
                 base_messages[0], {"role": "user", "content": attempt_prompt}
@@ -1100,9 +1157,15 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                           f"rejected at temperature 0; further retries cannot "
                           f"differ", flush=True)
                     break
+            response_format = get_response_format(params, client)
+            portable_response_format = get_response_format(params, client, portable=True)
+            if portable_response_format == response_format:
+                portable_response_format = None
             response = create_completion(
-                client, get_response_format(params, client),
+                client, response_format,
                 schema_rejected_by=schema_rejected_by,
+                portable_response_format=portable_response_format,
+                ordered_schema_rejected_by=getattr(params, "ordered_schema_rejected_by", None),
                 run_profile_index=run_profile_index, request_admission=params.request_admission,
                 model=model_name,
                 messages=messages,
@@ -1205,6 +1268,8 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                     "error": None,
                     "response_fingerprint": response_fingerprint,
                     "response_repeat_count": repeat_count,
+                    **({"reasoning_reservation": dict(params.reasoning_reservation)}
+                       if getattr(params, "reasoning_reservation", None) is not None else {}),
                 }
                 if response_log_error is not None:
                     attempt_record["response_log_error"] = response_log_error
@@ -1263,6 +1328,8 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                                   "finish_reason": None, "requested_max_tokens": requested_max,
                                   "effective_max_tokens": None, "prompt_tokens": None,
                                   "completion_tokens": None,
+                                  **({"reasoning_reservation": dict(params.reasoning_reservation)}
+                                     if getattr(params, "reasoning_reservation", None) is not None else {}),
                                   "error": f"{type(e).__name__}: {e}",
                                   "error_category": error_details["category"],
                                   "http_status": error_details["status_code"],

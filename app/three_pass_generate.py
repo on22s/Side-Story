@@ -20,6 +20,7 @@ from core import llm_timeout_seconds
 from source_encoding import read_source_text, get_normalized_source_newlines
 from llm_provider import (make_llm_client, make_run_client, get_run_model_binding,
                           get_run_fingerprint_identity, is_manual_client)
+from llm_request_budget import get_prompt_token_estimate
 
 from judge_reason_log import record_judge_run
 from generate_script import (call_llm_for_entries, split_into_chunks,
@@ -588,7 +589,9 @@ def build_attribute_request(frozen_batch, params, roster,
         sys_prompt = params.attribute_system_prompt
     elif params.system_prompt:
         sys_prompt = params.system_prompt
-    if params.user_prompt_template:
+    if params.attribute_user_prompt_template:
+        usr_template = params.attribute_user_prompt_template
+    elif params.user_prompt_template:
         usr_template = params.user_prompt_template
     neighbor_contexts = neighbor_contexts or [{} for _ in frozen_batch]
     batch_json = json.dumps([
@@ -625,7 +628,7 @@ def wrap_window_surround(user_prompt, surround, instruct=False):
 # What the attribution pass asks the server to constrain replies to, when
 # the profile's structured_output is "auto" (issue #522 s9.1). Validation of
 # the CONTENT (index head check, text freeze, roster membership) is unchanged:
-# the schema only guarantees the shape.
+# the window schema also fixes the already-frozen narration labels.
 ATTRIBUTION_RESPONSE_SCHEMA = {
     "name": "speaker_attribution",
     "schema": {
@@ -638,6 +641,8 @@ ATTRIBUTION_RESPONSE_SCHEMA = {
         },
     },
 }
+
+ATTRIBUTION_SCHEMA_POLICY = "portable_default_frozen_narration_v3"
 
 
 def get_attribution_response_schema(speaker_traits=False, indexes=None):
@@ -655,8 +660,29 @@ def get_attribution_response_schema(speaker_traits=False, indexes=None):
 SPEAKER_MAX_CHARS = 80
 
 
-def get_exact_index_schema(schema, indexes):
-    """`schema` narrowed to one row per index, each `n` drawn from `indexes`.
+def get_exact_index_schema(schema, indexes, *, frozen_entries=None):
+    """Keep the portable schema and offer a positional schema to capable servers.
+
+    Draft-7 tuple items bind every position to one physical source index. The
+    portable schema remains separate so rejecting tuple validation cannot turn
+    off otherwise working structured output. Native validation remains final.
+    """
+    indexes = list(indexes)
+    portable = get_portable_index_schema(
+        {key: value for key, value in schema.items() if key != "ordered_schema"},
+        indexes, frozen_entries=frozen_entries)
+    if indexes:
+        portable["ordered_schema"] = {
+            **portable["schema"],
+            "items": [get_portable_index_schema(portable, [index])["schema"]["items"]
+                      for index in indexes],
+            "additionalItems": False,
+        }
+    return portable
+
+
+def get_portable_index_schema(schema, indexes, *, frozen_entries=None):
+    """Fix the row count and allowed indices without requiring tuple support.
 
     A grammar-constrained server (llama.cpp) then cannot return a wrong row
     count or an out-of-window index. Measured 2026-10-13 on full Alice with
@@ -666,12 +692,45 @@ def get_exact_index_schema(schema, indexes):
     strict-schema providers accept; a server that rejects it falls back for
     the run like any schema rejection. Labels are still the model's.
 
+    With frozen entries, narration indexes can only produce NARRATOR. Each
+    alternative is a complete object schema so grammar converters cannot
+    discard constraints beside an anyOf. Existing alternatives (judge reasons)
+    and sparse index selections retain their own fields.
+
     `speaker` is also capped at SPEAKER_MAX_CHARS: with only the row count
     fixed, a Pass 2 window on a local run (Qwen3-14B, 2026-10-13) answered
     with one name repeated inside a single speaker value until the cap, four
     times, each retry with a larger budget. The longest gold speaker label in any fixture is 52
     characters."""
     indexes = list(indexes)
+    original_items = schema["schema"]["items"]
+    if frozen_entries is not None or "anyOf" in original_items:
+        alternatives = []
+        for item in original_items.get("anyOf", [original_items]):
+            allowed = item["properties"]["n"].get("enum", indexes)
+            selected = [index for index in indexes if index in allowed]
+            groups = [(selected, False)]
+            if frozen_entries is not None:
+                groups = [([index for index in selected
+                            if frozen_entries[index]["type"] == "SPOKEN"], False),
+                          ([index for index in selected
+                            if frozen_entries[index]["type"] != "SPOKEN"], True)]
+            for group, narration in groups:
+                if not group:
+                    continue
+                narrowed = get_portable_index_schema(
+                    {**schema, "schema": {**schema["schema"], "items": item}}, group)
+                narrowed_item = narrowed["schema"]["items"]
+                if narration:
+                    narrowed_item["properties"]["speaker"] = {
+                        **narrowed_item["properties"]["speaker"], "const": "NARRATOR"}
+                alternatives.append(narrowed_item)
+        if indexes and not alternatives:
+            raise ValueError("No attribution schema alternative covers the requested indexes")
+        items = (alternatives[0] if len(alternatives) == 1
+                 else {"anyOf": alternatives} if alternatives else original_items)
+        return {**schema, "schema": {**schema["schema"], "items": items,
+                                     "minItems": len(indexes), "maxItems": len(indexes)}}
     items = dict(schema["schema"]["items"])
     properties = {**items["properties"], "n": {"type": "integer", "enum": indexes}}
     if "speaker" in properties:
@@ -840,8 +899,10 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
     # function safe - validate_attribution's text freeze, the index_head_check
     # binding, the exhaustion path - is shared by any provider, so an
     # alternative attribution strategy cannot quietly skip them. Default None
-    # is the production path, byte-identical to before.
+    # uses the canonical attribution prompt and the same role-bound schema.
     if entries_provider is None:
+        call_params = replace(call_params, response_schema=get_exact_index_schema(
+            call_params.response_schema, range(len(frozen_batch)), frozen_entries=frozen_batch))
         named = call_llm_for_entries(
             client, model_name, sys_prompt, user_prompt, call_params,
             log_name="llm_responses.log", label="ATTRIBUTE",
@@ -1218,15 +1279,18 @@ def _call_segment(client, model_name, chunk, sys_prompt, user_prompt, params,
     if validate is None:
         validate = lambda entries: validate_segment_for_params(
             chunk, entries, params, quote_analysis=quote_analysis)
-    # Segmentation only adds small JSON/type overhead around source text. Bound
-    # both the first request and retry ceiling so a weak model cannot spend
-    # 10k-16k tokens expanding a ~1k-token source chunk.
+    # Include per-line JSON overhead while keeping both requests and retries
+    # bounded, so short lines fit without letting a weak model expand forever.
     source_words = max(1, len(chunk.split()))
     completion_ceiling = resolve_completion_ceiling(
-        source_words, params, reasoning_allowance=params.reasoning_allowance)
+        source_words, params, reasoning_allowance=params.reasoning_allowance,
+        source_text=chunk)
+    completion_ceiling = min(params.request_output_ceiling or completion_ceiling,
+                             completion_ceiling)
     bounded_params = replace(
         params, max_tokens=min(params.max_tokens, completion_ceiling),
         hard_max_tokens=min(params.hard_max_tokens, completion_ceiling),
+        request_output_ceiling=completion_ceiling,
         temperature=(params.segment_temperature
                      if params.segment_temperature is not None else params.temperature))
     def repair(entries):
@@ -1684,7 +1748,9 @@ def get_segment_chunk_records(source_text, chunk_size, params):
     while True:
         records = split_into_chunk_records(source_text, max_size=size)
         if all(does_request_fit_context(system_prompt, user_template.format(chunk=record["text"]),
-                                        sizing_params, resolve_completion_ceiling(len(record["text"].split()), params))
+                                        sizing_params, resolve_completion_ceiling(
+                                            len(record["text"].split()), params,
+                                            source_text=record["text"]))
                for record in records):
             return records
         if size <= 500:
@@ -1810,12 +1876,12 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
     largest_completion = 0
     for chunk in chunks:
         largest_completion = max(largest_completion, resolve_completion_ceiling(
-            max(1, len(chunk.split())), params))
+            max(1, len(chunk.split())), params, source_text=chunk))
     for chunk in unresolved_chunks:
         completion = min(
             int(settings["max_tokens"]),
             resolve_completion_ceiling(
-                max(1, len(chunk.split())), params))
+                max(1, len(chunk.split())), params, source_text=chunk))
         add_request("segment", segment_system,
                     segment_template.format(chunk=chunk), completion)
         windows = context_windows
@@ -2186,6 +2252,9 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
         "collect_all_failures": collect_all_failures,
         # Older checkpoints cannot prove the voting/seed/reasoning controls.
         "pipeline_version": 9,
+        # A free-form primary can fail over to structured output, so bind
+        # the schema policy even when the initial profile has it disabled.
+        "attribution_schema_policy": ATTRIBUTION_SCHEMA_POLICY,
         "attribution_votes": attribution_votes,
         "vote_temperature": vote_temperature,
         "first_person_narrator": normalize_narrator_name(first_person_narrator),
@@ -2770,6 +2839,25 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             # nothing to give it context for.
             if not any(index not in deterministic for index, _ in pending):
                 continue
+            def get_attribute_singletons(request_params, window=tuple(pending)):
+                traits = get_established_traits(named) if speaker_traits else None
+                for index, entry in window:
+                    contexts = get_missing_attribute_contexts(
+                        segmented, [index], attribute_batch_size, attribute_bounds)
+                    surround = build_window_surround(segmented, [index], attribute_context_chars)
+                    if hasattr(entries_provider, "build_request"):
+                        yield entries_provider.build_request(
+                            [entry], request_params, roster, contexts, surround, traits)
+                    else:
+                        yield get_attribute_sizing_request(
+                            [entry], request_params, roster, contexts, surround,
+                            attribute_prompt_variant, attribute_prompt_texts, cast, traits)
+
+            def get_attribute_params(request_params, profile_bound=False):
+                return get_indexed_reasoning_request_params(
+                    request_params, params, get_attribute_singletons, allow_retry_growth=True,
+                    profile_bound=profile_bound)
+
             work = [pending]
             while work:
                 current = work.pop(0)
@@ -2782,7 +2870,10 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                 surround = build_window_surround(
                     segmented, [index for index, _ in current], attribute_context_chars)
                 if attribute_target_chars or attribute_context_chars > 20000:
-                    request_params = ensure_run_request_params(client, params)
+                    request_params = ensure_run_request_params(client, replace(
+                    params, request_params_resolver=get_attribute_params,
+                    reasoning_reservation={"entry_count": len(current),
+                                           "per_entry_tokens": ATTRIBUTE_TOKENS_PER_ENTRY}))
                     system_prompt, user_prompt = get_attribute_sizing_request(
                         batch, request_params, roster, contexts, surround,
                         attribute_prompt_variant, attribute_prompt_texts, cast,
@@ -2807,7 +2898,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                     in_flight["current"], in_flight["attempt_start"] = current, attempt_start
                     exhausted = []
                     new_named, vote_confidences = attribute_batch_voted(
-                        client, model_name, batch, params, roster=roster,
+                        client, model_name, batch, request_params, roster=roster,
                         votes=attribution_votes,
                         vote_temperature=vote_temperature,
                         on_exhaustion=on_exhaustion, keep_scope=keep_scope,
@@ -2931,13 +3022,27 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                    if annotated[index] is None]
         if not pending:
             continue
+        def get_instruct_singletons(request_params, window=tuple(pending)):
+            for index, entry in window:
+                yield build_instruct_request(
+                    [entry], request_params, get_missing_entry_contexts(named, [index]),
+                    build_instruct_surround(named, [index], instruct_context_chars))
+
+        def get_instruct_params(request_params, profile_bound=False):
+            return get_indexed_reasoning_request_params(
+                request_params, params, get_instruct_singletons, allow_retry_growth=False,
+                profile_bound=profile_bound)
+
         work = [pending]
         while work:
             current = work.pop(0)
             batch = [entry for _, entry in current]
             contexts = get_missing_entry_contexts(
                 named, [index for index, _ in current])
-            request_params = ensure_run_request_params(client, params)
+            request_params = ensure_run_request_params(client, replace(
+                params, request_params_resolver=get_instruct_params,
+                reasoning_reservation={"entry_count": len(current),
+                                       "per_entry_tokens": INSTRUCT_TOKENS_PER_ENTRY}))
             validate_instruct_context_chars(instruct_context_chars, request_params)
             indices = [index for index, _ in current]
             surround = build_instruct_surround(named, indices, instruct_context_chars)
@@ -3227,6 +3332,39 @@ INSTRUCT_TOKENS_PER_ENTRY = 160
 INDEX_OUTPUT_FLOOR = 1024
 
 
+def get_indexed_reasoning_request_params(request_params, source_params,
+                                        get_singleton_requests, allow_retry_growth,
+                                        profile_bound=False):
+    """Bound applied reasoning by a fixed source window, preserving raw learning."""
+    raw = max(0, int(source_params.reasoning_allowance or 0))
+    if not raw:
+        return replace(request_params, reasoning_allowance=0,
+                       observed_calls=source_params.observed_calls,
+                       reasoning_reservation={**request_params.reasoning_reservation,
+                           "raw": 0, "applied": 0, "limit": None, "scope": "unobserved"})
+    initial = min(source_params.request_initial_max_tokens
+                  or (source_params.task_max_tokens if profile_bound else None)
+                  or source_params.max_tokens,
+                  request_params.hard_max_tokens)
+    budgets = [get_effective_max_tokens(
+        request_params.hard_max_tokens if allow_retry_growth else initial,
+        request_params.context_length,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        request_params.hard_max_tokens, scale_to_context=False,
+        max_input_tokens=request_params.max_input_tokens)
+        for system, user in get_singleton_requests(request_params)]
+    limit = max(0, min(budgets) - INDEX_OUTPUT_FLOOR)
+    metadata = {**request_params.reasoning_reservation,
+                "raw": raw, "applied": min(raw, limit), "limit": limit,
+                "scope": "context" if request_params.context_length else "output_only"}
+    resolved = replace(request_params, reasoning_allowance=metadata["applied"],
+                       observed_calls=source_params.observed_calls,
+                       max_tokens=initial, request_initial_max_tokens=None,
+                       reasoning_reservation=metadata)
+    return bound_index_request_params(resolved, metadata["entry_count"],
+                                      metadata["per_entry_tokens"])
+
+
 def resolve_index_output_ceiling(entry_count, per_entry_tokens, params):
     """Bound a Pass 2/3 request to what its window can need, or None.
 
@@ -3244,21 +3382,31 @@ def resolve_index_output_ceiling(entry_count, per_entry_tokens, params):
 
 def bound_index_request_params(call_params, entry_count, per_entry_tokens):
     """Return call_params with max_tokens capped by resolve_index_output_ceiling."""
+    if getattr(call_params, "request_params_resolver", None):
+        call_params = replace(call_params, reasoning_reservation={
+            **call_params.reasoning_reservation,
+            "entry_count": entry_count, "per_entry_tokens": per_entry_tokens})
     ceiling = resolve_index_output_ceiling(entry_count, per_entry_tokens, call_params)
     if ceiling is None or call_params.max_tokens <= ceiling:
         return call_params
     return replace(call_params, max_tokens=ceiling)
 
 
-def resolve_completion_ceiling(source_words, params, reasoning_allowance=0):
+def resolve_completion_ceiling(source_words, params, reasoning_allowance=0, *,
+                               source_text=None):
     """Bound segmentation output, leaving room for invisible reasoning.
 
-    The visible-output bound is unchanged from the original: it stops a weak
-    model spending 10k-16k tokens expanding a ~1k-token chunk. The reasoning
-    allowance is added on top rather than carved out of it, so a reasoning
-    model gets the same visible budget as everyone else.
+    Keep the word-ratio floor and estimate JSON overhead for line-heavy text.
+    One object per nonblank line is a budgeting surrogate, not a segmentation
+    rule or a tokenizer guarantee. Words-only callers retain their old bound.
+    Reasoning is added once, separately from the visible output allowance.
     """
     visible = max(512, math.ceil(max(1, source_words) * params.segment_output_ratio))
+    if source_text is not None:
+        entries = [{"type": "NARRATOR", "text": line}
+                   for line in source_text.splitlines() if line.strip()]
+        serialized = json.dumps(entries, ensure_ascii=False, indent=2)
+        visible = max(visible, get_prompt_token_estimate([{"content": serialized}]))
     return visible + max(0, int(reasoning_allowance))
 
 
@@ -3541,7 +3689,7 @@ def main():
             attribute_prompt_texts = dict(attribute_prompt_texts, system=params.attribute_system_prompt)
     elif attribute_prompt_texts and attribute_prompt_variant == "default":
         params.attribute_system_prompt = attribute_prompt_texts.get("system") or None
-        params.user_prompt_template = attribute_prompt_texts.get("user") or None
+        params.attribute_user_prompt_template = attribute_prompt_texts.get("user") or None
     client = make_run_client(config, llm, llm_timeout_seconds())
 
     # The CLI flag overrides the Setup switch; neither set means 'line'.
