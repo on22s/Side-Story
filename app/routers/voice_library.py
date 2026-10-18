@@ -8,7 +8,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core import (
     LORA_MODELS_DIR,
@@ -35,7 +35,8 @@ from core import (
     get_trait_assignment_metadata,
 )
 from voice_manifest import get_resolved_adapter_id_mapping
-from book_state_transaction import ensure_book_state
+from routers.voices import _apply_book_voice_update
+from book_state_transaction import ensure_book_state, get_book_snapshot, get_book_snapshot_token
 from utils import atomic_json_write, file_lock, is_generic_speaker, safe_load_json, secure_filename
 
 
@@ -53,6 +54,7 @@ class LibrarySaveRequest(BaseModel):
     cast_specific: Optional[List[str]] = None # subset to force into the cast even if normally shared (e.g. a different narrator)
 
 class LibraryApplyRequest(BaseModel):
+    book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
     cast: str
     mapping: Dict[str, str]                   # current character name -> library member key to apply
 
@@ -307,11 +309,24 @@ def _apply_cast_to_saved_book(name, cast_name, mapping):
             lib, cast_name, mapping, chars=chars, book_id=book_id, require_members=True)
 
 
-def _apply_cast_to_current_book(cast_name, mapping):
+def _apply_cast_to_current_book(cast_name, mapping, book_token):
     with ensure_book_state(os.path.dirname(VOICE_CONFIG_PATH)), file_lock(VOICE_LIBRARY_PATH):
+        snapshot = get_book_snapshot(os.path.dirname(VOICE_CONFIG_PATH), include_voices=False)
+        if get_book_snapshot_token(snapshot) != book_token:
+            raise HTTPException(status_code=409, detail="Active book changed; reopen Apply cast before saving")
         lib = _get_cast_library(cast_name)
-        return _apply_cast_to_config_file(
-            VOICE_CONFIG_PATH, lib, cast_name, mapping, book_id=get_active_book_id())
+        # Member availability does not depend on existing voice assignments.
+        # Keep an unmapped cast from rewriting or creating the active config.
+        _, applied = _apply_cast_mapping(lib, cast_name, mapping, {}, book_id=snapshot["book_id"])
+        if not applied:
+            return []
+        def transform(current):
+            nonlocal applied
+            updated, applied = _apply_cast_mapping(
+                lib, cast_name, mapping, current, book_id=snapshot["book_id"])
+            return updated
+        _apply_book_voice_update(transform, config_path=VOICE_CONFIG_PATH)
+        return applied
 
 
 @router.get("/api/voice_library")
@@ -498,18 +513,17 @@ async def voice_library_match(request: CastCreateRequest):
 def _build_cast_match_response(request: CastCreateRequest):
     """Fuzzy-match the current book's characters against a cast (+shared pool).
     Returns proposals for the user to confirm before applying. `name` = cast name."""
-    cast_name = request.name.strip()
-    lib = _get_cast_library(cast_name)
-
-    pool = _cast_match_pool(lib, cast_name, get_active_book_id())
-
-    counts = _script_line_counts()
-    if not counts:
-        raise HTTPException(status_code=400, detail="No characters in the current book. Generate a script first.")
-
-    proposals = _build_match_proposals(counts, pool)
-
-    return {"cast": cast_name, "proposals": proposals}
+    with ensure_book_state(os.path.dirname(VOICE_CONFIG_PATH)):
+        snapshot = get_book_snapshot(os.path.dirname(VOICE_CONFIG_PATH), include_voices=False)
+        cast_name = request.name.strip()
+        lib = _get_cast_library(cast_name)
+        pool = _cast_match_pool(lib, cast_name, snapshot["book_id"])
+        counts = _script_line_counts()
+        if not counts:
+            raise HTTPException(status_code=400, detail="No characters in the current book. Generate a script first.")
+        proposals = _build_match_proposals(counts, pool)
+        return {"cast": cast_name, "proposals": proposals,
+                "book_token": get_book_snapshot_token(snapshot)}
 
 
 @router.post("/api/voice_library/match_bulk")
@@ -569,7 +583,7 @@ async def voice_library_apply(request: LibraryApplyRequest):
     # review's concurrent speaker-rename remap of the same file.
     try:
         applied = await asyncio.to_thread(
-            _apply_cast_to_current_book, cast_name, request.mapping)
+            _apply_cast_to_current_book, cast_name, request.mapping, request.book_token)
     except TimeoutError:
         raise HTTPException(status_code=503, detail="Voice config is busy (locked by another operation); please try again.")
     warnings = []
