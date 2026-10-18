@@ -20,7 +20,8 @@ from urllib.parse import urlparse
 from llm_provider import make_llm_client, resolve_api_key
 
 from benchmark_worker_protocol import get_benchmark_worker_result
-from benchmark_core import load_resumable_benchmark_report, save_benchmark_report
+from benchmark_core import (get_benchmark_llm_config, load_resumable_benchmark_report,
+                            save_benchmark_report)
 from benchmark_fixtures import _hash_entries, get_normalized_source_chunks
 from benchmark_validation import (validate_persona_speakers, get_benchmark_file_path,
                                   get_benchmark_directory_path, get_adapter_artifact_path,
@@ -32,7 +33,7 @@ from lmstudio_settings import get_lmstudio_status, get_remote_lmstudio_status
 from lora_evidence import get_file_sha256
 from utils import is_path_inside
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
-from review_script import check_text_loss, diff_entries, review_batch
+from review_script import check_text_loss, diff_entries, review_batch, get_review_batch_status
 from voicelab_settings import get_voice_lab_script_path
 from functools import wraps
 from benchmark_execution import (BENCHMARK_STATE, BenchmarkCancelled,
@@ -1085,11 +1086,10 @@ def _run_llm_worker(stage, payload, settings, ssh_alias):
 
 
 def _get_llm_benchmark_target(config, target):
+    llm = get_benchmark_llm_config(config, target)
     if target == "local":
-        llm = config.get("llm_local") or config.get("llm") or {}
         status = get_lmstudio_status(llm.get("model_name"))
     elif target == "thunder":
-        llm = config.get("llm_remote") or {}
         remote_port = urlparse(llm.get("base_url") or "").port or 1234
         status = get_remote_lmstudio_status(
             (config.get("llm_remote_ssh") or "").strip(), llm.get("model_name"),
@@ -1213,18 +1213,21 @@ def _run_script_review_case(fixture, original, repetition, client, model_name,
     corrected = review_batch(
         client, model_name, original, 1, 1, params,
         previous_tail=fixture.get("previous_tail") or None,
-        max_retries=max_retries, attempt_observer=attempts.append)
+        max_retries=max_retries, attempt_observer=attempts.append, retain_partial_labels=True)
     corrected = corrected or []
+    review_status = get_review_batch_status(corrected, attempts)
     text_ok, _, _, ratio = check_text_loss(
         original, corrected, threshold=lower, upper_bound=upper)
     structural_ok = bool(corrected) and all(
         isinstance(entry, dict) and isinstance(entry.get("text"), str)
         and isinstance(entry.get("speaker"), str) for entry in corrected)
     return {"fixture_id": fixture["id"], "repetition": repetition,
-            "status": "passed" if text_ok and structural_ok else "failed",
+            "status": "passed" if text_ok and structural_ok and review_status['status'] == 'complete' else "failed",
+            "review_status": review_status['status'],
             "elapsed_seconds": round(time.monotonic() - started, 3),
-            "entry_count": len(corrected), "attempts": attempts,
-            "quality": {"passed": text_ok and structural_ok,
+            "entry_count": len(corrected), "attempts": review_status['attempts'],
+            "partial_retention": review_status['partial_retention'],
+            "quality": {"passed": text_ok and structural_ok and review_status['status'] == 'complete',
                         "word_ratio": round(ratio, 4),
                         "text_loss_passed": text_ok,
                         "structural_passed": structural_ok},

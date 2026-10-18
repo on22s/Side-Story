@@ -3714,6 +3714,7 @@
             if (s.speakers_merged) { txt += `, ${s.speakers_merged} speakers merged`; }
             if (s.batches_failed) { txt += `, ${s.batches_failed} batch(es) failed`; }
             if (s.batches_skipped_vram) { txt += `, ${s.batches_skipped_vram} batch(es) skipped (VRAM)`; }
+            if (s.accounting_warning) { txt += ` — ${s.accounting_warning}`; }
             return txt;
         }
 
@@ -3723,6 +3724,7 @@
                       `(${t.text_changed} text, ${t.speaker_changed} speaker, ${t.instruct_changed} instruct, ` +
                       `+${t.entries_added}/-${t.entries_removed} entries)`;
             if (t.batches_failed) { txt += ` — ${t.batches_failed} batch(es) failed`; }
+            if (t.accounting_warning) { txt += ` — ${t.accounting_warning}`; }
             return txt;
         }
 
