@@ -5031,6 +5031,44 @@
         "summary": "Drift Check Endpoint"
       }
     },
+    "/api/chunks/quality": {
+      "get": {
+        "operationId": "get_editor_quality_api_chunks_quality_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "expected_book_token",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Expected Book Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Editor Quality"
+      }
+    },
     "/api/chunks/restore": {
       "post": {
         "description": "Re-insert a previously deleted chunk at a specific index.",
@@ -11556,6 +11594,23 @@
           }
         },
         "summary": "Select Voice Version"
+      }
+    },
+    "/api/workspace": {
+      "get": {
+        "description": "Summarize selected-book progress without initializing chunks or generating audio.",
+        "operationId": "get_book_workspace_status_api_workspace_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Book Workspace Status"
       }
     },
     "/favicon.ico": {

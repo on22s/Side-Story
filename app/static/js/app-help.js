@@ -154,6 +154,7 @@
             'cast-select': {what: 'The saved cast (character → voice mapping) applied to this book.'},
 
             // Editor tab
+            'editor-quality-filter': {what: 'Filter saved unknown-speaker, failed-render, missing-file and voice-drift findings. No check is started.'},
             'chk-drift-only': {what: 'Show only chunks the drift check flagged as sounding unlike their speaker’s reference voice.'},
 
             // Result tab
@@ -413,6 +414,12 @@
             'scrollToChunkRow': 'Jump to the script line referenced by this comparison result.',
             'retryDeliveryInstructions': 'Retry generation of delivery instructions using the retained recovery state.',
             'cancelDeliveryInstructions': 'Request cancellation of delivery-instruction generation.',
+            'renderEditorQualityInbox': 'Filter saved unresolved-speaker, render-failure, missing-file and voice-drift findings. This does not start a quality check.',
+            'showMoreEditorFindings': 'Show the next 50 matching saved findings.',
+            'focusEditorReviewField': 'Focus the original selected-line field in the Editor table. Edits use its existing save controls.',
+            'playEditorReviewLine': 'Play the selected line with its existing audio player, stopping sequence playback first.',
+            'generateEditorReviewLine': 'Generate the selected line through the existing save, book-identity and GPU checks.',
+            'selectEditorReviewLineById': 'Inspect this line without changing it or starting work.',
             'loadChunks': 'Refresh the chunk editor from the current book’s saved chunks.',
             'generateChunk': 'Generate audio for this script line using its current speaker and delivery settings.',
             'toggleChunkExpand': 'Show or hide this line’s expanded editing controls.',
@@ -424,6 +431,10 @@
             'auditSavedScript': 'Inspect this saved script’s audit information before using it.',
             'loadScript': 'Load this saved book as the active script and its associated voice assignments.',
             'deleteScript': 'Delete this saved book.',
+            'refreshWorkspaceView': 'Refresh selected-book facts, the saved-book list and running-task status. This does not start or resume generation.',
+            'continueBookWorkspace': 'Refresh the selected book and open the next workflow screen. This does not replace a book or start a task.',
+            'openWorkspaceSavedBook': 'Use the existing saved-book confirmation to load this book; replacing the active book is a separate confirmed action.',
+            'openWorkspaceTask': 'Open this task’s screen and restore its existing status controls. No pause, resume, cancellation or new work is triggered by navigation.',
             'playDesignedVoice': 'Play this saved designed-voice preview.',
             'openDesignedVoiceForEdit': 'Load this saved voice’s description and sample into the Designer.',
             'deleteDesignedVoice': 'Delete this saved designed voice.',
@@ -497,6 +508,7 @@
         };
 
         const NAV_HELP = {
+            'home': 'View the selected book’s saved progress, open its next workflow screen and inspect running work. Viewing does not start generation.',
             'setup': 'Configure the model connection, synthesis settings and prompts used by the app.',
             'script': 'Import a book, annotate its script, review speaker labels and save the result.',
             'voices': 'Assign and review each character’s voice, references and changes over time.',

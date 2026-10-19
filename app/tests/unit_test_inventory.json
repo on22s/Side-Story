@@ -1191,6 +1191,28 @@
     "tests.test_book_state_transaction.BookStateTransactionTests.test_success_publishes_complete_set_and_removes_prior_sidecars",
     "tests.test_book_state_transaction.SavedBookTransactionHttpTests.test_http_load_failure_preserves_prior_book_and_success_publishes_all"
   ],
+  "test_book_workspace": [
+    "tests.test_book_workspace.BookWorkspaceTests.test_actual_route_returns_safe_conflict_for_corrupt_script_without_repair",
+    "tests.test_book_workspace.BookWorkspaceTests.test_empty_and_missing_chunks_are_distinct_from_completed_audio_and_do_not_write",
+    "tests.test_book_workspace.BookWorkspaceTests.test_existing_voice_eligibility_and_pending_state_versions_are_used",
+    "tests.test_book_workspace.BookWorkspaceTests.test_journal_progress_is_read_without_compaction_and_outputs_are_unverified",
+    "tests.test_book_workspace.BookWorkspaceTests.test_missing_empty_and_escaping_audio_do_not_count_as_present",
+    "tests.test_book_workspace.BookWorkspaceTests.test_wrong_book_journal_and_corrupt_chunk_data_remain_unavailable_and_untouched"
+  ],
+  "test_book_workspace_js": [
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_continue_refreshes_identity_and_navigates_without_any_mutating_api",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_declared_task_targets_exist_and_audio_uses_its_actual_cancel_screen",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_failed_library_loader_releases_button_and_refreshes_actual_selected_book",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_hidden_and_stale_monitor_results_do_not_erase_previous_known_work",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_hostile_names_are_text_and_library_load_uses_existing_confirmed_loader",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_invalidation_during_a_read_queues_the_newest_book_and_preserves_library_focus_nodes",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_late_reply_is_ignored_and_queued_refresh_does_not_overlap_requests",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_leaving_home_while_an_action_reads_status_prevents_late_navigation",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_malformed_counts_and_unsafe_next_destination_are_rejected",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_monitor_ignores_obsolete_visit_and_invalid_registry_without_claiming_idle",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_monitor_keeps_disclosure_nodes_and_withholds_eta_for_paused_manual_and_cancel",
+    "tests.test_book_workspace_js.BookWorkspaceJsTests.test_read_failure_keeps_display_but_disables_continue_and_never_navigates"
+  ],
   "test_boundary_conflict_audit": [],
   "test_build_accent_calibration": [],
   "test_build_scoring_sheet": [
@@ -2889,6 +2911,26 @@
     "tests.test_editor_report_cover_boundary.EditorReportCoverBoundaryTests.test_cover_response_uses_leaf_and_published_image_is_unchanged",
     "tests.test_editor_report_cover_boundary.EditorReportCoverBoundaryTests.test_listing_and_download_share_realpath_boundary",
     "tests.test_editor_report_cover_boundary.EditorReportCoverBoundaryTests.test_portable_invalid_names_are_not_listed_or_downloaded"
+  ],
+  "test_editor_review_facts": [
+    "tests.test_editor_review_facts.EditorReviewFactsTests.test_failed_invalid_and_unmeasured_voice_checks_never_become_passes",
+    "tests.test_editor_review_facts.EditorReviewFactsTests.test_flags_discriminate_pending_missing_failed_unknown_and_real_drift",
+    "tests.test_editor_review_facts.EditorReviewFactsTests.test_loaded_rows_are_detached_from_later_persisted_status_changes",
+    "tests.test_editor_review_facts.EditorReviewFactsTests.test_outside_paths_and_io_refusals_are_unavailable_without_reading_them",
+    "tests.test_editor_review_facts.EditorReviewFactsTests.test_route_refuses_wrong_book_and_returns_matching_revision_without_writing_chunks"
+  ],
+  "test_editor_review_js": [
+    "tests.test_editor_review_js.EditorReviewJsTests.test_filters_counts_text_injection_and_inspector_use_saved_facts",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_malformed_or_changed_facts_and_failures_disable_old_links",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_markup_preserves_handlers_separates_whole_book_actions_and_loads_before_restore",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_pagination_counts_every_finding_and_preserves_all_rows",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_pending_audition_stops_if_the_book_or_audio_element_is_replaced",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_play_and_generate_reuse_existing_audio_and_original_handlers",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_reorder_resolves_current_uid_and_drafts_focus_original_controls",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_replaced_uid_clears_selection_and_old_finding_cannot_target_replacement",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_serialized_latest_request_wins_and_late_book_reply_cannot_paint",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_stacked_mobile_selection_reveals_inspector_but_field_focus_stays_in_table",
+    "tests.test_editor_review_js.EditorReviewJsTests.test_unchanged_findings_retain_focus_and_disclosure_and_publish_no_drafts"
   ],
   "test_editor_review_regressions": [
     "tests.test_editor_review_regressions.ConfigDefaultsRace.test_actual_configuration_loader_preserves_edits_during_both_fetches",
@@ -10455,6 +10497,12 @@
   "test_workbench_status_js": [
     "tests.test_workbench_status_js.WorkbenchStatusJsTests.test_page_initialization_restores_existing_voicelab_run_and_controls",
     "tests.test_workbench_status_js.WorkbenchStatusJsTests.test_remote_optimize_toggle_tracks_actual_status_after_endpoint_switch"
+  ],
+  "test_workflow_disclosures": [
+    "tests.test_workflow_disclosures.WorkflowDisclosureTests.test_cast_and_recovery_keep_native_disclosures_and_live_targets",
+    "tests.test_workflow_disclosures.WorkflowDisclosureTests.test_optional_tuning_has_one_original_control_and_run_actions_stay_outside",
+    "tests.test_workflow_disclosures.WorkflowDisclosureTests.test_real_training_builder_reads_nondefault_tuning_without_visibility_checks",
+    "tests.test_workflow_disclosures.WorkflowDisclosureTests.test_tab_boundaries_keep_voice_logs_and_training_controls_in_their_screen"
   ],
   "test_worktree_gpu_lock": [
     "tests.test_worktree_gpu_lock.WorktreeGpuLockTests.test_linked_worktree_and_primary_share_actual_kernel_lock",
