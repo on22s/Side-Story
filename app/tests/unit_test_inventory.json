@@ -8925,7 +8925,8 @@
     "tests.test_task_reattachment.TaskReattachmentJsTests.test_request_tasks_disable_until_done_and_dynamic_tasks_receive_fallback",
     "tests.test_task_reattachment.TaskReattachmentJsTests.test_shared_script_log_controls_remain_serialized",
     "tests.test_task_reattachment.TaskReattachmentJsTests.test_slow_review_hydration_does_not_delay_independent_controls",
-    "tests.test_task_reattachment.TaskReattachmentJsTests.test_training_preparer_audio_benchmark_adapters_and_idle_dispatch"
+    "tests.test_task_reattachment.TaskReattachmentJsTests.test_training_preparer_audio_benchmark_adapters_and_idle_dispatch",
+    "tests.test_task_reattachment.TaskReattachmentJsTests.test_word_timing_reload_restores_editor_activity_and_cancel_until_retirement"
   ],
   "test_task_start_controls_js": [
     "tests.test_task_start_controls_js.TaskStartControlJsTests.test_export_control_ids_are_wired_to_actual_buttons",
@@ -10659,6 +10660,25 @@
     "tests.test_windows_tree_dispatch.WindowsTreeDispatchTests.test_failed_taskkill_has_one_failure_policy_and_no_parent_only_fallback",
     "tests.test_windows_tree_dispatch.WindowsTreeDispatchTests.test_grace_and_force_dispatch_to_entire_owned_tree",
     "tests.test_windows_tree_dispatch.WindowsTreeDispatchTests.test_owned_windows_job_uses_existing_grace_and_force_dispatch"
+  ],
+  "test_word_timing": [
+    "tests.test_word_timing.WordTimingTests.test_api_claim_lifetime_and_stale_uid_use_actual_editor_contract",
+    "tests.test_word_timing.WordTimingTests.test_cache_is_bound_to_audio_text_and_model_and_never_rewrites_them",
+    "tests.test_word_timing.WordTimingTests.test_cancel_before_start_does_not_launch_a_child",
+    "tests.test_word_timing.WordTimingTests.test_foreign_audio_and_stale_revision_refused_before_asr",
+    "tests.test_word_timing.WordTimingTests.test_invalid_overlap_saturation_and_nonfinite_timestamps_are_rejected",
+    "tests.test_word_timing.WordTimingTests.test_known_answer_words_and_contractions_keep_real_bounds",
+    "tests.test_word_timing.WordTimingTests.test_mutation_during_asr_is_refused_without_publishing_or_overwriting_cache",
+    "tests.test_word_timing.WordTimingTests.test_native_multiword_groups_retain_group_timing",
+    "tests.test_word_timing.WordTimingTests.test_real_cancelled_child_is_reaped_and_timeout_is_finite",
+    "tests.test_word_timing.WordTimingTests.test_repeated_missing_and_wrong_words_do_not_receive_invented_times",
+    "tests.test_word_timing.WordTimingTests.test_verified_audio_uses_open_captured_inode_and_refuses_changed_bytes"
+  ],
+  "test_word_timing_js": [
+    "tests.test_word_timing_js.WordTimingJsTests.test_failed_snapshot_does_not_start_asr_and_wrong_take_result_is_refused",
+    "tests.test_word_timing_js.WordTimingJsTests.test_late_reply_cannot_paint_another_line_or_override_pending_edits",
+    "tests.test_word_timing_js.WordTimingJsTests.test_reattached_timing_prevents_new_start_and_retains_cancel_after_redraw",
+    "tests.test_word_timing_js.WordTimingJsTests.test_unicode_spans_seek_native_player_and_track_playback_without_generation"
   ],
   "test_workbench_status_js": [
     "tests.test_workbench_status_js.WorkbenchStatusJsTests.test_page_initialization_restores_existing_voicelab_run_and_controls",

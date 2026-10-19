@@ -427,6 +427,8 @@
             'renderEditorQualityInbox': 'Filter saved unresolved-speaker, render-failure, missing-file and voice-drift findings. This does not start a quality check.',
             'showMoreEditorFindings': 'Show the next 50 matching saved findings.',
             'focusEditorReviewField': 'Focus the original selected-line field in the Editor table. Edits use its existing save controls.',
+            'createEditorWordTiming': 'Estimate word/group times for this saved English line using the installed CPU ASR provider. No model download. Timing does not certify pronunciation.',
+            'cancelEditorWordTiming': 'Request cancellation of word timing, retaining ownership until the worker exits and preserving existing audio.',
             'playEditorReviewLine': 'Play the selected line with its existing audio player, stopping sequence playback first.',
             'generateEditorReviewLine': 'Generate the selected line through the existing save, book-identity and GPU checks.',
             'selectEditorReviewLineById': 'Inspect this line without changing it or starting work.',
