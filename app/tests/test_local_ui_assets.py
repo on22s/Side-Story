@@ -54,6 +54,7 @@ class LocalUiAssetTests(unittest.TestCase):
                           '/static/js/app-workspace.js?v=__APP_BUILD__',
                           '/static/js/app-pronunciation.js?v=__APP_BUILD__',
                           '/static/js/app-editor-review.js?v=__APP_BUILD__',
+                          '/static/js/app-tts-capabilities.js?v=__APP_BUILD__',
                           '/static/js/app-guides.js?v=__APP_BUILD__'}
         urls = [url for url, _ in resources]
         self.assertEqual(len(urls), len(set(urls)))
