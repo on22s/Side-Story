@@ -1,6 +1,6 @@
 # 2026-10-20 source-review remediation plan
 
-Goal **3.5** · [Execution tracker #1366](https://github.com/on22s/alexandria-audiobook2/issues/1366) · **OPEN**
+Goal **3.5** · [Execution tracker #1366](https://github.com/on22s/alexandria-audiobook2/issues/1366) · **OPEN:43/58 accepted;15 remain**
 
 Reviewed main: `4c31e52c39cb3a1c81cc4cac03bf4ae9d5e2a96d`. This plan covers 41 findings (40 confirmed, one evidence-backed investigation), 16 enhancement observations and 13 test gaps. It creates **58 child issues**: 41 bug/investigation tasks and 17 enhancements. The seventeenth enhancement groups the two independent experiment-reporting gaps. The other test gaps belong to their related fix or test-hardening task.
 
@@ -100,17 +100,17 @@ Reviewed main: `4c31e52c39cb3a1c81cc4cac03bf4ae9d5e2a96d`. This plan covers 41 f
 
 ### Batch 07: Restore diagnostic CLI and provenance contracts
 
-**Dependencies:** Batch02, Batch06 (accepted). **Tasks:**7. **Status:** combined release passed; new exact-head CI and merge pending. **PR:** [#1447](https://github.com/on22s/alexandria-audiobook2/pull/1447).
+**Dependencies:** Batch02, Batch06 (accepted). **Tasks:**7. **Status:** accepted and merged (seven tasks). **PR:** [#1447](https://github.com/on22s/alexandria-audiobook2/pull/1447).
 
 **Batch acceptance:** Run supported CLI initialization and minimal one-item cases without model inference. Verify obsolete callback/constructor signatures, empty strata, perfect-result summaries and failed patch capture. Provenance must distinguish saved, partial and failed evidence; never advertise an empty patch as reproducible code.
 
-- [ ] **F007** [#1403](https://github.com/on22s/alexandria-audiobook2/issues/1403) — The per-line character-traits experiment installs a callback with an obsolete signature and crashes on accepted attribution.
-- [ ] **F033** [#1404](https://github.com/on22s/alexandria-audiobook2/issues/1404) — Requesting one pitch-separation adapter divides by zero when the manifest has multiple adapters
-- [ ] **F034** [#1405](https://github.com/on22s/alexandria-audiobook2/issues/1405) — Respelling-selectivity reports crash when all valid paired terms fall in one stratum.
-- [ ] **F035** [#1406](https://github.com/on22s/alexandria-audiobook2/issues/1406) — A valid perfect-attribution result crashes the roster-order CLI while printing its summary.
-- [ ] **F036** [#1407](https://github.com/on22s/alexandria-audiobook2/issues/1407) — Two optional three-pass diagnostics still use the removed presegment_quotes constructor argument
-- [ ] **F037** [#1408](https://github.com/on22s/alexandria-audiobook2/issues/1408) — The two-by-two attribution experiment crashes before loading inputs because REPO is assigned after its first use
-- [ ] **F041** [#1409](https://github.com/on22s/alexandria-audiobook2/issues/1409) — Dirty-run provenance reports a saved reproduction patch even when git diff fails
+- [x] **F007** [#1403](https://github.com/on22s/alexandria-audiobook2/issues/1403) — The per-line character-traits experiment installs a callback with an obsolete signature and crashes on accepted attribution.
+- [x] **F033** [#1404](https://github.com/on22s/alexandria-audiobook2/issues/1404) — Requesting one pitch-separation adapter divides by zero when the manifest has multiple adapters
+- [x] **F034** [#1405](https://github.com/on22s/alexandria-audiobook2/issues/1405) — Respelling-selectivity reports crash when all valid paired terms fall in one stratum.
+- [x] **F035** [#1406](https://github.com/on22s/alexandria-audiobook2/issues/1406) — A valid perfect-attribution result crashes the roster-order CLI while printing its summary.
+- [x] **F036** [#1407](https://github.com/on22s/alexandria-audiobook2/issues/1407) — Two optional three-pass diagnostics still use the removed presegment_quotes constructor argument
+- [x] **F037** [#1408](https://github.com/on22s/alexandria-audiobook2/issues/1408) — The two-by-two attribution experiment crashes before loading inputs because REPO is assigned after its first use
+- [x] **F041** [#1409](https://github.com/on22s/alexandria-audiobook2/issues/1409) — Dirty-run provenance reports a saved reproduction patch even when git diff fails
 
 ### Batch 08: Improve API and export responsiveness
 
@@ -126,7 +126,7 @@ Reviewed main: `4c31e52c39cb3a1c81cc4cac03bf4ae9d5e2a96d`. This plan covers 41 f
 
 ### Batch 09: Harden diagnostics and regression tests
 
-**Dependencies:** Batch 05, Batch 06. **Tasks:** 7. **Status:** not started. **PR:** not opened.
+**Dependencies:** Batch05, Batch06 (accepted). **Tasks:**7. **Status:** combined release passed after native process-probe repair; new exact-head CI/merge pending. **PR:** [#1453](https://github.com/on22s/alexandria-audiobook2/pull/1453).
 
 **Batch acceptance:** Use mutation-sensitive assertions: wrong empty API names, an unreaped dead lock holder, forbidden chunk changes and zeroed decoded speech must make the relevant tests fail. Restore correct behavior afterward. Check deleted-artifact refusal, telemetry distinctions, temporary cleanup, ETA denominators and post-purge failure semantics without deleting real assets.
 
@@ -390,3 +390,33 @@ PR #1447 is being integrated with this accepted main. The seven implementation p
 ## Batch07 integrated qualification — 2026-10-20
 
 PR #1447 integrated against accepted F028 main e37a69e62f0db28e1c2e9fdb9250dc550bb18169. Fresh combined ./ready.sh quick passed8643 unit tests with zero unit skips,72 API passes/zero failures and12 explicit full-mode exclusions;all8 gates passed859.861s. 234 distinct targeted checks passed(230 CPU plus4 navigation);all17 new methods remain inventoried. The original8623-unit gate remains historical evidence. Both prose/task conflicts are reconciled; implementation paths merged cleanly and the derived inventory was rebuilt. New exact published-head CI and merge remain pending;no Batch07 task accepted. GPU/model/listening/full native-platform qualification unrun.36/58 accepted;22 remain.
+
+## Batch09 verification progress — 2026-10-20
+
+All seven Batch09 tasks have development fixes on freshly fetched accepted main d74e11bf.218 distinct targeted CPU tests plus4 navigation tests passed with zero skips.11 new methods cover deletion guards, detector-error telemetry, native ZIP/PCM cleanup, ETA and post-write purge outcomes. Five scoped mutations remained false-green under the old tests, are rejected by the hardened tests and pass again after restoration.95 unittest.main guards moved to file end; non-guard AST bodies unchanged; direct module execution matches inventoried IDs (13 training benchmark/16 production audio/10 API-summary tests). Required release/exact-head CI/merge pending; no task accepted. GPU/model/listening/full native-platform qualification unrun.
+
+Purge preflight safeguards and exact target selection remain unchanged. Post-write failures report the completed API steps, an unconfirmed operation when applicable, observed versus expected freed bytes and accounting uncertainty. No Hub operation used real assets. Extracted dataset PCM is removed on successful metrics, missing metadata, metric failure and exceptions; input ZIP/reference bytes remain exact. Prompt caching keeps its existing file-version identity and negative-cache behavior while removing unused mtime state. ETA uses the matching successful time_seconds population. The artifact-loss guard compares the baseline Git tree and current index and refuses staged or unstaged measured-file deletion. Detector errors retain conservative validation behavior with distinct redacted error-type telemetry.
+
+
+## Batch07 accepted reconciliation — 2026-10-20
+
+Accepted via PR1447,merged as b48669b18ed9f4f026311a947f9f88158832e1c3,tree-identical to tested headf3fb0a9b98d7be7be6ec17381435cbc098f05862. All5 exact-head CI checks passed. Combined quick8643unit0skip/72API0failed12explicitfull-modeexclusions/all8gates859.861s. 234distincttargetedchecks(230CPU+4navigation),plus4navigationafterbookkeeping. Seven child acceptance checklists verified CLOSED. GPU/model/listening/full product-native qualification unrun.43/58accepted;15remain.
+
+## Batch09 integration qualification — 2026-10-20
+
+All seven Batch09 tasks have development fixes on freshly fetched accepted main d74e11bf.218 distinct targeted CPU tests plus4 navigation tests passed with zero skips.11 new methods cover deletion guards, detector-error telemetry, native ZIP/PCM cleanup, ETA and post-write purge outcomes. Five scoped mutations remained false-green under the old tests, are rejected by the hardened tests and pass again after restoration.95 unittest.main guards moved to file end; non-guard AST bodies unchanged; direct module execution matches inventoried IDs (13 training benchmark/16 production audio/10 API-summary tests). Required release/exact-head CI/merge pending; no task accepted. GPU/model/listening/full native-platform qualification unrun. Original d74-based quick release subsequently passed8617 unit0skip/72API0failed12explicitexclusions/all8gates856.810s. Now integrated against accepted F028+Batch07 main b48669b18ed9f4f026311a947f9f88158832e1c3;code applied cleanly and two shared tracking conflicts reconciled. Combined259 distinct targeted checks passed with zero skips in23.692s,including the accepted external SDK/engine lifetime and Batch07 regressions. Five scoped mutations again stayed false-green under the old tests,were rejected by hardened tests,and passed after restoration. All95 guard placements preserve the expected non-guard AST bodies;direct13/16/10 test modules again match exact inventory IDs. New combined release/exact-head CI/merge pending;no Batch09 task accepted.
+
+
+## Batch09 combined release qualification — 2026-10-20
+
+All seven Batch09 failures/test gaps were reproduced before repair on accepted d74e11bf. Integrated against accepted main b48669b18ed9f4f026311a947f9f88158832e1c3. 259 distinct targeted checks passed23.692s/zero skips,including accepted external SDK/engine and Batch07 controls. Five scoped mutations stayed false-green under old tests,were rejected by hardened tests,and passed after restoration. 95 unittest.main guards are at file end with the expected non-guard AST bodies preserved;direct13/16/10 benchmark/production-audio/API modules exactly match inventory IDs. Fresh combined ./ready.sh quick passed8654 unit tests with zero unit skips,72 API passes/zero failures and12 explicit full-mode exclusions;all8 gates passed888.126s. Exact published-head CI and merge pending;no Batch09 task accepted.43/58accepted;15remain. GPU/model/listening/full product-native qualification unrun. No real Hub assets modified.
+
+
+## Batch09 native CI probe repair — 2026-10-20
+
+PR1453 first exact-head CI attempt failed one existing Linux process-liveness probe with ProcessLookupError/ESRCH while reading /proc after a real child exited. The helper was unchanged from accepted main; a passing base run does not refute this observed exit race. Deterministic ESRCH reproduction fails before repair. The probe now classifies ESRCH/ENOENT as exited while permission errors still raise and a real current process remains live. Native wrapper signal/lease controls and a fresh full release are being rerun before the next commit;previous8654-unit/888.126s release remains historical,not proof for this added regression. No Batch09 task accepted;43/58accepted15remain.
+
+
+## Batch09 repaired combined release — 2026-10-20
+
+PR1453 combined candidate includes a native /proc exit-race probe repair:ENOENT/ESRCH report an exited process,while permission errors still raise and actual live PID remains live. The first exact-head CI failure and its passing base report are preserved;the same helper was present on the base. Deterministic before/after controls reproduce the observed race.267 distinct targeted checks passed48.279s without skips,including real signal-tree/lease controls;12 focused ownership checks passed24.720s. Five mutation controls and direct13/16/10 inventory parity remain covered;95 relocated guards preserve expected AST bodies. Fresh ./ready.sh quick passed8655 unit tests without skips,72API passes/zero failures/12explicit full-mode exclusions and all8gates in851.436s. Validated treed2220060a98e34c2b8bde49a607c4c6c9b54b1b1. Only bookkeeping changes follow this gate;new published-head CI and merge pending.43/58accepted15remain;no Batch09 task accepted. Full product-native/GPU/model/listening qualification unrun. Private ROCm-runtime quick API preflight separately passed72/0/12;not a full-inference pass.
