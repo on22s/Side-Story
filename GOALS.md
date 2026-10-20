@@ -2741,6 +2741,13 @@ to 58 child issues; **0/58 execution tasks are complete** at plan creation.
 The 192 passing targeted review tests do not establish a complete release,
 GPU/model, native-platform or listening pass.
 
+**Batch 01 progress — 2026-10-20.** Four fixes prepared; 238 combined targeted
+CPU tests passed. Local quick-release verification passed (8,546 unit tests;
+72 API passes with 12 expected full-mode exclusions). Exact-head/native Windows
+CI remains pending in [PR #1426](https://github.com/on22s/alexandria-audiobook2/pull/1426);
+**0/58 tasks accepted**. This is implementation progress, not a claim
+of merged fixes or live GPU/model/listening qualification.
+
 **Target — OPEN.** Zero undisposed execution tasks, with the required
 regressions and platform/model checks recorded on the exact merged revisions.
 Work in Batches 01–10: data/ownership first; LLM recovery and audio correctness
