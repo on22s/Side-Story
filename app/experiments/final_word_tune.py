@@ -17,8 +17,9 @@ WHAT IT READS, following the paper's section 3, over the FINAL WORD only
     rising          excursion above RISE_BOUNDARY_ERB.
 
 ERB, NOT HERTZ OR SEMITONES, because the paper reports in ERB and its +0.38
-boundary is only comparable in the same unit. The conversion is Praat's
-hertzToErb, since the paper tracked pitch with Praat. The +0.38 boundary was
+boundary is only comparable in the same unit. The conversion follows paper
+Appendix B.1 Eq. 6 and author f0.py: 21.4 * log10(1 + f/228.8), which differs
+from Praat's hertzToErb. The +0.38 boundary was
 fitted to THEIR models' assertions and questions; it is a starting point to be
 re-checked on ours, not a constant. The continuous excursion is always recorded
 beside the boolean.
@@ -34,7 +35,7 @@ times pyin's points over a 0.15-0.3 s final word.
 PITCH CEILING. A ceiling that suits a voice's median cuts off the top of a
 question rise in a higher voice, and losing exactly the top of a rise biases
 the read-out toward "falling" (one pilot rise reached ~445 Hz). PITCH_CEILING_HZ
-is 600; a test pins a 250->450 Hz rise that a 350 Hz ceiling loses.
+is 700; a test pins a 250->450 Hz rise that a 350 Hz ceiling loses.
 
 PITCH RANGE: TWO PASSES (Hirst 2011; Hirst & De Looze 2020, ch. 13). A blind
 listening check of 12 pilot clips matched the single-pass Praat read-out on
@@ -55,6 +56,12 @@ activity rule, arXiv:2610.28035 Appendix D) whenever that is later.
 UNMEASURED IS NOT FLAT. A word with too few voiced frames returns
 `measured: False` with the reason, never an excursion of 0 (Rule 21: a fallback
 that returns a plausible value is the dangerous kind).
+
+METHOD LIMITS. This uses raw autocorrelation with two-pass ranges, not the
+author code's filtered tracker or detached-edge-island removal. Voiced-point
+quintiles follow the current author default; the article describes temporal
+grid quintiles instead. These adaptations and the borrowed boundary remain
+unvalidated on Qwen. Mathematical controls are not human listening validation.
 
 Usage:
     python app/experiments/final_word_tune.py --manifest clips.jsonl --out tune.json
@@ -86,8 +93,8 @@ ALIGN_MODEL = "facebook/wav2vec2-large-960h"
 
 
 def hz_to_erb(hz):
-    """Praat's hertzToErb: ERB-rate of a frequency in Hz."""
-    return 11.17 * math.log((hz + 312.0) / (hz + 14680.0)) + 43.0
+    """Paper Appendix B.1 Eq. 6, also used by the author's f0.py."""
+    return 21.4 * math.log10(1.0 + hz / 228.8)
 
 
 def get_words(text):
@@ -168,7 +175,7 @@ def get_speech_end(samples, rate):
 
 
 def get_final_word_span(wav, text, device="cpu", model_name=ALIGN_MODEL):
-    """(start, end, score) of the line's last word, by known-text CTC alignment."""
+    """(start, end, word) of the line's last word, by known-text CTC alignment."""
     from ctc_text_boundary import align_lines
 
     words = get_words(text)
@@ -200,19 +207,25 @@ def measure_clip(wav, text, device="cpu"):
 
 
 def main():
-    from experiments.provenance import provenance
+    from experiments.provenance import provenance, file_sha256
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", choices=("cpu",), default="cpu", help="Offline CPU scorer only")
     args = parser.parse_args()
     with open(args.manifest, encoding="utf-8") as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
     results = []
     for row in rows:
         try:
+            identity = file_sha256(row['wav'])
+            if row.get('wav_sha256') is not None and row['wav_sha256'] != identity:
+                raise ValueError('Clip no longer matches its captured artifact identity')
             readout = measure_clip(row["wav"], row["text"], args.device)
+            if file_sha256(row['wav']) != identity:
+                raise ValueError('Clip changed during measurement')
+            readout['measured_wav_sha256'] = identity
         except Exception as error:  # recorded into the artifact, never a value
             readout = {"measured": False, "reason": f"{type(error).__name__}: {error}"}
         results.append({**row, **readout})

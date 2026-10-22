@@ -4063,9 +4063,10 @@
   ],
   "test_final_word_tune": [
     "tests.test_final_word_tune.HzToErbTest.test_is_increasing",
-    "tests.test_final_word_tune.HzToErbTest.test_matches_praat_reference_values",
+    "tests.test_final_word_tune.HzToErbTest.test_matches_paper_equation_6_reference_values",
     "tests.test_final_word_tune.SpeechEndTest.test_end_is_where_the_tone_stops_not_the_file",
     "tests.test_final_word_tune.SpeechEndTest.test_silence_has_no_speech_end",
+    "tests.test_final_word_tune.TuneReadoutTest.test_borrowed_boundary_uses_the_paper_scale",
     "tests.test_final_word_tune.TuneReadoutTest.test_edge_frames_are_lost",
     "tests.test_final_word_tune.TuneReadoutTest.test_fall_reads_as_falling",
     "tests.test_final_word_tune.TuneReadoutTest.test_flat_tone_is_not_rising",
@@ -6324,7 +6325,11 @@
     "tests.test_normalize_for_speech.TestStructuralMarks.test_inline_asterisks_and_underscores_are_not_scene_breaks",
     "tests.test_normalize_for_speech.TestStructuralMarks.test_runs_of_marks_collapse",
     "tests.test_normalize_for_speech.TestStructuralMarks.test_standalone_asterisk_and_underscore_scene_breaks_still_work",
-    "tests.test_normalize_for_speech.TestStructuralMarks.test_the_measured_defect"
+    "tests.test_normalize_for_speech.TestStructuralMarks.test_the_measured_defect",
+    "tests.test_normalize_for_speech.TestTerminalBoundaryEvidence.test_authored_terminal_marks_survive_with_closing_marks_and_second_pass_is_clean",
+    "tests.test_normalize_for_speech.TestTerminalBoundaryEvidence.test_existing_full_stop_is_retained_and_not_reported_as_new",
+    "tests.test_normalize_for_speech.TestTerminalBoundaryEvidence.test_unterminated_prose_and_quoted_fragments_keep_existing_period_policy",
+    "tests.test_normalize_for_speech.TestTerminalBoundaryEvidence.test_whitespace_trim_reports_no_added_period_for_terminated_question"
   ],
   "test_numbered_chapter_boundaries": [
     "tests.test_numbered_chapter_boundaries.NumberedChapterBoundariesTests.test_a_heading_inside_an_open_single_quote_still_stays_joined",
@@ -7627,6 +7632,24 @@
     "tests.test_publisher_matter.StripPublisherMatterTest.test_story_is_untouched_when_there_is_no_colophon",
     "tests.test_publisher_matter.StripPublisherMatterTest.test_story_mentioning_copyright_mid_book_is_kept",
     "tests.test_publisher_matter.StripPublisherMatterTest.test_story_mentions_at_both_ends_preserve_exact_preprocessed_source"
+  ],
+  "test_question_punctuation_ab": [
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_adapter_generation_is_frozen_and_changed_declared_generation_refuses",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_cancellation_after_last_partial_record_cannot_publish_complete_metadata",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_cancellation_during_final_validation_keeps_the_run_incomplete",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_engine_settings_change_stops_the_pair",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_existing_output_is_not_reused_or_deleted",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_mismatched_submitted_text_never_publishes_a_manifest",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_occupied_host_lease_refuses_before_engine_initialization",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_owned_pair_captures_actual_text_and_confines_speaker_paths",
+    "tests.test_question_punctuation_ab.QuestionExperimentTests.test_unowned_render_refuses_before_provider_or_removal",
+    "tests.test_question_punctuation_ab.QuestionInputTests.test_empty_or_duplicate_speaker_selections_refuse",
+    "tests.test_question_punctuation_ab.QuestionInputTests.test_existing_run_refuses_without_importing_core_or_reusing_rows",
+    "tests.test_question_punctuation_ab.QuestionInputTests.test_explicit_local_builtin_lora_inputs_are_supported",
+    "tests.test_question_punctuation_ab.QuestionInputTests.test_random_duplicate_or_out_of_range_seeds_refuse",
+    "tests.test_question_punctuation_ab.QuestionInputTests.test_windowed_comparison_refuses_before_runtime",
+    "tests.test_question_punctuation_ab.QuestionScoringIdentityTests.test_ctc_cache_reuses_keys_and_evicts_at_two_models",
+    "tests.test_question_punctuation_ab.QuestionScoringIdentityTests.test_scoring_binds_actual_bytes_and_refuses_stale_or_changed_clips"
   ],
   "test_queue_chain_lib": [
     "tests.test_queue_chain_lib.ChainTest.test_every_chain_finds_the_interpreter_from_a_worktree",
@@ -9091,6 +9114,37 @@
     "tests.test_settings_preview_js.SettingsPreviewJsTests.test_programmatic_generation_and_preset_writers_invalidate_previews",
     "tests.test_settings_preview_js.SettingsPreviewJsTests.test_real_payload_builder_captures_active_and_inactive_profiles_without_mutation"
   ],
+  "test_severe_failure_rate": [
+    "tests.test_severe_failure_rate.CapHitTest.test_a_foreign_sample_rate_is_unmeasured",
+    "tests.test_severe_failure_rate.CapHitTest.test_a_normal_line_is_not",
+    "tests.test_severe_failure_rate.CapHitTest.test_an_unknown_cap_is_unmeasured",
+    "tests.test_severe_failure_rate.CapHitTest.test_exactly_the_cap_is_a_hit",
+    "tests.test_severe_failure_rate.CapHitTest.test_invalid_calibration_caps_are_unmeasured",
+    "tests.test_severe_failure_rate.CapHitTest.test_one_token_short_is_still_a_hit",
+    "tests.test_severe_failure_rate.CapHitTest.test_the_measured_hit_length_is_flagged",
+    "tests.test_severe_failure_rate.CapHitTest.test_two_tokens_short_is_not",
+    "tests.test_severe_failure_rate.CapHitTest.test_windowed_takes_are_unmeasured",
+    "tests.test_severe_failure_rate.SilenceTest.test_a_quiet_tone_above_the_threshold_is_not_silence",
+    "tests.test_severe_failure_rate.SilenceTest.test_all_zeros_is_all_silent_not_measured_as_pauses",
+    "tests.test_severe_failure_rate.SilenceTest.test_long_internal_gap_is_flagged",
+    "tests.test_severe_failure_rate.SilenceTest.test_long_tail_is_flagged",
+    "tests.test_severe_failure_rate.SilenceTest.test_partial_quiet_tail_does_not_round_up_to_the_failure_threshold",
+    "tests.test_severe_failure_rate.SilenceTest.test_short_audible_final_bin_is_not_diluted_by_padding",
+    "tests.test_severe_failure_rate.SilenceTest.test_short_internal_gap_is_not",
+    "tests.test_severe_failure_rate.SilenceTest.test_short_silent_clip_reports_only_its_real_duration",
+    "tests.test_severe_failure_rate.SilenceTest.test_short_tail_is_not",
+    "tests.test_severe_failure_rate.SilenceTest.test_threshold_is_the_shared_export_one",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_antiphase_section_is_not_an_internal_silence",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_antiphase_stereo_is_audible_in_both_channels",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_book_cli_never_applies_current_cap_to_old_or_external_audio",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_missing_audio_is_unmeasured_on_every_reason",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_one_quiet_audible_channel_is_enough",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_real_stereo_gap_and_tail_still_flagged",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_real_take_flags_serialize_to_json",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_take_without_a_receipt_has_unmeasured_content",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_union_counts_a_take_with_two_reasons_once",
+    "tests.test_severe_failure_rate.TakeAndReportTest.test_unmeasured_never_counts_as_severe_or_as_clean"
+  ],
   "test_shared_duplicate_gates": [
     "tests.test_shared_duplicate_gates.SharedDuplicateGateTests.test_zero_one_and_two_source_occurrences_have_matching_verdicts"
   ],
@@ -10003,6 +10057,7 @@
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_processor_identity_binds_effective_call_policy",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_random_external_compiled_or_unsupported_requests_skip_model_initialization",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_runtime_normalizes_known_torch_version_subclass",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_speech_policy_loaded_code_is_bound_and_missing_certificate_refuses_recovery",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_tokenizer_working_padding_changes_do_not_relabel_vocabulary",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_unknown_loaded_object_is_not_labeled_from_current_model_files",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_unsupported_generation_modes_are_refused_and_config_paths_do_not_define_semantics",
@@ -11010,6 +11065,7 @@
     "tests.test_tts_speech_input.TTSSpeechInputTests.test_native_batch_missing_waveform_and_save_failure_do_not_lend_receipts",
     "tests.test_tts_speech_input.TTSSpeechInputTests.test_project_single_parallel_and_native_routes_carry_input_to_shared_publication",
     "tests.test_tts_speech_input.TTSSpeechInputTests.test_split_batch_parents_get_complete_original_index_input",
+    "tests.test_tts_speech_input.TTSSpeechInputTests.test_terminal_punctuation_reaches_each_builtin_provider_and_capture_unchanged",
     "tests.test_tts_speech_input.TTSSpeechInputTests.test_unknown_successful_override_and_disabled_capture_have_no_guessed_input"
   ],
   "test_tts_validation_manifest": [

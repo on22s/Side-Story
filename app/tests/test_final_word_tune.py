@@ -56,10 +56,10 @@ def read(y, ceiling=tune.PITCH_CEILING_HZ):
 
 
 class HzToErbTest(unittest.TestCase):
-    def test_matches_praat_reference_values(self):
-        # Printed by Praat itself (parselmouth, `hertzToErb`), not recalled.
-        for hz, erb in ((100, 3.011324), (150, 4.253029),
-                        (450, 9.618586), (1000, 15.289092)):
+    def test_matches_paper_equation_6_reference_values(self):
+        # Eq. 6 / author f0.py, independently evaluated numerical controls.
+        for hz, erb in ((100, 3.36998188), (150, 4.68561453),
+                        (450, 10.10691641), (1000, 15.62253891)):
             self.assertAlmostEqual(tune.hz_to_erb(hz), erb, places=5)
 
     def test_is_increasing(self):
@@ -67,6 +67,12 @@ class HzToErbTest(unittest.TestCase):
 
 
 class TuneReadoutTest(unittest.TestCase):
+    def test_borrowed_boundary_uses_the_paper_scale(self):
+        # Praat hertzToErb gives 0.3682 and flips this same contour below 0.38.
+        readout = tune.get_tune_readout(np.arange(30) * 0.005, [150.] * 24 + [166.] * 6, 0, 0.15)
+        self.assertAlmostEqual(readout['excursion_erb'], 0.3845, places=4)
+        self.assertTrue(readout['rising'])
+
     def assert_excursion(self, start_hz, end_hz, readout):
         self.assertTrue(readout["measured"], readout)
         times = get_voiced_times(get_glide(start_hz, end_hz))
