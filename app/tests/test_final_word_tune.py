@@ -136,6 +136,26 @@ class TuneReadoutTest(unittest.TestCase):
         self.assertGreater(readout["offset_vs_line_erb"], 0)
 
 
+class TwoPassTest(unittest.TestCase):
+    def test_range_comes_from_the_first_pass_quartiles(self):
+        times, f0, pitch_range = tune.get_two_pass_contour(get_glide(150, 220), RATE)
+        self.assertIsNotNone(pitch_range)
+        self.assertLess(pitch_range["floor_hz"], 150)
+        self.assertGreater(pitch_range["ceiling_hz"], 220)
+
+    def test_a_rise_survives_the_second_pass(self):
+        times, f0, _ = tune.get_two_pass_contour(get_glide(250, 450), RATE)
+        readout = tune.get_tune_readout(times, f0, 0.0, SECONDS)
+        self.assertTrue(readout["measured"], readout)
+        self.assertTrue(readout["rising"])
+
+    def test_noise_has_no_range_and_stays_unmeasured(self):
+        rng = np.random.default_rng(0)
+        noise = (0.1 * rng.standard_normal(int(RATE * SECONDS))).astype("float32")
+        times, f0, pitch_range = tune.get_two_pass_contour(noise, RATE)
+        self.assertFalse(tune.get_tune_readout(times, f0, 0.0, SECONDS)["measured"])
+
+
 class SpeechEndTest(unittest.TestCase):
     def test_end_is_where_the_tone_stops_not_the_file(self):
         samples = np.concatenate([get_glide(150, 220), np.zeros(int(RATE * 0.4), "float32")])

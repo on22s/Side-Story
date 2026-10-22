@@ -36,6 +36,16 @@ question rise in a higher voice, and losing exactly the top of a rise biases
 the read-out toward "falling" (one pilot rise reached ~445 Hz). PITCH_CEILING_HZ
 is 600; a test pins a 250->450 Hz rise that a 350 Hz ceiling loses.
 
+PITCH RANGE: TWO PASSES (Hirst 2011; Hirst & De Looze 2020, ch. 13). A blind
+listening check of 12 pilot clips matched the single-pass Praat read-out on
+only 5 of the 10 clips the listener could call. The three large misses were
+tracking errors, not intonation: a 3-frame 518-568 Hz burst after a 98->63 Hz
+fall, a word whose first half was tracked an octave high, and a climb onto a
+harmonic. The published fix tracks once at 60-700 Hz, then again between
+0.75 x q1 and 1.5 x q3 of that first track. Hirst offers 2.5 x q3 for
+expanded (expressive) ranges; the artifact records the read-out under both,
+with 1.5 x q3 fixed as the primary before rescoring.
+
 WORD END = END OF SPEECH. CTC marks a short spike, not where a word ends: in
 the pilot the aligned end of the final word came 0.02-0.12 s before speech
 stopped, cutting off the edge tone being measured. Since the final word is the
@@ -65,7 +75,10 @@ from utils import atomic_json_write
 
 RISE_BOUNDARY_ERB = 0.38
 PITCH_FLOOR_HZ = 60
-PITCH_CEILING_HZ = 600
+PITCH_CEILING_HZ = 700
+FLOOR_Q1_FACTOR = 0.75
+CEILING_Q3_FACTOR = 1.5
+EXPANDED_CEILING_Q3_FACTOR = 2.5
 PITCH_STEP_SECONDS = 0.005
 MIN_VOICED_SECONDS = 0.06
 MIN_VOICED_FRACTION = 0.25
@@ -113,17 +126,31 @@ def get_tune_readout(times, f0_hz, start, end, line_median_hz=None):
     return result
 
 
-def get_pitch_contour(samples, rate, ceiling=PITCH_CEILING_HZ):
+def get_pitch_contour(samples, rate, ceiling=PITCH_CEILING_HZ, floor=PITCH_FLOOR_HZ):
     """(times, f0 in Hz with NaN where unvoiced) from Praat's ac tracker."""
     import numpy as np
     import parselmouth
 
     sound = parselmouth.Sound(np.asarray(samples, dtype="float64"), sampling_frequency=rate)
     pitch = sound.to_pitch_ac(time_step=PITCH_STEP_SECONDS,
-                              pitch_floor=PITCH_FLOOR_HZ, pitch_ceiling=ceiling)
+                              pitch_floor=floor, pitch_ceiling=ceiling)
     f0 = pitch.selected_array["frequency"].astype("float64")
     f0[f0 <= 0] = np.nan
     return list(pitch.xs()), f0.tolist()
+
+
+def get_two_pass_contour(samples, rate, ceiling_q3_factor=CEILING_Q3_FACTOR):
+    """Hirst's two-pass track: the second pass's range comes from the first's."""
+    import numpy as np
+
+    times, f0 = get_pitch_contour(samples, rate)
+    voiced = [f for f in f0 if not np.isnan(f)]
+    if len(voiced) < 4:
+        return times, f0, None
+    q1, q3 = np.percentile(voiced, [25, 75])
+    floor, ceiling = FLOOR_Q1_FACTOR * q1, ceiling_q3_factor * q3
+    times, f0 = get_pitch_contour(samples, rate, ceiling=ceiling, floor=floor)
+    return times, f0, {"floor_hz": round(float(floor), 1), "ceiling_hz": round(float(ceiling), 1)}
 
 
 def get_speech_end(samples, rate):
@@ -157,15 +184,19 @@ def measure_clip(wav, text, device="cpu"):
 
     samples, rate = soundfile.read(wav, dtype="float64", always_2d=True)
     samples = samples.mean(axis=1)
-    times, f0 = get_pitch_contour(samples, rate)
     start, ctc_end, word = get_final_word_span(wav, text, device)
     speech_end = get_speech_end(samples, rate)
     end = max(ctc_end, speech_end) if speech_end is not None else ctc_end
-    line_voiced = [f for f in f0 if not np.isnan(f)]
-    median = float(np.median(line_voiced)) if line_voiced else None
+    readouts = {}
+    for name, factor in (("primary", CEILING_Q3_FACTOR), ("expanded", EXPANDED_CEILING_Q3_FACTOR)):
+        times, f0, pitch_range = get_two_pass_contour(samples, rate, factor)
+        line_voiced = [f for f in f0 if not np.isnan(f)]
+        median = float(np.median(line_voiced)) if line_voiced else None
+        readouts[name] = {"pitch_range": pitch_range,
+                          **get_tune_readout(times, f0, start, end, median)}
     return {"final_word": word, "ctc_end": round(ctc_end, 3),
             "speech_end": None if speech_end is None else round(speech_end, 3),
-            **get_tune_readout(times, f0, start, end, median)}
+            **readouts["primary"], "expanded": readouts["expanded"]}
 
 
 def main():
@@ -188,7 +219,9 @@ def main():
         print(json.dumps(results[-1]), flush=True)
     measured = [r for r in results if r.get("measured")]
     document = {"rise_boundary_erb": RISE_BOUNDARY_ERB, "tracker": "praat to_pitch_ac",
-                "pitch_floor_hz": PITCH_FLOOR_HZ, "pitch_ceiling_hz": PITCH_CEILING_HZ,
+                "first_pass_hz": [PITCH_FLOOR_HZ, PITCH_CEILING_HZ],
+                "second_pass": f"{FLOOR_Q1_FACTOR} x q1 to {CEILING_Q3_FACTOR} x q3 "
+                               f"(expanded: {EXPANDED_CEILING_Q3_FACTOR} x q3)",
                 "pitch_step_seconds": PITCH_STEP_SECONDS,
                 "min_voiced_seconds": MIN_VOICED_SECONDS,
                 "align_model": ALIGN_MODEL,

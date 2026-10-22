@@ -4076,6 +4076,9 @@
     "tests.test_final_word_tune.TuneReadoutTest.test_rise_below_the_boundary_is_not_rising",
     "tests.test_final_word_tune.TuneReadoutTest.test_rise_reads_as_rising",
     "tests.test_final_word_tune.TuneReadoutTest.test_window_outside_the_contour_is_unmeasured",
+    "tests.test_final_word_tune.TwoPassTest.test_a_rise_survives_the_second_pass",
+    "tests.test_final_word_tune.TwoPassTest.test_noise_has_no_range_and_stays_unmeasured",
+    "tests.test_final_word_tune.TwoPassTest.test_range_comes_from_the_first_pass_quartiles",
     "tests.test_final_word_tune.WordsTest.test_quotes_and_apostrophes",
     "tests.test_final_word_tune.WordsTest.test_terminal_punctuation_never_becomes_a_word",
     "tests.test_final_word_tune.WordsTest.test_text_without_words_is_empty"
