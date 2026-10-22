@@ -4061,6 +4061,22 @@
     "tests.test_final_audio_restore.FinalAudioRestoreTests.test_head_checks_the_real_download_without_transferring_audio",
     "tests.test_final_audio_restore.FinalAudioRestoreTests.test_native_result_tab_restores_download_and_rejects_stale_missing_or_failed_checks"
   ],
+  "test_final_word_tune": [
+    "tests.test_final_word_tune.HzToErbTest.test_is_increasing",
+    "tests.test_final_word_tune.HzToErbTest.test_matches_praat_reference_values",
+    "tests.test_final_word_tune.TuneReadoutTest.test_fall_reads_as_falling",
+    "tests.test_final_word_tune.TuneReadoutTest.test_flat_tone_is_not_rising",
+    "tests.test_final_word_tune.TuneReadoutTest.test_high_rise_is_measured_above_the_old_ceiling",
+    "tests.test_final_word_tune.TuneReadoutTest.test_noise_is_unmeasured_not_flat",
+    "tests.test_final_word_tune.TuneReadoutTest.test_offset_is_reported_against_the_line_median",
+    "tests.test_final_word_tune.TuneReadoutTest.test_old_350_hz_ceiling_loses_the_high_rise",
+    "tests.test_final_word_tune.TuneReadoutTest.test_rise_below_the_boundary_is_not_rising",
+    "tests.test_final_word_tune.TuneReadoutTest.test_rise_reads_as_rising",
+    "tests.test_final_word_tune.TuneReadoutTest.test_window_outside_the_contour_is_unmeasured",
+    "tests.test_final_word_tune.WordsTest.test_quotes_and_apostrophes",
+    "tests.test_final_word_tune.WordsTest.test_terminal_punctuation_never_becomes_a_word",
+    "tests.test_final_word_tune.WordsTest.test_text_without_words_is_empty"
+  ],
   "test_find_nicknames": [
     "tests.test_find_nicknames.ConcurrentAliasPublicationTests.test_http_correction_and_discovery_share_lock_and_latest_human_values",
     "tests.test_find_nicknames.ParseAliasResponseTests.test_alias_free_discovery_preserves_human_registry",

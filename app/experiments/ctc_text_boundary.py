@@ -1,5 +1,6 @@
 """Align known transcript lines to continuous audio with CTC segmentation."""
 import argparse
+import functools
 import json
 import os
 import statistics
@@ -25,14 +26,20 @@ def get_log_probs(output):
     return output.logits.log_softmax(dim=-1)
 
 
+@functools.lru_cache(maxsize=2)
+def _load_ctc(model_name, device):
+    from transformers import AutoModelForCTC, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_name)
+    return processor, AutoModelForCTC.from_pretrained(model_name).to(device).eval()
+
+
 def align_lines(wav, texts, model_name, device):
     import librosa
     import torch
     import torchaudio
-    from transformers import AutoModelForCTC, AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModelForCTC.from_pretrained(model_name).to(device).eval()
+    processor, model = _load_ctc(model_name, device)
     speech, _ = librosa.load(wav, sr=processor.feature_extractor.sampling_rate)
     inputs = processor(speech, sampling_rate=processor.feature_extractor.sampling_rate,
                        return_tensors="pt")
