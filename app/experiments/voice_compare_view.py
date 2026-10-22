@@ -224,10 +224,10 @@ def alignment_path(human_path, arm_path, sr=22050):
     return path[:, 0] * sec, path[:, 1] * sec
 
 
-def f0_contour(y, sr, fmax=350):
+def f0_contour(y, sr):
     import librosa
     import numpy as np
-    f0, voiced, _ = librosa.pyin(y, fmin=60, fmax=fmax, sr=sr)
+    f0, voiced, _ = librosa.pyin(y, fmin=60, fmax=350, sr=sr)
     if f0 is None:
         return None, None
     t = librosa.times_like(f0, sr=sr)

@@ -23,11 +23,24 @@ fitted to THEIR models' assertions and questions; it is a starting point to be
 re-checked on ours, not a constant. The continuous excursion is always recorded
 beside the boolean.
 
-PITCH CEILING. `f0_contour` defaults to 350 Hz, which is enough for a voice's
-median but not for the top of a question rise in a higher voice: frames above
-the ceiling come back unvoiced, and losing exactly the top of a rise biases the
-read-out toward "falling". This uses FMAX_HZ instead; a test pins a 250->450 Hz
-rise that the 350 Hz ceiling cannot measure.
+PITCH TRACKER: PRAAT, NOT PYIN. The first pilot (2026-10-22, 40 clips, two
+"husky" library LoRA voices) scored with `voice_compare_view.f0_contour`
+(librosa pyin) left 27 of 40 final words unmeasured. pyin's voicing probability
+sat near 0.01 on these voices even where Praat's autocorrelation tracker found
+steady voicing at a plausible pitch ("boat": Praat 22 voiced 5-ms frames at
+146 Hz, pyin 0 of 10). The paper also used Praat. A 5 ms step gives about four
+times pyin's points over a 0.15-0.3 s final word.
+
+PITCH CEILING. A ceiling that suits a voice's median cuts off the top of a
+question rise in a higher voice, and losing exactly the top of a rise biases
+the read-out toward "falling" (one pilot rise reached ~445 Hz). PITCH_CEILING_HZ
+is 600; a test pins a 250->450 Hz rise that a 350 Hz ceiling loses.
+
+WORD END = END OF SPEECH. CTC marks a short spike, not where a word ends: in
+the pilot the aligned end of the final word came 0.02-0.12 s before speech
+stopped, cutting off the edge tone being measured. Since the final word is the
+last thing said, its end is taken as the end of audible speech (LoCA's
+activity rule, arXiv:2610.28035 Appendix D) whenever that is later.
 
 UNMEASURED IS NOT FLAT. A word with too few voiced frames returns
 `measured: False` with the reason, never an excursion of 0 (Rule 21: a fallback
@@ -51,10 +64,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import atomic_json_write
 
 RISE_BOUNDARY_ERB = 0.38
-FMAX_HZ = 600
-MIN_VOICED_POINTS = 10
+PITCH_FLOOR_HZ = 60
+PITCH_CEILING_HZ = 600
+PITCH_STEP_SECONDS = 0.005
+MIN_VOICED_SECONDS = 0.06
 MIN_VOICED_FRACTION = 0.25
-SAMPLE_RATE = 22050
 ALIGN_MODEL = "facebook/wav2vec2-large-960h"
 
 
@@ -81,7 +95,7 @@ def get_tune_readout(times, f0_hz, start, end, line_median_hz=None):
     base = {"start": round(start, 3), "end": round(end, 3),
             "frames": len(inside), "voiced_points": len(voiced),
             "voiced_fraction": round(fraction, 3)}
-    if len(voiced) < MIN_VOICED_POINTS:
+    if len(voiced) * PITCH_STEP_SECONDS < MIN_VOICED_SECONDS:
         return {**base, "measured": False, "reason": "too few voiced points"}
     if fraction < MIN_VOICED_FRACTION:
         return {**base, "measured": False, "reason": "voiced fraction too low"}
@@ -99,6 +113,33 @@ def get_tune_readout(times, f0_hz, start, end, line_median_hz=None):
     return result
 
 
+def get_pitch_contour(samples, rate, ceiling=PITCH_CEILING_HZ):
+    """(times, f0 in Hz with NaN where unvoiced) from Praat's ac tracker."""
+    import numpy as np
+    import parselmouth
+
+    sound = parselmouth.Sound(np.asarray(samples, dtype="float64"), sampling_frequency=rate)
+    pitch = sound.to_pitch_ac(time_step=PITCH_STEP_SECONDS,
+                              pitch_floor=PITCH_FLOOR_HZ, pitch_ceiling=ceiling)
+    f0 = pitch.selected_array["frequency"].astype("float64")
+    f0[f0 <= 0] = np.nan
+    return list(pitch.xs()), f0.tolist()
+
+
+def get_speech_end(samples, rate):
+    """Seconds at which audible speech stops (LoCA's 50 ms RMS activity rule)."""
+    import librosa
+    import numpy as np
+
+    rms = librosa.feature.rms(y=np.asarray(samples, dtype="float32"),
+                              frame_length=int(0.05 * rate), hop_length=int(0.02 * rate))[0]
+    threshold = float(np.clip(0.15 * np.percentile(rms, 95), 0.0003, 0.003))
+    active = np.where(rms > threshold)[0]
+    if not active.size:
+        return None
+    return float(librosa.frames_to_time(active[-1], sr=rate, hop_length=int(0.02 * rate)))
+
+
 def get_final_word_span(wav, text, device="cpu", model_name=ALIGN_MODEL):
     """(start, end, score) of the line's last word, by known-text CTC alignment."""
     from ctc_text_boundary import align_lines
@@ -111,19 +152,20 @@ def get_final_word_span(wav, text, device="cpu", model_name=ALIGN_MODEL):
 
 
 def measure_clip(wav, text, device="cpu"):
-    import librosa
     import numpy as np
-    from voice_compare_view import f0_contour
+    import soundfile
 
-    y, sr = librosa.load(wav, sr=SAMPLE_RATE)
-    times, f0 = f0_contour(y, sr, fmax=FMAX_HZ)
-    if times is None:
-        return {"measured": False, "reason": "no pitch track"}
-    start, end, word = get_final_word_span(wav, text, device)
-    line_voiced = f0[~np.isnan(f0)]
-    median = float(np.median(line_voiced)) if line_voiced.size else None
-    return {"final_word": word,
-            **get_tune_readout(times.tolist(), f0.tolist(), start, end, median)}
+    samples, rate = soundfile.read(wav, dtype="float64", always_2d=True)
+    samples = samples.mean(axis=1)
+    times, f0 = get_pitch_contour(samples, rate)
+    start, ctc_end, word = get_final_word_span(wav, text, device)
+    speech_end = get_speech_end(samples, rate)
+    end = max(ctc_end, speech_end) if speech_end is not None else ctc_end
+    line_voiced = [f for f in f0 if not np.isnan(f)]
+    median = float(np.median(line_voiced)) if line_voiced else None
+    return {"final_word": word, "ctc_end": round(ctc_end, 3),
+            "speech_end": None if speech_end is None else round(speech_end, 3),
+            **get_tune_readout(times, f0, start, end, median)}
 
 
 def main():
@@ -145,7 +187,10 @@ def main():
         results.append({**row, **readout})
         print(json.dumps(results[-1]), flush=True)
     measured = [r for r in results if r.get("measured")]
-    document = {"rise_boundary_erb": RISE_BOUNDARY_ERB, "fmax_hz": FMAX_HZ,
+    document = {"rise_boundary_erb": RISE_BOUNDARY_ERB, "tracker": "praat to_pitch_ac",
+                "pitch_floor_hz": PITCH_FLOOR_HZ, "pitch_ceiling_hz": PITCH_CEILING_HZ,
+                "pitch_step_seconds": PITCH_STEP_SECONDS,
+                "min_voiced_seconds": MIN_VOICED_SECONDS,
                 "align_model": ALIGN_MODEL,
                 "summary": {"clips": len(results), "measured": len(measured),
                             "rising": sum(1 for r in measured if r["rising"])},
