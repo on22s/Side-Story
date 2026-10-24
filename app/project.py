@@ -412,7 +412,7 @@ def is_kana_letter(ch):
     return unicodedata.name(ch, "").startswith(KANA_NAME_PREFIXES)
 
 
-def get_chunk_char_limit(text, base=MAX_CHUNK_CHARS):
+def get_chunk_char_limit(text, base=MAX_CHUNK_CHARS, language=None):
     """Return the TTS chunk character limit, reduced for Chinese and Japanese.
 
     Chinese and Japanese characters take longer to speak than English ones
@@ -431,15 +431,22 @@ def get_chunk_char_limit(text, base=MAX_CHUNK_CHARS):
                 kana += 1
     if not han_or_kana:
         return base
-    # Any Han/kana text gets the shorter budget. A mixed Chinese/Japanese
-    # passage takes the lower Chinese limit unless kana clearly dominates.
-    language = "ja" if kana * 2 >= han_or_kana else "zh"
-    return max(1, int(base / CJK_SPEECH_RATE_FACTORS[language]))
+    # Prefer the configured synthesis language; otherwise use kana-majority
+    # heuristics. A mixed passage takes the lower Chinese limit unless kana
+    # clearly dominates.
+    configured = str(language or "").strip().casefold()
+    if configured in ("japanese", "ja"):
+        chosen = "ja"
+    elif configured in ("chinese", "zh"):
+        chosen = "zh"
+    else:
+        chosen = "ja" if kana * 2 >= han_or_kana else "zh"
+    return max(1, int(base / CJK_SPEECH_RATE_FACTORS[chosen]))
 
 
 def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                       review_sink=None, include_source_indices=False,
-                      language_aware=True):
+                      language_aware=True, language=None):
     """Group consecutive entries by same speaker into chunks up to max_chars"""
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
@@ -478,7 +485,8 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                 and not _is_structural_text(current_text)
                 and not _is_structural_text(text)):
             combined = current_text + ("" if JOINS_WITHOUT_SPACE.match(text) else " ") + text
-            limit = get_chunk_char_limit(combined, max_chars) if language_aware else max_chars
+            limit = (get_chunk_char_limit(combined, max_chars, language)
+                     if language_aware else max_chars)
             if len(combined) <= limit:
                 current_text = combined
                 if include_source_indices:
@@ -508,7 +516,8 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
     for chunk in chunks:
         remaining = chunk["text"]
         while True:
-            limit = get_chunk_char_limit(remaining, max_chars) if language_aware else max_chars
+            limit = (get_chunk_char_limit(remaining, max_chars, language)
+                     if language_aware else max_chars)
             if len(remaining) <= limit:
                 break
             boundaries = list(re.finditer(r"\s+|[.!?。！？，、；：…]", remaining[:limit]))
@@ -809,7 +818,8 @@ class ProjectManager:
                 return []
 
             review = []
-            chunks = group_into_chunks(script, review_sink=review)
+            chunks = group_into_chunks(script, review_sink=review,
+                                       language=self._load_tts_config().get('language'))
             log_review_characters(review)
 
             # Initialize chunk status
