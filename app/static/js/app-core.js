@@ -7280,13 +7280,12 @@
             // endings on every line when the line count is unchanged.
             if (typeof saved !== 'string' || typeof value !== 'string'
                     || !saved.includes('\r') || value.includes('\r')) { return value; }
-            const savedParts = saved.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) || [];
+            const savedLines = saved.split(/\r\n|\r|\n/);
+            const savedEndings = saved.match(/(?:\r\n|\r|\n)/g) || [];
             const incomingLines = value.split('\n');
-            if (savedParts.length !== incomingLines.length) { return value; }
-            return incomingLines.map((line, index) => {
-                const ending = (savedParts[index].match(/(?:\r\n|\r|\n)$/) || [''])[0];
-                return line + (ending || (index < incomingLines.length - 1 ? '\n' : ''));
-            }).join('');
+            if (savedLines.length !== incomingLines.length) { return value; }
+            return incomingLines.map((line, index) => line + (
+                savedEndings[index] || (index < incomingLines.length - 1 ? '\n' : ''))).join('');
         }
 
         window.updateChunk = async (id, field, value) => {
