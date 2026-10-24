@@ -165,6 +165,10 @@ from routers.speaker_review import router as speaker_review_router
 
 app.include_router(speaker_review_router)
 
+from routers.character_roster import router as character_roster_router
+
+app.include_router(character_roster_router)
+
 from routers.voices import router as voices_router
 
 app.include_router(voices_router)
@@ -172,6 +176,9 @@ app.include_router(voices_router)
 from routers.editor import router as editor_router
 
 app.include_router(editor_router)
+
+from routers.sound_design import router as sound_design_router
+app.include_router(sound_design_router)
 
 from routers.pronunciation_panel import router as pronunciation_router
 app.include_router(pronunciation_router)

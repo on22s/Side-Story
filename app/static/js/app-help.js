@@ -8,6 +8,11 @@
         // has no entry, or if a recommendation has no source.
         /** @type {Object<string, {what: string, recommend?: string, source?: string}>} */
         const FIELD_HELP = {
+            'roster-import': {what: 'Choose an exported approved character roster. Review every imported identity and quote against the selected book before approval.'},
+            'roster-survivor': {what: 'Choose which selected existing identity survives a merge. Other merged identities are retired.'},
+            'roster-split-name': {what: 'Name the new character when splitting one selected identity. Supply a supporting source quote before approval.'},
+            'roster-split-new': {what: 'Retire the original identity and allocate two new identities for this split. Leave off to keep the original identity for one character.'},
+            'roster-consent': {what: 'Confirm that you reviewed the proposed identities and exact source locations. Edits invalidate this confirmation.'},
             'setup-settings-category': {what: 'Choose which Setup category to display. Edits in other categories are retained. Save Configuration applies all edited categories.'},
             'setup-settings-search': {what: 'Find available Setup settings by their labels and explanations, then jump to the original control. Does not search field values or save settings.'},
             // Setup: LLM connection
@@ -167,6 +172,7 @@
             'cast-select': {what: 'The saved cast (character → voice mapping) applied to this book.'},
 
             // Editor tab
+            'sound-assets-file': {what: 'Choose WAV, FLAC, MP3 or OGG audio to retain in the sound asset library. Import verifies the complete file. It does not change book audio; use the library to audition it first.'},
             'editor-repair-chapter': {what: 'Choose one detected export chapter, or the entire book, for the audio repair preview. Without headings, each line is a chapter.'},
             'editor-repair-speakers': {what: 'Select one or more literal speaker labels to include in the repair preview. Preview shows the exact affected lines before audio replacement.'},
             'editor-quality-filter': {what: 'Filter saved unknown-speaker, failed-render, missing-file and voice-drift findings. No check is started.'},
@@ -287,6 +293,12 @@
         };
 
         const ACTION_HELP = {
+            'soundAssetsImport': 'Import and verify the selected audio for reuse. It does not select a cue or change book audio.',
+            'soundAssetsCancel': 'Request import cancellation. Cleanup may continue briefly; refresh the library before retrying.',
+            'soundAssetsRefresh': 'Read retained sound assets and incomplete imports. Refreshing stops any current asset audition.',
+            'soundAssetsCleanup': 'Remove only this incomplete import and release its reserved storage. Ready assets are retained.',
+            'soundAssetsStart': 'Choose the audition start time in seconds within this sound. The preview lasts at most ten seconds.',
+            'soundAssetsListen': 'Verify the retained sound and play up to ten seconds from the chosen start. Book audio is unchanged.',
             'clearM4bTitle': 'Intentionally leave the next M4B title empty. Clears this field and prevents a source suggestion or the default title from filling it.',
             'previewM4bPublication': 'Read captured EPUB metadata and cover suggestions for the selected book. Does not change project files or start generation.',
             'applyM4bPublication': 'Apply only your chosen suggestions to untouched fields and the source-cover selection. Export starts separately.',
@@ -515,6 +527,20 @@
         };
 
         const ITEM_HELP = {
+            'roster-load': 'Load the selected source, cast, approved identities and saved undo. After an unconfirmed write, inspect saved state before another action.',
+            'roster-export': 'Download the approved character identities and evidence. Unsaved draft edits are excluded.',
+            'roster-recover': 'Restore the previous unsaved draft for this source and saved roster, then review it again.',
+            'roster-seed': 'Start an empty identity draft from this source’s current cast. Add and locate supporting quotes before approval.',
+            'roster-add': 'Add a character with a new identity to the draft. Supply its name and supporting source quote.',
+            'roster-merge': 'Merge selected draft characters into the chosen surviving identity. Review aliases and evidence before approval.',
+            'roster-split': 'Split one selected character into separate identities. Review each resulting character’s name and supporting quotes.',
+            'roster-retire': 'Remove selected characters from the draft while retaining their retired identity history after approval.',
+            'roster-previous': 'Show the previous page of draft characters.',
+            'roster-next': 'Show the next page of draft characters.',
+            'roster-preview': 'Check identity decisions and exact quotes against current saved inputs. Preview does not approve or change the cast.',
+            'roster-approve': 'Approve the exact reviewed draft for future script generation and save one exact undo. Changed inputs refuse approval.',
+            'roster-undo': 'Restore the cast and roster from before the last approval. Changed source or approved files prevent an unsafe rollback.',
+            'roster-discard': 'Explicitly remove the saved undo while keeping the current cast and roster. Resolve it before another approval.',
             'settings-llm-advanced-toggle': 'Show or hide request timeouts and retry backoff for the selected LLM location. Expanding this group does not change its settings.',
             'script-recovery-inject': 'Paste a replacement model reply for the failed chunk, then validate it before applying it.',
             'config-save-button-top': 'Save the current configuration so subsequent tasks use these settings.',

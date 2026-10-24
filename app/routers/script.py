@@ -72,6 +72,7 @@ from alexandria_alignment import validate_epub_archive
 from epub_package import get_epub_package
 from epub_publication import get_epub_publication_candidate, get_epub_publication_origin
 from project_scope_files import capture_scope_file
+from source_upload_publication import create_source_upload_stage, publish_completed_upload
 from publication_source import (PublicationSourceLimit, get_upload_publication_update,
     apply_publication_source_update, restore_publication_source_update,
     get_saved_publication_source_bytes, get_publication_source_path)
@@ -688,35 +689,6 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None) -> 
     return normalize_extracted_text('\n\n'.join(chapters))
 
 
-def _claim_unique_path(directory: str, filename: str) -> str:
-    """Atomically reserve a unique path in directory for filename, returning the
-    path to a newly-created empty file the caller should now write/truncate into.
-
-    A directory scan picks a good starting candidate (avoiding O(n) O_EXCL
-    failures when the directory is large), then os.O_EXCL claims it -
-    closing the TOCTOU race a scan-then-write approach has under concurrent
-    uploads of the same filename. Caps at 1000 attempts to prevent a DoS
-    from a maliciously pre-populated directory.
-    """
-    existing = {e.name for e in os.scandir(directory) if e.is_file()}
-    base, ext = os.path.splitext(filename)
-    candidate = filename
-    counter = 1
-    while True:
-        if candidate not in existing:
-            path = os.path.join(directory, candidate)
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                os.close(fd)
-                return path
-            except FileExistsError:
-                pass  # lost the race - fall through and try the next candidate
-        if counter > 1000:
-            raise RuntimeError(f"Too many collisions for filename: {filename}")
-        counter += 1
-        candidate = f"{base}_{counter}{ext}"
-
-
 def _get_upload_hash(path: str) -> str:
     """Return SHA-256 from a bounded cache of current upload versions."""
     stat = os.stat(path)
@@ -774,13 +746,27 @@ def _get_reusable_uploads() -> List[dict]:
     return uploads
 
 
+def _apply_upload_selection(path, before_publication=None):
+    # Retain the kernel task barrier while slow metadata/book I/O runs, without
+    # retaining the local task mutex on another ASGI handler's thread.
+    with ensure_book_switch_allowed(hold_task_mutex=False):
+        try:
+            options = {'timeout': 0}
+            if before_publication is not None:
+                options['before_publication'] = before_publication
+            apply_book_input_selection(DATA_DIR, path,
+                secure_filename(os.path.splitext(os.path.basename(path))[0]), **options)
+        except ValueError:
+            raise HTTPException(status_code=409, detail=(
+                'Book metadata requires inspection; existing book files were preserved.')) from None
+
+
 def _select_upload(filename: str) -> str:
     safe_name = _require_safe_filename(filename, "Invalid upload filename")
     path = os.path.join(UPLOADS_DIR, safe_name)
     if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in {".txt", ".md"}:
         raise HTTPException(status_code=404, detail=f"Reusable upload '{filename}' not found.")
-    with ensure_book_switch_allowed():
-        apply_book_input_selection(DATA_DIR, path, secure_filename(os.path.splitext(safe_name)[0]), timeout=0)
+    _apply_upload_selection(path)
     return path
 
 
@@ -814,25 +800,7 @@ def get_upload_storage_bytes():
                    if entry.is_file(follow_symlinks=False))
 
 
-async def await_upload_operation(operation):
-    """Finish admitted I/O before reporting cancellation to its owner."""
-    task = asyncio.create_task(operation)
-    cancelled = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            cancelled = error
-        except Exception:
-            break
-    try:
-        result = task.result()
-    except BaseException:
-        if cancelled is not None:
-            raise cancelled
-        raise
-    return result, cancelled
-
+from upload_operation import await_upload_operation
 
 @router.post("/api/upload")
 async def upload_file(file: UploadFile = File(...), select_active: bool = True):
@@ -851,13 +819,19 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
         storage_lock.__exit__(None, None, None)
         raise cancelled
     owned_paths = set()
+    selection = {'publication_started': False}
+    def retain_selected_source(path=None):
+        # Worker handoff: after publication starts its outcome may be unknown.
+        # Preserve valid uploaded files/provenance even if cancellation or an I/O
+        # error arrives after a book-state rename. They remain quota-accounted.
+        selection['publication_started'] = True
     publication = publication_update = None
     try:
         available = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
         if available <= 0:
             raise HTTPException(status_code=413, detail="Source upload storage limit reached.")
         file_path, cancelled = await await_upload_operation(
-            asyncio.to_thread(_claim_unique_path, UPLOADS_DIR, safe_name))
+            asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR))
         owned_paths.add(file_path)
         if cancelled is not None:
             raise cancelled
@@ -865,7 +839,7 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
             _save_upload_limited(file, file_path, min(MAX_SCRIPT_UPLOAD_BYTES, available)))
         if cancelled is not None:
             raise cancelled
-        if file_path.lower().endswith('.epub'):
+        if safe_name.lower().endswith('.epub'):
             try:
                 captured, cancelled = await await_upload_operation(asyncio.to_thread(
                     capture_scope_file, Path(file_path).parent.resolve(), os.path.basename(file_path),
@@ -897,9 +871,9 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
             publication, cancelled = await await_upload_operation(asyncio.to_thread(capture_publication))
             if cancelled is not None:
                 raise cancelled
-            txt_name = os.path.basename(file_path).rsplit('.', 1)[0] + '.txt'
+            safe_name = os.path.splitext(safe_name)[0] + '.txt'
             txt_path, cancelled = await await_upload_operation(
-                asyncio.to_thread(_claim_unique_path, UPLOADS_DIR, txt_name))
+                asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR))
             owned_paths.add(txt_path)
             if cancelled is not None:
                 raise cancelled
@@ -920,27 +894,42 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
                     source_limit=MAX_SCRIPT_UPLOAD_BYTES))
                 if cancelled is not None:
                     raise cancelled
-                _, cancelled = await await_upload_operation(asyncio.to_thread(
-                    apply_publication_source_update, publication_update))
-                if cancelled is not None:
-                    raise cancelled
+                if reused:
+                    # This source is already library-owned. A reader may observe
+                    # the atomic provenance update before this request returns.
+                    retain_selected_source()
+                    _, cancelled = await await_upload_operation(asyncio.to_thread(
+                        apply_publication_source_update, publication_update))
+                    if cancelled is not None:
+                        raise cancelled
             except PublicationSourceLimit as error:
                 raise HTTPException(status_code=413, detail=str(error)) from error
             except ValueError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
+        if not reused:
+            file_path, cancelled = await await_upload_operation(asyncio.to_thread(
+                publish_completed_upload, file_path, safe_name, retain_selected_source,
+                limit=MAX_SCRIPT_UPLOAD_BYTES,
+                companion_bytes=publication_update['new_bytes'] if publication_update else None))
+            if cancelled is not None:
+                raise cancelled
         if select_active:
-            with ensure_book_switch_allowed():
-                apply_book_input_selection(DATA_DIR, file_path,
-                                          secure_filename(os.path.splitext(os.path.basename(file_path))[0]), timeout=0)
+            _, cancelled = await await_upload_operation(asyncio.to_thread(
+                _apply_upload_selection, file_path, retain_selected_source))
+            if cancelled is not None:
+                raise cancelled
         return {"filename": file.filename, "stored_filename": os.path.basename(file_path),
                 "path": file_path, "reused": reused,
                 "publication_status": publication['metadata_status'] if publication is not None else 'not_captured',
                 "publication_warnings": publication['warnings'] if publication is not None else []}
     except BaseException:
         try:
-            if publication_update is not None:
+            if publication_update is not None and not selection['publication_started']:
                 await await_upload_operation(asyncio.to_thread(restore_publication_source_update, publication_update))
         finally:
+            # Only private stages belong to this request. Public sources were
+            # handed off at visibility and must survive another reader selecting
+            # them, including cancellation before our own book selection.
             for path in owned_paths:
                 try:
                     os.remove(path)
@@ -1255,7 +1244,8 @@ async def snapshot_script(request: SnapshotRequest):
 
 def _snapshot_script_sync(request):
     from routers.scripts_library import (_require_saved_book_name, _get_saved_book_companions,
-                                         validate_book_json_bytes)
+                                         validate_book_json_bytes, _capture_cue_companion)
+    from sound_design_registry import ACTIVE_CUES, get_saved_sound_design_path
     safe_name = _require_saved_book_name(request.name)
     dest = os.path.join(SCRIPTS_DIR, f"{safe_name}.json")
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
@@ -1276,8 +1266,12 @@ def _snapshot_script_sync(request):
         if any(os.path.lexists(path) for path in (dest, *_get_saved_book_companions(dest))):
             raise HTTPException(status_code=409,
                                 detail="A saved script already uses that snapshot name.")
+        book_id = get_active_book_id() or safe_name
+        cue_bytes = _capture_cue_companion(DATA_DIR, ACTIVE_CUES, book_id)
         script_bytes = json.dumps(entries, ensure_ascii=False, indent=2).encode('utf-8')
         replacements = {os.path.basename(dest): script_bytes}
+        if cue_bytes is not None:
+            replacements[os.path.basename(get_saved_sound_design_path(dest))] = cue_bytes
         if os.path.exists(VOICE_CONFIG_PATH):
             voice_bytes = Path(VOICE_CONFIG_PATH).read_bytes()
             validate_book_json_bytes(voice_bytes, dict, 409, 'Active snapshot voices')
@@ -1289,7 +1283,7 @@ def _snapshot_script_sync(request):
             raise HTTPException(status_code=409, detail=f'Publication provenance cannot be snapshotted: {error}') from error
         if publication is not None:
             replacements[os.path.basename(get_publication_source_path(dest))] = publication
-        replacements[os.path.basename(metadata)] = json.dumps({"book_id": get_active_book_id() or safe_name,
+        replacements[os.path.basename(metadata)] = json.dumps({"book_id": book_id,
                            "snapshot": {"entries": len(entries),
                                         "segmented": len(checkpoint.get("segmented") or []),
                                         "chunks_done": checkpoint.get("chunks_done"),
@@ -1956,10 +1950,8 @@ async def cast_list_cancel():
     return _cancel_task("cast_list", "No cast list is being built.", "Cast list build already exited.")
 
 
-@router.get("/api/cast_list")
-async def get_cast_list():
-    """The selected book's cast list, or {"cast": null} when it has none."""
-    _, path = await asyncio.to_thread(get_current_cast_list_target)
+def get_current_cast_list():
+    _, path = get_current_cast_list_target()
     document = safe_load_json(path, default=None)
     if not isinstance(document, dict) or not isinstance(document.get("cast"), list):
         return {"cast": None}
@@ -1969,11 +1961,14 @@ async def get_cast_list():
             "edited": bool(provenance.get("edited"))}
 
 
-@router.post("/api/cast_list")
-async def save_cast_list_endpoint(update: CastListUpdate):
-    """Save a hand-edited list. Refused, and nothing written, if generation
-    would refuse it."""
-    _, path = await asyncio.to_thread(get_current_cast_list_target)
+@router.get("/api/cast_list")
+async def get_cast_list():
+    """The selected book's cast list, or {"cast": null} when it has none."""
+    return await asyncio.to_thread(get_current_cast_list)
+
+
+def save_current_cast_list(update: CastListUpdate):
+    _, path = get_current_cast_list_target()
     previous = safe_load_json(path, default={})
     provenance = dict((previous.get("provenance") or {}) if isinstance(previous, dict) else {})
     provenance["edited"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1986,14 +1981,25 @@ async def save_cast_list_endpoint(update: CastListUpdate):
     return {"status": "saved", "count": len(update.cast)}
 
 
-@router.delete("/api/cast_list")
-async def delete_cast_list():
-    _, path = await asyncio.to_thread(get_current_cast_list_target)
+@router.post("/api/cast_list")
+async def save_cast_list_endpoint(update: CastListUpdate):
+    """Save a hand-edited list. Refused, and nothing written, if generation
+    would refuse it."""
+    return await asyncio.to_thread(save_current_cast_list, update)
+
+
+def delete_current_cast_list():
+    _, path = get_current_cast_list_target()
     if not os.path.isfile(path):
         return {"status": "deleted"}
     with file_lock(path):
         Path(path).unlink(missing_ok=True)
     return {"status": "deleted"}
+
+
+@router.delete("/api/cast_list")
+async def delete_cast_list():
+    return await asyncio.to_thread(delete_current_cast_list)
 
 
 @router.post("/api/review_script/batch/start")

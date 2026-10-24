@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import warnings
 from unittest.mock import patch
 
 import httpx
@@ -24,6 +25,36 @@ def image_bytes(fmt):
 
 
 class M4bCoverAdmissionTests(unittest.TestCase):
+    def test_finished_cover_probe_rejects_duplicate_nonfinite_and_wrong_typed_data(self):
+        import media_process
+        from m4b_cover import ensure_m4b_output_cover
+        replies = [
+            (b'{}',None),
+            (b'{"streams":[],"streams":[]}',None),
+            (b'{"streams":NaN}',None),
+            (b'{"streams":{}}',None),
+            (b'{"streams":[{"codec_type":"video","disposition":{"attached_pic":true}}]}','0'*64),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)/'private.m4b';output.write_bytes(b'bounded fixture')
+            for reply,expected in replies:
+                with self.subTest(reply=reply), patch.object(media_process,'run_owned_media_check',return_value=reply):
+                    with self.assertRaises(ValueError):
+                        ensure_m4b_output_cover(output,expected)
+
+    def test_upload_pixel_limit_holds_when_pillow_warnings_are_ignored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); cover = root / 'm4b_cover.jpg'
+            prior = image_bytes('JPEG'); cover.write_bytes(prior)
+            app = FastAPI(); app.include_router(editor.router)
+            with patch.object(editor, 'DATA_DIR', str(root)), TestClient(app) as client, \
+                    patch.object(Image, 'MAX_IMAGE_PIXELS', 400), warnings.catch_warnings():
+                warnings.simplefilter('ignore', Image.DecompressionBombWarning)
+                response = client.post('/api/m4b_cover', files={'file': ('cover.png', image_bytes('PNG'), 'image/png')})
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual(prior, cover.read_bytes())
+                self.assertFalse(list(root.glob('m4b_cover.jpg.upload.*')))
+
     def test_invalid_and_truncated_uploads_preserve_prior_cover_and_remove_owned_stage(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); cover = root / 'm4b_cover.jpg'
