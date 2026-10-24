@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from fastapi import HTTPException
 
 from adapter_publication import save_adapter_publication_bytes
 from experiments.plan_dialogue_continuity import get_continuity_experiment_packet
@@ -34,6 +35,11 @@ def get_continuity_output_path(root, path):
 
 
 def run_owned_continuity_pair(core, raw, packet, row, voices, destination):
+    return run_owned_audio_experiment(core, lambda engine: save_continuity_render_pair(
+        engine, raw, packet, row, voices, destination), destination)
+
+
+def run_owned_audio_experiment(core, render_audio, destination):
     """Disposable-process only: failed cleanup terminates this whole process.
 
     Never return through core's unconditional claim release with native models
@@ -46,8 +52,7 @@ def run_owned_continuity_pair(core, raw, packet, row, voices, destination):
             engine = core.project_manager.get_engine()
             if engine is None:
                 raise RuntimeError('Experiment engine initialization failed')
-            outcome['receipt'] = save_continuity_render_pair(
-                engine, raw, packet, row, voices, destination)
+            outcome['receipt'] = render_audio(engine)
         except BaseException as error:
             outcome['error'] = error
         finally:
@@ -81,6 +86,14 @@ def run_owned_continuity_pair(core, raw, packet, row, voices, destination):
     return outcome['receipt']
 
 
+def get_experiment_source_identity(root):
+    def git(*arguments):
+        return subprocess.check_output(['git', *arguments], cwd=root, text=True).strip()
+    if git('status', '--porcelain', '--untracked-files=all'):
+        raise ValueError('Native experiments require a clean committed checkout')
+    return {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}')}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('input', 'voices', 'config', 'out'):
@@ -103,11 +116,7 @@ def main(argv=None):
         if not isinstance(voice, dict):
             raise ValueError('Declare a voice configuration for the selected speaker')
         root = Path(__file__).resolve().parents[2]
-        def git(*arguments):
-            return subprocess.check_output(['git', *arguments], cwd=root, text=True).strip()
-        if git('status', '--porcelain', '--untracked-files=all'):
-            raise ValueError('Native experiments require a clean committed checkout')
-        identity = {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
+        identity = {**get_experiment_source_identity(root),
                     'inputs': {name: hashlib.sha256(value).hexdigest() for name, value in
                                (('source', raw), ('voices', voices_raw), ('config', config_raw))}}
         out = get_continuity_output_path(root, args.out)
@@ -120,7 +129,9 @@ def main(argv=None):
         os.environ['ALEXANDRIA_DATA_DIR'] = str(data)
         import core
         receipt = run_owned_continuity_pair(core, raw, packet, args.row, voices, out / 'pair')
-    except (OSError, ValueError, RuntimeError) as error:
+        if get_experiment_source_identity(root) != {key: identity[key] for key in ('head', 'tree')}:
+            raise ValueError('Experiment source changed during rendering')
+    except (OSError, ValueError, RuntimeError, HTTPException) as error:
         parser.error(str(error))
     print(json.dumps({'status': 'captured', 'uid': receipt['uid'], 'out': str(out),
                       'qualification': receipt['qualification']}))

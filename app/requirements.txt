@@ -19,6 +19,9 @@ numpy==2.2.6
 # Exact word-level edit alignment without repetitive-book SequenceMatcher scans.
 rapidfuzz==3.14.5
 librosa==0.11.0
+# Praat pitch tracking for experiments/final_word_tune.py and voice_compare_view.py.
+# Was already installed in app/env but undeclared, so CI lacked it.
+praat-parselmouth==0.4.7
 # Speaker embeddings (ECAPA) for the voice-drift check and the LoRA identity
 # gate. Pure-Python on top of the torch that torch.js installed; the worker
 # (experiments/_ecapa_batch.py) pins CPU on purpose.
