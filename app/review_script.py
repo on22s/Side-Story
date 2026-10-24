@@ -888,8 +888,8 @@ REVIEW_LABEL_SYSTEM = (
 
 def get_review_source_narration(entry):
     """Return the source's narration fact, or None when it is unestablished."""
-    from dialogue_spans import get_source_narration
-    return get_source_narration(entry)
+    spoken = entry.get('spoken')
+    return not spoken if type(spoken) is bool else None
 
 
 def get_review_label_binding(batch_entries, entries):

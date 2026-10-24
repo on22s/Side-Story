@@ -43,10 +43,6 @@ INTERIOR_DASH_TURN = re.compile(
 LABEL_LINE = re.compile(r"^[ \t]*([A-Z][A-Z .'’-]{1,30}):[ \t]+(\S.*)$", re.M)
 
 
-# The longest distinct-mark pair allowed to cross a blank line.
-MAX_CROSSING_CHARS = 2000
-
-
 def _paired_spans(text):
     spans = []
     for opener, closer in PAIRED:
@@ -63,7 +59,7 @@ def _paired_spans(text):
                     continue
                 positions.append(position)
             for start, end in zip(positions[0::2], positions[1::2]):
-                if end - start <= 1:
+                if not 1 < end - start < 2000:
                     continue
                 # A SPAN MAY NOT CROSS A PARAGRAPH BREAK. Straight quotes are
                 # identical opening and closing, so they can only be paired by
@@ -79,25 +75,10 @@ def _paired_spans(text):
                     continue
                 spans.append((start + 1, end))
         else:
-            # Pair each opener with the next closer. A pair longer than
-            # MAX_CROSSING_CHARS is kept only inside one paragraph: a long
-            # speech is fine (#1533, 9 of Dorian Gray's speeches run past
-            # 2,000 characters), a long span across a blank line is a
-            # mis-pair swallowing narration. Shorter pairs keep the old rule,
-            # so a multi-paragraph speech closed within the limit still counts.
-            # A rejected pair advances to the next opener, as the old bounded
-            # regex did.
-            position = text.find(opener)
-            while position != -1:
-                end = text.find(closer, position + 1)
-                if end == -1:
-                    break
-                inner = text[position + 1:end]
-                if inner and (len(inner) <= MAX_CROSSING_CHARS or "\n\n" not in inner):
-                    spans.append((position + 1, end))
-                    position = text.find(opener, end + 1)
-                else:
-                    position = text.find(opener, position + 1)
+            for match in re.finditer(
+                    re.escape(opener) + r"([^" + re.escape(closer) + r"]{1,2000})"
+                    + re.escape(closer), text):
+                spans.append((match.start(1), match.end(1)))
     return spans
 
 
@@ -298,11 +279,9 @@ def apply_dialogue_map(entries, source_text, speaker_names=None):
     convention = detect_convention(source_text)
     if not convention:
         return {"entries": list(entries), "convention": None,
-                "located": 0, "spoken": 0, "ambiguous": 0, "speaker_changes": [],
-                "narration_changes": []}
+                "located": 0, "spoken": 0, "ambiguous": 0, "speaker_changes": []}
     mapped = mark_entries(entries, source_text, convention, speaker_names=speaker_names)
     mapped, speaker_changes = apply_source_speakers(mapped)
-    mapped, narration_changes = apply_source_narration(mapped)
     ambiguous = sum(1 for entry in mapped if entry.get("dialogue_ambiguity"))
     if ambiguous:
         logging.getLogger(__name__).warning(
@@ -315,36 +294,7 @@ def apply_dialogue_map(entries, source_text, speaker_names=None):
         "spoken": sum(1 for entry in mapped if entry.get("spoken")),
         "ambiguous": ambiguous,
         "speaker_changes": speaker_changes,
-        "narration_changes": narration_changes,
     }
-
-
-def get_source_narration(entry):
-    """True/False when the source says narration/speech, None when unestablished."""
-    spoken = entry.get("spoken")
-    return not spoken if type(spoken) is bool else None
-
-
-def apply_source_narration(entries):
-    """-> (entries, changes) with source-confirmed narration voiced by NARRATOR.
-
-    #1534: a model-split chunk can type narration as speech and the naming pass
-    then gives it a character. Where the source's quote marks place the line
-    outside every quotation, that is the fact and the character is the guess,
-    so the speaker becomes NARRATOR and the change is recorded. A printed
-    speaker label is the source too, so a line carrying one is left alone.
-    """
-    updated, changes = [], []
-    for entry in entries:
-        row = dict(entry)
-        current = str(row.get("speaker") or "")
-        if (get_source_narration(row) is True and current != "NARRATOR"
-                and not row.get("source_speaker")):
-            row["speaker"] = "NARRATOR"
-            changes.append({"type": "source_narration", "before": current,
-                            "after": "NARRATOR"})
-        updated.append(row)
-    return updated, changes
 
 # A NAME IMMEDIATELY BEFORE THE QUOTE. Web-novel transcripts often print the
 # speaker and then the line:

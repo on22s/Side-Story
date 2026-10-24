@@ -107,8 +107,9 @@ def get_narrator_generation_context(entry):
 def get_chunk_context(entry):
     """Copy voice selection and explicit structural intent for chunk rebuilding."""
     context = get_narrator_generation_context(entry)
-    if "spoken" in entry:
-        context["spoken"] = copy.deepcopy(entry["spoken"])
+    # Absent and False both mean "not established as speech"; normalizing them
+    # keeps an unlocated row from splitting a narration run.
+    context["spoken"] = bool(entry.get("spoken", False))
     return context
 
 
@@ -1025,6 +1026,10 @@ class ProjectManager:
                 chunk["status"] = "pending"
                 chunk["audio_path"] = None
                 chunk["drift"] = None
+                # The source mapping belonged to the old text/speaker.
+                for field in ("spoken", "source_speaker", "source_span",
+                              "dialogue_ambiguity"):
+                    chunk.pop(field, None)
 
         return self._modify_chunk(index, mutator)
 
