@@ -16,15 +16,17 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 
 import pronunciation
 from audio_validation import validate_generated_audio
-from book_state_transaction import ensure_book_state
-from core import project_manager, run_claimed_task_worker, process_state, ensure_book_switch_allowed
+from book_state_transaction import ensure_book_state, get_book_operation_token
+from core import (project_manager, run_claimed_task_worker, process_state, ensure_book_switch_allowed,
+                  is_task_running)
 from routers.editor import (check_chunk_identity, SCRIPT_PATH, _ensure_editor_chunks,
                             get_editor_book_identity, get_snapshot_digest)
 from project import get_speaker, get_occurrence_speech_projection
+from speech_numbers import STATE_KEY as DATE_ORDER_KEY, get_book_date_order_status
 from speech_text import get_prelexicon_speech_normalization
 from tts import (get_resolved_speaker, is_voice_config_present, resolve_narrator_voice_config,
                  voice_config_for_chunk)
-from utils import atomic_json_write, file_lock
+from utils import atomic_json_write, file_lock, safe_load_json
 
 router = APIRouter()
 MAX_DOCUMENT_BYTES = 1024 * 1024
@@ -398,3 +400,64 @@ def save_occurrence_rules(request):
 @router.post('/api/pronunciation/occurrences/save')
 async def save_occurrence_rules_endpoint(request: PronunciationOccurrenceEdit):
     return await asyncio.to_thread(save_occurrence_rules, request)
+
+
+class DateOrderChoice(BaseModel):
+    choice: Literal['auto', 'mdy', 'dmy']
+    expected_book_token: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+INVALID_STATE_DETAIL = ('Book state (state.json) is unreadable or not an object; restore it from a saved book '
+                        'or fix it by hand before choosing a date order.')
+
+
+def _get_date_order_view_locked(data_dir):
+    """The status and the token from one book selection; caller holds ensure_book_state."""
+    try:
+        token = get_book_operation_token(data_dir)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=INVALID_STATE_DETAIL)
+    return {**get_book_date_order_status(data_dir), 'book_token': token}
+
+
+def get_date_order_view():
+    """The active book's slash-date order: the choice, what auto found, and why (#1546)."""
+    data_dir = os.path.dirname(SCRIPT_PATH)
+    # A book switch between reading the status and the token would pair one book's
+    # order with another's token, and a save against that token would then succeed.
+    with ensure_book_state(data_dir):
+        return _get_date_order_view_locked(data_dir)
+
+
+@router.get('/api/pronunciation/date_order')
+async def get_date_order_endpoint():
+    return await asyncio.to_thread(get_date_order_view)
+
+
+@router.post('/api/pronunciation/date_order')
+async def save_date_order_endpoint(request: DateOrderChoice):
+    return await asyncio.to_thread(save_date_order, request)
+
+
+def save_date_order(request):
+    """Record the reader's choice in the active book state; ambiguous dates follow it.
+
+    The choice applies to renders from now on; audio already rendered and its
+    history are left as they are.
+    """
+    data_dir = os.path.dirname(SCRIPT_PATH)
+    state_path = os.path.join(data_dir, 'state.json')
+    with ensure_book_state(data_dir), file_lock(state_path):
+        if _get_date_order_view_locked(data_dir)['book_token'] != request.expected_book_token:
+            raise HTTPException(status_code=409, detail='Active book changed; reload before choosing a date order.')
+        # Preparation must not change under a render that already prepared its text.
+        if is_task_running('audio', process_state):
+            raise HTTPException(status_code=409, detail='Audio is generating; change the date order after it finishes.')
+        state = safe_load_json(state_path, default={})
+        if not isinstance(state, dict):
+            raise HTTPException(status_code=422, detail=INVALID_STATE_DETAIL)
+        updated = {key: value for key, value in state.items() if key != DATE_ORDER_KEY}
+        if request.choice != 'auto':
+            updated[DATE_ORDER_KEY] = request.choice
+        atomic_json_write(updated, state_path, allow_nonatomic_fallback=False)
+        return _get_date_order_view_locked(data_dir)
