@@ -7275,8 +7275,26 @@
             return value;
         }
 
+        function mergeEditorLineEndings(saved, value) {
+            // An edited textarea arrives LF-normalized. Keep the saved line
+            // endings on every line when the line count is unchanged.
+            if (typeof saved !== 'string' || typeof value !== 'string'
+                    || !saved.includes('\r') || value.includes('\r')) { return value; }
+            const savedParts = saved.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) || [];
+            const incomingLines = value.split('\n');
+            if (savedParts.length !== incomingLines.length) { return value; }
+            return incomingLines.map((line, index) => {
+                const ending = (savedParts[index].match(/(?:\r\n|\r|\n)$/) || [''])[0];
+                return line + (ending || (index < incomingLines.length - 1 ? '\n' : ''));
+            }).join('');
+        }
+
         window.updateChunk = async (id, field, value) => {
             try {
+                const cached = cachedChunks.find(chunk => chunk.id === id);
+                if (field === 'text' || field === 'instruct') {
+                    value = mergeEditorLineEndings(cached?.[field], value);
+                }
                 const data = {};
                 data[field] = value;
                 await applyChunkEdits(id, data);
@@ -7295,7 +7313,7 @@
 
             const inputs = tr.querySelectorAll('input, textarea, select');
             const data = {};
-            const cached = cachedChunks.find(chunk => chunk.id === id && chunk.uid === tr.dataset.uid);
+            const cached = cachedChunks.find(chunk => chunk.id === id);
 
             inputs.forEach(input => {
                 const changeHandler = input.getAttribute('onchange');
@@ -7303,7 +7321,8 @@
                     // Extract field name from onchange="updateChunk(id, 'field', this.value)"
                     const match = changeHandler.match(/updateChunk\(\d+,\s*'(\w+)'/);
                     if (match) {
-                        data[match[1]] = getEditorFieldValue(match[1], input.value, cached?.[match[1]]);
+                        data[match[1]] = mergeEditorLineEndings(cached?.[match[1]],
+                            getEditorFieldValue(match[1], input.value, cached?.[match[1]]));
                     }
                 }
             });
