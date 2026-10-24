@@ -524,6 +524,7 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
             remaining = remaining[cut:]
         if remaining.strip() and not any(ch.isalnum() for ch in remaining) and bounded:
             bounded[-1]["text"] += remaining
+            bounded[-1]["pause_after"] = chunk.get("pause_after")
         else:
             bounded.append({**chunk, "text": remaining})
     normalized = [{**chunk, "text": get_tts_chunk_text(chunk["text"])}
