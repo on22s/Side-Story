@@ -6850,7 +6850,7 @@
                             const field = row.querySelector(selector);
                             if (!field) { return null; }
                             return {selector, value: field.value,
-                                dirty: field.value !== String(chunk[key] ?? ''),
+                                dirty: getEditorFieldValue(key, field.value, String(chunk[key] ?? '')) !== String(chunk[key] ?? ''),
                                 focused: field === document.activeElement,
                                 selectionStart: field.selectionStart, selectionEnd: field.selectionEnd,
                                 selectionDirection: field.selectionDirection};
@@ -7267,6 +7267,14 @@
             }
         }
 
+        function getEditorFieldValue(field, value, saved) {
+            // Textareas expose CRLF and CR as LF. An unchanged visible value
+            // must retain the saved bytes, including during a render barrier.
+            if ((field === 'text' || field === 'instruct') && typeof saved === 'string'
+                    && value === saved.replace(/\r\n?/g, '\n')) { return saved; }
+            return value;
+        }
+
         window.updateChunk = async (id, field, value) => {
             try {
                 const data = {};
@@ -7287,6 +7295,7 @@
 
             const inputs = tr.querySelectorAll('input, textarea, select');
             const data = {};
+            const cached = cachedChunks.find(chunk => chunk.id === id && chunk.uid === tr.dataset.uid);
 
             inputs.forEach(input => {
                 const changeHandler = input.getAttribute('onchange');
@@ -7294,7 +7303,7 @@
                     // Extract field name from onchange="updateChunk(id, 'field', this.value)"
                     const match = changeHandler.match(/updateChunk\(\d+,\s*'(\w+)'/);
                     if (match) {
-                        data[match[1]] = input.value;
+                        data[match[1]] = getEditorFieldValue(match[1], input.value, cached?.[match[1]]);
                     }
                 }
             });
@@ -7305,7 +7314,6 @@
             }
 
             if (changedOnly && !pendingChunkEdits.has(id) && !failedChunkEdits.has(id)) {
-                const cached = cachedChunks.find(chunk => chunk.id === id);
                 if (cached) {
                     for (const field of Object.keys(data)) {
                         const saved = field === 'pause_after' ? (cached[field] ?? null) : (cached[field] ?? '');
