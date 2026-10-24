@@ -101,8 +101,13 @@ def validate_generated_audio(path, context="audio generation"):
                 block = audio.read(65536)
                 if not len(block):
                     break
-                validate_finite_audio_values(block, context)
+                try:
+                    validate_finite_audio_values(block, context)
+                except ValueError as exc:
+                    raise GeneratedAudioError(str(exc)) from exc
                 decoded_frames += len(block)
+    except GeneratedAudioError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise GeneratedAudioError(
             f"{context} wrote undecodable audio: {type(exc).__name__}: "
