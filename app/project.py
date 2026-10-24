@@ -51,7 +51,7 @@ MAX_CHUNK_CHARS = 500
 # Korean (Hangul) was NOT measured, so it keeps MAX_CHUNK_CHARS.
 CJK_SPEECH_RATE_FACTORS = {"ja": 2.09, "zh": 2.72}
 CJK_IDEOGRAPH_NAME_PREFIXES = ("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")
-KANA_NAME_PREFIXES = ("HIRAGANA", "KATAKANA")
+KANA_NAME_PREFIXES = ("HIRAGANA", "KATAKANA", "HALFWIDTH KATAKANA")
 CHAPTER_HEADING_RE = re.compile(
     r'^(chapter|part|book|volume|prologue|epilogue|introduction|conclusion|act|section)\b',
     re.IGNORECASE
@@ -401,9 +401,10 @@ def get_chunk_text_key(text):
 
 
 def is_han_or_kana_letter(ch):
-    """True for Han, Hiragana and Katakana characters (issue #1332)."""
+    """True for Han, kana and Bopomofo characters (issue #1332)."""
     name = unicodedata.name(ch, "")
-    return name.startswith(CJK_IDEOGRAPH_NAME_PREFIXES + KANA_NAME_PREFIXES)
+    return name.startswith(CJK_IDEOGRAPH_NAME_PREFIXES + KANA_NAME_PREFIXES
+                           + ("BOPOMOFO",))
 
 
 def is_kana_letter(ch):
@@ -417,18 +418,28 @@ def get_chunk_char_limit(text, base=MAX_CHUNK_CHARS):
     Chinese and Japanese characters take longer to speak than English ones
     (issue #1332), so their chunks must be shorter. Latin, Cyrillic, Hangul
     and letterless text keep the English base limit."""
-    letters = [ch for ch in text if ch.isalpha()]
-    if not letters:
+    if text.isascii():
         return base
-    han_or_kana = sum(1 for ch in letters if is_han_or_kana_letter(ch))
-    if han_or_kana * 2 < len(letters):
+    letters = han_or_kana = kana = 0
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        letters += 1
+        if is_han_or_kana_letter(ch):
+            han_or_kana += 1
+            if is_kana_letter(ch):
+                kana += 1
+    if not han_or_kana:
         return base
-    language = "ja" if any(is_kana_letter(ch) for ch in letters) else "zh"
+    # Any Han/kana text gets the shorter budget. A mixed Chinese/Japanese
+    # passage takes the lower Chinese limit unless kana clearly dominates.
+    language = "ja" if kana * 2 >= han_or_kana else "zh"
     return max(1, int(base / CJK_SPEECH_RATE_FACTORS[language]))
 
 
 def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
-                      review_sink=None, include_source_indices=False):
+                      review_sink=None, include_source_indices=False,
+                      language_aware=True):
     """Group consecutive entries by same speaker into chunks up to max_chars"""
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
@@ -467,7 +478,8 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                 and not _is_structural_text(current_text)
                 and not _is_structural_text(text)):
             combined = current_text + ("" if JOINS_WITHOUT_SPACE.match(text) else " ") + text
-            if len(combined) <= get_chunk_char_limit(combined, max_chars):
+            limit = get_chunk_char_limit(combined, max_chars) if language_aware else max_chars
+            if len(combined) <= limit:
                 current_text = combined
                 if include_source_indices:
                     current_indices = sorted(set(current_indices + entry["_source_entry_indices"]))
@@ -495,17 +507,25 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
     bounded = []
     for chunk in chunks:
         remaining = chunk["text"]
-        limit = get_chunk_char_limit(chunk["text"], max_chars)
-        while len(remaining) > limit:
-            boundaries = list(re.finditer(r"\s+|[.!?。！？]", remaining[:limit]))
+        while True:
+            limit = get_chunk_char_limit(remaining, max_chars) if language_aware else max_chars
+            if len(remaining) <= limit:
+                break
+            boundaries = list(re.finditer(r"\s+|[.!?。！？，、；：…]", remaining[:limit]))
             cut = boundaries[-1].end() if boundaries else limit
             if cut < max(1, limit // 2):
                 cut = limit
             piece = {**chunk, "text": remaining[:cut]}
-            piece.pop("pause_after", None)
+            # A mid-sentence continuation must not inherit the 250 ms same-
+            # speaker export default; a sentence-ending cut may.
+            piece["pause_after"] = (None if remaining[:cut].rstrip().endswith(
+                (".", "!", "?", "。", "！", "？")) else 0)
             bounded.append(piece)
             remaining = remaining[cut:]
-        bounded.append({**chunk, "text": remaining})
+        if remaining.strip() and not any(ch.isalnum() for ch in remaining) and bounded:
+            bounded[-1]["text"] += remaining
+        else:
+            bounded.append({**chunk, "text": remaining})
     normalized = [{**chunk, "text": get_tts_chunk_text(chunk["text"])}
                   for chunk in bounded]
     return bind_literal_chunks(normalized, literal_policy)
