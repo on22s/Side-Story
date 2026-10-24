@@ -13,6 +13,7 @@ here. Refuses a source over the limit rather than truncating it.
     python -u cast_list.py book.txt --out cast.json [--no-strip-front-matter]
 """
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ import re
 import sys
 import time
 
-from utils import atomic_json_write
+from utils import atomic_json_write, file_lock
 
 PROMPT = ("Below is a complete novel. List every character who SPEAKS a quoted line at least "
           "once. Give each as the name a reader would use for them; if the text never names "
@@ -78,15 +79,18 @@ def get_cast_list_path(input_file, data_dir):
     return os.path.join(data_dir, CAST_LISTS_DIRNAME, digest.hexdigest() + ".json")
 
 
-def save_cast_list(path, cast, provenance=None):
+def save_cast_list(path, cast, provenance=None, *, lock=True):
     """Validate with the generator's own validator, then write atomically.
 
     Raises ValueError and writes nothing when generation would refuse the list.
+    The shared writer locks by default so the build subprocess and HTTP saves
+    serialize; a caller already holding the lock passes lock=False.
     """
     from three_pass_generate import get_cast_from_data
     get_cast_from_data(cast)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    atomic_json_write({"cast": cast, "provenance": provenance or {}}, path)
+    with (file_lock(path) if lock else nullcontext()):
+        atomic_json_write({"cast": cast, "provenance": provenance or {}}, path)
 
 
 def main(argv=None):
