@@ -372,6 +372,36 @@ def _capture_loaded_serving(engine, request, model):
     return NativeRecoveryServingIdentity(digest, loaded.asset_sha256, loaded.loader_code_sha256)
 
 
+def capture_native_lora_serving_identity(engine, request):
+    """Capture the loaded base model, adapter generation and LoRA prompt inputs."""
+    import tts
+    from lora_evidence import get_adapter_generation_sha256
+    with tts._LOCAL_TTS_LOCK:
+        if (type(request) is not tts.LoRARequest or type(request.seed) is not int
+                or not 0 <= request.seed < 2**64 or type(request.instruct) is not str
+                or len(request.instruct) > 65536 or type(engine._language) is not str
+                or len(engine._language) > 128 or engine.get_voice_backend('lora') != 'local'
+                or engine._compile_codec_enabled):
+            raise RecoveryIdentityUnavailable('unsupported_native_lora_request')
+        model, prompt = engine._ensure_local_lora_generation(
+            request.adapter_path, request.generation_sha256)
+        loaded = getattr(model, '_aa2_recovery_loaded_model', None)
+        if type(loaded) is not NativeRecoveryLoadedModel:
+            raise RecoveryIdentityUnavailable('lora_model_loaded_without_identity')
+        adapter_sha256 = get_adapter_generation_sha256(request.adapter_path)
+        if adapter_sha256 != request.generation_sha256:
+            raise RecoveryIdentityUnavailable('lora_adapter_generation_changed')
+        try:
+            digest = get_native_custom_code_sha256(state={
+                'category': 'lora', 'asset_sha256': loaded.asset_sha256,
+                'adapter_sha256': adapter_sha256, 'language': engine._language,
+                'seed': request.seed, 'instruct_sha256': get_recovery_digest(request.instruct),
+                'model': engine.get_model_settings()})
+        except (ImportError, AttributeError, KeyError, ValueError, TypeError, OSError) as error:
+            raise RecoveryIdentityUnavailable('unavailable_lora_serving_contract') from error
+        return NativeRecoveryServingIdentity(digest, loaded.asset_sha256, loaded.loader_code_sha256)
+
+
 def capture_native_custom_serving_identity(engine, request):
     """Capture actual serving dependencies atomically with respect to providers."""
     import tts
@@ -410,7 +440,11 @@ def ensure_native_recovery_serving_current(engine, request):
     if guard[0] is not engine:
         raise SynthesisRecoveryDependencyChanged('Recovery serving engine changed')
     try:
-        current = capture_native_custom_serving_identity(engine, request)
+        import tts
+        if type(request) is tts.LoRARequest:
+            current = capture_native_lora_serving_identity(engine, request)
+        else:
+            current = capture_native_custom_serving_identity(engine, request)
     except RecoveryIdentityUnavailable as error:
         raise SynthesisRecoveryDependencyChanged('Recovery serving identity became unproven') from error
     if current.sha256 != guard[1]:

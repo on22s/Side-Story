@@ -29,7 +29,7 @@ from tts_diagnostics import (capture_tts_operation, measure_tts_stage, record_tt
 import clone_reference_cache
 from adapter_checkpoint_transaction import (ensure_adapter_generation_snapshot, get_adapter_generation_sha256,
                                             get_adapter_serving_metadata)
-from lora_evidence import get_file_sha256, get_tts_model_settings
+from lora_evidence import get_file_sha256, get_tts_model_settings, get_adapter_generation_sha256
 from audio_validation import GeneratedAudioError, publish_audio_output
 from speech_text import normalize_for_speech, get_speech_preparation
 from audio_generation_owner import (is_audio_generation_cancelled, ensure_audio_generation_active,
@@ -411,6 +411,15 @@ def anchored_instruct(voice_data, instruct_text):
 @dataclass(frozen=True)
 class CustomVoiceRequest:
     voice: str
+    seed: int
+    instruct: str
+
+
+@dataclass(frozen=True)
+class LoRARequest:
+    """Stable request identity for a LoRA adapter and its serving inputs."""
+    adapter_path: str
+    generation_sha256: str
     seed: int
     instruct: str
 
@@ -2383,9 +2392,21 @@ class TTSEngine:
     def _generate_lora_voice_prepared(self, text, instruct_text, voice_data, output_path):
         try:
             self.get_voice_backend("lora")
+            adapter_path = voice_data.get("adapter_path")
+            request = None
+            if adapter_path:
+                if not os.path.isabs(adapter_path):
+                    adapter_path = _resolve_asset_path(adapter_path)
+                adapter_path = get_resolved_adapter_path(adapter_path)
+                if os.path.isdir(adapter_path):
+                    request = LoRARequest(
+                        adapter_path,
+                        voice_data.get("adapter_generation_sha256") or get_adapter_generation_sha256(adapter_path),
+                        int(voice_data.get("seed", -1)), instruct_text or "")
             windowed = self._render_synthesis_windows(
                 text, "lora", lambda span, path: self._generate_lora_voice_prepared(
-                    span, instruct_text, voice_data, path), output_path)
+                    span, instruct_text, voice_data, path), output_path,
+                recovery_request=request)
             if windowed is not None:
                 return windowed
             import time
