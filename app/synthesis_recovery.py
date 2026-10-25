@@ -9,7 +9,7 @@ from synthesis_recovery_cache import (RecoveryCacheStorage, RecoveryCacheUnavail
 from synthesis_recovery_context import get_synthesis_recovery_parent
 from synthesis_recovery_identity import RecoveryIdentityUnavailable, get_recovery_digest
 from synthesis_recovery_native import ensure_native_recovery_model_capture
-from synthesis_recovery_serving import (capture_native_custom_serving_identity,
+from synthesis_recovery_serving import (capture_native_serving_identity,
     ensure_native_recovery_serving, ensure_native_recovery_serving_current, _capture_engine_methods)
 from synthesis_input import (is_speech_input_capture_active, get_captured_speech_input,
                               capture_speech_input)
@@ -121,7 +121,7 @@ def ensure_synthesis_recovery(engine, category, plan, settings, request=None):
         reason = 'unsupported_durability'
     elif parent is None:
         reason = 'unowned_parent'
-    elif category != 'custom' or request is None:
+    elif category not in ('custom', 'lora', 'clone') or request is None:
         reason = 'unsupported_voice_category'
     if reason is not None:
         yield RecoverySession(reason)
@@ -131,7 +131,7 @@ def ensure_synthesis_recovery(engine, category, plan, settings, request=None):
         _capture_engine_methods(engine, {}, [])
         policy = engine.get_synthesis_recovery_policy()
         with ensure_native_recovery_model_capture():
-            identity = capture_native_custom_serving_identity(engine, request)
+            identity = capture_native_serving_identity(engine, request)
     except RecoveryIdentityUnavailable:
         yield RecoverySession('unproven_dependencies')
         return

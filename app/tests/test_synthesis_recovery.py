@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
+import tts
 from audio_generation_owner import AudioGenerationOwner, AudioGenerationCancelled, ensure_audio_generation_owner
 import synthesis_recovery as recovery
 from synthesis_recovery_cache import is_recovery_storage_platform_supported
@@ -31,7 +32,7 @@ class RecoveryOrchestrationTests(unittest.TestCase):
         self.engine = SimpleNamespace(_synthesis_recovery={'enabled': True, 'max_audio_mb': 16},
             get_synthesis_recovery_policy=lambda: {'enabled': True, 'max_audio_mb': 16})
         self.identity = NativeRecoveryServingIdentity('a' * 64, 'b' * 64, 'c' * 64)
-        self.request = object()
+        self.request = tts.CustomVoiceRequest("Ryan", 42, "")
         self.admit_error = None
 
     @contextmanager
@@ -41,20 +42,95 @@ class RecoveryOrchestrationTests(unittest.TestCase):
         yield
 
     @contextmanager
-    def scope(self, claim='a' * 32, identity=None, parent_inputs='d' * 64):
+    def scope(self, claim='a' * 32, identity=None, parent_inputs='d' * 64, *,
+              category='custom', plan=None, request=None):
         with ExitStack() as stack:
             stack.enter_context(ensure_audio_generation_owner(AudioGenerationOwner(claim, self.admit)))
             parent = RecoveryParent(str(self.root), 'b' * 64, 'c' * 64, parent_inputs,
                                     get_recovery_claim_digest(), self.admit)
             stack.enter_context(ensure_synthesis_recovery_parent(parent))
             stack.enter_context(patch.object(recovery, '_capture_engine_methods'))
-            stack.enter_context(patch.object(recovery, 'capture_native_custom_serving_identity',
+            stack.enter_context(patch.object(recovery, 'capture_native_serving_identity',
                                              return_value=identity or self.identity))
-            stack.enter_context(patch('synthesis_recovery_serving.capture_native_custom_serving_identity',
+            serving_capture = {
+                'lora': 'capture_native_lora_serving_identity',
+                'clone': 'capture_native_clone_serving_identity',
+            }.get(category, 'capture_native_custom_serving_identity')
+            stack.enter_context(patch('synthesis_recovery_serving.' + serving_capture,
                                      return_value=identity or self.identity))
-            session = stack.enter_context(recovery.ensure_synthesis_recovery(self.engine, 'custom',
-                                         self.plan, self.policy, self.request))
+            session = stack.enter_context(recovery.ensure_synthesis_recovery(
+                self.engine, category, plan or self.plan, self.policy, request or self.request))
             yield session, parent
+
+    def test_clone_windows_share_the_same_verified_recovery_session(self):
+        policy = get_synthesis_window_settings({'enabled': True,
+            'budgets': {'local.clone': {'max_chars': 5}}})
+        plan = get_synthesis_window_plan('One. Two.', policy, ['local.clone'])
+        request = tts.CloneRequest('/private/reference.wav', 'Reference words.', 42)
+        calls = []
+        def render(text, path):
+            calls.append(text)
+            return self.write(path)
+        with self.scope(category='clone', plan=plan, request=request) as (session, parent):
+            self.assertEqual('eligible', session.reason)
+            receipt = render_synthesis_windows(plan, render, self.root / 'clone.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['saved_windows'])
+        calls.clear()
+        with self.scope('f' * 32, category='clone', plan=plan, request=request) as (session, parent):
+            receipt = render_synthesis_windows(plan, render, self.root / 'clone.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['reused_windows'])
+            self.assertEqual([], calls)
+
+        # The renderer must reject fresh audio whose dependency identity drifted
+        # during the provider call, before storing it under the original key.
+        prior = (self.root / 'clone.wav').read_bytes()
+        calls.clear()
+        changed = replace(self.identity, sha256='e' * 64)
+        current = [self.identity]
+        def drifting_render(text, path):
+            result = render(text, path)
+            current[0] = changed
+            return result
+        with self.scope(category='clone', plan=plan, request=request,
+                        parent_inputs='9' * 64) as (session, parent):
+            with patch('synthesis_recovery_serving.capture_native_clone_serving_identity',
+                       side_effect=lambda *args: current[0]):
+                with self.assertRaises(SynthesisRecoveryDependencyChanged):
+                    render_synthesis_windows(plan, drifting_render, self.root / 'clone.wav',
+                                             policy, recovery=session)
+                self.assertEqual([], session.saved)
+        self.assertEqual([plan.windows[0].text], calls)
+        self.assertEqual(prior, (self.root / 'clone.wav').read_bytes())
+        calls.clear()
+        with self.scope('7' * 32, category='clone', plan=plan, request=request,
+                        parent_inputs='9' * 64) as (session, parent):
+            receipt = render_synthesis_windows(plan, render, self.root / 'clone.wav',
+                                               policy, recovery=session)
+            self.assertEqual([], receipt['recovery']['reused_windows'])
+            self.assertEqual([window.text for window in plan.windows], calls)
+
+    def test_lora_windows_share_the_same_verified_recovery_session(self):
+        policy = get_synthesis_window_settings({'enabled': True,
+            'budgets': {'local.lora': {'max_chars': 5}}})
+        plan = get_synthesis_window_plan('One. Two.', policy, ['local.lora'])
+        request = tts.LoRARequest('/private/adapter', 'a' * 64, 42, '')
+        calls = []
+        def render(text, path):
+            calls.append(text)
+            return self.write(path)
+        with self.scope(category='lora', plan=plan, request=request) as (session, parent):
+            self.assertEqual('eligible', session.reason)
+            receipt = render_synthesis_windows(plan, render, self.root / 'lora.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['saved_windows'])
+        calls.clear()
+        with self.scope('f' * 32, category='lora', plan=plan, request=request) as (session, parent):
+            receipt = render_synthesis_windows(plan, render, self.root / 'lora.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['reused_windows'])
+            self.assertEqual([], calls)
 
     def write(self, path):
         sf.write(path, np.sin(np.arange(2400) * .1) * .2, 24000)

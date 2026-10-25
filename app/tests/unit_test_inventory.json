@@ -10654,11 +10654,13 @@
   "test_synthesis_recovery": [
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_cache_failure_keeps_serving_guard_and_postcommit_cleanup_cannot_raise",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_changed_parent_inputs_or_serving_identity_do_not_reuse_previous_audio",
+    "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_clone_windows_share_the_same_verified_recovery_session",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_corrupt_payload_falls_back_under_same_identity_without_touching_prior_cache",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_dependency_drift_after_copy_aborts_before_provider_and_preserves_prior",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_dependency_failure_after_private_assembly_keeps_prior_caller_output",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_disabled_or_unsupported_platform_does_no_model_or_cache_inspection",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_interruption_restart_reuses_only_completed_window_and_retires_explicitly",
+    "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_lora_windows_share_the_same_verified_recovery_session",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_owner_or_book_failure_is_never_an_optional_cache_miss"
   ],
   "test_synthesis_recovery_cache": [
@@ -10748,8 +10750,13 @@
   ],
   "test_synthesis_recovery_serving": [
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_actual_engine_method_and_module_function_overrides_are_unqualified",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_clone_admission_refuses_invalid_references_and_policies_before_loading",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_clone_dispatch_binds_reference_and_request_and_rejects_drift",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_equal_proven_identity_after_reload_continues_but_changed_or_unproven_aborts",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_guard_scope_is_not_transferred_to_unrelated_threads",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_lora_malformed_model_is_optional_and_merge_certificate_is_required",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_lora_merge_identity_binds_peft_release_and_loaded_merge_code",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_lora_refuses_replaced_loaders_before_calling_them",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_new_loader_release_and_allocation_policy_overrides_are_unqualified",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_processor_identity_binds_effective_call_policy",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_random_external_compiled_or_unsupported_requests_skip_model_initialization",
