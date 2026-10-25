@@ -157,22 +157,34 @@ def _write_marker(path, marker):
 
 
 def _read_marker(path):
+    # Reuse descriptor admission rather than opening an untrusted marker as a
+    # blocking stream (a FIFO can otherwise stop all export recovery).
+    from audio_take_history import _open_regular, _version
+
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-        with os.fdopen(descriptor, 'rb') as source:
+        path = Path(os.path.abspath(path))
+        # Canonicalize the trusted export parent (e.g. macOS /var), while
+        # retaining the staging and marker names for alias rejection.
+        root = path.parent.parent.resolve()
+        path = root / path.parent.name / path.name
+        source, before = _open_regular(path, root, MAX_MARKER_BYTES)
+        with source:
             raw = source.read(MAX_MARKER_BYTES + 1)
+            if (_version(os.fstat(source.fileno())) != _version(before)
+                    or _version(path.lstat()) != _version(before)):
+                return None
         if len(raw) > MAX_MARKER_BYTES:
             return None
         value = json.loads(raw)
     except (OSError, ValueError, TypeError, RecursionError, MemoryError):
         return None
-    if not isinstance(value, dict) or value.get('schema') != 1:
+    if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] != 1:
         return None
     kind = value.get('kind')
     prefix = value.get('prefix')
     parent = value.get('parent')
     token = value.get('token')
-    if (kind not in PREFIXES or prefix != PREFIXES[kind]
+    if (not isinstance(kind, str) or kind not in PREFIXES or prefix != PREFIXES[kind]
             or not isinstance(parent, str) or not os.path.isabs(parent)
             or not isinstance(token, str) or len(token) != 32):
         return None
@@ -273,7 +285,9 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
                         and any((path / 'old').iterdir())):
                     result['preserved'].append(str(path))
                     continue
-                if (path / OWNER_LOCK).is_symlink() or (path / MARKER).is_symlink():
+                if ((path / OWNER_LOCK).is_symlink()
+                        or (path / (OWNER_LOCK + '.lock')).is_symlink()
+                        or (path / MARKER).is_symlink()):
                     result['preserved'].append(str(path))
                     continue
                 marker = _read_marker(path / MARKER)
