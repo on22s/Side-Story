@@ -18,7 +18,7 @@ def get_basic_field(row, field):
     return get_chunk_text_key(value) if field == "text" and isinstance(value, str) else value
 
 
-def get_delivery_retry_chunks(before, after, chunks, language=None):
+def get_delivery_retry_chunks(before, after, chunks):
     """Preserve unchanged native groups; detach audio only for regrouped rows.
 
     Refuse an edited/reordered editor snapshot rather than replacing its work.
@@ -35,17 +35,18 @@ def get_delivery_retry_chunks(before, after, chunks, language=None):
     if chunks is None:
         return None
     language_aware = True
-    old_groups = group_into_chunks(before, include_source_indices=True, language=language)
+    old_groups = group_into_chunks(before, include_source_indices=True)
     if len(old_groups) != len(chunks):
         # Existing CJK books were chunked at the old 500-character limit. Keep
         # their legacy grouping for delivery retry instead of reporting a text edit.
         legacy_groups = group_into_chunks(before, include_source_indices=True,
-                                          language_aware=False, language=language)
+                                          language_aware=False, legacy_chunking=True)
         if len(legacy_groups) == len(chunks):
             old_groups = legacy_groups
             language_aware = False
     new_groups = group_into_chunks(after, include_source_indices=True,
-                                   language_aware=language_aware, language=language)
+                                   language_aware=language_aware,
+                                   legacy_chunking=not language_aware)
     if len(old_groups) != len(chunks) or any(
             any(get_basic_field(group, field) != get_basic_field(chunk, field)
                 for field in BASIC_FIELDS)
@@ -123,13 +124,11 @@ def _ensure_delivery_review_snapshot_locked(data_dir, manager):
         else:
             value = path.read_bytes() if path.exists() else None
         artifacts[str(path.relative_to(root))] = value
-    token_data = {"identity": snapshot["identity"],
-                  "language": manager._load_tts_config().get("language"), "artifacts": {
+    token_data = {"identity": snapshot["identity"], "artifacts": {
         name: hashlib.sha256(value).hexdigest() if value is not None else None
         for name, value in artifacts.items()}}
     token = hashlib.sha256(json.dumps(token_data, sort_keys=True).encode()).hexdigest()
-    return {"token": token, "entries": entries, "chunks": chunks, "artifacts": artifacts,
-            "language": manager._load_tts_config().get("language")}
+    return {"token": token, "entries": entries, "chunks": chunks, "artifacts": artifacts}
 
 
 def apply_delivery_retry(data_dir, snapshot, entries, cancel_check=None, retry_record=None):
@@ -149,8 +148,7 @@ def apply_delivery_retry(data_dir, snapshot, entries, cancel_check=None, retry_r
         current = _ensure_delivery_review_snapshot_locked(data_dir, manager)
         if current["token"] != snapshot["token"]:
             raise ValueError("Book or editor changed during delivery retry; results were not published.")
-        chunks = get_delivery_retry_chunks(snapshot["entries"], entries, current["chunks"],
-                                           language=current.get("language"))
+        chunks = get_delivery_retry_chunks(snapshot["entries"], entries, current["chunks"])
         values = {"annotated_script.json": entries}
         removals = []
         if chunks is not None:

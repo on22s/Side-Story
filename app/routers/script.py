@@ -2886,8 +2886,7 @@ def ensure_delivery_review_response():
     info = get_delivery_review_info(snapshot["entries"])
     reason = None
     try:
-        get_delivery_retry_chunks(snapshot["entries"], snapshot["entries"], snapshot["chunks"],
-                                  language=snapshot.get("language"))
+        get_delivery_retry_chunks(snapshot["entries"], snapshot["entries"], snapshot["chunks"])
     except ValueError as exc:
         reason = str(exc)
     return {**info, "snapshot": snapshot["token"], "retry_available": reason is None,
@@ -2932,8 +2931,7 @@ def start_delivery_retry(background_tasks, request):
     count = get_delivery_review_info(snapshot["entries"])["count"]
     if not count:
         raise HTTPException(status_code=409, detail="No fallback delivery instructions need retrying.")
-    get_delivery_retry_chunks(snapshot["entries"], snapshot["entries"], snapshot["chunks"],
-                              language=snapshot.get("language"))
+    get_delivery_retry_chunks(snapshot["entries"], snapshot["entries"], snapshot["chunks"])
     instruct_context_chars = get_delivery_retry_instruct_context(snapshot)
     config = copy.deepcopy(load_app_config(CONFIG_PATH))
 
