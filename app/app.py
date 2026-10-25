@@ -27,6 +27,7 @@ from run_history import mark_interrupted_runs
 import evaluation_reviews
 from book_state_transaction import ensure_book_state
 from task_ownership import ensure_startup_recovery
+from export_staging import reclaim_export_staging
 
 
 # Setup logging
@@ -58,6 +59,10 @@ async def lifespan(_app):
             with ensure_book_state(DATA_DIR):
                 from synthesis_workspace import apply_abandoned_synthesis_workspace_cleanup
                 apply_abandoned_synthesis_workspace_cleanup(DATA_DIR)
+                recovery = reclaim_export_staging((DATA_DIR, os.path.join(DATA_DIR, 'chapter_exports'),
+                                                   os.path.join(DATA_DIR, 'voicelines')))
+                for error in recovery['errors']:
+                    logger.warning('Export staging recovery: %s', error)
                 reset_stuck_chunks()
             interrupted = mark_interrupted_runs(RUN_HISTORY_DIR)
             if interrupted:
