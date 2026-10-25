@@ -56,9 +56,12 @@ Consequences:
 
 - Ordinary PCM that passes `is_bounded_pcm_supported` is staged and consumed in
   bounded blocks.
-- Custom/unknown/over-wide inputs keep their previous whole-buffer behavior and
-  their existing output compatibility.
-- Chapter export remains whole-chapter regardless of the segment dispatch.
-- #1088 item 2 is not claimed as a whole-app memory bound, and item 12 remains
-  an explicit deferral until the producer can preserve that dispatch and pass
-  the remaining compatibility/resource gates.
+- Custom/unknown/over-wide inputs keep their previous whole-buffer behavior up
+  to the 1 GiB assembled-PCM ceiling; a longer custom export now fails loudly
+  and must be converted to ordinary PCM or split.
+- Chapter export remains whole-chapter regardless of the segment dispatch; the
+  custom/unknown chapter cap is the same 1 GiB.
+- The limit bounds the assembled compatibility buffer, not decoded source PCM
+  already held by the caller, and does not establish a whole-app memory bound.
+  Item 12 remains an explicit deferral until the producer can preserve that
+  dispatch and pass the remaining compatibility/resource gates.

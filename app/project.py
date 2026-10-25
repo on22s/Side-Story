@@ -33,6 +33,7 @@ from chunk_status_journal import (ChunkStatusJournal, get_chunk_status_journal_p
                                   get_chunk_audio_key)
 from adapter_publication import sync_adapter_directory
 from config_settings import load_app_config
+from export_limits import ensure_legacy_pcm_allowed
 from lora_evidence import get_tts_model_settings
 from literal_policy import (ensure_literal_narration, bind_literal_chunks,
                             ensure_literal_chunk, ensure_literal_chunks, CHUNK_POLICY_KEY)
@@ -72,7 +73,7 @@ from tts import (
                  get_chunk_voice_inputs)
 from pydub import AudioSegment
 from audio_assembly import AudioSegmentBuilder
-from audio_pcm_producer import PCMSourceStore, get_audio_duration_ms
+from audio_pcm_producer import PCMSourceStore, get_audio_duration_ms, is_plain_pcm_source
 from audio_streaming import (get_track_wav_plan, get_track_pcm_plan, write_track_wav, write_combined_wav,
                              get_streamable_layout, write_combined_pcm, iter_track_pieces,
                              get_combined_source_plan, save_trimmed_pcm_sources, get_pcm_shape)
@@ -731,6 +732,8 @@ def _get_legacy_export_audio(segments, speakers, pause_ms, same_speaker_pause_ms
     trimmed = save_trimmed_pcm_sources(segments, cancel_check, None)
     pcm_plan = get_combined_source_plan(trimmed, speakers, pause_ms,
         same_speaker_pause_ms, pause_overrides, cancel_check)
+    if pcm_plan is not None:
+        ensure_legacy_pcm_allowed(pcm_plan)
     audio = combine_audio_with_pauses(segments, speakers, pause_ms,
         same_speaker_pause_ms, pause_overrides, cancel_check=cancel_check)
     if (pcm_plan is None or get_pcm_shape(audio) != ((pcm_plan['channels'],
@@ -2751,6 +2754,8 @@ class ProjectManager:
                     return None
                 try:
                     pcm_plan = get_chapter_pcm_plan(pairs, pause_defaults, cancel_check)
+                    if not all(is_plain_pcm_source(segment) for _, segment in pairs):
+                        ensure_legacy_pcm_allowed(pcm_plan)
                     quality_plan = get_chapter_quality_plan(pcm_plan, options['format'], options['export_quality'])
                     piece = self.get_chapter_audio(pairs, pause_defaults, cancel_check)
                     ensure_chapter_piece_matches_plan(piece, pcm_plan)

@@ -3987,6 +3987,11 @@
     "tests.test_export_frame_timeline.ExportFrameTimelineTests.test_pause_rounding_and_layout_promotion_follow_actual_pcm",
     "tests.test_export_frame_timeline.ExportFrameTimelineTests.test_thousand_clips_keep_native_labels_chapters_and_speaker_tracks_aligned"
   ],
+  "test_export_limits": [
+    "tests.test_export_limits.LegacyExportLimitTests.test_exact_ceiling_is_allowed_and_one_frame_over_is_refused",
+    "tests.test_export_limits.LegacyExportLimitTests.test_invalid_or_missing_plan_is_refused",
+    "tests.test_export_limits.LegacyExportLimitTests.test_project_refuses_before_the_whole_buffer_is_combined"
+  ],
   "test_export_pcm_plan": [
     "tests.test_export_pcm_plan.ExportPCMPlanTests.test_bad_or_unbounded_plans_refuse_and_unknown_shapes_remain_explicit",
     "tests.test_export_pcm_plan.ExportPCMPlanTests.test_callback_failure_and_late_cancel_leave_previous_pcm_and_wav_intact",
