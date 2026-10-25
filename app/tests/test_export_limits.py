@@ -29,12 +29,22 @@ class LegacyExportLimitTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ensure_legacy_pcm_allowed(value)
 
-    def test_project_refuses_before_the_whole_buffer_is_combined(self):
+    def test_project_refuses_before_trimming_or_combining(self):
         huge = plan(MAX_LEGACY_EXPORT_PCM_BYTES // 4 + 1)
         with patch.object(project, 'get_combined_source_plan', return_value=huge), \
+             patch.object(project, 'save_trimmed_pcm_sources',
+                          side_effect=AssertionError('trimmed copies must not be built')), \
              patch.object(project, 'combine_audio_with_pauses',
                           side_effect=AssertionError('whole-buffer combine must not run')):
             with self.assertRaisesRegex(ValueError, 'whole-buffer fallback is limited'):
+                project._get_legacy_export_audio(
+                    [AudioSegment.silent(duration=10, frame_rate=24000)], ['A'], 0, 0, None, None)
+
+    def test_unknown_plan_is_refused_before_combining(self):
+        with patch.object(project, 'get_combined_source_plan', return_value=None), \
+             patch.object(project, 'combine_audio_with_pauses',
+                          side_effect=AssertionError('whole-buffer combine must not run')):
+            with self.assertRaisesRegex(ValueError, 'no independent PCM frame plan'):
                 project._get_legacy_export_audio(
                     [AudioSegment.silent(duration=10, frame_rate=24000)], ['A'], 0, 0, None, None)
 

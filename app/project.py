@@ -73,7 +73,7 @@ from tts import (
                  get_chunk_voice_inputs)
 from pydub import AudioSegment
 from audio_assembly import AudioSegmentBuilder
-from audio_pcm_producer import PCMSourceStore, get_audio_duration_ms, is_plain_pcm_source
+from audio_pcm_producer import PCMSourceStore, get_audio_duration_ms
 from audio_streaming import (get_track_wav_plan, get_track_pcm_plan, write_track_wav, write_combined_wav,
                              get_streamable_layout, write_combined_pcm, iter_track_pieces,
                              get_combined_source_plan, save_trimmed_pcm_sources, get_pcm_shape)
@@ -729,11 +729,25 @@ def _load_audio_segment(path, **kwargs):
 
 def _get_legacy_export_audio(segments, speakers, pause_ms, same_speaker_pause_ms,
                              pause_overrides, cancel_check):
+    # Refuse an unmeasurable or oversized plan before copying trimmed sources
+    # or assembling the whole book. Trimming can only reduce the frame count,
+    # so the untrimmed plan is a safe upper bound; the exact plan is checked
+    # again after trimming.
+    upper = get_combined_source_plan(segments, speakers, pause_ms,
+        same_speaker_pause_ms, pause_overrides, cancel_check)
+    if upper is None:
+        raise ValueError(
+            'Legacy export contains a source with no independent PCM frame plan; '
+            'convert it to ordinary PCM or split the export.')
+    ensure_legacy_pcm_allowed(upper)
     trimmed = save_trimmed_pcm_sources(segments, cancel_check, None)
     pcm_plan = get_combined_source_plan(trimmed, speakers, pause_ms,
         same_speaker_pause_ms, pause_overrides, cancel_check)
-    if pcm_plan is not None:
-        ensure_legacy_pcm_allowed(pcm_plan)
+    if pcm_plan is None:
+        raise ValueError(
+            'Legacy export contains a source with no independent PCM frame plan; '
+            'convert it to ordinary PCM or split the export.')
+    ensure_legacy_pcm_allowed(pcm_plan)
     audio = combine_audio_with_pauses(segments, speakers, pause_ms,
         same_speaker_pause_ms, pause_overrides, cancel_check=cancel_check)
     if (pcm_plan is None or get_pcm_shape(audio) != ((pcm_plan['channels'],
@@ -2753,8 +2767,22 @@ class ProjectManager:
                 if skipped or not pairs:
                     return None
                 try:
+                    # get_chapter_audio always assembles the whole chapter, so
+                    # the same finite ceiling applies before any trimmed copy
+                    # is materialized. The untrimmed plan is a safe upper bound.
+                    upper = get_combined_source_plan(
+                        [segment for _, segment in pairs],
+                        [chunk['speaker'] for chunk, _ in pairs],
+                        *pause_defaults,
+                        [chunk.get('pause_after') for chunk, _ in pairs],
+                        cancel_check)
+                    if upper is None:
+                        raise ValueError(
+                            'Chapter sources have no independent PCM frame plan; '
+                            'convert them to ordinary PCM or split the chapter.')
+                    ensure_legacy_pcm_allowed(upper)
                     pcm_plan = get_chapter_pcm_plan(pairs, pause_defaults, cancel_check)
-                    if not all(is_plain_pcm_source(segment) for _, segment in pairs):
+                    if pcm_plan is not None:
                         ensure_legacy_pcm_allowed(pcm_plan)
                     quality_plan = get_chapter_quality_plan(pcm_plan, options['format'], options['export_quality'])
                     piece = self.get_chapter_audio(pairs, pause_defaults, cancel_check)
