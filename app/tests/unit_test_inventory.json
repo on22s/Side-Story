@@ -10654,6 +10654,7 @@
   "test_synthesis_recovery": [
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_cache_failure_keeps_serving_guard_and_postcommit_cleanup_cannot_raise",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_changed_parent_inputs_or_serving_identity_do_not_reuse_previous_audio",
+    "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_clone_windows_share_the_same_verified_recovery_session",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_corrupt_payload_falls_back_under_same_identity_without_touching_prior_cache",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_dependency_drift_after_copy_aborts_before_provider_and_preserves_prior",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_dependency_failure_after_private_assembly_keeps_prior_caller_output",
