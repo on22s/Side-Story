@@ -32,7 +32,7 @@ class RecoveryOrchestrationTests(unittest.TestCase):
         self.engine = SimpleNamespace(_synthesis_recovery={'enabled': True, 'max_audio_mb': 16},
             get_synthesis_recovery_policy=lambda: {'enabled': True, 'max_audio_mb': 16})
         self.identity = NativeRecoveryServingIdentity('a' * 64, 'b' * 64, 'c' * 64)
-        self.request = object()
+        self.request = tts.CustomVoiceRequest("Ryan", 42, "")
         self.admit_error = None
 
     @contextmanager
@@ -50,10 +50,11 @@ class RecoveryOrchestrationTests(unittest.TestCase):
                                     get_recovery_claim_digest(), self.admit)
             stack.enter_context(ensure_synthesis_recovery_parent(parent))
             stack.enter_context(patch.object(recovery, '_capture_engine_methods'))
-            capture = ('capture_native_lora_serving_identity'
-                       if category == 'lora' else 'capture_native_custom_serving_identity')
-            stack.enter_context(patch.object(recovery, capture, return_value=identity or self.identity))
-            stack.enter_context(patch('synthesis_recovery_serving.' + capture,
+            stack.enter_context(patch.object(recovery, 'capture_native_serving_identity',
+                                             return_value=identity or self.identity))
+            serving_capture = ('capture_native_lora_serving_identity'
+                               if category == 'lora' else 'capture_native_custom_serving_identity')
+            stack.enter_context(patch('synthesis_recovery_serving.' + serving_capture,
                                      return_value=identity or self.identity))
             session = stack.enter_context(recovery.ensure_synthesis_recovery(
                 self.engine, category, plan or self.plan, self.policy, request or self.request))

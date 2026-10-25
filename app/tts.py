@@ -29,7 +29,7 @@ from tts_diagnostics import (capture_tts_operation, measure_tts_stage, record_tt
 import clone_reference_cache
 from adapter_checkpoint_transaction import (ensure_adapter_generation_snapshot, get_adapter_generation_sha256,
                                             get_adapter_serving_metadata)
-from lora_evidence import get_file_sha256, get_tts_model_settings, get_adapter_generation_sha256
+from lora_evidence import get_file_sha256, get_tts_model_settings
 from audio_validation import GeneratedAudioError, publish_audio_output
 from speech_text import normalize_for_speech, get_speech_preparation
 from audio_generation_owner import (is_audio_generation_cancelled, ensure_audio_generation_active,
@@ -2389,25 +2389,32 @@ class TTSEngine:
             prepared["text"], prepared["instruct"], voice_data, output_path)
 
     @ensure_local_tts_serialized
-    def _generate_lora_voice_prepared(self, text, instruct_text, voice_data, output_path):
+    def _generate_lora_voice_prepared(self, text, instruct_text, voice_data, output_path,
+                                      recovery_request=None):
         try:
             self.get_voice_backend("lora")
             adapter_path = voice_data.get("adapter_path")
-            request = None
-            if getattr(self, "_synthesis_windows", None) and adapter_path:
+            request = recovery_request
+            if (request is None and getattr(self, "_synthesis_recovery", None)
+                    and getattr(self, "_synthesis_windows", None) and adapter_path):
                 if not os.path.isabs(adapter_path):
                     adapter_path = _resolve_asset_path(adapter_path)
                 adapter_path = get_resolved_adapter_path(adapter_path)
-                seed = voice_data.get("seed", -1)
-                if (os.path.isdir(adapter_path) and type(seed) is int
-                        and 0 <= seed < 2**64):
+                try:
+                    seed = int(voice_data.get("seed", -1))
+                except (TypeError, ValueError):
+                    seed = -1
+                character_style = (voice_data.get("character_style", "")
+                                   or voice_data.get("default_style", ""))
+                served_instruct = f"{instruct_text or ''} {character_style}".strip()
+                if os.path.isdir(adapter_path) and 0 <= seed < 2**64:
                     request = LoRARequest(
                         adapter_path,
                         voice_data.get("adapter_generation_sha256") or get_adapter_generation_sha256(adapter_path),
-                        seed, instruct_text or "")
+                        seed, served_instruct)
             windowed = self._render_synthesis_windows(
                 text, "lora", lambda span, path: self._generate_lora_voice_prepared(
-                    span, instruct_text, voice_data, path), output_path,
+                    span, instruct_text, voice_data, path, recovery_request=request), output_path,
                 recovery_request=request)
             if windowed is not None:
                 return windowed

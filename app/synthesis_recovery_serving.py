@@ -373,9 +373,9 @@ def _capture_loaded_serving(engine, request, model):
 
 
 def capture_native_lora_serving_identity(engine, request):
-    """Capture the loaded base model, adapter generation and LoRA prompt inputs."""
+    """Capture the loaded base model, adapter generation and LoRA serving code."""
     import tts
-    from lora_evidence import get_adapter_generation_sha256
+    import torch
     with tts._LOCAL_TTS_LOCK:
         if (type(request) is not tts.LoRARequest or type(request.seed) is not int
                 or not 0 <= request.seed < 2**64 or type(request.instruct) is not str
@@ -383,23 +383,49 @@ def capture_native_lora_serving_identity(engine, request):
                 or len(engine._language) > 128 or engine.get_voice_backend('lora') != 'local'
                 or engine._compile_codec_enabled):
             raise RecoveryIdentityUnavailable('unsupported_native_lora_request')
-        model, prompt = engine._ensure_local_lora_generation(
-            request.adapter_path, request.generation_sha256)
+        try:
+            model, _ = engine._ensure_local_lora_generation(
+                request.adapter_path, request.generation_sha256)
+        except (ValueError, OSError, TypeError, KeyError) as error:
+            raise RecoveryIdentityUnavailable('lora_adapter_or_loader_unavailable') from error
         loaded = getattr(model, '_aa2_recovery_loaded_model', None)
         if type(loaded) is not NativeRecoveryLoadedModel:
             raise RecoveryIdentityUnavailable('lora_model_loaded_without_identity')
-        adapter_sha256 = get_adapter_generation_sha256(request.adapter_path)
-        if adapter_sha256 != request.generation_sha256:
-            raise RecoveryIdentityUnavailable('lora_adapter_generation_changed')
+        if get_native_custom_code_sha256() != loaded.loader_code_sha256:
+            raise RecoveryIdentityUnavailable('lora_loaded_code_changed')
+        for name, expected in tts._RAW_LORA_METHODS.items():
+            callback = getattr(engine, name, None)
+            function = callback.__func__ if type(callback) is MethodType else callback
+            if function is not expected:
+                raise RecoveryIdentityUnavailable('overridden_lora_engine_method')
+        root = model.model
+        dtype_names = ((torch.float16, 'float16'), (torch.bfloat16, 'bfloat16'),
+                       (torch.float32, 'float32'), (torch.float64, 'float64'))
+        dtype = next((name for value, name in dtype_names if root.dtype is value), None)
+        default_dtype = next((name for value, name in dtype_names
+                              if torch.get_default_dtype() is value), None)
+        if dtype is None or default_dtype is None:
+            raise RecoveryIdentityUnavailable('unqualified_lora_serving_precision')
         try:
-            digest = get_native_custom_code_sha256(state={
-                'category': 'lora', 'asset_sha256': loaded.asset_sha256,
-                'adapter_sha256': adapter_sha256, 'language': engine._language,
-                'seed': request.seed, 'instruct_sha256': get_recovery_digest(request.instruct),
-                'model': engine.get_model_settings()})
+            callbacks, code_files = {}, []
+            _capture_engine_methods(engine, callbacks, code_files)
+            digest = get_native_custom_code_sha256(extra_callables=callbacks,
+                extra_code_files=code_files, state={
+                    'category': 'lora', 'asset_sha256': loaded.asset_sha256,
+                    'load_options_sha256': loaded.options_sha256,
+                    'adapter_sha256': request.generation_sha256,
+                    'aa2_loaded_code': _get_aa2_loaded_code(),
+                    'runtime': _get_runtime_build(torch, root.device),
+                    'dtype': dtype, 'default_dtype': default_dtype,
+                    'language': engine._language, 'seed': request.seed,
+                    'instruct_sha256': get_recovery_digest(request.instruct),
+                    'model': engine.get_model_settings()})
+        except RecoveryIdentityUnavailable:
+            raise
         except (ImportError, AttributeError, KeyError, ValueError, TypeError, OSError) as error:
             raise RecoveryIdentityUnavailable('unavailable_lora_serving_contract') from error
-        return NativeRecoveryServingIdentity(digest, loaded.asset_sha256, loaded.loader_code_sha256)
+        return NativeRecoveryServingIdentity(digest, loaded.asset_sha256,
+                                             loaded.loader_code_sha256)
 
 
 def capture_native_custom_serving_identity(engine, request):
@@ -421,6 +447,14 @@ def capture_native_custom_serving_identity(engine, request):
             raise RecoveryIdentityUnavailable('unavailable_serving_contract') from error
 
 
+def capture_native_serving_identity(engine, request):
+    """One dispatch for the request's serving-identity capture."""
+    import tts
+    return (capture_native_lora_serving_identity(engine, request)
+            if type(request) is tts.LoRARequest
+            else capture_native_custom_serving_identity(engine, request))
+
+
 @contextmanager
 def ensure_native_recovery_serving(engine, identity):
     if type(identity) is not NativeRecoveryServingIdentity:
@@ -440,11 +474,7 @@ def ensure_native_recovery_serving_current(engine, request):
     if guard[0] is not engine:
         raise SynthesisRecoveryDependencyChanged('Recovery serving engine changed')
     try:
-        import tts
-        if type(request) is tts.LoRARequest:
-            current = capture_native_lora_serving_identity(engine, request)
-        else:
-            current = capture_native_custom_serving_identity(engine, request)
+        current = capture_native_serving_identity(engine, request)
     except RecoveryIdentityUnavailable as error:
         raise SynthesisRecoveryDependencyChanged('Recovery serving identity became unproven') from error
     if current.sha256 != guard[1]:
