@@ -314,7 +314,7 @@ def capture_native_recovery_load(model_cls, model_id, local_path, load_kwargs):
     if dtype_name is None:
         raise RecoveryIdentityUnavailable('unsupported_native_load_options')
     device = load_kwargs.get('device_map', 'cpu')
-    if (type(device) is not str or device not in ('cpu', 'mps')
+    if (type(device) is not str or device not in ('cpu', 'mps', 'cuda')
             and not (device.startswith('cuda:') and device[5:].isascii() and device[5:].isdecimal())):
         raise RecoveryIdentityUnavailable('unsupported_native_load_device')
     from audio_generation_owner import ensure_audio_generation_active
