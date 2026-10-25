@@ -34,8 +34,19 @@ def get_delivery_retry_chunks(before, after, chunks):
         raise ValueError("Delivery retry changed frozen or unaffected entries.")
     if chunks is None:
         return None
+    language_aware = True
     old_groups = group_into_chunks(before, include_source_indices=True)
-    new_groups = group_into_chunks(after, include_source_indices=True)
+    if len(old_groups) != len(chunks):
+        # Existing CJK books were chunked at the old 500-character limit. Keep
+        # their legacy grouping for delivery retry instead of reporting a text edit.
+        legacy_groups = group_into_chunks(before, include_source_indices=True,
+                                          language_aware=False, legacy_chunking=True)
+        if len(legacy_groups) == len(chunks):
+            old_groups = legacy_groups
+            language_aware = False
+    new_groups = group_into_chunks(after, include_source_indices=True,
+                                   language_aware=language_aware,
+                                   legacy_chunking=not language_aware)
     if len(old_groups) != len(chunks) or any(
             any(get_basic_field(group, field) != get_basic_field(chunk, field)
                 for field in BASIC_FIELDS)
