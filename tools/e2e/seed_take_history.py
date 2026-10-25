@@ -81,6 +81,8 @@ def main(data_dir):
         snapshots = [row for row in archives['records'] if row['has_restore_evidence']]
         if not snapshots:
             raise RuntimeError('fixture did not retain restore evidence')
+        (target / '.e2e-take-history.json').write_text(json.dumps({
+            'fixture': 'take_history', 'version': 1}))
         output = {'rows': 2, 'snapshot_version': snapshots[0]['version'],
                   'snapshot_sha256': snapshots[0]['sha256'],
                   'original_sha256': __import__('hashlib').sha256(original).hexdigest(),

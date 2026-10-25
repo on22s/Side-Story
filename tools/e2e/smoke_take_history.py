@@ -26,12 +26,16 @@ REPO = Path(__file__).resolve().parents[2]
 APP = REPO / 'app'
 TOOLS = REPO / 'tools/e2e'
 sys.path.insert(0, str(APP))
-from subprocess_ownership import start_owned_subprocess, stop_owned_subprocess
+from subprocess_ownership import run_owned_capture, start_owned_subprocess, stop_owned_subprocess
 
 
 def get_app_python():
-    candidate = APP / 'env/bin/python'
-    return str(candidate) if candidate.is_file() else sys.executable
+    result = run_owned_capture([str(REPO / 'tools/regen_derived.sh'), '--python'],
+                               timeout=30, text=True)
+    path = result.stdout.strip()
+    if result.returncode != 0 or not os.path.isfile(path):
+        raise RuntimeError(f'no app interpreter: {result.stderr.strip() or path}')
+    return path
 
 
 def get_free_port():
@@ -83,6 +87,14 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def read_audio(data_dir, relative):
+    root = Path(data_dir).resolve()
+    path = (root / relative).resolve()
+    if root not in path.parents:
+        raise AssertionError(f'audio path escaped the private data directory: {relative}')
+    return path.read_bytes()
+
+
 def wait_api(predicate, timeout=20, interval=0.1):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -95,12 +107,10 @@ def wait_api(predicate, timeout=20, interval=0.1):
 
 def open_take_panel(page):
     page.evaluate("document.querySelectorAll('details').forEach(d=>d.open=true)")
-    page.get_by_role('button', name="This line's snapshots").click()
     page.evaluate('loadEditorTakeSnapshots(false)')
-    page.wait_for_function("() => takeHistoryBusy === false", timeout=15000)
     page.wait_for_function(
-        "() => document.getElementById('editor-take-status').textContent.includes('saved snapshot')",
-        timeout=10000)
+        "() => !takeHistoryBusy && document.querySelectorAll('#editor-take-list > div').length > 0",
+        timeout=15000)
 
 
 def snapshot_card(page, version):
@@ -117,7 +127,8 @@ def snapshot_card(page, version):
 
 def select_line(page, index):
     page.evaluate(f'selectEditorReviewLineById({index})')
-    page.wait_for_timeout(250)
+    page.wait_for_function(
+        'index => getEditorReviewTarget()?.chunk.id === index', arg=index, timeout=10000)
 
 
 def run_browser(base, data_dir, metadata, failures, checks):
@@ -152,13 +163,24 @@ def run_browser(base, data_dir, metadata, failures, checks):
             # A pending save must stay bound to row 0 while the user switches
             # rows before the request is released. This is also the save flow.
             held = {}
-            def hold(route):
+            responses = []
+            def hold_save(route):
+                if route.request.method != 'POST':
+                    route.continue_(); return
+                body = route.request.post_data_json or {}
+                if body.get('expected_uid') != 'line':
+                    route.continue_(); return
                 held['route'] = route
-            page.route('**/*take_snapshot*', hold)
+            def note_response(response):
+                if ('/api/chunks/0/take_snapshots' in response.url
+                        and response.request.method == 'POST'):
+                    responses.append(response.status)
+            page.on('response', note_response)
+            page.route('**/api/chunks/0/take_snapshots', hold_save)
             before0 = get_json(base, f'/api/take_snapshots?expected_book_token={token}&uid=line')['total']
             before1 = get_json(base, f'/api/take_snapshots?expected_book_token={token}&uid=other')['total']
             row1_before = next(row for row in get_json(base, '/api/chunks') if row['id'] == 1)
-            row1_hash = sha((Path(data_dir) / row1_before['audio_path']).read_bytes())
+            row1_hash = sha(read_audio(data_dir, row1_before['audio_path']))
             page.locator('#editor-take-save').click()
             for _ in range(200):
                 if 'route' in held:
@@ -168,13 +190,19 @@ def run_browser(base, data_dir, metadata, failures, checks):
                 raise AssertionError('pending save request was not intercepted')
             select_line(page, 1)
             held['route'].continue_()
+            for _ in range(200):
+                if responses:
+                    break
+                page.wait_for_timeout(50)
+            if responses != [200]:
+                raise AssertionError(f'pending row save response was {responses}, expected [200]')
             wait_api(lambda: get_json(base,
                 f'/api/take_snapshots?expected_book_token={token}&uid=line')['total'] > before0)
-            page.unroute('**/*take_snapshot*')
+            page.unroute('**/api/chunks/0/take_snapshots')
             if get_json(base, f'/api/take_snapshots?expected_book_token={token}&uid=other')['total'] != before1:
                 raise AssertionError('pending save was redirected to the newly selected row')
             row1 = next(row for row in get_json(base, '/api/chunks') if row['id'] == 1)
-            if sha((Path(data_dir) / row1['audio_path']).read_bytes()) != row1_hash:
+            if sha(read_audio(data_dir, row1['audio_path'])) != row1_hash:
                 raise AssertionError('row switch changed the other row audio')
             checks.append('pending row ownership')
 
@@ -215,9 +243,12 @@ def run_browser(base, data_dir, metadata, failures, checks):
                     raise AssertionError(f"restore did not select the saved revision: {status}")
                 return None
             row0 = wait_api(restored, timeout=40)
-            selected = (Path(data_dir) / row0['audio_path']).read_bytes()
+            selected = read_audio(data_dir, row0['audio_path'])
             if sha(selected) != origin['sha256']:
                 raise AssertionError('restored file does not match the snapshot hash')
+            archive = get_json(base, f'/api/take_snapshots?expected_book_token={token}&uid=line')['records']
+            if not any(record['sha256'] == metadata['current_sha256'] for record in archive):
+                raise AssertionError('restore did not retain the displaced take')
             checks.append('restore hash')
             page.wait_for_function('() => takeHistoryBusy === false', timeout=20000)
             select_line(page, 0)
@@ -229,9 +260,20 @@ def run_browser(base, data_dir, metadata, failures, checks):
             manifest_path = Path(data_dir) / 'take_history/manifest.json'
             before_archive = len(json.loads(manifest_path.read_text())['records'])
             held = {}
+            responses = []
             def hold_book(route):
+                if route.request.method != 'POST':
+                    route.continue_(); return
+                body = route.request.post_data_json or {}
+                if body.get('expected_uid') != 'line':
+                    route.continue_(); return
                 held['route'] = route
-            page.route('**/*take_snapshot*', hold_book)
+            def note_book_response(response):
+                if ('/api/chunks/0/take_snapshots' in response.url
+                        and response.request.method == 'POST'):
+                    responses.append(response.status)
+            page.on('response', note_book_response)
+            page.route('**/api/chunks/0/take_snapshots', hold_book)
             select_line(page, 0)
             page.locator('#editor-take-save').click()
             for _ in range(200):
@@ -243,10 +285,17 @@ def run_browser(base, data_dir, metadata, failures, checks):
             page.evaluate("void loadScript('Other')")
             page.locator('#confirmModalOk').wait_for(state='visible', timeout=10000)
             page.locator('#confirmModalOk').click()
-            wait_api(lambda: page.evaluate('currentBookFilename') == 'Other.json', timeout=20)
+            page.wait_for_function('old => currentBookFilename === "Other.json" && chunkSnapshotBookToken !== old',
+                                   arg=token, timeout=20000)
             held['route'].continue_()
-            page.wait_for_timeout(750)
-            page.unroute('**/*take_snapshot*')
+            for _ in range(200):
+                if responses:
+                    break
+                page.wait_for_timeout(50)
+            if not responses or any(status != 409 for status in responses):
+                raise AssertionError(f'book-switch save responses were {responses}, expected only 409')
+            page.wait_for_function('() => takeHistoryBusy === false', timeout=10000)
+            page.unroute('**/api/chunks/0/take_snapshots')
             after_archive = len(json.loads(manifest_path.read_text())['records'])
             if after_archive != before_archive:
                 raise AssertionError('pending save wrote into the old book after switching')
@@ -277,13 +326,14 @@ def main(argv=None):
     log_path = os.path.join(data_dir, 'server.log')
     failures, checks = [], []
     status = 0
+    infrastructure_error = None
     app_python = args.app_python or get_app_python()
     env = dict(os.environ, ALEXANDRIA_DATA_DIR=data_dir, ALEXANDRIA_HOST='127.0.0.1',
                ALEXANDRIA_PORT=str(get_free_port()), PYTHONDONTWRITEBYTECODE='1')
     base = f"http://127.0.0.1:{env['ALEXANDRIA_PORT']}"
     try:
-        seed = subprocess.run([app_python, str(TOOLS / 'seed_take_history.py')],
-                              env=env, capture_output=True, text=True, timeout=120)
+        seed = run_owned_capture([app_python, str(TOOLS / 'seed_take_history.py')],
+                                 env=env, timeout=120, text=True)
         if seed.returncode:
             raise RuntimeError(f'seed failed ({seed.returncode}): {seed.stderr[-2048:]}')
         metadata = json.loads(seed.stdout)
@@ -294,15 +344,21 @@ def main(argv=None):
         wait_ready(base + '/', server, log_path)
         run_browser(base, data_dir, metadata, failures, checks)
         print('checks:', ', '.join(checks))
-    except Exception as error:
+    except AssertionError as error:
         failures.append(f'{type(error).__name__}: {error}')
+    except Exception as error:
+        infrastructure_error = f'{type(error).__name__}: {error}'
     finally:
         if server is not None:
             try:
                 stop_server(server)
             except Exception as error:
-                failures.append(f'cleanup: {type(error).__name__}: {error}')
-        if failures:
+                infrastructure_error = (infrastructure_error or
+                                        f'cleanup: {type(error).__name__}: {error}')
+        if infrastructure_error:
+            status = 2
+            print(f'COULD NOT RUN: {infrastructure_error}', file=sys.stderr)
+        elif failures:
             status = 1
             for failure in failures:
                 print(f'FAIL: {failure}', file=sys.stderr)

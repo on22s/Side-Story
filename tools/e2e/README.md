@@ -71,13 +71,14 @@ Run it with Playwright in its own environment:
 ```bash
 uv venv .e2e-venv && uv pip install --python .e2e-venv -r requirements-test.txt
 .e2e-venv/bin/playwright install chromium-headless-shell
-.e2e-venv/bin/python tools/e2e/smoke_take_history.py \
-  --app-python /path/to/alexandria/app/env/bin/python
+.e2e-venv/bin/python tools/e2e/smoke_take_history.py
 ```
 
 A temporary `ALEXANDRIA_DATA_DIR` is created with mode 0700 and seeded by
-`seed_take_history.py`; the server runs on a free loopback port under the
-existing owned-subprocess cleanup. Synthetic audio and the CPU fixture engine
+`seed_take_history.py`. The server wrapper refuses to run unless the private
+fixture marker is present, binds only loopback, and runs under the existing
+owned-subprocess cleanup. Synthetic audio and the CPU fixture engine
 are the only inputs: no model, GPU, real book or listening result is involved.
-Failures keep the data directory and `server.log`; `--keep` does the same on
-success. This is a standalone harness, not a default CI job.
+Failures keep the data directory and `server.log` once the server has started;
+`--keep` does the same on success. `--app-python` can override the interpreter
+resolver. This is a standalone harness, not a default CI job.
