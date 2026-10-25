@@ -80,8 +80,8 @@ audio revision, so later review notes cannot relabel an earlier performance.
 
 Inspect a rendered line and open **Saved take snapshots**. Choose **Save this take**
 before changing its words, voice or seed, or regenerating it. This saves an immutable
-copy of the selected audio plus its recorded text, delivery, seed counter and available
-evidence. Use **This line's snapshots** to compare copies, or **All project snapshots**
+copy of the selected audio plus its recorded text, speaker, delivery, seed counter and available
+evidence. Use **This line's snapshots** to audition copies, or **All project snapshots**
 to find copies from earlier lines and book generations. Playback verifies the saved
 bytes and leaves the selected line audio unchanged.
 
@@ -98,11 +98,30 @@ removed. A failed or interrupted copy never replaces the selected audio; its cha
 incomplete record remains visible for cleanup. Unknown or damaged archive metadata
 is preserved for inspection instead of being silently repaired or pruned.
 
-Saving is explicit in this version. Automatic retention and restoring a snapshot as
-the selected take are not yet available. Legacy recordings may lack exact generation
-dependencies, so snapshots remain audition-only rather than certifying a voice/model
-match. Loading a saved script creates new line identities; old snapshots remain in
-**All project snapshots** and are never assigned to new lines by position or text.
+**Automatic take history** is off by default. In Editor, open that section, choose
+**Refresh setting**, then **Turn on** to retain prior selected performances before
+regeneration. Archive limits still apply: if the prior take cannot be retained safely,
+regeneration is refused before replacing it. **Turn off** stops new automatic snapshots;
+existing snapshots remain, and a pending prior take stays protected until its replacement
+succeeds.
+
+On a supported host, ready snapshots with restoration evidence for the current book
+and line show **Check & restore**. The button starts an eligibility check; it does not
+guarantee the snapshot can be restored. Restoration verifies the saved audio and
+its original generation dependencies against the current line, retains the displaced
+take, and selects the saved performance without generating new speech. If the displaced
+take cannot be retained safely, restoration is refused. It does not
+change the authored script to fit an incompatible snapshot. Verified restoration is
+currently limited to built-in local CustomVoice on supported Linux hosts. The saved
+performance needs native publication evidence from rendering with synthesis windows
+and recovery enabled. Clone and LoRA internal-window recovery is a separate feature and
+does not qualify those snapshots for restoration.
+
+Ready, undeleted legacy recordings or snapshots without matching restoration evidence
+remain available for audition. Changes to text, voice, model settings or other recorded dependencies can
+make a snapshot ineligible for restoration. Loading a saved script creates new line
+identities; old snapshots remain in **All project snapshots** and are never assigned to
+new lines by position or text.
 
 ## Merging
 
