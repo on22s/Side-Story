@@ -1983,6 +1983,8 @@ class TTSEngine:
                 render_synthesis_windows(plan, render, output_path, self._synthesis_windows,
                                          cancel_check=is_audio_generation_cancelled, recovery=recovery, **options)
             return True
+        except (AudioGenerationCancelled, ExportCancelled):
+            raise
         except Exception as error:
             apply_tts_failure(error)
             return False
@@ -2090,16 +2092,17 @@ class TTSEngine:
         voice_data = voice_config.get(speaker, {}) if isinstance(voice_config, dict) else {}
         if (request is None and getattr(self, "_synthesis_recovery", None)
                 and getattr(self, "_synthesis_windows", None)
+                and self.get_voice_backend("clone") == "local"
                 and voice_data.get("ref_audio") and voice_data.get("ref_text")):
-            ref_audio = voice_data["ref_audio"]
-            if not os.path.isabs(ref_audio):
-                ref_audio = _resolve_asset_path(ref_audio)
             try:
+                ref_audio = voice_data["ref_audio"]
+                if not os.path.isabs(ref_audio):
+                    ref_audio = _resolve_asset_path(ref_audio)
                 seed = int(voice_data.get("seed", -1))
-            except (TypeError, ValueError):
-                seed = -1
-            if 0 <= seed < 2**64:
-                request = CloneRequest(ref_audio, voice_data["ref_text"], seed)
+                if isinstance(voice_data["ref_text"], str) and 0 <= seed < 2**64:
+                    request = CloneRequest(ref_audio, voice_data["ref_text"], seed)
+            except (TypeError, ValueError, OSError):
+                request = None
         windowed = self._render_synthesis_windows(
             text, "clone", lambda span, path: self._generate_clone_voice_prepared(
                 span, speaker, voice_config, path, recovery_request=request), output_path,
@@ -2446,7 +2449,9 @@ class TTSEngine:
                     seed = -1
                 character_style = (voice_data.get("character_style", "")
                                    or voice_data.get("default_style", ""))
-                served_instruct = f"{instruct_text or ''} {character_style}".strip()
+                served_instruct = instruct_text or ""
+                if character_style:
+                    served_instruct = f"{served_instruct} {character_style}".strip()
                 if os.path.isdir(adapter_path) and 0 <= seed < 2**64:
                     request = LoRARequest(
                         adapter_path,
@@ -3789,7 +3794,8 @@ _RAW_COMMON_SINGLE_METHODS = {name: getattr(TTSEngine, name) for name in (
 _RAW_CLONE_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
     name: getattr(TTSEngine, name) for name in (
         'generate_clone_voice', '_generate_clone_voice_prepared',
-        '_local_generate_clone', '_init_local_clone', '_get_clone_prompt')}}
+        '_local_generate_clone', '_init_local_clone', '_get_clone_prompt',
+        '_prepare_clone_prompt')}}
 
 _RAW_DESIGN_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
     name: getattr(TTSEngine, name) for name in (

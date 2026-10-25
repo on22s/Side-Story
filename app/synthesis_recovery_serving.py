@@ -473,9 +473,15 @@ def capture_native_clone_serving_identity(engine, request):
                 or engine.get_voice_backend('clone') != 'local'
                 or engine._compile_codec_enabled):
             raise RecoveryIdentityUnavailable('unsupported_native_clone_request')
+        for name, expected in tts._RAW_CLONE_METHODS.items():
+            callback = getattr(engine, name, None)
+            function = callback.__func__ if type(callback) is MethodType else callback
+            if function is not expected:
+                raise RecoveryIdentityUnavailable('overridden_clone_engine_method')
         try:
             model = engine._init_local_clone()
-            resolved, reference_bytes = get_adapter_asset_snapshot(request.ref_audio_path)
+            _resolved, reference_bytes = get_adapter_asset_snapshot(request.ref_audio_path)
+            _ensure_class(model, 'qwen_tts.inference.qwen3_tts_model', 'Qwen3TTSModel')
         except (ValueError, OSError, TypeError, KeyError) as error:
             raise RecoveryIdentityUnavailable('clone_reference_or_loader_unavailable') from error
         loaded = getattr(model, '_aa2_recovery_loaded_model', None)
@@ -483,17 +489,16 @@ def capture_native_clone_serving_identity(engine, request):
             raise RecoveryIdentityUnavailable('clone_model_loaded_without_identity')
         if get_native_custom_code_sha256() != loaded.loader_code_sha256:
             raise RecoveryIdentityUnavailable('clone_loaded_code_changed')
-        for name, expected in tts._RAW_CLONE_METHODS.items():
-            callback = getattr(engine, name, None)
-            function = callback.__func__ if type(callback) is MethodType else callback
-            if function is not expected:
-                raise RecoveryIdentityUnavailable('overridden_clone_engine_method')
-        root = model.model
-        dtype_names = ((torch.float16, 'float16'), (torch.bfloat16, 'bfloat16'),
-                       (torch.float32, 'float32'), (torch.float64, 'float64'))
-        dtype = next((name for value, name in dtype_names if root.dtype is value), None)
-        default_dtype = next((name for value, name in dtype_names
-                              if torch.get_default_dtype() is value), None)
+        try:
+            root = _ensure_class(model.model, 'qwen_tts.core.models.modeling_qwen3_tts',
+                                 'Qwen3TTSForConditionalGeneration')
+            dtype_names = ((torch.float16, 'float16'), (torch.bfloat16, 'bfloat16'),
+                           (torch.float32, 'float32'), (torch.float64, 'float64'))
+            dtype = next((name for value, name in dtype_names if root.dtype is value), None)
+            default_dtype = next((name for value, name in dtype_names
+                                  if torch.get_default_dtype() is value), None)
+        except (AttributeError, TypeError) as error:
+            raise RecoveryIdentityUnavailable('unsupported_clone_model_shape') from error
         if dtype is None or default_dtype is None:
             raise RecoveryIdentityUnavailable('unqualified_clone_serving_precision')
         try:
@@ -503,7 +508,6 @@ def capture_native_clone_serving_identity(engine, request):
                 'category': 'clone', 'asset_sha256': loaded.asset_sha256,
                 'load_options_sha256': loaded.options_sha256,
                 'reference_sha256': hashlib.sha256(reference_bytes).hexdigest(),
-                'reference_path': resolved,
                 'reference_text_sha256': get_recovery_digest(request.ref_text),
                 'aa2_loaded_code': _get_aa2_loaded_code(),
                 'runtime': _get_runtime_build(torch, root.device),
