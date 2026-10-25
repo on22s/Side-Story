@@ -1,5 +1,6 @@
 """Ownership-marked export staging survives ordinary exit and reclaims only abandoned work."""
 import os
+import json
 from pathlib import Path
 import signal
 import subprocess
@@ -9,7 +10,7 @@ import time
 import unittest
 
 from export_staging import (ExportStaging, create_export_staging, reclaim_export_staging,
-                            MARKER, PREFIXES)
+                            MARKER, OWNER_LOCK, PREFIXES)
 
 
 APP = Path(__file__).resolve().parent.parent
@@ -113,13 +114,71 @@ class ExportStagingTests(unittest.TestCase):
     def test_corrupt_marker_is_preserved_without_aborting_reclaim(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            broken = root / (PREFIXES['mp3'] + 'broken')
-            broken.mkdir()
-            (broken / MARKER).write_text('[' * 2000 + ']' * 2000)
-            result = reclaim_export_staging((root,))
-            self.assertEqual([], result['removed'])
-            self.assertIn(str(broken), result['preserved'])
-            self.assertTrue(broken.is_dir())
+            marker = dict(schema=1, kind='mp3', prefix=PREFIXES['mp3'],
+                          parent=str(root.resolve()), token='0' * 32)
+            malformed = ['[' * 2000 + ']' * 2000,
+                         json.dumps({**marker, 'kind': []}),
+                         json.dumps({**marker, 'kind': {}}),
+                         json.dumps({**marker, 'schema': True}),
+                         ' ' * 4097]
+            preserved = []
+            for index, raw in enumerate(malformed):
+                broken = root / (PREFIXES['mp3'] + 'broken-' + str(index))
+                broken.mkdir()
+                (broken / MARKER).write_text(raw)
+                preserved.append(broken)
+            directory = root / (PREFIXES['mp3'] + 'directory-marker')
+            (directory / MARKER).mkdir(parents=True)
+            preserved.append(directory)
+            if hasattr(os, 'mkfifo'):
+                pipe = root / (PREFIXES['mp3'] + 'fifo-marker')
+                pipe.mkdir()
+                os.mkfifo(pipe / MARKER)
+                preserved.append(pipe)
+            process, valid = self.run_child(tmp, mode='exit')
+            process.wait(timeout=10)
+            process.communicate()
+            # Bound the whole reclaim in a child so a FIFO regression cannot
+            # hang the test runner. subprocess.run kills/reaps its own child.
+            child = ('import sys,json; sys.path.insert(0,sys.argv[1]); '
+                     'from export_staging import reclaim_export_staging; '
+                     'print(json.dumps(reclaim_export_staging((sys.argv[2],))))')
+            completed = subprocess.run([sys.executable, '-c', child, str(APP), str(root)],
+                                       capture_output=True, text=True, timeout=10, check=True)
+            result = json.loads(completed.stdout)
+            self.assertEqual([str(valid)], result['removed'])
+            self.assertFalse(valid.exists())
+            for broken in preserved:
+                with self.subTest(path=broken.name):
+                    self.assertIn(str(broken), result['preserved'])
+                    self.assertTrue(broken.is_dir())
+            if hasattr(os, 'mkfifo'):
+                racing = root / (PREFIXES['mp3'] + 'replaced-marker')
+                racing.mkdir()
+                (racing / MARKER).write_text(json.dumps(marker))
+                # Replace a regular marker after lstat, just before os.open.
+                # O_NONBLOCK must also protect this race, not just static FIFOs.
+                child = r'''
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from export_staging import reclaim_export_staging, MARKER
+original = os.open
+target = os.path.join(sys.argv[3], MARKER)
+def replace_then_open(path, flags, *args, **kwargs):
+    if os.fspath(path) == target:
+        os.unlink(target)
+        os.mkfifo(target)
+        os.open = original
+    return original(path, flags, *args, **kwargs)
+os.open = replace_then_open
+print(json.dumps(reclaim_export_staging((sys.argv[2],))))
+'''
+                completed = subprocess.run(
+                    [sys.executable, '-c', child, str(APP), str(root), str(racing.resolve())],
+                    capture_output=True, text=True, timeout=10, check=True)
+                result = json.loads(completed.stdout)
+                self.assertIn(str(racing), result['preserved'])
+                self.assertTrue((racing / MARKER).is_fifo())
 
     def test_chapter_rollback_old_directory_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,12 +206,24 @@ class ExportStagingTests(unittest.TestCase):
                 '"parent":"/definitely/not/this/root","token":"' + '0' * 32 + '"}')
             symlink = root / (PREFIXES['mp3'] + 'symlink')
             symlink.symlink_to(sibling, target_is_directory=True)
+            process, aliased_lock = self.run_child(tmp, mode='exit')
+            process.wait(timeout=10)
+            process.communicate()
+            target = root / 'foreign-lock'
+            target.write_bytes(b'keep')
+            actual_lock = aliased_lock / (OWNER_LOCK + '.lock')
+            actual_lock.unlink()
+            actual_lock.symlink_to(target)
             result = reclaim_export_staging((root,))
             self.assertEqual([], result['removed'])
             self.assertTrue((sibling / 'unknown.bin').is_file())
             self.assertTrue((missing / 'payload.bin').is_file())
             self.assertTrue((foreign / MARKER).is_file())
             self.assertTrue(symlink.is_symlink())
+            self.assertIn(str(aliased_lock), result['preserved'])
+            self.assertTrue(actual_lock.is_symlink())
+            self.assertEqual(b'keep', target.read_bytes())
+            self.assertEqual(b'x' * 4096, (aliased_lock / 'payload.bin').read_bytes())
 
     def test_preserved_recovery_directory_is_not_reaped(self):
         with tempfile.TemporaryDirectory() as tmp:

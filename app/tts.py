@@ -1666,11 +1666,27 @@ class TTSEngine:
             # This model instance is fresh from _load_model and cached only
             # here, so merging in place cannot leak into the stock/clone
             # paths; switching adapters reloads the base anyway.
+            # A recovery certificate must describe the implementation that
+            # actually merged these tensors, not a later installed PEFT release.
+            merge_sha256 = None
+            if getattr(model, '_aa2_recovery_loaded_model', None) is not None:
+                from synthesis_recovery_serving import get_native_lora_merge_sha256
+                from synthesis_recovery_identity import RecoveryIdentityUnavailable
+                try:
+                    merge_sha256 = get_native_lora_merge_sha256()
+                except (RecoveryIdentityUnavailable, ImportError, AttributeError, ValueError, OSError):
+                    pass  # Optional recovery cannot prevent ordinary synthesis.
             model.model.talker = PeftModel.from_pretrained(
                 model.model.talker,
                 adapter_path,
             ).merge_and_unload()
             model.model.talker.eval()
+            if merge_sha256 is not None:
+                try:
+                    if get_native_lora_merge_sha256() == merge_sha256:
+                        model._aa2_recovery_lora_merge_sha256 = merge_sha256
+                except (RecoveryIdentityUnavailable, ImportError, AttributeError, ValueError, OSError):
+                    pass
 
             if self._compile_codec_enabled:
                 self._compile_codec(model)

@@ -11,6 +11,80 @@ import tts
 
 
 class RecoveryServingTests(unittest.TestCase):
+    def test_lora_refuses_replaced_loaders_before_calling_them(self):
+        from unittest.mock import Mock
+        engine = tts.TTSEngine({'tts': {'mode': 'local', 'compile_codec': False}})
+        request = tts.LoRARequest('/private/adapter', 'a' * 64, 42, '')
+        for name in ('_ensure_local_lora_generation', '_init_local_lora', '_ensure_lora_prompt'):
+            with self.subTest(method=name):
+                replacement = Mock(side_effect=RuntimeError('must not load'))
+                with patch.object(engine, name, replacement):
+                    with self.assertRaises(RecoveryIdentityUnavailable):
+                        serving.capture_native_lora_serving_identity(engine, request)
+                replacement.assert_not_called()
+
+    def test_lora_malformed_model_is_optional_and_merge_certificate_is_required(self):
+        from unittest.mock import Mock
+        from qwen_tts import Qwen3TTSModel
+        from synthesis_recovery_native import NativeRecoveryLoadedModel
+        engine = tts.TTSEngine({'tts': {'mode': 'local', 'compile_codec': False}})
+        request = tts.LoRARequest('/private/adapter', 'a' * 64, 42, '')
+        wrapper = Qwen3TTSModel.__new__(Qwen3TTSModel)
+        wrapper._aa2_recovery_loaded_model = NativeRecoveryLoadedModel('a'*64, 'b'*64, 'c'*64)
+        for model in (object(), wrapper):
+            loader = Mock(return_value=(model, None))
+            expected = {**tts._RAW_LORA_METHODS, '_ensure_local_lora_generation': loader}
+            with self.subTest(model=type(model).__name__), patch.object(engine, '_ensure_local_lora_generation', loader), patch.object(tts, '_RAW_LORA_METHODS', expected), patch.object(serving, 'get_native_custom_code_sha256', return_value='b'*64), patch.object(serving, 'get_native_lora_merge_sha256', return_value='d'*64):
+                with self.assertRaises(RecoveryIdentityUnavailable):
+                    serving.capture_native_lora_serving_identity(engine, request)
+                loader.assert_called_once()
+
+    def test_lora_merge_identity_binds_peft_release_and_loaded_merge_code(self):
+        from peft.tuners.lora.layer import Linear
+        first = serving.get_native_lora_merge_sha256()
+        self.assertEqual(first, serving.get_native_lora_merge_sha256())
+        with patch.object(serving, 'version', return_value='different-release'):
+            self.assertNotEqual(first, serving.get_native_lora_merge_sha256())
+        def changed_merge(self, *args, **kwargs):
+            raise AssertionError('identity inspection must not execute merge')
+        with patch.object(Linear, 'merge', changed_merge):
+            self.assertNotEqual(first, serving.get_native_lora_merge_sha256())
+        self.assertEqual(first, serving.get_native_lora_merge_sha256())
+        import torch
+        from qwen_tts import Qwen3TTSModel
+        from unittest.mock import Mock
+        from synthesis_recovery_native import NativeRecoveryLoadedModel
+        from synthesis_recovery_identity import get_recovery_digest
+        engine = tts.TTSEngine({'tts': {'mode': 'local', 'compile_codec': False}})
+        wrapper = Qwen3TTSModel.__new__(Qwen3TTSModel)
+        wrapper.model = SimpleNamespace(dtype=torch.float32, device=torch.device('cpu'))
+        wrapper._aa2_recovery_loaded_model = NativeRecoveryLoadedModel('a'*64, 'b'*64, 'c'*64)
+        wrapper._aa2_recovery_lora_merge_sha256 = first
+        loader = Mock(return_value=(wrapper, None))
+        request = tts.LoRARequest('/private/adapter', 'a'*64, 42, '')
+        expected = {**tts._RAW_LORA_METHODS, '_ensure_local_lora_generation': loader}
+        def project(**kwargs):
+            return get_recovery_digest(kwargs['state']) if kwargs else 'b'*64
+        # The fake loader/class/runtime isolate the real LoRA projection and
+        # dispatch/serving guard; no native provider or merge is executed.
+        with patch.object(engine, '_ensure_local_lora_generation', loader), patch.object(tts, '_RAW_LORA_METHODS', expected), patch.object(serving, '_ensure_class', side_effect=lambda value, *args: value), patch.object(serving, 'get_native_custom_code_sha256', side_effect=project), patch.object(serving, '_get_runtime_build', return_value={'fixture': 'cpu'}), patch.object(serving, '_get_aa2_loaded_code', return_value={}), patch.object(serving, 'get_native_lora_merge_sha256', return_value=first) as merge, patch.object(serving, 'capture_native_custom_serving_identity', side_effect=AssertionError('wrong dispatch')):
+            identity = serving.capture_native_lora_serving_identity(engine, request)
+            with serving.ensure_native_recovery_serving(engine, identity):
+                serving.ensure_native_recovery_serving_current(engine, request)
+                merge.return_value = 'e'*64
+                with self.assertRaises(serving.SynthesisRecoveryDependencyChanged):
+                    serving.ensure_native_recovery_serving_current(engine, request)
+                # A newly loaded model with the changed PEFT implementation gets
+                # a different serving key, rather than reusing the old cache.
+                wrapper._aa2_recovery_lora_merge_sha256 = 'e'*64
+                changed = serving.capture_native_lora_serving_identity(engine, request)
+                self.assertNotEqual(identity.sha256, changed.sha256)
+                merge.return_value = first
+                wrapper._aa2_recovery_lora_merge_sha256 = first
+                engine._max_new_tokens += 1
+                with self.assertRaises(serving.SynthesisRecoveryDependencyChanged):
+                    serving.ensure_native_recovery_serving_current(engine, request)
+
     def test_speech_policy_loaded_code_is_bound_and_missing_certificate_refuses_recovery(self):
         import speech_policy
         from synthesis_recovery_identity import get_recovery_digest

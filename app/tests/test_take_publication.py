@@ -325,7 +325,7 @@ class TakePublicationTests(unittest.TestCase):
                 Path(manager.voice_config_path).write_text(json.dumps(
                     {'NARRATOR':{'type':'custom','voice':'Ryan','seed':42}}))
                 with patch.object(manager,'get_engine',return_value=engine), \
-                        patch('synthesis_recovery.capture_native_custom_serving_identity',return_value=identity), \
+                        patch('synthesis_recovery.capture_native_serving_identity',return_value=identity), \
                         patch('synthesis_recovery_serving.capture_native_custom_serving_identity',return_value=identity), \
                         patch('speech_verification.verify_finished_speech',side_effect=AssertionError('ASR must stay off')):
                     if mode=='single':

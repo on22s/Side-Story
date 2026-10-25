@@ -49,3 +49,36 @@ Media errors and rejected `play()` calls fail the run.
 These bounds include browser decoding and timer variability.
 Browser waits that time out are incomplete runs (exit 2), retain diagnostics
 and never report PASS.
+
+## Retained takes
+
+`smoke_take_history.py` drives the real Editor take-history controls against a
+private synthetic book whose saved take has CPU-generated restoration evidence.
+The server wrapper replaces only the native serving identity and engine with the
+existing synthetic CPU fixture; the app, routes, bytes, locks and Editor UI are
+real.
+
+It checks:
+
+- archived snapshot audition bytes against the recorded SHA-256;
+- saving the selected take and delete-with-undo, including unchanged archived bytes;
+- verified restoration of the saved take, then the selected file hash;
+- a pending save that cannot be redirected by switching rows;
+- a pending save that cannot be redirected by switching books.
+
+Run it with Playwright in its own environment:
+
+```bash
+uv venv .e2e-venv && uv pip install --python .e2e-venv -r requirements-test.txt
+.e2e-venv/bin/playwright install chromium-headless-shell
+.e2e-venv/bin/python tools/e2e/smoke_take_history.py
+```
+
+A temporary `ALEXANDRIA_DATA_DIR` is created with mode 0700 and seeded by
+`seed_take_history.py`. The server wrapper refuses to run unless the private
+fixture marker is present, binds only loopback, and runs under the existing
+owned-subprocess cleanup. Synthetic audio and the CPU fixture engine
+are the only inputs: no model, GPU, real book or listening result is involved.
+Failures keep the data directory and `server.log` once the server has started;
+`--keep` does the same on success. `--app-python` can override the interpreter
+resolver. This is a standalone harness, not a default CI job.
