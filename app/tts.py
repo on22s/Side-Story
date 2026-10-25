@@ -2394,7 +2394,7 @@ class TTSEngine:
             self.get_voice_backend("lora")
             adapter_path = voice_data.get("adapter_path")
             request = None
-            if self._synthesis_windows and adapter_path:
+            if getattr(self, "_synthesis_windows", None) and adapter_path:
                 if not os.path.isabs(adapter_path):
                     adapter_path = _resolve_asset_path(adapter_path)
                 adapter_path = get_resolved_adapter_path(adapter_path)
