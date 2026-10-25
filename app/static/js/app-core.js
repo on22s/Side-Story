@@ -68,15 +68,16 @@
             const container = document.getElementById('toast-container');
             const bgClass = type === 'success' ? 'bg-success' :
                            type === 'error' ? 'bg-danger' :
-                           type === 'warning' ? 'bg-warning text-dark' : 'bg-info';
+                           type === 'warning' ? 'bg-warning' : 'bg-info';
+            const lightBackground = type !== 'success' && type !== 'error';
             const liveRole = type === 'error' ? 'alert' : 'status';
             const livePriority = type === 'error' ? 'assertive' : 'polite';
             const id = 'toast-' + Date.now() + '-' + (++toastSequence);
             const html = `
-                <div id="${id}" class="toast align-items-center text-white ${bgClass} border-0" role="${liveRole}" aria-live="${livePriority}" aria-atomic="true">
+                <div id="${id}" class="toast align-items-center ${lightBackground ? 'text-dark' : 'text-white'} ${bgClass} border-0" role="${liveRole}" aria-live="${livePriority}" aria-atomic="true">
                     <div class="d-flex">
                         <div class="toast-body">${escapeHtml(message)}</div>
-                        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Dismiss notification"></button>
+                        <button type="button" class="btn-close${lightBackground ? '' : ' btn-close-white'} me-2 m-auto" ${lightBackground ? 'style="filter: none;"' : ''} data-bs-dismiss="toast" aria-label="Dismiss notification"></button>
                     </div>
                 </div>`;
             container.insertAdjacentHTML('beforeend', html);
@@ -6849,7 +6850,7 @@
                             const field = row.querySelector(selector);
                             if (!field) { return null; }
                             return {selector, value: field.value,
-                                dirty: field.value !== String(chunk[key] ?? ''),
+                                dirty: getEditorFieldValue(key, field.value, String(chunk[key] ?? '')) !== String(chunk[key] ?? ''),
                                 focused: field === document.activeElement,
                                 selectionStart: field.selectionStart, selectionEnd: field.selectionEnd,
                                 selectionDirection: field.selectionDirection};
@@ -7266,8 +7267,33 @@
             }
         }
 
+        function getEditorFieldValue(field, value, saved) {
+            // Textareas expose CRLF and CR as LF. An unchanged visible value
+            // must retain the saved bytes, including during a render barrier.
+            if ((field === 'text' || field === 'instruct') && typeof saved === 'string'
+                    && value === saved.replace(/\r\n?/g, '\n')) { return saved; }
+            return value;
+        }
+
+        function mergeEditorLineEndings(saved, value) {
+            // An edited textarea arrives LF-normalized. Keep the saved line
+            // endings on every line when the line count is unchanged.
+            if (typeof saved !== 'string' || typeof value !== 'string'
+                    || !saved.includes('\r') || value.includes('\r')) { return value; }
+            const savedLines = saved.split(/\r\n|\r|\n/);
+            const savedEndings = saved.match(/(?:\r\n|\r|\n)/g) || [];
+            const incomingLines = value.split('\n');
+            if (savedLines.length !== incomingLines.length) { return value; }
+            return incomingLines.map((line, index) => line + (
+                savedEndings[index] || (index < incomingLines.length - 1 ? '\n' : ''))).join('');
+        }
+
         window.updateChunk = async (id, field, value) => {
             try {
+                const cached = cachedChunks.find(chunk => chunk.id === id);
+                if (field === 'text' || field === 'instruct') {
+                    value = mergeEditorLineEndings(cached?.[field], value);
+                }
                 const data = {};
                 data[field] = value;
                 await applyChunkEdits(id, data);
@@ -7286,6 +7312,7 @@
 
             const inputs = tr.querySelectorAll('input, textarea, select');
             const data = {};
+            const cached = cachedChunks.find(chunk => chunk.id === id);
 
             inputs.forEach(input => {
                 const changeHandler = input.getAttribute('onchange');
@@ -7293,7 +7320,8 @@
                     // Extract field name from onchange="updateChunk(id, 'field', this.value)"
                     const match = changeHandler.match(/updateChunk\(\d+,\s*'(\w+)'/);
                     if (match) {
-                        data[match[1]] = input.value;
+                        data[match[1]] = mergeEditorLineEndings(cached?.[match[1]],
+                            getEditorFieldValue(match[1], input.value, cached?.[match[1]]));
                     }
                 }
             });
@@ -7304,7 +7332,6 @@
             }
 
             if (changedOnly && !pendingChunkEdits.has(id) && !failedChunkEdits.has(id)) {
-                const cached = cachedChunks.find(chunk => chunk.id === id);
                 if (cached) {
                     for (const field of Object.keys(data)) {
                         const saved = field === 'pause_after' ? (cached[field] ?? null) : (cached[field] ?? '');
