@@ -2398,11 +2398,13 @@ class TTSEngine:
                 if not os.path.isabs(adapter_path):
                     adapter_path = _resolve_asset_path(adapter_path)
                 adapter_path = get_resolved_adapter_path(adapter_path)
-                if os.path.isdir(adapter_path):
+                seed = voice_data.get("seed", -1)
+                if (os.path.isdir(adapter_path) and type(seed) is int
+                        and 0 <= seed < 2**64):
                     request = LoRARequest(
                         adapter_path,
                         voice_data.get("adapter_generation_sha256") or get_adapter_generation_sha256(adapter_path),
-                        int(voice_data.get("seed", -1)), instruct_text or "")
+                        seed, instruct_text or "")
             windowed = self._render_synthesis_windows(
                 text, "lora", lambda span, path: self._generate_lora_voice_prepared(
                     span, instruct_text, voice_data, path), output_path,

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
+import tts
 from audio_generation_owner import AudioGenerationOwner, AudioGenerationCancelled, ensure_audio_generation_owner
 import synthesis_recovery as recovery
 from synthesis_recovery_cache import is_recovery_storage_platform_supported
@@ -41,20 +42,43 @@ class RecoveryOrchestrationTests(unittest.TestCase):
         yield
 
     @contextmanager
-    def scope(self, claim='a' * 32, identity=None, parent_inputs='d' * 64):
+    def scope(self, claim='a' * 32, identity=None, parent_inputs='d' * 64, *,
+              category='custom', plan=None, request=None):
         with ExitStack() as stack:
             stack.enter_context(ensure_audio_generation_owner(AudioGenerationOwner(claim, self.admit)))
             parent = RecoveryParent(str(self.root), 'b' * 64, 'c' * 64, parent_inputs,
                                     get_recovery_claim_digest(), self.admit)
             stack.enter_context(ensure_synthesis_recovery_parent(parent))
             stack.enter_context(patch.object(recovery, '_capture_engine_methods'))
-            stack.enter_context(patch.object(recovery, 'capture_native_custom_serving_identity',
-                                             return_value=identity or self.identity))
-            stack.enter_context(patch('synthesis_recovery_serving.capture_native_custom_serving_identity',
+            capture = ('capture_native_lora_serving_identity'
+                       if category == 'lora' else 'capture_native_custom_serving_identity')
+            stack.enter_context(patch.object(recovery, capture, return_value=identity or self.identity))
+            stack.enter_context(patch('synthesis_recovery_serving.' + capture,
                                      return_value=identity or self.identity))
-            session = stack.enter_context(recovery.ensure_synthesis_recovery(self.engine, 'custom',
-                                         self.plan, self.policy, self.request))
+            session = stack.enter_context(recovery.ensure_synthesis_recovery(
+                self.engine, category, plan or self.plan, self.policy, request or self.request))
             yield session, parent
+
+    def test_lora_windows_share_the_same_verified_recovery_session(self):
+        policy = get_synthesis_window_settings({'enabled': True,
+            'budgets': {'local.lora': {'max_chars': 5}}})
+        plan = get_synthesis_window_plan('One. Two.', policy, ['local.lora'])
+        request = tts.LoRARequest('/private/adapter', 'a' * 64, 42, '')
+        calls = []
+        def render(text, path):
+            calls.append(text)
+            return self.write(path)
+        with self.scope(category='lora', plan=plan, request=request) as (session, parent):
+            self.assertEqual('eligible', session.reason)
+            receipt = render_synthesis_windows(plan, render, self.root / 'lora.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['saved_windows'])
+        calls.clear()
+        with self.scope('f' * 32, category='lora', plan=plan, request=request) as (session, parent):
+            receipt = render_synthesis_windows(plan, render, self.root / 'lora.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['reused_windows'])
+            self.assertEqual([], calls)
 
     def write(self, path):
         sf.write(path, np.sin(np.arange(2400) * .1) * .2, 24000)

@@ -10653,6 +10653,7 @@
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_dependency_failure_after_private_assembly_keeps_prior_caller_output",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_disabled_or_unsupported_platform_does_no_model_or_cache_inspection",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_interruption_restart_reuses_only_completed_window_and_retires_explicitly",
+    "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_lora_windows_share_the_same_verified_recovery_session",
     "tests.test_synthesis_recovery.RecoveryOrchestrationTests.test_owner_or_book_failure_is_never_an_optional_cache_miss"
   ],
   "test_synthesis_recovery_cache": [
