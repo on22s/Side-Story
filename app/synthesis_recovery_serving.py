@@ -409,8 +409,7 @@ def capture_native_lora_serving_identity(engine, request):
         try:
             callbacks, code_files = {}, []
             _capture_engine_methods(engine, callbacks, code_files)
-            digest = get_native_custom_code_sha256(extra_callables=callbacks,
-                extra_code_files=code_files, state={
+            digest = get_native_custom_code_sha256(extra_code_files=code_files, state={
                     'category': 'lora', 'asset_sha256': loaded.asset_sha256,
                     'load_options_sha256': loaded.options_sha256,
                     'adapter_sha256': request.generation_sha256,
