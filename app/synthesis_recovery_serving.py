@@ -459,6 +459,65 @@ def capture_native_lora_serving_identity(engine, request):
                                              loaded.loader_code_sha256)
 
 
+def capture_native_clone_serving_identity(engine, request):
+    """Capture the loaded Base model, exact reference bytes and clone serving code."""
+    import hashlib
+    import tts
+    import torch
+    from voice_manifest import get_adapter_asset_snapshot
+    with tts._LOCAL_TTS_LOCK:
+        if (type(request) is not tts.CloneRequest or type(request.seed) is not int
+                or not 0 <= request.seed < 2**64 or type(request.ref_text) is not str
+                or not request.ref_text or len(request.ref_text) > 65536
+                or type(engine._language) is not str or len(engine._language) > 128
+                or engine.get_voice_backend('clone') != 'local'
+                or engine._compile_codec_enabled):
+            raise RecoveryIdentityUnavailable('unsupported_native_clone_request')
+        try:
+            model = engine._init_local_clone()
+            resolved, reference_bytes = get_adapter_asset_snapshot(request.ref_audio_path)
+        except (ValueError, OSError, TypeError, KeyError) as error:
+            raise RecoveryIdentityUnavailable('clone_reference_or_loader_unavailable') from error
+        loaded = getattr(model, '_aa2_recovery_loaded_model', None)
+        if type(loaded) is not NativeRecoveryLoadedModel:
+            raise RecoveryIdentityUnavailable('clone_model_loaded_without_identity')
+        if get_native_custom_code_sha256() != loaded.loader_code_sha256:
+            raise RecoveryIdentityUnavailable('clone_loaded_code_changed')
+        for name, expected in tts._RAW_CLONE_METHODS.items():
+            callback = getattr(engine, name, None)
+            function = callback.__func__ if type(callback) is MethodType else callback
+            if function is not expected:
+                raise RecoveryIdentityUnavailable('overridden_clone_engine_method')
+        root = model.model
+        dtype_names = ((torch.float16, 'float16'), (torch.bfloat16, 'bfloat16'),
+                       (torch.float32, 'float32'), (torch.float64, 'float64'))
+        dtype = next((name for value, name in dtype_names if root.dtype is value), None)
+        default_dtype = next((name for value, name in dtype_names
+                              if torch.get_default_dtype() is value), None)
+        if dtype is None or default_dtype is None:
+            raise RecoveryIdentityUnavailable('unqualified_clone_serving_precision')
+        try:
+            callbacks, code_files = {}, []
+            _capture_engine_methods(engine, callbacks, code_files)
+            digest = get_native_custom_code_sha256(extra_code_files=code_files, state={
+                'category': 'clone', 'asset_sha256': loaded.asset_sha256,
+                'load_options_sha256': loaded.options_sha256,
+                'reference_sha256': hashlib.sha256(reference_bytes).hexdigest(),
+                'reference_path': resolved,
+                'reference_text_sha256': get_recovery_digest(request.ref_text),
+                'aa2_loaded_code': _get_aa2_loaded_code(),
+                'runtime': _get_runtime_build(torch, root.device),
+                'dtype': dtype, 'default_dtype': default_dtype,
+                'language': engine._language, 'seed': request.seed,
+                'model': engine.get_model_settings()})
+        except RecoveryIdentityUnavailable:
+            raise
+        except (ImportError, AttributeError, KeyError, ValueError, TypeError, OSError) as error:
+            raise RecoveryIdentityUnavailable('unavailable_clone_serving_contract') from error
+        return NativeRecoveryServingIdentity(digest, loaded.asset_sha256,
+                                             loaded.loader_code_sha256)
+
+
 def capture_native_custom_serving_identity(engine, request):
     """Capture actual serving dependencies atomically with respect to providers."""
     import tts
@@ -481,9 +540,11 @@ def capture_native_custom_serving_identity(engine, request):
 def capture_native_serving_identity(engine, request):
     """One dispatch for the request's serving-identity capture."""
     import tts
-    return (capture_native_lora_serving_identity(engine, request)
-            if type(request) is tts.LoRARequest
-            else capture_native_custom_serving_identity(engine, request))
+    if type(request) is tts.LoRARequest:
+        return capture_native_lora_serving_identity(engine, request)
+    if type(request) is tts.CloneRequest:
+        return capture_native_clone_serving_identity(engine, request)
+    return capture_native_custom_serving_identity(engine, request)
 
 
 @contextmanager

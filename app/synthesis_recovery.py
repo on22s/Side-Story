@@ -121,7 +121,7 @@ def ensure_synthesis_recovery(engine, category, plan, settings, request=None):
         reason = 'unsupported_durability'
     elif parent is None:
         reason = 'unowned_parent'
-    elif category not in ('custom', 'lora') or request is None:
+    elif category not in ('custom', 'lora', 'clone') or request is None:
         reason = 'unsupported_voice_category'
     if reason is not None:
         yield RecoverySession(reason)

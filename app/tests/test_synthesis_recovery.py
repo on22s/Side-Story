@@ -52,13 +52,36 @@ class RecoveryOrchestrationTests(unittest.TestCase):
             stack.enter_context(patch.object(recovery, '_capture_engine_methods'))
             stack.enter_context(patch.object(recovery, 'capture_native_serving_identity',
                                              return_value=identity or self.identity))
-            serving_capture = ('capture_native_lora_serving_identity'
-                               if category == 'lora' else 'capture_native_custom_serving_identity')
+            serving_capture = {
+                'lora': 'capture_native_lora_serving_identity',
+                'clone': 'capture_native_clone_serving_identity',
+            }.get(category, 'capture_native_custom_serving_identity')
             stack.enter_context(patch('synthesis_recovery_serving.' + serving_capture,
                                      return_value=identity or self.identity))
             session = stack.enter_context(recovery.ensure_synthesis_recovery(
                 self.engine, category, plan or self.plan, self.policy, request or self.request))
             yield session, parent
+
+    def test_clone_windows_share_the_same_verified_recovery_session(self):
+        policy = get_synthesis_window_settings({'enabled': True,
+            'budgets': {'local.clone': {'max_chars': 5}}})
+        plan = get_synthesis_window_plan('One. Two.', policy, ['local.clone'])
+        request = tts.CloneRequest('/private/reference.wav', 'Reference words.', 42)
+        calls = []
+        def render(text, path):
+            calls.append(text)
+            return self.write(path)
+        with self.scope(category='clone', plan=plan, request=request) as (session, parent):
+            self.assertEqual('eligible', session.reason)
+            receipt = render_synthesis_windows(plan, render, self.root / 'clone.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['saved_windows'])
+        calls.clear()
+        with self.scope('f' * 32, category='clone', plan=plan, request=request) as (session, parent):
+            receipt = render_synthesis_windows(plan, render, self.root / 'clone.wav', policy,
+                                               recovery=session)
+            self.assertEqual([0, 1], receipt['recovery']['reused_windows'])
+            self.assertEqual([], calls)
 
     def test_lora_windows_share_the_same_verified_recovery_session(self):
         policy = get_synthesis_window_settings({'enabled': True,

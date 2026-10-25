@@ -424,6 +424,14 @@ class LoRARequest:
     instruct: str
 
 
+@dataclass(frozen=True)
+class CloneRequest:
+    """Stable request identity for a cloned reference voice."""
+    ref_audio_path: str
+    ref_text: str
+    seed: int
+
+
 def get_custom_voice_request(voice_config, speaker, instruct_text):
     """The actual native speaker, seed and anchored instruction selection."""
     voice_data = voice_config.get(speaker)
@@ -2075,11 +2083,27 @@ class TTSEngine:
         return self._generate_clone_voice_prepared(
             normalize_for_speech(text), speaker, voice_config, output_path)
 
-    def _generate_clone_voice_prepared(self, text, speaker, voice_config, output_path):
+    def _generate_clone_voice_prepared(self, text, speaker, voice_config, output_path,
+                                       recovery_request=None):
         """Render explicitly prepared input; public callers use the raw wrapper."""
+        request = recovery_request
+        voice_data = voice_config.get(speaker, {}) if isinstance(voice_config, dict) else {}
+        if (request is None and getattr(self, "_synthesis_recovery", None)
+                and getattr(self, "_synthesis_windows", None)
+                and voice_data.get("ref_audio") and voice_data.get("ref_text")):
+            ref_audio = voice_data["ref_audio"]
+            if not os.path.isabs(ref_audio):
+                ref_audio = _resolve_asset_path(ref_audio)
+            try:
+                seed = int(voice_data.get("seed", -1))
+            except (TypeError, ValueError):
+                seed = -1
+            if 0 <= seed < 2**64:
+                request = CloneRequest(ref_audio, voice_data["ref_text"], seed)
         windowed = self._render_synthesis_windows(
             text, "clone", lambda span, path: self._generate_clone_voice_prepared(
-                span, speaker, voice_config, path), output_path)
+                span, speaker, voice_config, path, recovery_request=request), output_path,
+            recovery_request=request)
         if windowed is not None:
             return windowed
         if self.get_voice_backend("clone") == "local":
