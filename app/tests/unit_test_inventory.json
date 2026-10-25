@@ -10750,6 +10750,8 @@
   ],
   "test_synthesis_recovery_serving": [
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_actual_engine_method_and_module_function_overrides_are_unqualified",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_clone_admission_refuses_invalid_references_and_policies_before_loading",
+    "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_clone_dispatch_binds_reference_and_request_and_rejects_drift",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_equal_proven_identity_after_reload_continues_but_changed_or_unproven_aborts",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_guard_scope_is_not_transferred_to_unrelated_threads",
     "tests.test_synthesis_recovery_serving.RecoveryServingTests.test_lora_malformed_model_is_optional_and_merge_certificate_is_required",

@@ -473,16 +473,19 @@ def capture_native_clone_serving_identity(engine, request):
                 or engine.get_voice_backend('clone') != 'local'
                 or engine._compile_codec_enabled):
             raise RecoveryIdentityUnavailable('unsupported_native_clone_request')
+        callbacks, code_files = {}, []
+        _capture_engine_methods(engine, callbacks, code_files)
         for name, expected in tts._RAW_CLONE_METHODS.items():
             callback = getattr(engine, name, None)
             function = callback.__func__ if type(callback) is MethodType else callback
             if function is not expected:
                 raise RecoveryIdentityUnavailable('overridden_clone_engine_method')
         try:
-            model = engine._init_local_clone()
+            # Reference admission precedes model loading, as in ordinary cloning.
             _resolved, reference_bytes = get_adapter_asset_snapshot(request.ref_audio_path)
+            model = engine._init_local_clone()
             _ensure_class(model, 'qwen_tts.inference.qwen3_tts_model', 'Qwen3TTSModel')
-        except (ValueError, OSError, TypeError, KeyError) as error:
+        except (ImportError, AttributeError, ValueError, OSError, TypeError, KeyError) as error:
             raise RecoveryIdentityUnavailable('clone_reference_or_loader_unavailable') from error
         loaded = getattr(model, '_aa2_recovery_loaded_model', None)
         if type(loaded) is not NativeRecoveryLoadedModel:
@@ -502,8 +505,6 @@ def capture_native_clone_serving_identity(engine, request):
         if dtype is None or default_dtype is None:
             raise RecoveryIdentityUnavailable('unqualified_clone_serving_precision')
         try:
-            callbacks, code_files = {}, []
-            _capture_engine_methods(engine, callbacks, code_files)
             digest = get_native_custom_code_sha256(extra_code_files=code_files, state={
                 'category': 'clone', 'asset_sha256': loaded.asset_sha256,
                 'load_options_sha256': loaded.options_sha256,

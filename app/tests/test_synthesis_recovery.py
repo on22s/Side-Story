@@ -83,6 +83,34 @@ class RecoveryOrchestrationTests(unittest.TestCase):
             self.assertEqual([0, 1], receipt['recovery']['reused_windows'])
             self.assertEqual([], calls)
 
+        # The renderer must reject fresh audio whose dependency identity drifted
+        # during the provider call, before storing it under the original key.
+        prior = (self.root / 'clone.wav').read_bytes()
+        calls.clear()
+        changed = replace(self.identity, sha256='e' * 64)
+        current = [self.identity]
+        def drifting_render(text, path):
+            result = render(text, path)
+            current[0] = changed
+            return result
+        with self.scope(category='clone', plan=plan, request=request,
+                        parent_inputs='9' * 64) as (session, parent):
+            with patch('synthesis_recovery_serving.capture_native_clone_serving_identity',
+                       side_effect=lambda *args: current[0]):
+                with self.assertRaises(SynthesisRecoveryDependencyChanged):
+                    render_synthesis_windows(plan, drifting_render, self.root / 'clone.wav',
+                                             policy, recovery=session)
+                self.assertEqual([], session.saved)
+        self.assertEqual([plan.windows[0].text], calls)
+        self.assertEqual(prior, (self.root / 'clone.wav').read_bytes())
+        calls.clear()
+        with self.scope('7' * 32, category='clone', plan=plan, request=request,
+                        parent_inputs='9' * 64) as (session, parent):
+            receipt = render_synthesis_windows(plan, render, self.root / 'clone.wav',
+                                               policy, recovery=session)
+            self.assertEqual([], receipt['recovery']['reused_windows'])
+            self.assertEqual([window.text for window in plan.windows], calls)
+
     def test_lora_windows_share_the_same_verified_recovery_session(self):
         policy = get_synthesis_window_settings({'enabled': True,
             'budgets': {'local.lora': {'max_chars': 5}}})
