@@ -14,6 +14,9 @@ DIRECTORY = '.sound_design_renders'
 MAX_STAGES = 16
 MAX_ENTRIES = 4096
 MAX_DEPTH = 4
+# Worker creation receipts/marker plus one nested-retirement container are
+# bounded by 64 KiB. Worker request/chapter metadata has its own output budget.
+EXPORT_METADATA_RESERVE = 64 * 1024
 
 
 def get_sound_render_stage_files(directory, root, *, cancel_check=None):
@@ -68,22 +71,67 @@ def ensure_sound_render_quota(root, *, cancel_check=None, max_bytes=MAX_TOTAL_BY
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1:
             raise ValueError('Unsafe sound render lease')
     with ensure_sound_asset_lease(directory / 'quota', cancel_check):
-        charged = count = 0
-        with os.scandir(directory) as children:
-            for child in children:
-                _check_cancelled(cancel_check)
-                if child.name == 'quota.lock':
-                    continue
-                count += 1
-                if count > MAX_STAGES:
-                    raise ValueError('Sound render stages are full; inspect retained candidates')
-                if re.fullmatch(r'render-[A-Za-z0-9_-]+', child.name) is None:
-                    raise ValueError('Unknown sound render entry requires inspection')
-                charged += get_sound_render_stage_files(child.path, root, cancel_check=cancel_check)[0]
-                if charged > max_bytes:
-                    raise ValueError('Sound render staging is full; inspect retained candidates')
+        charged, count = get_sound_render_usage(directory, root, cancel_check=cancel_check,
+                                                max_bytes=max_bytes)
         _check_cancelled(cancel_check)
         yield directory, max_bytes - charged, count
+
+
+def get_sound_render_usage(directory, root, *, cancel_check=None, max_bytes=MAX_TOTAL_BYTES):
+    """Charge public candidates and private export slots without reclaiming."""
+    from export_staging_retirement import DIRECTORY as REGISTRY, PosixRetirement
+    charged = count = 0
+    with os.scandir(directory) as children:
+        for child in children:
+            _check_cancelled(cancel_check)
+            if child.name == 'quota.lock':
+                continue
+            if child.name == REGISTRY:
+                try:
+                    with PosixRetirement(parent=directory, create=False) as registry:
+                        for name in registry.slot_names():
+                            count += 1
+                            if count > MAX_STAGES:
+                                raise ValueError('Sound render stages are full; inspect retained candidates')
+                            registry.open_slot(name)
+                            charged += get_sound_render_stage_files(
+                                Path(directory) / REGISTRY / name, root,
+                                cancel_check=cancel_check)[0]
+                            registry.slot = registry.slot_fd = None
+                            if charged > max_bytes:
+                                raise ValueError('Sound render staging is full; inspect retained candidates')
+                except TimeoutError:
+                    raise
+                except OSError as error:
+                    raise ValueError('Unsafe sound export registry requires inspection') from error
+                continue
+            count += 1
+            if count > MAX_STAGES:
+                raise ValueError('Sound render stages are full; inspect retained candidates')
+            if re.fullmatch(r'render-[A-Za-z0-9_-]+', child.name) is None:
+                raise ValueError('Unknown sound render entry requires inspection')
+            charged += get_sound_render_stage_files(child.path, root, cancel_check=cancel_check)[0]
+            if charged > max_bytes:
+                raise ValueError('Sound render staging is full; inspect retained candidates')
+    return charged, count
+
+
+@contextmanager
+def ensure_sound_export_stage(root, *, cancel_check=None, max_bytes=MAX_TOTAL_BYTES):
+    """Own a recoverable delivery copy under the existing quota lease."""
+    from export_staging import create_export_staging
+    with ensure_sound_render_quota(root, cancel_check=cancel_check,
+                                   max_bytes=max_bytes) as (directory, _, count):
+        if count >= MAX_STAGES:
+            raise ValueError('Sound render stages are full; inspect retained candidates')
+        with create_export_staging(directory, 'sound_delivery') as stage:
+            charged, _ = get_sound_render_usage(directory, Path(root).absolute(),
+                cancel_check=cancel_check, max_bytes=max_bytes)
+            available = max_bytes - charged - EXPORT_METADATA_RESERVE
+            if available <= 0:
+                raise ValueError('Insufficient quota for sound delivery metadata')
+            _check_cancelled(cancel_check)
+            yield stage, available
 
 
 @contextmanager
