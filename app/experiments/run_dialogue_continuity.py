@@ -14,7 +14,9 @@ from fastapi import HTTPException
 
 from adapter_publication import save_adapter_publication_bytes
 from experiments.plan_dialogue_continuity import get_continuity_experiment_packet
-from experiments.render_dialogue_continuity import save_continuity_render_pair
+from experiments.render_dialogue_continuity import (save_continuity_render_pair,
+    save_hidden_context_capture_pair, get_hidden_context_capture_requests,
+    get_continuity_voice_inputs)
 from project_scope_files import capture_scope_file
 
 
@@ -36,6 +38,11 @@ def get_continuity_output_path(root, path):
 
 def run_owned_continuity_pair(core, raw, packet, row, voices, destination):
     return run_owned_audio_experiment(core, lambda engine: save_continuity_render_pair(
+        engine, raw, packet, row, voices, destination), destination)
+
+
+def run_owned_hidden_context_pair(core, raw, packet, row, voices, destination):
+    return run_owned_audio_experiment(core, lambda engine: save_hidden_context_capture_pair(
         engine, raw, packet, row, voices, destination), destination)
 
 
@@ -99,6 +106,8 @@ def main(argv=None):
     for name in ('input', 'voices', 'config', 'out'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--row', required=True, type=int, help='Zero-based source row')
+    parser.add_argument('--capture-hidden-context', action='store_true',
+                        help='Capture full hidden-following/sandwich requests; no cropping or take delivery')
     args = parser.parse_args(argv)
     try:
         if 'core' in sys.modules or os.environ.get('ALEXANDRIA_DATA_DIR'):
@@ -111,10 +120,14 @@ def main(argv=None):
             raise ValueError('This experiment requires explicit local TTS settings')
         if not 0 <= args.row < len(packet['plan']['rows']):
             raise ValueError('Invalid experiment row')
+        if args.capture_hidden_context:
+            get_hidden_context_capture_requests(packet, args.row)
         speaker = packet['plan']['rows'][args.row]['speaker']
         voice = voices.get(speaker) if isinstance(voices, dict) else None
         if not isinstance(voice, dict):
             raise ValueError('Declare a voice configuration for the selected speaker')
+        if args.capture_hidden_context:
+            get_continuity_voice_inputs(voices, speaker, args.row)
         root = Path(__file__).resolve().parents[2]
         identity = {**get_experiment_source_identity(root),
                     'inputs': {name: hashlib.sha256(value).hexdigest() for name, value in
@@ -128,7 +141,8 @@ def main(argv=None):
         save_adapter_publication_bytes(str(data / 'config.json'), config_raw)
         os.environ['ALEXANDRIA_DATA_DIR'] = str(data)
         import core
-        receipt = run_owned_continuity_pair(core, raw, packet, args.row, voices, out / 'pair')
+        capture = run_owned_hidden_context_pair if args.capture_hidden_context else run_owned_continuity_pair
+        receipt = capture(core, raw, packet, args.row, voices, out / 'pair')
         if get_experiment_source_identity(root) != {key: identity[key] for key in ('head', 'tree')}:
             raise ValueError('Experiment source changed during rendering')
     except (OSError, ValueError, RuntimeError, HTTPException) as error:

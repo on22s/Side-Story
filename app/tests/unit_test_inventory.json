@@ -5043,6 +5043,16 @@
     "tests.test_hf_purge_outcomes.PurgeOutcomeTests.test_storage_read_error_after_actual_deletion_reports_accounting_uncertainty",
     "tests.test_hf_purge_outcomes.PurgeOutcomeTests.test_wrong_post_purge_accounting_keeps_the_completed_deletion_visible"
   ],
+  "test_hidden_context_capture": [
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_changed_submitted_text_never_receives_guessed_author_coordinates",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_cli_invalid_context_and_seed_fail_before_creating_output",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_context_digest_tracks_audible_choices_not_unselected_neighbor_data",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_edge_rows_and_overlong_whole_context_words_refuse",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_exact_unicode_spans_context_provenance_and_manual_choices",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_failed_stale_cancelled_and_forged_plan_cannot_publish_raw_pair",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_hidden_controller_uses_real_owner_and_shared_cleanup_order",
+    "tests.test_hidden_context_capture.HiddenContextCaptureTests.test_owned_raw_pair_records_actual_bytes_and_target_voice_for_both_variants"
+  ],
   "test_hifitts_completion": [
     "tests.test_hifitts_completion.HiFiTTSCompletionTests.test_actual_prepare_and_build_producers_publish_artifacts_accepted_by_validator",
     "tests.test_hifitts_completion.HiFiTTSCompletionTests.test_missing_adapter_validator_dependency_refuses_before_training_dispatch",
