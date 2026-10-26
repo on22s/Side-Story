@@ -67,40 +67,7 @@ Remote LLMs receive annotation text; external TTS receives synthesis inputs. Use
 <details>
 <summary>Detailed features</summary>
 
-## Where to start
-
-| I want to… | Start here |
-|---|---|
-| **Make an audiobook** | [Install](#installation), then follow [your first audiobook](#your-first-audiobook). |
-| **Pick a model for my graphics card** | [Which model for your card](#which-model-for-your-card), then the [full guide](docs/wiki/Which-Model-For-Your-Card.md). |
-| **Understand the research results** | [Results at a glance](#results-at-a-glance), then [RECIPES.md](RECIPES.md) and the [Muse quant comparison](docs/results/muse-quant-baselines.md). |
-| **Find a particular run or its raw data** | Search the [results index](RESULTS_INDEX.md); each entry links to the committed artifact. |
-| **Browse all documentation** | The [documentation map](docs/README.md) lists user guides, operations notes, results and history. |
-| **Contribute** | The [project wiki](https://github.com/on22s/alexandria-audiobook2/wiki), then [Contributing](#contributing) and [GOALS.md](GOALS.md). |
-
-You do not need to read any of the research sections to install or use the app.
-
-## Research and development
-
-It is a research fork of [Alexandria](https://github.com/Finrandojin/alexandria-audiobook).
-What makes it different is that **every choice is measured**:
-
-- which model and prompt pick the right speaker, scored against books where
-  people have labelled every line;
-- how close a generated voice gets to a real human reading;
-- whether details like Japanese pitch accent survive synthesis.
-
-The settings that won are the defaults, and every alternative stays selectable
-in the Setup tab. For example, the `michel2_full` attribution prompt became the
-default on 2026-09-19, once the last model family confirmed it was best. The
-numbers, the failures and the recipes are all in this repository.
-
-**Key documents**
-
-- **[GOALS.md](GOALS.md)** — what "good" means for each goal, with the current measurement
-- **[RECIPES.md](RECIPES.md)** — the training and serving settings that worked, each with the look-alike setting that failed
-- **[RESULTS_INDEX.md](RESULTS_INDEX.md)** — every experiment artifact
-- **[Adapters on Hugging Face](https://huggingface.co/Om22s/alexandria-qwen3-attribution)**, and **[HF_MODEL_GUIDE.md](HF_MODEL_GUIDE.md)** for how they are released
+## Features
 
 ### AI-Powered Pipeline
 - **Local & Cloud LLM Support** - Connect an OpenAI-compatible API (LM Studio, Ollama, OpenAI, etc.)
@@ -411,10 +378,7 @@ On AMD/Linux, check the actual GPU/ROCm combination before changing packages. Do
 <details>
 <summary>Script format, output files, and API examples</summary>
 
-- Four-book fixture: **97.3% / 97.5% / 94.5% / 92.9%** per book. Two books are outside
-  the 5% band the goal asks for.
-- All 28 PDNC novels: the best local model, Qwen3.8-27B UD-Q3_K_XL, is within 5% on
-  **20 of 28** books. The misses are being re-measured at 40 windows per book.
+## Script Format
 
 The generated script is a JSON array with `speaker`, `text`, and `instruct` fields:
 
