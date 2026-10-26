@@ -58,9 +58,14 @@ class ExternalPoolTests(unittest.TestCase):
     def test_unreadable_gpu_model_config_limits_batch_to_one(self):
         engine = tts_module.TTSEngine.__new__(tts_module.TTSEngine)
         engine._max_new_tokens = 2048
+        engine._device = 'cpu'
         fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
         with patch.dict(sys.modules, {"torch": fake_torch}):
-            self.assertEqual(1, engine._estimate_max_batch_size(SimpleNamespace()))
+            for model, expected in ((SimpleNamespace(device='cuda:0'), 1),
+                                    (SimpleNamespace(device='cpu'), 9999),
+                                    (SimpleNamespace(), 9999)):
+                with self.subTest(device=getattr(model, 'device', 'configured-cpu')):
+                    self.assertEqual(expected, engine._estimate_max_batch_size(model))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

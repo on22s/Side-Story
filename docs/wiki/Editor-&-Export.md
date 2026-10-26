@@ -112,10 +112,11 @@ its original generation dependencies against the current line, retains the displ
 take, and selects the saved performance without generating new speech. If the displaced
 take cannot be retained safely, restoration is refused. It does not
 change the authored script to fit an incompatible snapshot. Verified restoration is
-currently limited to built-in local CustomVoice on supported Linux hosts. The saved
-performance needs native publication evidence from rendering with synthesis windows
-and recovery enabled. Clone and LoRA internal-window recovery is a separate feature and
-does not qualify those snapshots for restoration.
+available for built-in local CustomVoice, VoiceClone and LoRA on supported Linux hosts.
+The saved performance needs native publication evidence from rendering with synthesis
+windows and recovery enabled. Current clone reference bytes and LoRA adapter generation
+must match the recorded execution dependencies. Older snapshots without that evidence
+remain available for audition.
 
 Ready, undeleted legacy recordings or snapshots without matching restoration evidence
 remain available for audition. Changes to text, voice, model settings or other recorded dependencies can
