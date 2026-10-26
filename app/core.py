@@ -1,7 +1,7 @@
 import json
 import asyncio
 import contextvars
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import functools
 import logging
 import math
@@ -27,6 +27,8 @@ import aiofiles
 from fastapi import HTTPException, UploadFile
 
 from character_evidence import aliases_for
+from audio_generation_owner import (AUDIO_GENERATION_CANCELLED, AudioGenerationCancelled, AudioGenerationOwner,
+                                    ensure_audio_generation_owner)
 from project import ProjectManager
 from config_settings import load_app_config
 from utils import (atomic_json_write, get_app_config_path, get_runtime_data_dir,
@@ -37,7 +39,8 @@ from lmstudio_settings import (get_active_llm_config, get_current_status, get_ef
 from hf_utils import fetch_builtin_manifest, is_adapter_downloaded
 from run_history import finish_run, prune_runs, record_artifact, start_run
 from experiments.gpu_guard import acquire_gpu_lock, release_gpu_lock
-from task_ownership import acquire_task_lease, ensure_startup_recovery
+from task_ownership import (acquire_task_lease, ensure_startup_recovery, get_task_resource_path,
+                            ensure_task_resources_available, TaskOwnershipBusy)
 
 
 logger = logging.getLogger("AlexandriaUI")
@@ -285,24 +288,33 @@ def get_stored_line_count(entry) -> int:
         return 0
 
 
-def _load_voice_library() -> dict:
+def _load_voice_library(*, for_update=False) -> dict:
     # favorites: adapter ids the user starred (#522 19.4); user data, so it
     # lives here rather than in the shipped built-in manifest.
     lib = {"shared": {}, "casts": {}, "favorites": []}
-    if os.path.exists(VOICE_LIBRARY_PATH):
-        try:
-            with open(VOICE_LIBRARY_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                for section in ("shared", "casts", "favorites"):
-                    value = data.get(section, lib[section])
-                    if isinstance(value, type(lib[section])):
-                        lib[section] = value
-                    else:
-                        logger.warning("Invalid voice library section %s; using default", section)
-                lib["favorites"] = [str(a) for a in lib["favorites"] if a]
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            _warn_corrupted_json("voice library", VOICE_LIBRARY_PATH, "resetting to empty", e)
+    try:
+        with open(VOICE_LIBRARY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("Voice library must be a JSON object")
+        for section in ("shared", "casts", "favorites"):
+            value = data.get(section, lib[section])
+            if isinstance(value, type(lib[section])):
+                lib[section] = value
+            elif for_update:
+                raise ValueError(f"Invalid voice library section {section}")
+            else:
+                logger.warning("Invalid voice library section %s; using default", section)
+        lib["favorites"] = [str(a) for a in lib["favorites"] if a]
+    except FileNotFoundError:
+        pass  # First use may create the library; failed reads must not reset it.
+    except (ValueError, OSError) as e:
+        if for_update:
+            _warn_corrupted_json("voice library", VOICE_LIBRARY_PATH, "leaving unchanged", e)
+            raise HTTPException(status_code=409, detail=(
+                "Voice library could not be read safely and was left unchanged. "
+                "Repair or restore voice_library.json before trying again.")) from e
+        _warn_corrupted_json("voice library", VOICE_LIBRARY_PATH, "using empty read-only view", e)
     return lib
 
 
@@ -541,6 +553,8 @@ def _revalidate_voicelab_paths(*path_label_pairs: Tuple[Optional[str], str]) -> 
 
 # Global state for process tracking
 process_state = {
+    "word_timing": {"running": False, "logs": [], "cancel": False},
+    "speech_verification": {"running": False, "logs": [], "cancel": False},
     "script": {"running": False, "logs": [], "cancel": False, "pid": None, "process": None, "paused": False, "start_time": None},
     "voices": {"running": False, "logs": []},
     "persona": {"running": False, "logs": [], "cancel": False, "process": None},
@@ -551,7 +565,7 @@ process_state = {
     "drift_check": {"running": False, "logs": []},
     "speaker_review": {"running": False, "logs": [], "cancel": False, "status": "idle"},
     "report_explanation": {"running": False, "logs": [], "cancel": False, "status": "idle"},
-    "review": {"running": False, "logs": [], "cancel": False, "pid": None, "process": None, "paused": False, "start_time": None},
+    "review": {"running": False, "status": "idle", "logs": [], "cancel": False, "pid": None, "process": None, "paused": False, "start_time": None},
     "batch_review": {"running": False, "logs": [], "cancel": False, "tasks": [], "current_task_idx": -1, "process": None, "pid": None, "paused": False, "start_time": None, "bidirectional": False,
                      "totals_fwd": {"text_changed": 0, "speaker_changed": 0, "instruct_changed": 0, "entries_added": 0, "entries_removed": 0, "narrators_merged": 0, "speakers_merged": 0, "batches_failed": 0, "batches_skipped_vram": 0, "total_changes": 0, "books_done": 0},
                      "totals_bwd": {"text_changed": 0, "speaker_changed": 0, "instruct_changed": 0, "entries_added": 0, "entries_removed": 0, "narrators_merged": 0, "speakers_merged": 0, "batches_failed": 0, "batches_skipped_vram": 0, "total_changes": 0, "books_done": 0},
@@ -664,9 +678,7 @@ _request_task_claims = contextvars.ContextVar("alexandria_request_task_claims", 
 
 def get_saved_book_destination_path(path):
     """Identify a saved name through directory aliases and platform casing."""
-    path = os.path.abspath(path)
-    return os.path.normcase(os.path.join(os.path.realpath(os.path.dirname(path)),
-                                        os.path.basename(path)))
+    return get_task_resource_path(path)
 
 
 @contextmanager
@@ -687,7 +699,13 @@ def ensure_saved_book_destination_available(path):
                     "This saved book is owned by batch review. Wait for it to finish or cancel it."))
         _saved_book_publications[destination] = _saved_book_publications.get(destination, 0) + 1
     try:
-        yield
+        try:
+            with ensure_task_resources_available(DATA_DIR, ('batch_review',), (destination,), mutation_timeout=10):
+                yield
+        except TaskOwnershipBusy as error:
+            raise HTTPException(status_code=409, detail=(
+                "This saved book is owned by batch review or another save. "
+                "Wait for it to finish or cancel it.")) from error
     finally:
         with _gpu_lock:
             remaining = _saved_book_publications[destination] - 1
@@ -698,18 +716,25 @@ def ensure_saved_book_destination_available(path):
 
 
 @contextmanager
-def ensure_book_switch_allowed():
+def ensure_book_switch_allowed(*, operation="switch books", hold_task_mutex=True):
     """Exclude local and foreign task admission until a book switch commits."""
     try:
-        with _gpu_lock, ensure_startup_recovery(DATA_DIR, timeout=0) as idle:
+        with ExitStack() as task_mutex, ExitStack() as admission:
+            task_mutex.enter_context(_gpu_lock)
+            idle = admission.enter_context(ensure_startup_recovery(DATA_DIR, timeout=0))
             busy = [name for name in process_state if is_task_running(name)]
             if busy:
                 raise HTTPException(status_code=409, detail=(
-                    "Cannot switch books while tasks are running: " + ", ".join(busy)
+                    f"Cannot {operation} while tasks are running: " + ", ".join(busy)
                     + ". Wait for them to finish or cancel them."))
             if not idle:
                 raise HTTPException(status_code=409, detail=(
-                    "Cannot switch books while another process owns a task. Wait for it to finish or cancel it."))
+                    f"Cannot {operation} while another process owns a task. Wait for it to finish or cancel it."))
+            # Short existing book switches retain their waiting task behavior.
+            # Long scope scans release only this mutex: the kernel admission
+            # barrier still excludes every task claim through the entire yield.
+            if not hold_task_mutex:
+                task_mutex.close()
             yield
     except TimeoutError as exc:
         raise HTTPException(status_code=409, detail="Book is busy; try switching again.") from exc
@@ -726,7 +751,7 @@ def _reap_gpu_leases():
                 return
         time.sleep(0.1)
 
-def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False):
+def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources=None):
     """Atomically re-check and reserve the GPU lock for task_name.
 
     check_global_gpu_lock() alone has a TOCTOU race: two requests for
@@ -745,6 +770,16 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False):
             check_global_gpu_lock(task_name, cpu_only=True)
         else:
             check_global_gpu_lock(task_name)
+        if task_name == "audio":
+            try:
+                with ensure_startup_recovery(DATA_DIR, timeout=0) as idle:
+                    if idle:
+                        from synthesis_workspace import apply_abandoned_synthesis_workspace_cleanup
+                        from book_state_transaction import ensure_book_state
+                        with ensure_book_state(DATA_DIR, timeout=0):
+                            apply_abandoned_synthesis_workspace_cleanup(DATA_DIR)
+            except TimeoutError:
+                pass  # Ordinary task-lease admission still determines conflicts.
         needs_local_gpu = (not cpu_only and task_name not in NON_GPU_TASKS
                            and (task_name not in LLM_TASKS
                                 or (llm_is_on_this_gpu() if llm_config is None
@@ -753,12 +788,16 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False):
         handle = None
         try:
             conflicts = gpu_lock_conflicts(task_name, cpu_only=cpu_only)
+            lease_options = {} if resources is None else {"resources": resources}
             if cpu_only:
-                task_lease = acquire_task_lease(DATA_DIR, task_name, conflicts, cpu_only=True)
+                task_lease = acquire_task_lease(DATA_DIR, task_name, conflicts, cpu_only=True, **lease_options)
             else:
-                task_lease = acquire_task_lease(DATA_DIR, task_name, conflicts)
+                task_lease = acquire_task_lease(DATA_DIR, task_name, conflicts, **lease_options)
             if needs_local_gpu:
                 handle = acquire_gpu_lock()
+                if task_name != "audio" and not project_manager.ensure_idle_local_models_released():
+                    raise HTTPException(status_code=409, detail=(
+                        "The local TTS engine is still in use. Wait for it to finish before starting GPU work."))
             if handle is not None:
                 _gpu_leases[task_name] = handle
                 if len(_gpu_leases) == 1:
@@ -781,7 +820,8 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False):
             if task_lease is not None:
                 task_lease.close()
             if isinstance(error, (OSError, RuntimeError)):
-                raise HTTPException(status_code=400, detail=str(error)) from error
+                status = 409 if resources is not None and isinstance(error, TaskOwnershipBusy) else 400
+                raise HTTPException(status_code=status, detail=str(error)) from error
             raise
 
 
@@ -810,11 +850,15 @@ class _RequestTaskClaims(list):
     closed = False
 
 
-def reserve_background_task(task_name, *, cpu_only=False, saved_destinations=None):
+def reserve_background_task(task_name, *, cpu_only=False, saved_destinations=None, resources=None):
     """Reserve unstarted work and bind its token to the current request."""
     destinations = (tuple(get_saved_book_destination_path(path) for path in saved_destinations)
                     if saved_destinations is not None else None)
-    claim_id = claim_gpu_task(task_name, cpu_only=True) if cpu_only else claim_gpu_task(task_name)
+    if destinations is not None:
+        resources = tuple(resources or ()) + destinations
+    resource_options = {} if resources is None else {"resources": resources}
+    claim_id = (claim_gpu_task(task_name, cpu_only=True, **resource_options) if cpu_only
+                else claim_gpu_task(task_name, **resource_options))
     try:
         with _gpu_lock:
             claims = _request_task_claims.get()
@@ -860,9 +904,10 @@ def schedule_claimed_background_task(background_tasks, task_name, callback, *arg
     return register_claimed_background_task(background_tasks, task_name, claim_id, callback, *args, **kwargs)
 
 
-async def run_claimed_task_worker(task_name, callback, *args, **kwargs):
+async def run_claimed_task_worker(task_name, callback, *args, cpu_only=False, **kwargs):
     """Keep a started thread's exact claim until its callback exits after cancellation."""
-    claim_id = reserve_background_task(task_name)
+    claim_id = (reserve_background_task(task_name, cpu_only=True) if cpu_only
+                else reserve_background_task(task_name))
     try:
         return await asyncio.to_thread(_run_owned_background_task, task_name, claim_id,
                                        functools.partial(callback, *args, **kwargs))
@@ -880,11 +925,28 @@ def _ensure_owned_task_started(task_name, claim_id, already_started=False):
         return True
 
 
+@contextmanager
+def _ensure_audio_task_owner(claim_id, *, allow_cancelled=False, task_name='audio'):
+    # Same mutex as cancel admission. Always acquire it before Project chunk locks.
+    with _gpu_lock:
+        owner = _task_claims.get(task_name)
+        if (owner is None or owner["id"] != claim_id or owner["phase"] != "started"
+                or (process_state[task_name].get("cancel", False) and not allow_cancelled)):
+            raise AudioGenerationCancelled('Speech verification cancelled' if task_name == 'speech_verification'
+                                           else AUDIO_GENERATION_CANCELLED)
+        yield
+
+
 def _run_owned_background_task(task_name, claim_id, callback, already_started=False):
     if not _ensure_owned_task_started(task_name, claim_id, already_started):
         return
     try:
-        return callback()
+        owner = (AudioGenerationOwner(claim_id, functools.partial(_ensure_audio_task_owner,
+                    claim_id,task_name=task_name))
+                 if task_name in ('audio', 'speech_verification', 'm4b_export',
+                                  'chapter_export', 'audacity_export') else None)
+        with ensure_audio_generation_owner(owner):
+            return callback()
     finally:
         release_gpu_task_claim(task_name, claim_id)
 
@@ -1114,6 +1176,13 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
             if task_name == "review":
                 stats = _extract_review_stats(state["logs"])
                 failures = _extract_failed_sections(state["logs"])
+                if stats is None or stats.get("batches_failed") or stats.get("batches_skipped_vram"):
+                    if "status" in state: state["status"] = "incomplete"
+                if stats is None:
+                    completion_note = (
+                        f"Task {task_name} ended without a review summary. "
+                        "Review completion could not be verified; re-run the review."
+                    )
                 if stats:
                     if stats.get("batches_failed"):
                         disposition = (
@@ -1921,8 +1990,8 @@ _REPORT_SUMMARY_SYSTEM_PROMPT = (
 
 
 def _load_llm_config() -> dict:
-    """Return the `llm` section of config.json, or {} if missing/unreadable."""
-    return load_app_config(CONFIG_PATH).get("llm", {})
+    """Return the active profile with inherited global request limits."""
+    return get_active_llm_config(load_app_config(CONFIG_PATH))
 
 
 class LLMConfigError(ValueError):
@@ -1939,19 +2008,32 @@ def _validate_local_llm_base_url(base_url: str) -> None:
     """Raise LLMConfigError if base_url is set but doesn't point to a local/trusted host.
 
     Enforced both when an LLM client is constructed (_make_llm_client) and when
-    config is saved (save_config), so config.json can never persist a non-local
-    endpoint and every consumer of the `llm` config section is protected.
+    config is saved (save_config). Hosted providers use their documented HTTPS
+    API origins; arbitrary public and private-network endpoints remain refused.
     """
     if not base_url:
         return
     if is_local_llm_endpoint(base_url):
         return
     from urllib.parse import urlparse
-    hostname = (urlparse(base_url).hostname or "").lower()
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
     # Thunder Compute forwards instance ports via *.thundercompute.net, so allow
     # that trusted remote host for running LM Studio on a Thunder GPU instance.
     if hostname == "thundercompute.net" or hostname.endswith(".thundercompute.net"):
         return
+    hosted_paths = {"api.deepseek.com": ("", "/v1"), "api.openai.com": ("/v1",),
+                    "openrouter.ai": ("/api/v1",)}
+    if hostname in hosted_paths:
+        try:
+            port = parsed.port
+        except ValueError:
+            port = -1
+        if (parsed.scheme == "https" and port in (None, 443)
+                and parsed.username is None and parsed.password is None
+                and not parsed.query and not parsed.fragment
+                and parsed.path.rstrip("/") in hosted_paths[hostname]):
+            return
     raise LLMConfigError(f"LLM base_url '{base_url}' is not local. Only local/trusted LLM endpoints are permitted.")
 
 
@@ -2036,6 +2118,7 @@ def _llm_summarize_report(markdown_body: str) -> Optional[str]:
     Best-effort: returns None (and the caller falls back to the plain-language
     report on its own) if the LLM is unavailable or the request fails.
     Validates that the configured base_url is local/trusted before sending data."""
+    from manual_llm_context import ManualRequestCancelled
     try:
         client, model_name = _make_llm_client(timeout=60)
 
@@ -2058,6 +2141,8 @@ def _llm_summarize_report(markdown_body: str) -> Optional[str]:
         )
         text = (response.choices[0].message.content or "").strip()
         return text or None
+    except ManualRequestCancelled:
+        raise
     except Exception as e:
         logger.warning(f"LLM report summary failed, continuing without it: {e}")
         return None

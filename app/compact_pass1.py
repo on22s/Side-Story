@@ -64,11 +64,6 @@ def norm(t):
     return re.sub(r"\W+", "", t or "").lower()
 
 
-def is_mixed_unit(unit, analyze):
-    """True when the unit holds both quoted and unquoted words (a 2-label scheme cannot represent it)."""
-    return len({r["type"] for r in analyze(unit)["regions"]}) > 1
-
-
 def build_compact_prompt(units):
     body = "\n".join(f"N{i}: {u}" for i, u in enumerate(units, 1))
     return COMPACT_SYSTEM, "Label every line.\n\n" + body
@@ -151,6 +146,7 @@ def segment_chunk_compact(client, model_name, chunk, params, attempt_sink=None):
     bounded = replace(
         # Side-Story's Pass 1 (_call_segment) bounds these two only.
         params, max_tokens=cap, hard_max_tokens=min(params.hard_max_tokens, cap),
+        request_output_ceiling=min(params.request_output_ceiling or cap, cap),
         temperature=(params.segment_temperature
                      if params.segment_temperature is not None else params.temperature))
 

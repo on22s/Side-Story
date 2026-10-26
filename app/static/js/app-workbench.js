@@ -495,11 +495,12 @@
             const description = emotion ? `${rootDesc}, ${emotion}` : rootDesc;
 
             // Resolve seed: per-line > global > random
-            let seed;
+            let seed, inheritSeed;
             try {
                 const globalSeed = getDatasetSeed(document.getElementById('dsb-global-seed').value);
                 const lineSeed = getDatasetSeed(row.seed);
-                seed = lineSeed >= 0 ? lineSeed : globalSeed;
+                inheritSeed = lineSeed < 0;
+                seed = inheritSeed ? globalSeed : lineSeed;
             } catch (e) { showToast(e.message, 'error'); return; }
 
             // Optimistic UI
@@ -514,6 +515,7 @@
                     dataset_name: name,
                     sample_index: index,
                     seed,
+                    inherit_seed: inheritSeed,
                 });
                 if (!isCurrent()) { return; }
                 dsbRows[index].status = 'done';
@@ -1146,7 +1148,10 @@
                 batch_preparer: () => { _pollPreparerLogs('batch_preparer'); },
                 audio: () => {
                     show('btn-cancel-merge');
-                    pollLogs('audio', 'audio-logs', () => { show('btn-cancel-merge', 'none'); });
+                    pollLogs('audio', 'audio-logs', () => {
+                        show('btn-cancel-merge', 'none');
+                        window.resetExportQualityView?.();
+                    });
                 },
                 benchmark: () => { refreshBenchmarkStatus(); },
                 audacity_export: () => { pollExport('audacity_export'); },
@@ -1163,6 +1168,18 @@
                 lmstudio_optimize: () => { reattachTaskActivity('lmstudio_optimize', ['lmstudio-optimize-toggle'], 'lmstudio-status-badge', refreshLmStudioStatus); },
                 voice_design: () => { reattachTaskActivity('voice_design', ['btn-design-preview'], 'design-status', loadDesignedVoices); },
                 lora_test: () => { reattachTaskActivity('lora_test', [], 'lora-test-status'); },
+                word_timing: () => {
+                    if (typeof applyWordTimingTaskActivity === 'function') { applyWordTimingTaskActivity(true); }
+                    reattachTaskActivity('word_timing', ['editor-word-timing'], 'editor-word-status', () => {
+                        if (typeof applyWordTimingTaskActivity === 'function') { applyWordTimingTaskActivity(false); }
+                    });
+                },
+                speech_verification: () => {
+                    if (typeof applySpeechVerificationTaskActivity === 'function') { applySpeechVerificationTaskActivity(true); }
+                    reattachTaskActivity('speech_verification', ['editor-line-speech-recheck'], 'editor-line-speech-status', () => {
+                        if (typeof applySpeechVerificationTaskActivity === 'function') { applySpeechVerificationTaskActivity(false); }
+                    });
+                },
                 drift_check: () => { reattachTaskActivity('drift_check', [], null, () => loadChunks(false)); },
             };
             const controlGroups = new Map(logGroups.flatMap(group =>
@@ -1224,6 +1241,7 @@
             const files = document.getElementById('prep-batch-files').files;
             const tbody = document.getElementById('prep-batch-queue-body');
             tbody.innerHTML = '';
+            prepBatchQueue.forEach(task => { task.picker?.dispose(); });
             prepBatchQueue = [];
 
             if (!files.length) {
@@ -1239,7 +1257,10 @@
                     <td id="prep-batch-status-${i}"><span class="badge bg-secondary">Pending</span></td>
                 `;
                 tbody.appendChild(row);
-                prepBatchQueue.push({ audio: file });
+                const pickerArea = document.createElement('div');
+                row.firstElementChild.appendChild(pickerArea);
+                const picker = window.createAudioChannelPicker(pickerArea, file, 'preparer');
+                prepBatchQueue.push({ audio: file, picker });
             });
         };
 
@@ -1258,9 +1279,13 @@
             document.getElementById('btn-prep-start').disabled = submitting || taskName !== null;
             document.getElementById('btn-prep-cancel').style.display = taskName ? 'inline-block' : 'none';
             document.getElementById('prep-batch-files').disabled = submitting || taskName === 'batch_preparer';
+            document.getElementById('prep-audio-file').disabled = submitting || taskName === 'preparer';
+            document.getElementById('prep-source-file').disabled = submitting || taskName === 'preparer';
+            window.preparerChannelPicker?.setDisabled?.(submitting || taskName === 'preparer');
+            prepBatchQueue.forEach(task => { task.picker?.setDisabled?.(submitting || taskName === 'batch_preparer'); });
         }
 
-        async function _submitPreparer(taskName, formData) {
+        async function _submitPreparer(taskName, formData, onAccepted) {
             if (prepSubmitting || prepActiveTask) { return; }
             const task = PREPARER_TASKS[taskName];
             _applyPreparerControls(null, true);
@@ -1274,6 +1299,23 @@
             } catch (e) {
                 _applyPreparerControls(null);
                 showActionError(taskName === 'batch_preparer' ? 'Batch preparer start is unconfirmed' : 'Preparer start is unconfirmed', e, 'Check preparer task status and output files before starting again. Review any input or configuration refusal below.');
+                return false;
+            }
+            onAccepted?.();
+            return true;
+        }
+
+        async function _submitPreparerAfterSelection(taskName, buildForm, onAccepted) {
+            if (prepSubmitting || prepActiveTask) { return; }
+            _applyPreparerControls(null, true);
+            try {
+                const form = await buildForm();
+                // Transfer the UI reservation synchronously to the existing request owner.
+                prepSubmitting = false;
+                return _submitPreparer(taskName, form, onAccepted);
+            } catch (error) {
+                _applyPreparerControls(null);
+                showActionError('Could not prepare selected audio', error, 'Your files are retained. Select an expired or changed preview again before starting.');
             }
         }
 
@@ -1284,11 +1326,14 @@
             const audioFile = document.getElementById('prep-audio-file').files[0];
             if (!audioFile) { showToast('Audio file required', 'error'); return; }
 
+            const picker = window.preparerChannelPicker;
+            const channelSelection = picker ? picker.getSelection() : {channel: 'mix', token: null};
             const sourceFile = document.getElementById('prep-source-file').files[0];
             const diarizationMode = document.getElementById('prep-diarization-mode').value;
 
             const config = {
                 audio_filename: audioFile.name,
+                audio_channel: channelSelection.channel,
                 output_filename: document.getElementById('prep-output').value,
                 lang:            document.getElementById('prep-lang').value,
                 min_confidence:  getNumFieldValue('prep-confidence', 0.85),
@@ -1317,12 +1362,17 @@
                 hf_token:                   document.getElementById('prep-hf-token').value || null,
             };
 
-            const fd = new FormData();
-            fd.append('config_json', JSON.stringify(config));
-            fd.append('audio_file', audioFile);
-            if (sourceFile) { fd.append('source_file', sourceFile); }
+            return _submitPreparerAfterSelection('preparer', async () => {
+                if (channelSelection.pending) { channelSelection.token = await channelSelection.pending; }
+                if (document.getElementById('prep-audio-file').files[0] !== audioFile) { throw new Error('Audio selection changed. Start again with the current file.'); }
+                const fd = new FormData();
+                fd.append('config_json', JSON.stringify(config));
+                if (channelSelection.token) { fd.append('preview_token', channelSelection.token); }
+                else { fd.append('audio_file', audioFile); }
+                if (sourceFile) { fd.append('source_file', sourceFile); }
 
-            return _submitPreparer('preparer', fd);
+                return fd;
+            }, () => picker?.consumeStage?.(channelSelection.token));
         };
 
         window.cancelPreparer = () => {
@@ -1334,25 +1384,35 @@
             if (!prepBatchQueue.length) { showToast('No files selected', 'warning'); return; }
 
             const files = prepBatchQueue.map(t => t.audio);
-            const tasks = files.map(file => ({
-                audio_filename:  file.name,
-                output_filename: `voice_dataset_${file.name.replace(/\.[^.]+$/, '')}.zip`,
-            }));
-            const diarizationMode = document.getElementById('prep-diarization-mode').value;
-            const body = {
-                tasks,
-                lang:           document.getElementById('prep-lang').value,
-                min_confidence: getNumFieldValue('prep-confidence', 0.85),
-                min_snr:        getNumFieldValue('prep-snr', 25, true),
-                diarize:        diarizationMode === 'full',
-                auto_detect_speakers: diarizationMode === 'auto',
-                hf_token:       document.getElementById('prep-hf-token').value || null,
-            };
+            const pickers = prepBatchQueue.map(t => t.picker);
+            let selections;
+            return _submitPreparerAfterSelection('batch_preparer', async () => {
+                selections = await Promise.all(pickers.map(async picker => {
+                    const selected = picker.getSelection();
+                    return {...selected, token: selected.pending ? await selected.pending : selected.token};
+                }));
+                const tasks = files.map((file, index) => ({
+                    audio_channel: selections[index].channel,
+                    preview_token: selections[index].token || "",
+                    audio_filename:  file.name,
+                    output_filename: `voice_dataset_${file.name.replace(/\.[^.]+$/, '')}.zip`,
+                }));
+                const diarizationMode = document.getElementById('prep-diarization-mode').value;
+                const body = {
+                    tasks,
+                    lang:           document.getElementById('prep-lang').value,
+                    min_confidence: getNumFieldValue('prep-confidence', 0.85),
+                    min_snr:        getNumFieldValue('prep-snr', 25, true),
+                    diarize:        diarizationMode === 'full',
+                    auto_detect_speakers: diarizationMode === 'auto',
+                    hf_token:       document.getElementById('prep-hf-token').value || null,
+                };
 
-            const fd = new FormData();
-            fd.append('config_json', JSON.stringify(body));
-            files.forEach(file => { fd.append('audio_files', file); });
-            return _submitPreparer('batch_preparer', fd);
+                const fd = new FormData();
+                fd.append('config_json', JSON.stringify(body));
+                files.forEach((file, index) => { if (!selections[index].token) { fd.append('audio_files', file); } });
+                return fd;
+            }, () => pickers.forEach((picker, index) => picker.consumeStage?.(selections[index].token)));
         }
 
         function _pollPreparerLogs(taskName) {

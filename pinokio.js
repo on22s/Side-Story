@@ -10,6 +10,7 @@ module.exports = {
       voiceTools: info.running("install-voice-tools.js"),
       start: info.running("start.js"),
       start_llm: info.running("start_llm.js"),
+      stage4_checkpoint: info.running("run_stage4_checkpoint.js"),
       reset: info.running("reset.js"),
       update: info.running("update.js")
     }
@@ -82,6 +83,15 @@ module.exports = {
       }]
     }
 
+    if (running.stage4_checkpoint) {
+      return [{
+        default: true,
+        icon: "fa-solid fa-flask",
+        text: "Stage 4 Checkpoint Running",
+        href: "run_stage4_checkpoint.js"
+      }]
+    }
+
     if (running.reset) {
       return [{
         default: true,
@@ -116,6 +126,10 @@ module.exports = {
       icon: "fa-solid fa-power-off",
       text: "Start",
       href: "start.js"
+    }, {
+      icon: "fa-solid fa-flask",
+      text: "Run Stage 4 Checkpoint",
+      href: "run_stage4_checkpoint.js"
     }, {
       icon: "fa-solid fa-brain",
       text: "Start LLM: Gemma 4 (Voice Tools)",

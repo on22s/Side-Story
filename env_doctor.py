@@ -34,7 +34,7 @@ ENV_SPECS = {
             "librosa", "transformers", "peft", "mutagen", "torch", "qwen-tts",
         ],
         "optional": [],
-        "version_hint": {},
+        "version_hint": {"torch": "2.10.0+rocm"},
     },
 }
 

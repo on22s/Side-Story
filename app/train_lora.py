@@ -205,12 +205,26 @@ def save_training_checkpoint(model, output_dir, ref_audio_path, ref_sample_text,
                 if get_audio_shape(source) != admitted_shape:
                     raise ValueError('Training reference changed before conversion')
                 decoded_frames = 0
-                for block in source.blocks(blocksize=65536, dtype='float32', always_2d=True):
-                    validate_finite_audio_values(block, 'training reference')
-                    mono = block.mean(axis=1)
-                    validate_finite_audio_values(mono, 'training reference')
-                    destination.write(mono)
-                    decoded_frames += len(block)
+                if source.format == 'MP3':
+                    from audio_pcm_decode import decode_audio_pcm
+                    def write_mono(block):
+                        destination.write(block.mean(axis=1))
+                    # Seekable input preserves MPEG gapless frame accounting.
+                    # Keep the original reference unchanged and publish only the
+                    # complete private checkpoint generation.
+                    with open(ref_audio_path, 'rb') as encoded:
+                        facts = decode_audio_pcm(encoded, os.path.realpath(ref_audio_path),
+                            frames=source.frames, sample_rate=source.samplerate,
+                            channels=source.channels, source_limit=1024**3,
+                            check_active=lambda: None, consume_pcm=write_mono)
+                    decoded_frames = facts['frames']
+                else:
+                    for block in source.blocks(blocksize=65536, dtype='float32', always_2d=True):
+                        validate_finite_audio_values(block, 'training reference')
+                        mono = block.mean(axis=1)
+                        validate_finite_audio_values(mono, 'training reference')
+                        destination.write(mono)
+                        decoded_frames += len(block)
                 if decoded_frames != ref_info.frames or destination.tell() != ref_info.frames:
                     raise ValueError('Training reference changed during conversion')
             # Rewriting must not erase corruption introduced while reading.
@@ -334,13 +348,6 @@ def load_dataset(data_dir, hf_model, processor, device, dtype, max_audio_seconds
     # ── Extract speaker embedding from ref_audio (consistent across all samples) ──
     # Check for ref_audio field in entries, or fall back to ref.wav in dataset dir,
     # or use the first training sample as reference.
-    def _resolve_in_data_dir(rel_path):
-        """Resolve `rel_path` under data_dir, or return None if it escapes."""
-        resolved = os.path.realpath(os.path.join(data_dir, rel_path))
-        if is_path_inside(resolved, data_dir):
-            return resolved
-        return None
-
     try:
         ref_audio_path = get_training_reference_path(data_dir, entries)
     except ValueError as error:

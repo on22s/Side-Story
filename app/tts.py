@@ -1,6 +1,7 @@
 import os
 import copy
 import ntpath
+import zlib
 import hashlib
 import io
 import re
@@ -9,9 +10,11 @@ import logging
 import tempfile
 import sys
 import threading
+import time
+import weakref
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
 from types import MethodType
 import shutil
 import uuid
@@ -20,14 +23,37 @@ import numpy as np
 import soundfile as sf
 
 import device_utils
+from tts_diagnostics import (capture_tts_operation, measure_tts_stage, record_tts_audio,
+                             record_tts_cache, record_tts_failure, measure_tts_stage_time,
+                             record_tts_reference_cache)
+import clone_reference_cache
 from adapter_checkpoint_transaction import (ensure_adapter_generation_snapshot, get_adapter_generation_sha256,
                                             get_adapter_serving_metadata)
 from lora_evidence import get_file_sha256, get_tts_model_settings
 from audio_validation import GeneratedAudioError, publish_audio_output
 from speech_text import normalize_for_speech, get_speech_preparation
+from audio_generation_owner import (is_audio_generation_cancelled, ensure_audio_generation_active,
+                                    AudioGenerationCancelled)
+from synthesis_render import (ensure_synthesis_receipts, get_synthesis_window_plan,
+                              render_synthesis_windows)
+from synthesis_recovery_context import (ensure_synthesis_recovery_batch_parent,
+                                        get_synthesis_batch_output_path)
+from synthesis_settings import get_enabled_synthesis_recovery_settings
+from speech_verification_settings import get_enabled_speech_verification_settings
+from synthesis_input import (ensure_speech_input_capture, is_speech_input_capture_active,
+    capture_speech_input, get_captured_speech_input, promote_speech_input, capture_composite_speech_input)
+from synthesis_recovery_serving import (ensure_native_recovery_serving_current,
+                                        SynthesisRecoveryDependencyChanged)
+from pronunciation import ensure_occurrence_pronunciation_context, get_pronunciation_model_context
 from pydub import AudioSegment
 from audio_assembly import AudioSegmentBuilder
+from export_limits import ensure_pause_allowed
+from audio_pcm_producer import (get_pcm_source_shape, get_audio_duration_ms,
+                                get_joined_pcm_shape, get_promoted_pcm_shape, get_silence_pcm_shape)
 from voice_manifest import get_resolved_adapter_path, get_adapter_asset_snapshot
+from external_tts_executor import ExternalTTSExecutor
+from external_tts_client import (ExternalTTSClient, ExternalPrediction,
+                                 ensure_external_request_control)
 
 try:
     from .utils import secure_filename as _secure_filename, get_runtime_data_dir as _get_runtime_data_dir, is_path_inside
@@ -40,6 +66,36 @@ except ImportError:
 # including distinct engine instances. Reentrancy permits prompt/load helpers
 # and fallback generation to use the same admission as their outer render.
 _LOCAL_TTS_LOCK = threading.RLock()
+_EXTERNAL_RUNTIME_LOCK = threading.Lock()
+
+
+def create_external_client(url, timeout):
+    return ExternalTTSClient(url, timeout)
+
+
+def _close_external_runtime(lock, calls, clients, executor):
+    with lock:
+        cancelled = list(calls)
+        cached = list(clients.values())
+    for event in cancelled:
+        event.set()
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+    failure = None
+    for client in cached:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as error:
+                failure = failure or error
+    if failure is not None:
+        raise failure
+    if executor is not None:
+        # Closing the owned SDK wakes workers into diagnostics and private-file
+        # cleanup. Keep that work alive until it finishes, before finalization
+        # can tear down buffered output. A stuck caller retains failed ownership.
+        executor.shutdown(wait=True, cancel_futures=True, timeout=2)
 
 
 @dataclass(frozen=True)
@@ -56,22 +112,38 @@ class TTSFailure:
 class TTSGenerationResult:
     success: bool
     failure: TTSFailure | None = None
+    synthesis_receipt: dict | None = None
+    speech_input: dict | None = None
 
 
 _TTS_FAILURES = ContextVar("tts_generation_failures", default=None)
 
 
+def capture_batch_speech_inputs(render):
+    @wraps(render)
+    def wrapped(self, chunks, voice_config, output_dir, batch_seed=-1, *, capture_input=False):
+        enabled = capture_input is True or bool(getattr(self, '_speech_verification', None))
+        with ensure_speech_input_capture(enabled):
+            result = render(self, chunks, voice_config, output_dir, batch_seed)
+            if not enabled:
+                return result
+            inputs = {}
+            for index in result['completed']:
+                record = get_captured_speech_input(get_synthesis_batch_output_path(output_dir, index))
+                if record is not None:
+                    inputs[index] = record
+            return {**result, 'speech_inputs': inputs}
+    return wrapped
+
+
 def apply_tts_failure(error, category=None, next_action=None):
     """Record a terminal failure only for the current structured render call."""
     failures = _TTS_FAILURES.get()
-    if failures is None:
-        return
     if category is None:
         if isinstance(error, UnsupportedVoiceBackendError):
             category = "unsupported_backend"
             next_action = "Select local TTS for this voice or choose a supported external voice."
-        elif isinstance(error, MemoryError) or any(
-                cls.__name__ == "OutOfMemoryError" for cls in type(error).__mro__):
+        elif device_utils.is_allocation_failure(error):
             category = "out_of_memory"
             next_action = "Free GPU memory or reduce the workload before retrying."
         elif isinstance(error, GeneratedAudioError):
@@ -85,6 +157,9 @@ def apply_tts_failure(error, category=None, next_action=None):
             next_action = "Check the TTS server and its logs before retrying."
         else:
             category = "generation_error"
+    record_tts_failure(category)
+    if failures is None:
+        return
     from diagnostics import redact_text
     detail = redact_text(str(error) or type(error).__name__)
     failures.append(TTSFailure(category, detail,
@@ -96,7 +171,15 @@ def ensure_local_tts_serialized(method):
     @wraps(method)
     def run(*args, **kwargs):
         with _LOCAL_TTS_LOCK:
-            return method(*args, **kwargs)
+            owner = args[0] if args else None
+            tracked = hasattr(owner, '_local_model_active_leases')
+            if tracked:
+                owner._local_model_active_leases += 1
+            try:
+                return method(*args, **kwargs)
+            finally:
+                if tracked:
+                    owner._local_model_active_leases -= 1
     return run
 
 
@@ -258,6 +341,50 @@ def get_chunk_voice_inputs(voices, chunk, index, resolve_alias=None):
     return inputs
 
 
+def get_pronunciation_render_context(voices, chunk, index, model_settings, *, source_speaker=None):
+    """Identify the selected root/group assignment and actual speech mode."""
+    inputs = get_chunk_voice_inputs(voices, chunk, index)
+    identity = {name: {key: value for key, value in fields.items()
+                       if key not in {"character_style", "default_style", "seed"}}
+                for name, fields in inputs.items()}
+    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8", errors="surrogatepass")
+    context = {"speaker": chunk.get("speaker") if source_speaker is None else source_speaker,
+               "voice_sha256": hashlib.sha256(encoded).hexdigest(),
+               **get_pronunciation_model_context(model_settings)}
+    return {key: value if isinstance(value, str) and len(value) <= 256 else None
+            for key, value in context.items()}
+
+
+CHUNK_SEED_PRIME = 1_000_003
+
+
+def get_chunk_seed(text, take=0):
+    """Return a stable, non-negative seed for normalized text and a take."""
+    normalized = " ".join(str(text).split())
+    return (zlib.crc32(normalized.encode("utf-8")) + int(take) * CHUNK_SEED_PRIME) % 2**31
+
+
+def get_reproducible_voice_config(resolved, seed, *, take=0):
+    """Copy voices, retaining pinned originals and offsetting numbered takes."""
+    reproducible = {}
+    for name, data in resolved.items():
+        if not isinstance(data, dict):
+            reproducible[name] = copy.deepcopy(data)
+            continue
+        entry = copy.deepcopy(data)
+        try:
+            current_seed = int(entry.get("seed", -1))
+        except (TypeError, ValueError):
+            current_seed = -1
+        if current_seed < 0:
+            entry["seed"] = seed
+        elif int(take) > 0:
+            entry["seed"] = (current_seed + int(take) * CHUNK_SEED_PRIME) % 2**31
+        reproducible[name] = entry
+    return reproducible
+
+
 def get_batch_voice_config(voice_config, speaker, chunk_index, batch_seed):
     """Override seeds after timeline selection without mutating stored voices."""
     resolved = voice_config_for_chunk(voice_config, speaker, chunk_index)
@@ -279,6 +406,22 @@ def anchored_instruct(voice_data, instruct_text):
     if anchor and line:
         return f"{anchor} {line}"
     return anchor or line or (voice_data.get("default_style") or "").strip() or "neutral"
+
+
+@dataclass(frozen=True)
+class CustomVoiceRequest:
+    voice: str
+    seed: int
+    instruct: str
+
+
+def get_custom_voice_request(voice_config, speaker, instruct_text):
+    """The actual native speaker, seed and anchored instruction selection."""
+    voice_data = voice_config.get(speaker)
+    if not voice_data:
+        return None
+    return CustomVoiceRequest(voice_data.get("voice", "Ryan"), int(voice_data.get("seed", -1)),
+                              anchored_instruct(voice_data, instruct_text))
 
 
 def voice_is_set(voice_data):
@@ -476,6 +619,20 @@ def _silent_edge_ms(segment, from_end, threshold_db, cancel_check=None):
     return min(silent, length)
 
 
+def get_trim_bounds_ms(segment, threshold_db=EDGE_SILENCE_THRESHOLD_DBFS,
+                       keep_head_ms=EDGE_SILENCE_KEEP_HEAD_MS,
+                       keep_tail_ms=EDGE_SILENCE_KEEP_TAIL_MS, cancel_check=None):
+    """-> (start_ms, end_ms) for the canonical edge-trim rule."""
+    ensure_audio_export_active(cancel_check)
+    if segment is None or len(segment) == 0:
+        return 0, 0
+    lead = _silent_edge_ms(segment, False, threshold_db, cancel_check)
+    if lead >= len(segment):
+        return 0, len(segment)
+    tail = _silent_edge_ms(segment, True, threshold_db, cancel_check)
+    return max(0, lead - keep_head_ms), len(segment) - max(0, tail - keep_tail_ms)
+
+
 def trim_edge_silence(segment, threshold_db=EDGE_SILENCE_THRESHOLD_DBFS,
                       keep_head_ms=EDGE_SILENCE_KEEP_HEAD_MS,
                       keep_tail_ms=EDGE_SILENCE_KEEP_TAIL_MS, cancel_check=None):
@@ -485,24 +642,23 @@ def trim_edge_silence(segment, threshold_db=EDGE_SILENCE_THRESHOLD_DBFS,
     ensure_audio_export_active(cancel_check)
     if segment is None or len(segment) == 0:
         return segment
-    lead = _silent_edge_ms(segment, False, threshold_db, cancel_check)
-    if lead >= len(segment):
-        return segment
-    tail = _silent_edge_ms(segment, True, threshold_db, cancel_check)
-    start = max(0, lead - keep_head_ms)
-    end = len(segment) - max(0, tail - keep_tail_ms)
-    return segment[start:end] if (start, end) != (0, len(segment)) else segment
+    bounds = get_trim_bounds_ms(segment, threshold_db, keep_head_ms, keep_tail_ms,
+                                cancel_check)
+    return segment[bounds[0]:bounds[1]] if bounds != (0, len(segment)) else segment
 
 
 def get_pause_duration_ms(previous_chunk, next_chunk, pause_ms=DEFAULT_PAUSE_MS,
                           same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS):
-    """Return the existing override-or-speaker-boundary pause rule."""
+    """Return the pause rule, rejecting values above the shared export limit."""
     override = previous_chunk.get("pause_after")
     if override is not None:
-        return int(override)
-    if next_chunk.get("speaker") == previous_chunk.get("speaker"):
-        return same_speaker_pause_ms
-    return pause_ms
+        duration = int(override)
+    elif next_chunk.get("speaker") == previous_chunk.get("speaker"):
+        duration = same_speaker_pause_ms
+    else:
+        duration = pause_ms
+    ensure_pause_allowed(duration)
+    return duration
 
 
 def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_MS,
@@ -554,22 +710,44 @@ def compute_timeline(chunks_with_audio, pause_ms=DEFAULT_PAUSE_MS,
     Returns:
         list of (chunk_dict, AudioSegment, abs_start_ms) tuples.
     """
-    timeline = []
+    return list(iter_timeline(chunks_with_audio, pause_ms, same_speaker_pause_ms,
+                              cancel_check=cancel_check))
+
+
+def iter_timeline(chunks_with_audio, pause_ms=DEFAULT_PAUSE_MS,
+                  same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS, cancel_check=None,
+                  already_trimmed=False):
+    """Yield the existing trimmed timeline without retaining preceding audio."""
     cursor_ms = 0
+    prefix_shape = None
     prev_chunk = None
 
     for chunk, segment in chunks_with_audio:
         ensure_audio_export_active(cancel_check)
-        segment = trim_edge_silence(segment, cancel_check=cancel_check)   # same cut the combined audio gets
+        if not already_trimmed:
+            segment = trim_edge_silence(segment, cancel_check=cancel_check)   # same cut the combined audio gets
+        segment_shape = get_pcm_source_shape(segment)
         if prev_chunk is not None:
-            cursor_ms += get_pause_duration_ms(
+            pause = get_pause_duration_ms(
                 prev_chunk, chunk, pause_ms, same_speaker_pause_ms)
+            # Mirror combine's (gap + segment), then prefix promotion. The
+            # integer PCM clock retains fractional milliseconds across a book.
+            piece = get_joined_pcm_shape(get_silence_pcm_shape(pause), segment_shape)
+            joined = get_joined_pcm_shape(prefix_shape, piece)
+            if joined is not None:
+                promoted = get_promoted_pcm_shape(segment_shape, joined[0])
+                cursor_ms = 1000 * (joined[1] - promoted[1]) / joined[0][1]
+            else:
+                cursor_ms += pause
+            prefix_shape = joined
+        else:
+            prefix_shape = segment_shape
 
-        timeline.append((chunk, segment, cursor_ms))
-        cursor_ms += len(segment)
+        yield chunk, segment, cursor_ms
+        cursor_ms = (1000 * prefix_shape[1] / prefix_shape[0][1]
+                     if prefix_shape is not None else cursor_ms + get_audio_duration_ms(segment))
         prev_chunk = chunk
-
-    return timeline
+        del segment
 
 
 
@@ -577,10 +755,7 @@ class UnsupportedVoiceBackendError(ValueError):
     """The selected backend cannot serve this voice category."""
 
 
-_TTS_BACKEND_CAPABILITIES = {
-    "local": frozenset({"custom", "clone", "lora", "design", "ensemble"}),
-    "external": frozenset({"custom", "clone", "ensemble"}),
-}
+from tts_capabilities import get_tts_backend_capabilities
 
 
 def get_memory_bounded_codec_decode(decode):
@@ -617,10 +792,22 @@ class TTSEngine:
     Models and clients are lazily initialized on first use.
     """
 
+    _LOCAL_MODEL_IDS = {
+        "custom": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "clone": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        "lora": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    }
+
     def __init__(self, config):
         model_settings = get_tts_model_settings(config)
         tts_config = config.get("tts", {})
         self._mode = model_settings["mode"]
+        self._synthesis_windows = copy.deepcopy(model_settings.get("synthesis_windows"))
+        # Recovery changes execution/retention, never the acoustic model or LoRA
+        # evidence identity returned by get_model_settings.
+        self._synthesis_recovery = get_enabled_synthesis_recovery_settings(tts_config.get("synthesis_recovery"))
+        self._speech_verification = get_enabled_speech_verification_settings(tts_config.get('speech_verification'))
         self._url = tts_config.get("url", "http://127.0.0.1:7860")
         # Each endpoint has one lazily created client per configured worker.
         # Every client keeps its own lock: gradio_client cannot be shared
@@ -647,6 +834,11 @@ class TTSEngine:
 
         # Lazy-loaded backends (guarded by _model_lock to prevent concurrent loads)
         self._model_lock = threading.Lock()
+        self._local_model_active_leases = 0
+        self._local_model_devices = {}
+        self._local_release_pending_devices = set()
+        self._local_release_pending_families = set()
+        self._local_model_release_events = []
         self._local_custom_model = None
         self._local_clone_model = None
         self._local_design_model = None
@@ -659,9 +851,15 @@ class TTSEngine:
         self._external_pool_lock = threading.Lock()
         self._external_next = 0
         self._external_client_next = {}
+        self._external_executor = None
+        self._external_calls = set()
+        self._external_closed = False
 
-        # Clone prompt cache: speaker_name -> (reference input key, reusable voice_clone_prompt)
-        self._clone_prompt_cache = {}
+        self._prepared_reference_cache = clone_reference_cache.ReferenceLRU(
+            clone_reference_cache.PREPARED_MAX_ENTRIES, clone_reference_cache.PREPARED_MAX_BYTES)
+        self._clone_prompt_cache = clone_reference_cache.ReferenceLRU(
+            clone_reference_cache.PROMPT_MAX_ENTRIES, clone_reference_cache.PROMPT_MAX_BYTES)
+        self._clone_prompt_model_ref = None
         # LoRA clone prompt cache: (adapter_path, serving generation) -> reusable prompt
         self._lora_prompt_cache = {}
 
@@ -1085,7 +1283,25 @@ class TTSEngine:
         return None
 
     @staticmethod
-    def _load_model(model_cls, model_id, load_kwargs):
+    def _load_model(model_cls, model_id, load_kwargs, *, release_for_oom=None):
+        """Retry one allocation failure after cleanup, preserving cache repair."""
+        for attempt in range(2):
+            ensure_audio_generation_active()
+            try:
+                return TTSEngine._load_model_attempt(model_cls, model_id, load_kwargs)
+            except AudioGenerationCancelled:
+                raise
+            except Exception as error:
+                if attempt or not device_utils.is_allocation_failure(error):
+                    raise
+            # Leave the exception scope before cleanup: failed loader frames may
+            # retain partially allocated models. Never interpret a retry differently.
+            ensure_audio_generation_active()
+            cleanup = release_for_oom or TTSEngine._clear_gpu_cache
+            cleanup()
+
+    @staticmethod
+    def _load_model_attempt(model_cls, model_id, load_kwargs):
         """Load a model, preferring local cache to avoid network issues.
 
         Checks if the model snapshot exists in the HF cache and loads from
@@ -1097,14 +1313,33 @@ class TTSEngine:
         local_path = TTSEngine._resolve_local_model_path(model_id)
         if local_path:
             print(f"  Loading from local cache: {local_path}")
+            from synthesis_recovery_native import (capture_native_recovery_load,
+                complete_native_recovery_load)
+            from synthesis_recovery_identity import RecoveryIdentityUnavailable
+            proposal = None
             try:
-                model = model_cls.from_pretrained(local_path, **load_kwargs)
+                proposal = capture_native_recovery_load(model_cls, model_id, local_path, load_kwargs)
+            except (RecoveryIdentityUnavailable, OSError, ValueError, RecursionError) as error:
+                print(f"  Recovery model identity unavailable: {type(error).__name__}")
+            try:
+                # Use the exact canonical directory whose names/bytes were
+                # captured. A cache ref alias cannot redirect the admitted load.
+                source = proposal.snapshot.root if proposal is not None else local_path
+                model = model_cls.from_pretrained(source, **load_kwargs)
             except Exception as e:
+                if device_utils.is_allocation_failure(e):
+                    raise
+                proposal = None
                 import traceback
                 print(f"  Warning: Failed to load from local cache: {e}")
                 traceback.print_exc()
                 print(f"  Retrying with model ID (may download missing files)...")
                 model = model_cls.from_pretrained(model_id, **load_kwargs)
+            if proposal is not None:
+                try:
+                    complete_native_recovery_load(model, proposal)
+                except (RecoveryIdentityUnavailable, OSError, ValueError, RecursionError) as error:
+                    print(f"  Recovery loaded model is unproven: {type(error).__name__}")
         else:
             print(f"  Model not cached locally, downloading {model_id}...")
             model = model_cls.from_pretrained(model_id, **load_kwargs)
@@ -1114,6 +1349,124 @@ class TTSEngine:
             decoder = codec_model.decoder
             decoder.chunked_decode = get_memory_bounded_codec_decode(decoder.chunked_decode)
         return model
+
+    @staticmethod
+    def get_local_model_inventory():
+        """Observe known cached base assets; never construct an engine or load."""
+        from synthesis_recovery_identity import get_model_asset_observation
+        records = []
+        for model_id in dict.fromkeys(TTSEngine._LOCAL_MODEL_IDS.values()):
+            families = [name for name, value in TTSEngine._LOCAL_MODEL_IDS.items() if value == model_id]
+            try:
+                path = TTSEngine._resolve_local_model_path(model_id)
+                observation = get_model_asset_observation(path) if path else {'state': 'not_cached'}
+            except (ImportError, OSError, ValueError, RuntimeError, RecursionError):
+                observation = {'state': 'unavailable'}
+            records.append({'model_id': model_id, 'families': families, **observation})
+        return records
+
+    def get_model_residency(self):
+        """Observe this engine without loading models or waiting for inference."""
+        if not _LOCAL_TTS_LOCK.acquire(blocking=False):
+            return {"state": "busy", "active_leases": None, "residents": None}
+        try:
+            native = sys.modules.get('synthesis_recovery_native')
+            observe_load = getattr(native, 'get_native_recovery_load_observation', None)
+            return {"state": "observed", "active_leases": self._local_model_active_leases,
+                    "cleanup_pending": bool(self._local_release_pending_devices),
+                    "release_events": copy.deepcopy(self._local_model_release_events),
+                    "residents": [{"family": name, "device": self._local_model_devices.get(name),
+                                   "load_capture": observe_load(getattr(self, f"_local_{name}_model"))
+                                   if observe_load is not None else None}
+                                  for name in ("custom", "clone", "design", "lora")
+                                  if getattr(self, f"_local_{name}_model") is not None]}
+        finally:
+            _LOCAL_TTS_LOCK.release()
+
+    def _release_local_model_family(self, name):
+        """Drop one serialized family and its dependent caches."""
+        setattr(self, f"_local_{name}_model", None)
+        self._local_model_devices.pop(name, None)
+        if name == "custom":
+            self._custom_warmup_needed = True
+        elif name == "clone":
+            self._clear_clone_reference_caches()
+        elif name == "lora":
+            self._lora_adapter_path = None
+            self._lora_generation_sha256 = None
+            self._lora_prompt_cache.clear()
+
+    def ensure_idle_local_models_released(self):
+        """Release idle residents under the existing serialization boundary.
+
+        Callers still need task/host ownership before admitting GPU work.
+        Synchronization failure leaves model references and caches intact.
+        """
+        if not _LOCAL_TTS_LOCK.acquire(blocking=False):
+            return False
+        try:
+            if self._local_model_active_leases or not self._model_lock.acquire(blocking=False):
+                return False
+            try:
+                families = [name for name in ("custom", "clone", "design", "lora")
+                            if getattr(self, f"_local_{name}_model") is not None]
+                return self._release_local_model_families(families)
+            finally:
+                self._model_lock.release()
+        finally:
+            _LOCAL_TTS_LOCK.release()
+
+    def _release_local_model_families(self, families, *, extra_devices=()):
+        """Caller holds local serialization/model lock; failed cleanup stays fenced."""
+        families = sorted(set(families) | self._local_release_pending_families)
+        devices = ({self._local_model_devices.get(name) for name in families
+                    if getattr(self, f"_local_{name}_model") is not None}
+                   | self._local_release_pending_devices | set(extra_devices))
+        if not families and not devices:
+            return True
+        if None in devices:
+            return False
+        devices = sorted(devices)
+        started = time.monotonic()
+        event = {"families": list(families), "result": "failed", "phase": "synchronize",
+                 "before": [device_utils.get_loaded_torch_memory_observation(d) for d in devices]}
+        torch = sys.modules.get("torch")
+        try:
+            for device in devices:
+                if device.startswith("cuda"):
+                    if torch is None:
+                        return False
+                    torch.cuda.synchronize(device)
+                elif device == "mps":
+                    if torch is None:
+                        return False
+                    torch.mps.synchronize()
+                elif device != "cpu":
+                    return False
+            self._local_release_pending_devices.update(devices)
+            self._local_release_pending_families.update(families)
+            event["phase"] = "drop_models"
+            for name in families:
+                self._release_local_model_family(name)
+            event["phase"] = "clear_cache"
+            self._clear_gpu_cache()
+            if "mps" in devices:
+                torch.mps.empty_cache()
+            self._local_release_pending_devices.clear()
+            self._local_release_pending_families.clear()
+            event.update(result="released", phase="complete")
+            return True
+        finally:
+            event["after"] = [device_utils.get_loaded_torch_memory_observation(d) for d in devices]
+            event["elapsed_seconds"] = max(0, time.monotonic() - started)
+            self._local_model_release_events.append(event)
+            del self._local_model_release_events[:-8]
+
+    def _release_inactive_models_after_oom(self, family, device):
+        families = [name for name in ("custom", "clone", "design", "lora")
+                    if name != family and getattr(self, f"_local_{name}_model") is not None]
+        if not self._release_local_model_families(families, extra_devices=(device,)):
+            raise RuntimeError("Cannot release inactive models with unknown loaded devices")
 
     def _release_inactive_local_models(self, family, device, dtype):
         """Keep cached families only when another load has ample headroom.
@@ -1145,18 +1498,11 @@ class TTSEngine:
                 print(f"Cannot size local model capacity: {exc}; releasing inactive families.")
         for name in inactive:
             print(f"Releasing inactive local {name} model before loading {family}...")
-            setattr(self, f"_local_{name}_model", None)
-            if name == "custom":
-                self._custom_warmup_needed = True
-            elif name == "clone":
-                self._clone_prompt_cache.clear()
-            elif name == "lora":
-                self._lora_adapter_path = None
-                self._lora_generation_sha256 = None
-                self._lora_prompt_cache.clear()
+            self._release_local_model_family(name)
         self._clear_gpu_cache()
 
     @ensure_local_tts_serialized
+    @measure_tts_stage("model_preparation")
     def _init_local_custom(self):
         """Load Qwen3-TTS CustomVoice model on demand."""
         if self._local_custom_model is not None:
@@ -1182,8 +1528,10 @@ class TTSEngine:
             if device != "cpu":
                 load_kwargs["device_map"] = device
             self._local_custom_model = self._load_model(
-                Qwen3TTSModel, "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", load_kwargs,
+                Qwen3TTSModel, self._LOCAL_MODEL_IDS["custom"], load_kwargs,
+                release_for_oom=lambda: self._release_inactive_models_after_oom("custom", device),
             )
+            self._local_model_devices["custom"] = device
             vram_after = self._vram_snapshot("post-load")
             model_gb = vram_after.get("allocated_gb", 0) - vram_before.get("allocated_gb", 0)
             print(f"CustomVoice model loaded: {model_gb:.2f} GB VRAM footprint")
@@ -1192,6 +1540,7 @@ class TTSEngine:
             return self._local_custom_model
 
     @ensure_local_tts_serialized
+    @measure_tts_stage("model_preparation")
     def _init_local_clone(self):
         """Load Qwen3-TTS Base model (for voice cloning) on demand."""
         if self._local_clone_model is not None:
@@ -1216,14 +1565,17 @@ class TTSEngine:
             if device != "cpu":
                 load_kwargs["device_map"] = device
             self._local_clone_model = self._load_model(
-                Qwen3TTSModel, "Qwen/Qwen3-TTS-12Hz-1.7B-Base", load_kwargs,
+                Qwen3TTSModel, self._LOCAL_MODEL_IDS["clone"], load_kwargs,
+                release_for_oom=lambda: self._release_inactive_models_after_oom("clone", device),
             )
+            self._local_model_devices["clone"] = device
             if self._compile_codec_enabled:
                 self._compile_codec(self._local_clone_model)
             print("Base model (voice cloning) loaded.")
             return self._local_clone_model
 
     @ensure_local_tts_serialized
+    @measure_tts_stage("model_preparation")
     def _init_local_design(self):
         """Load Qwen3-TTS VoiceDesign model on demand."""
         if self._local_design_model is not None:
@@ -1248,14 +1600,17 @@ class TTSEngine:
             if device != "cpu":
                 load_kwargs["device_map"] = device
             self._local_design_model = self._load_model(
-                Qwen3TTSModel, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", load_kwargs,
+                Qwen3TTSModel, self._LOCAL_MODEL_IDS["design"], load_kwargs,
+                release_for_oom=lambda: self._release_inactive_models_after_oom("design", device),
             )
+            self._local_model_devices["design"] = device
             if self._compile_codec_enabled:
                 self._compile_codec(self._local_design_model)
             print("VoiceDesign model loaded.")
             return self._local_design_model
 
     @ensure_local_tts_serialized
+    @measure_tts_stage("model_preparation")
     def _init_local_lora(self, adapter_path, generation_sha256=None, source_adapter_path=None):
         """Load Qwen3-TTS Base model with a LoRA adapter on demand.
 
@@ -1302,7 +1657,8 @@ class TTSEngine:
                 load_kwargs["device_map"] = device
 
             model = self._load_model(
-                Qwen3TTSModel, "Qwen/Qwen3-TTS-12Hz-1.7B-Base", load_kwargs,
+                Qwen3TTSModel, self._LOCAL_MODEL_IDS["lora"], load_kwargs,
+                release_for_oom=lambda: self._release_inactive_models_after_oom("lora", device),
             )
 
             # Apply the adapter, then fold it into the base weights.
@@ -1330,6 +1686,7 @@ class TTSEngine:
                 self._compile_codec(model)
 
             self._local_lora_model = model
+            self._local_model_devices["lora"] = device
             self._lora_adapter_path = source_adapter_path
             self._lora_generation_sha256 = generation_sha256
             print(f"LoRA adapter loaded from {source_adapter_path}")
@@ -1350,32 +1707,125 @@ class TTSEngine:
         """-> (client, lock) for the next endpoint worker, creating its client on demand."""
         url = url or self._next_external_url()
         with self._external_pool_lock:
+            if self._external_closed:
+                raise RuntimeError("External TTS engine is closed")
             worker = self._external_client_next.get(url, 0) % self._external_parallel_workers
             self._external_client_next[url] = worker + 1
             key = (url, worker)
             lock = self._external_locks.setdefault(key, threading.Lock())
             client = self._gradio_clients.get(key)
         if client is None:
-            from gradio_client import Client
             with lock:
                 client = self._gradio_clients.get(key)
                 if client is None:
                     print(f"Connecting to TTS server at {url}...")
-                    client = Client(url)
+                    client = create_external_client(url, self._external_timeout)
                     with self._external_pool_lock:
-                        self._gradio_clients[key] = client
-                    print(f"Connected to external TTS server {url}.")
+                        closed = self._external_closed
+                        if not closed:
+                            self._gradio_clients[key] = client
+                    if closed:
+                        close = getattr(client, "close", None)
+                        if close is not None:
+                            close()
+                        raise RuntimeError("External TTS engine is closed")
+                    print(f"External TTS client ready for {url}.")
         return client, lock
 
-    def _init_external(self):
-        """Create/return a Gradio client for the next endpoint in the pool."""
-        return self._external_endpoint()[0]
+    def _ensure_external_executor(self):
+        with _EXTERNAL_RUNTIME_LOCK:
+            if not hasattr(self, "_external_pool_lock"):
+                self._external_pool_lock = threading.Lock()
+            if not hasattr(self, "_gradio_clients"):
+                self._gradio_clients = {}
+            if not hasattr(self, "_external_calls"):
+                self._external_calls = set()
+            if not hasattr(self, "_external_closed"):
+                self._external_closed = False
+            if self._external_closed:
+                raise RuntimeError("External TTS engine is closed")
+            executor = getattr(self, "_external_executor", None)
+            if executor is None:
+                workers = (getattr(self, "_external_parallel_workers", 1)
+                           * len(getattr(self, "_external_urls", None) or [None]))
+                executor = ExternalTTSExecutor(workers)
+                self._external_executor = executor
+                self._external_finalizer = weakref.finalize(
+                    self, _close_external_runtime, self._external_pool_lock,
+                    self._external_calls, self._gradio_clients, executor)
+            return executor
+
+    def _submit_external(self, function, cancelled, *args):
+        executor = self._ensure_external_executor()
+        with self._external_pool_lock:
+            if self._external_closed:
+                cancelled.set()
+                raise RuntimeError("External TTS engine is closed")
+            self._external_calls.add(cancelled)
+        try:
+            future = executor.submit(partial(copy_context().run, function), *args)
+        except BaseException:
+            with self._external_pool_lock:
+                self._external_calls.discard(cancelled)
+            cancelled.set()
+            raise
+        owner = weakref.ref(self)
+        def release(future):
+            engine = owner()
+            if engine is not None:
+                with engine._external_pool_lock:
+                    engine._external_calls.discard(cancelled)
+        future.add_done_callback(release)
+        return future
+
+    def close_external(self):
+        with _EXTERNAL_RUNTIME_LOCK:
+            if not hasattr(self, "_external_pool_lock"):
+                return
+            with self._external_pool_lock:
+                self._external_closed = True
+            executor = getattr(self, "_external_executor", None)
+        _close_external_runtime(self._external_pool_lock, getattr(self, "_external_calls", set()),
+                                self._gradio_clients, executor)
+        finalizer = getattr(self, "_external_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
 
     # ── Clone prompt cache (local mode) ──────────────────────────
 
+    def _clear_clone_reference_caches(self):
+        self._clone_prompt_cache.clear()
+        prepared = getattr(self, '_prepared_reference_cache', None)
+        if prepared is not None:
+            prepared.clear()
+        self._clone_prompt_model_ref = None
+
+    def _capture_clone_prompt_cache_copy(self, prompt):
+        try:
+            captured = clone_reference_cache.copy_clone_prompt(prompt, self._clone_prompt_cache.max_bytes)
+        except Exception as error:
+            # Optional retention must not turn a usable provider result into a
+            # render failure. Release cache storage before ordinary generation.
+            self._clone_prompt_cache.clear()
+            self._prepared_reference_cache.clear()
+            logging.warning('Clone reference cache copy bypassed (%s).', type(error).__name__)
+            captured = None
+        if captured is None:
+            self._clone_prompt_cache.record_bypass()
+        return captured
+
     @ensure_local_tts_serialized
+    @measure_tts_stage("reference_preparation")
     def _get_clone_prompt(self, speaker, voice_config):
-        """Get or create a cached voice clone prompt for a speaker."""
+        """Prepare an admitted reference, sharing bounded content/model work."""
+        try:
+            return self._prepare_clone_prompt(speaker, voice_config)
+        finally:
+            record_tts_reference_cache(self._prepared_reference_cache.snapshot(),
+                                       self._clone_prompt_cache.snapshot())
+
+    def _prepare_clone_prompt(self, speaker, voice_config):
+        ensure_audio_generation_active()
         voice_data = voice_config.get(speaker, {})
         ref_audio_path = voice_data.get("ref_audio")
         ref_text = voice_data.get("ref_text")
@@ -1388,74 +1838,179 @@ class TTSEngine:
         # Hash and decode one captured reference, resolving historical adapter
         # directories under publication admission before reading their bytes.
         ref_audio_path, audio_bytes = get_adapter_asset_snapshot(ref_audio_path)
-        reference_key = (ref_audio_path, ref_text, hashlib.sha256(audio_bytes).hexdigest())
-        if speaker in self._clone_prompt_cache:
-            cached_key, cached_prompt = self._clone_prompt_cache[speaker]
-            if cached_key == reference_key:
-                return cached_prompt
-            print(f"Voice changed for '{speaker}', rebuilding clone prompt...")
-
+        digest = hashlib.sha256(audio_bytes).hexdigest()
+        # Admission always precedes hits, including a resident-family change.
         model = self._init_local_clone()
+        owner = self._clone_prompt_model_ref
+        if owner is None or owner() is not model:
+            self._clear_clone_reference_caches()
+            try:
+                self._clone_prompt_model_ref = weakref.ref(model)
+            except TypeError:
+                # An unknown provider without weak identity remains uncached.
+                pass
+        prepared_key = (clone_reference_cache.PREPROCESSING_VERSION, digest)
+        cache_prompt = self._clone_prompt_model_ref is not None and type(ref_text) is str
+        prompt_key = (*prepared_key, ref_text) if cache_prompt else None
+        if cache_prompt:
+            cached = self._clone_prompt_cache.lookup(prompt_key)
+            if cached is not None:
+                copied = self._capture_clone_prompt_cache_copy(cached)
+                if copied is not None:
+                    ensure_audio_generation_active()
+                    record_tts_cache(True)
+                    return copied[0]
+                cached = None  # Release the evicted buffers before rebuilding.
+        else:
+            self._clone_prompt_cache.record_bypass()
+        record_tts_cache(False)
 
-        # Load reference audio as numpy array
-        audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes))
-        # Ensure mono
-        if audio_array.ndim > 1:
-            audio_array = audio_array.mean(axis=1)
+        prepared = self._prepared_reference_cache.lookup(prepared_key)
+        audio_array = None
+        if prepared is not None:
+            try:
+                audio_array = prepared[0].copy(order='C')
+                sample_rate = prepared[1]
+            except MemoryError:
+                self._prepared_reference_cache.clear()
+                self._prepared_reference_cache.record_bypass()
+                prepared = None
+        staged_reference = None
+        if audio_array is None:
+            # Preserve float64 decode/mono mean before the provider's float32
+            # conversion. Changing that order changes reference samples.
+            audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes))
+            if audio_array.ndim > 1:
+                audio_array = audio_array.mean(axis=1)
+            charge = (audio_array.nbytes + sys.getsizeof(audio_array)
+                      + sys.getsizeof(sample_rate) + sys.getsizeof((audio_array, sample_rate)))
+            if charge <= self._prepared_reference_cache.max_bytes:
+                try:
+                    snapshot = audio_array.copy(order='C')
+                    snapshot.flags.writeable = False
+                    staged_reference = (snapshot, sample_rate)
+                except MemoryError:
+                    self._prepared_reference_cache.clear()
+                    self._prepared_reference_cache.record_bypass()
+            else:
+                self._prepared_reference_cache.record_bypass()
 
         print(f"Creating clone prompt for '{speaker}'...")
+        ensure_audio_generation_active()
         prompt = model.create_voice_clone_prompt(
             ref_audio=(audio_array, sample_rate),
             ref_text=ref_text,
         )
-        self._clone_prompt_cache[speaker] = (reference_key, prompt)
-        print(f"Clone prompt cached for '{speaker}'.")
+        ensure_audio_generation_active()
+        if staged_reference is not None:
+            self._prepared_reference_cache.store(prepared_key, staged_reference, charge)
+        if cache_prompt:
+            captured = self._capture_clone_prompt_cache_copy(prompt)
+            if captured is not None:
+                self._clone_prompt_cache.store(prompt_key, captured[0], captured[1])
+        ensure_audio_generation_active()
+        print(f"Clone prompt prepared for '{speaker}'.")
         return prompt
 
     def get_voice_backend(self, category):
         """Return the selected backend or reject unsupported local-model fallback."""
-        capabilities = _TTS_BACKEND_CAPABILITIES.get(self._mode)
-        if capabilities is None:
-            raise UnsupportedVoiceBackendError(f"Unknown TTS mode: {self._mode}")
-        if category not in capabilities:
+        try:
+            capabilities = get_tts_backend_capabilities(self._mode)
+        except ValueError as error:
+            raise UnsupportedVoiceBackendError(str(error)) from error
+        if category not in capabilities['voice_categories']:
             raise UnsupportedVoiceBackendError(
                 f"{category} voices require local TTS mode; external TTS supports custom and clone voices.")
         return self._mode
 
     def get_model_settings(self):
         """Return the actual model settings used by this initialized engine."""
-        return {"mode": self._mode, "device": self._device,
-                "compile_codec": self._compile_codec_enabled,
-                "max_new_tokens": self._max_new_tokens, "language": self._language}
+        settings = {"mode": self._mode, "device": self._device,
+                    "compile_codec": self._compile_codec_enabled,
+                    "max_new_tokens": self._max_new_tokens, "language": self._language}
+        if getattr(self, "_synthesis_windows", None) is not None:
+            settings["synthesis_windows"] = copy.deepcopy(self._synthesis_windows)
+        return settings
+
+    def get_synthesis_recovery_policy(self):
+        return copy.deepcopy(getattr(self, "_synthesis_recovery", None))
+
+    def get_speech_verification_policy(self):
+        return copy.deepcopy(getattr(self, '_speech_verification', None))
+
+    def _get_synthesis_window_plan(self, text, category, voice_data=None, voice_config=None):
+        settings = getattr(self, "_synthesis_windows", None)
+        if settings is None:
+            return None
+        keys = [f"{self.get_voice_backend(category)}.{category}"]
+        if category == "ensemble":
+            for member in self._get_ensemble_members(voice_data, voice_config):
+                member_category = voice_category(voice_config[member])
+                keys.append(f"{self.get_voice_backend(member_category)}.{member_category}")
+        return get_synthesis_window_plan(text, settings, keys)
+
+    def _render_synthesis_windows(self, text, category, render, output_path,
+                                  voice_data=None, voice_config=None, recovery_request=None):
+        try:
+            ensure_audio_generation_active()
+            plan = self._get_synthesis_window_plan(text, category, voice_data, voice_config)
+            if plan is None:
+                return None
+            from synthesis_recovery import ensure_synthesis_recovery
+            with ensure_synthesis_recovery(self, category, plan, self._synthesis_windows,
+                                           recovery_request) as recovery:
+                from synthesis_workspace import get_synthesis_workspace_parent
+                from synthesis_recovery_context import get_synthesis_recovery_parent
+                # Only this synchronous built-in output writer is initially
+                # qualified. Unknown/external providers can outlive their caller.
+                workspace_parent = get_synthesis_workspace_parent(
+                    self, category, get_synthesis_recovery_parent())
+                options = {} if workspace_parent is None else {'workspace_parent': workspace_parent}
+                render_synthesis_windows(plan, render, output_path, self._synthesis_windows,
+                                         cancel_check=is_audio_generation_cancelled, recovery=recovery, **options)
+            return True
+        except Exception as error:
+            apply_tts_failure(error)
+            return False
 
     # ── Core generation methods ──────────────────────────────────
 
     def _external_single(self, generate, output_path):
         """Bound one external request without publishing late audio."""
+        from concurrent.futures import TimeoutError as FutureTimeout
         staging_path = f"{output_path}.pending.{uuid.uuid4().hex}"
         cancelled = threading.Event()
-        finished = threading.Event()
-        result = {"success": False}
+        deadline = time.monotonic() + self._external_timeout
+        capture_inputs = is_speech_input_capture_active()
 
         def work():
             try:
-                result["success"] = generate(staging_path, cancelled)
+                if cancelled.is_set() or time.monotonic() >= deadline:
+                    return False, time.monotonic(), None
+                with (ensure_external_request_control(deadline, cancelled),
+                      ensure_speech_input_capture(capture_inputs)):
+                    success = generate(staging_path, cancelled)
+                    proof = get_captured_speech_input(staging_path) if success else None
+                    return success, time.monotonic(), proof
             except Exception as error:
                 import traceback
                 traceback.print_exc()
                 apply_tts_failure(error)
+                return False, time.monotonic(), None
             finally:
                 if cancelled.is_set():
                     try:
                         os.remove(staging_path)
                     except FileNotFoundError:
                         pass
-                finished.set()
-
-        context = copy_context()
-        threading.Thread(target=lambda: context.run(work), daemon=True).start()
-        if not finished.wait(self._external_timeout):
+        future = self._submit_external(work, cancelled)
+        try:
+            success, finished_at, speech_input = future.result(timeout=max(0, deadline - time.monotonic()))
+            if finished_at > deadline:
+                raise FutureTimeout()
+        except FutureTimeout:
             cancelled.set()
+            future.cancel()
             try:
                 os.remove(staging_path)
             except FileNotFoundError:
@@ -1463,8 +2018,20 @@ class TTSEngine:
             print(f"External TTS timed out after {self._external_timeout}s")
             apply_tts_failure(TimeoutError(f"External TTS timed out after {self._external_timeout}s"))
             return False
-        if (result["success"] and os.path.exists(staging_path)
+        except Exception as error:
+            apply_tts_failure(error)
+            success = False
+        except BaseException:
+            cancelled.set()
+            future.cancel()
+            try:
+                os.remove(staging_path)
+            except FileNotFoundError:
+                pass
+            raise
+        if (success and os.path.exists(staging_path)
                 and publish_audio_output(staging_path, output_path, cancelled)):
+            promote_speech_input(speech_input, output_path)
             return True
         try:
             os.remove(staging_path)
@@ -1472,6 +2039,7 @@ class TTSEngine:
             pass
         return False
 
+    @capture_tts_operation("generate_custom_voice")
     def generate_custom_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using CustomVoice model. Returns True on success."""
         prepared = get_speech_preparation(text, instruct_text)
@@ -1480,6 +2048,13 @@ class TTSEngine:
 
     def _generate_custom_voice_prepared(self, text, instruct_text, speaker, voice_config, output_path):
         """Render explicitly prepared input; public callers use the raw wrapper."""
+        windowed = self._render_synthesis_windows(
+            text, "custom", lambda span, path: self._generate_custom_voice_prepared(
+                span, instruct_text, speaker, voice_config, path), output_path,
+            recovery_request=(get_custom_voice_request(voice_config, speaker, instruct_text)
+                              if getattr(self, '_synthesis_recovery', None) else None))
+        if windowed is not None:
+            return windowed
         if self.get_voice_backend("custom") == "local":
             return self._local_generate_custom(text, instruct_text, speaker, voice_config, output_path)
         else:
@@ -1488,6 +2063,7 @@ class TTSEngine:
                     text, instruct_text, speaker, voice_config, staged, cancelled=cancelled),
                 output_path)
 
+    @capture_tts_operation("generate_clone_voice")
     def generate_clone_voice(self, text, speaker, voice_config, output_path):
         """Generate audio using voice cloning. Returns True on success."""
         return self._generate_clone_voice_prepared(
@@ -1495,6 +2071,11 @@ class TTSEngine:
 
     def _generate_clone_voice_prepared(self, text, speaker, voice_config, output_path):
         """Render explicitly prepared input; public callers use the raw wrapper."""
+        windowed = self._render_synthesis_windows(
+            text, "clone", lambda span, path: self._generate_clone_voice_prepared(
+                span, speaker, voice_config, path), output_path)
+        if windowed is not None:
+            return windowed
         if self.get_voice_backend("clone") == "local":
             return self._local_generate_clone(text, speaker, voice_config, output_path)
         else:
@@ -1503,26 +2084,44 @@ class TTSEngine:
                     text, speaker, voice_config, staged, cancelled=cancelled),
                 output_path)
 
-    def generate_voice_result(self, text, instruct_text, speaker, voice_config, output_path):
+    @capture_tts_operation("generate_voice_result")
+    def generate_voice_result(self, text, instruct_text, speaker, voice_config, output_path, *, capture_input=False):
         """Return call-local diagnostics without changing legacy boolean methods."""
         failures = []
         token = _TTS_FAILURES.set(failures)
         try:
-            try:
-                success = bool(self.generate_voice(
-                    text, instruct_text, speaker, voice_config, output_path))
-            except Exception as error:
-                apply_tts_failure(error)
-                success = False
+            with (ensure_synthesis_receipts() as receipts,
+                  ensure_speech_input_capture(capture_input is True or bool(getattr(self, '_speech_verification', None)))):
+                try:
+                    success = bool(self.generate_voice(
+                        text, instruct_text, speaker, voice_config, output_path))
+                except Exception as error:
+                    apply_tts_failure(error)
+                    success = False
+                speech_input = get_captured_speech_input(output_path) if success else None
             # An ensemble can wrap the original member failure; retain its cause.
-            return TTSGenerationResult(success, None if success or not failures else failures[0])
+            return TTSGenerationResult(success, None if success or not failures else failures[0],
+                                       receipts[-1] if success and receipts else None, speech_input)
         finally:
             _TTS_FAILURES.reset(token)
 
+    @capture_tts_operation("generate_voice")
     def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using the appropriate method based on voice type config."""
         prepared = get_speech_preparation(text, instruct_text)
-        text, instruct_text = prepared["text"], prepared["instruct"]
+        return self._generate_voice_prepared(
+            prepared["text"], prepared["instruct"], speaker, voice_config, output_path)
+
+    def _dispatch_prepared_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        """Retain public dispatcher overrides without re-preparing native input."""
+        render = self.generate_voice
+        if (isinstance(render, MethodType) and render.__self__ is self
+                and render.__func__ is _RAW_GENERATE_VOICE):
+            return self._generate_voice_prepared(text, instruct_text, speaker, voice_config, output_path)
+        return render(text, instruct_text, speaker, voice_config, output_path)
+
+    def _generate_voice_prepared(self, text, instruct_text, speaker, voice_config, output_path):
+        """Dispatch input whose simultaneous speech preparation has already run."""
         speaker = get_resolved_speaker(speaker, voice_config)
         voice_config = resolve_narrator_voice_config(speaker, voice_config)
         voice_data = voice_config.get(speaker)
@@ -1548,12 +2147,23 @@ class TTSEngine:
             # Preserve historical override input and preparation semantics.
             return render(text, speaker, voice_config, output_path)
         elif category == "lora":
-            return self.generate_lora_voice(text, instruct_text, voice_data, output_path)
+            render = self.generate_lora_voice
+            if (isinstance(render, MethodType) and render.__self__ is self
+                    and render.__func__ is _RAW_LORA_VOICE):
+                return self._generate_lora_voice_prepared(text, instruct_text, voice_data, output_path)
+            return render(text, instruct_text, voice_data, output_path)
         elif category == "design":
-            return self.generate_design_voice(text, instruct_text, voice_data, output_path)
+            render = self.generate_design_voice
+            if (isinstance(render, MethodType) and render.__self__ is self
+                    and render.__func__ is _RAW_DESIGN_VOICE):
+                return self._generate_design_voice_prepared(text, instruct_text, voice_data, output_path)
+            return render(text, instruct_text, voice_data, output_path)
         elif category == "ensemble":
-            return self.generate_ensemble_voice(text, instruct_text, voice_data,
-                                                voice_config, output_path)
+            render = self.generate_ensemble_voice
+            if (isinstance(render, MethodType) and render.__self__ is self
+                    and render.__func__ is _RAW_ENSEMBLE_VOICE):
+                return self._generate_ensemble_voice_prepared(text, instruct_text, voice_data, voice_config, output_path)
+            return render(text, instruct_text, voice_data, voice_config, output_path)
         else:
             render = self.generate_custom_voice
             if (isinstance(render, MethodType) and render.__self__ is self
@@ -1563,6 +2173,7 @@ class TTSEngine:
             # Preserve historical override input and preparation semantics.
             return render(text, instruct_text, speaker, voice_config, output_path)
 
+    @capture_tts_operation("generate_ensemble_voice")
     def generate_ensemble_voice(self, text, instruct_text, voice_data, voice_config,
                                 output_path):
         """Render one line as several characters speaking at once.
@@ -1572,6 +2183,11 @@ class TTSEngine:
         assigned keeps that LoRA. The clips are then aligned and mixed by
         mix_to_unison.
         """
+        prepared = get_speech_preparation(text, instruct_text)
+        return self._generate_ensemble_voice_prepared(
+            prepared["text"], prepared["instruct"], voice_data, voice_config, output_path)
+
+    def _get_ensemble_members(self, voice_data, voice_config):
         members = voice_data.get("members") or []
         if not members:
             raise ValueError("Ensemble voice has no members configured.")
@@ -1588,27 +2204,49 @@ class TTSEngine:
                     f"Ensemble member '{member}' is itself an ensemble; "
                     f"ensembles cannot be nested.")
             self.get_voice_backend(voice_category(member_data))
+        return resolved_members
 
-        temp_dir = tempfile.mkdtemp(prefix="unison_")
-        try:
+    def _generate_ensemble_voice_prepared(self, text, instruct_text, voice_data, voice_config, output_path):
+        resolved_members = self._get_ensemble_members(voice_data, voice_config)
+        windowed = self._render_synthesis_windows(
+            text, "ensemble", lambda span, path: self._generate_ensemble_voice_prepared(
+                span, instruct_text, voice_data, voice_config, path), output_path,
+            voice_data=voice_data, voice_config=voice_config)
+        if windowed is not None:
+            return windowed
+        members = voice_data.get("members") or []
+        from synthesis_workspace import ensure_synthesis_workspace, get_synthesis_workspace_parent
+        from synthesis_recovery_context import get_synthesis_recovery_parent
+        from contextlib import ExitStack
+        workspace_parent = get_synthesis_workspace_parent(
+            self, "ensemble", get_synthesis_recovery_parent())
+        with ExitStack() as cleanup:
+            if workspace_parent is not None:
+                directory = cleanup.enter_context(
+                    ensure_synthesis_workspace(workspace_parent, max(2, len(resolved_members))))
+            else:
+                directory = tempfile.mkdtemp(prefix="unison_")
+                cleanup.callback(shutil.rmtree, directory, ignore_errors=True)
             member_paths = []
             for i, member in enumerate(resolved_members):
-                member_path = os.path.join(temp_dir, f"member_{i}.wav")
-                if not self.generate_voice(text, instruct_text, member,
-                                           voice_config, member_path):
+                member_path = os.path.join(str(directory), f"window-{i}.wav")
+                if not self._dispatch_prepared_voice(text, instruct_text, member,
+                                                    voice_config, member_path):
                     raise RuntimeError(
                         f"Ensemble member '{member}' failed to generate.")
                 member_paths.append(member_path)
 
             print(f"  Unison: mixing {len(member_paths)} voices ({', '.join(members)})")
-            return mix_to_unison(member_paths, output_path)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            success = mix_to_unison(member_paths, output_path)
+            if success and mix_to_unison is _RAW_MIX_TO_UNISON:
+                capture_composite_speech_input(member_paths, output_path, text, 'ensemble')
+            return success
 
     # ── Voice design generation ──────────────────────────────────
 
     @ensure_local_tts_serialized
-    def generate_voice_design(self, description, sample_text, language=None, seed=-1):
+    @capture_tts_operation("generate_voice_design")
+    def generate_voice_design(self, description, sample_text, language=None, seed=-1, preview_path=None):
         """Generate a voice from a text description using the VoiceDesign model.
 
         Args:
@@ -1637,13 +2275,14 @@ class TTSEngine:
             torch.manual_seed(seed)
 
         t_start = time.time()
-        wavs, sr = model.generate_voice_design(
-            text=sample_text,
-            instruct=description,
-            language=lang,
-            non_streaming_mode=True,
-            max_new_tokens=self._max_new_tokens,
-        )
+        with measure_tts_stage_time("inference_decode"):
+            wavs, sr = model.generate_voice_design(
+                text=sample_text,
+                instruct=description,
+                language=lang,
+                non_streaming_mode=True,
+                max_new_tokens=self._max_new_tokens,
+            )
         gen_time = time.time() - t_start
 
         if wavs is None or len(wavs) == 0:
@@ -1653,26 +2292,38 @@ class TTSEngine:
         duration = len(audio) / sr
         print(f"VoiceDesign: done in {gen_time:.1f}s -> {duration:.1f}s audio")
 
-        # Save to previews directory (under the runtime data dir, matching where
-        # app.py's /api/voice_design/save reads it back from).
-        previews_dir = _resolve_asset_path(os.path.join("designed_voices", "previews"))
-        os.makedirs(previews_dir, exist_ok=True)
-
-        filename = f"preview_{uuid.uuid4().hex}.wav"
-        wav_path = os.path.join(previews_dir, filename)
+        # Save to the requested registered path, or to the Designer previews
+        # directory (matching where app.py's /api/voice_design/save reads it).
+        if preview_path is None:
+            previews_dir = _resolve_asset_path(os.path.join("designed_voices", "previews"))
+            os.makedirs(previews_dir, exist_ok=True)
+            wav_path = os.path.join(previews_dir, f"preview_{uuid.uuid4().hex}.wav")
+        else:
+            wav_path = str(preview_path)
+            os.makedirs(os.path.dirname(wav_path) or '.', exist_ok=True)
         self._save_wav(audio, sr, wav_path)
+        capture_speech_input(wav_path, sample_text, lang, 'local_design_api')
 
         return wav_path, sr
 
+    @capture_tts_operation("generate_design_voice")
     def generate_design_voice(self, text, instruct_text, voice_data, output_path):
         """Generate audio using VoiceDesign model with combined description + instruct.
 
         The voice_data 'description' field provides the base voice identity,
         and the per-line instruct_text is appended for delivery/emotion direction.
         """
-        self.get_voice_backend("design")
         prepared = get_speech_preparation(text, instruct_text)
-        text, instruct_text = prepared["text"], prepared["instruct"]
+        return self._generate_design_voice_prepared(
+            prepared["text"], prepared["instruct"], voice_data, output_path)
+
+    def _generate_design_voice_prepared(self, text, instruct_text, voice_data, output_path):
+        self.get_voice_backend("design")
+        windowed = self._render_synthesis_windows(
+            text, "design", lambda span, path: self._generate_design_voice_prepared(
+                span, instruct_text, voice_data, path), output_path)
+        if windowed is not None:
+            return windowed
         import shutil
 
         base_desc = (voice_data.get("description") or "").strip()
@@ -1691,30 +2342,48 @@ class TTSEngine:
             description = "A clear, natural speaking voice"
 
         seed = int(voice_data.get("seed", -1))
-        wav_path, sr = self.generate_voice_design(description=description, sample_text=text, seed=seed)
-        staging_path = f"{output_path}.pending.{uuid.uuid4().hex}"
-        try:
-            shutil.copy2(wav_path, staging_path)
-            return publish_audio_output(staging_path, output_path)
-        finally:
+
+        def render(preview_path=None):
+            preview_options = {'preview_path': preview_path} if preview_path is not None else {}
+            wav_path, sr = self.generate_voice_design(
+                description=description, sample_text=text, seed=seed,
+                **preview_options)
+            speech_input = get_captured_speech_input(wav_path)
+            staging_path = f"{output_path}.pending.{uuid.uuid4().hex}"
             try:
-                os.remove(staging_path)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                logging.getLogger(__name__).warning("Design staging cleanup failed at %s: %s", staging_path, error)
-            # A generated preview is throwaway even when output copying fails.
-            if os.path.abspath(wav_path) != os.path.abspath(output_path):
+                shutil.copy2(wav_path, staging_path)
+                success = publish_audio_output(staging_path, output_path)
+                if success:
+                    promote_speech_input(speech_input, output_path)
+                return success
+            finally:
                 try:
-                    os.remove(wav_path)
+                    os.remove(staging_path)
                 except FileNotFoundError:
                     pass
                 except OSError as error:
-                    logging.getLogger(__name__).warning("Design preview cleanup failed at %s: %s", wav_path, error)
+                    logging.getLogger(__name__).warning("Design staging cleanup failed at %s: %s", staging_path, error)
+                # A generated preview is throwaway even when output copying fails.
+                if os.path.abspath(wav_path) != os.path.abspath(output_path):
+                    try:
+                        os.remove(wav_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as error:
+                        logging.getLogger(__name__).warning("Design preview cleanup failed at %s: %s", wav_path, error)
+
+        from synthesis_workspace import ensure_synthesis_workspace, get_synthesis_workspace_parent
+        from synthesis_recovery_context import get_synthesis_recovery_parent
+        workspace_parent = get_synthesis_workspace_parent(
+            self, "design", get_synthesis_recovery_parent())
+        if workspace_parent is None:
+            return render()
+        with ensure_synthesis_workspace(workspace_parent, 2) as directory:
+            return render(os.path.join(str(directory), "window-0.wav"))
 
     # ── LoRA voice generation ────────────────────────────────────
 
-    @ensure_local_tts_serialized
+    @capture_tts_operation("generate_lora_voice")
     def generate_lora_voice(self, text, instruct_text, voice_data, output_path):
         """Generate audio using a LoRA-finetuned Base model.
 
@@ -1726,9 +2395,18 @@ class TTSEngine:
         The LoRA weights refine voice identity beyond what the reference alone provides.
         """
         prepared = get_speech_preparation(text, instruct_text)
-        text, instruct_text = prepared["text"], prepared["instruct"]
+        return self._generate_lora_voice_prepared(
+            prepared["text"], prepared["instruct"], voice_data, output_path)
+
+    @ensure_local_tts_serialized
+    def _generate_lora_voice_prepared(self, text, instruct_text, voice_data, output_path):
         try:
             self.get_voice_backend("lora")
+            windowed = self._render_synthesis_windows(
+                text, "lora", lambda span, path: self._generate_lora_voice_prepared(
+                    span, instruct_text, voice_data, path), output_path)
+            if windowed is not None:
+                return windowed
             import time
 
             adapter_path = voice_data.get("adapter_path")
@@ -1797,14 +2475,15 @@ class TTSEngine:
                 torch.manual_seed(seed)
 
             t_start = time.time()
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                language=self._language,
-                voice_clone_prompt=prompt,
-                non_streaming_mode=True,
-                max_new_tokens=self._max_new_tokens,
-                **gen_extra,
-            )
+            with measure_tts_stage_time("inference_decode"):
+                wavs, sr = model.generate_voice_clone(
+                    text=text,
+                    language=self._language,
+                    voice_clone_prompt=prompt,
+                    non_streaming_mode=True,
+                    max_new_tokens=self._max_new_tokens,
+                    **gen_extra,
+                )
             gen_time = time.time() - t_start
 
             if wavs is None or len(wavs) == 0:
@@ -1817,6 +2496,7 @@ class TTSEngine:
             rtf = duration / gen_time if gen_time > 0 else 0
             print(f"TTS [local lora] done: {gen_time:.1f}s -> {duration:.1f}s audio ({rtf:.2f}x real-time)")
             self._save_wav(audio, sr, output_path)
+            capture_speech_input(output_path, text, self._language, 'local_lora_api')
             return True
 
         except Exception as e:
@@ -1845,6 +2525,7 @@ class TTSEngine:
             return model, prompt
 
     @ensure_local_tts_serialized
+    @measure_tts_stage("reference_preparation")
     def _ensure_lora_prompt(self, adapter_path, model, ref_text, generation_sha256=None, source_adapter_path=None):
         """Build and cache the clone prompt used by LoRA inference."""
         source_adapter_path = source_adapter_path or adapter_path
@@ -1852,6 +2533,7 @@ class TTSEngine:
             with ensure_adapter_generation_snapshot(adapter_path) as (snapshot, generation):
                 return self._ensure_lora_prompt(snapshot, model, ref_text, generation, source_adapter_path)
         cache_key = (source_adapter_path, generation_sha256)
+        record_tts_cache(cache_key in self._lora_prompt_cache)
         if cache_key not in self._lora_prompt_cache:
             audio_array, sample_rate = sf.read(os.path.join(adapter_path, "ref_sample.wav"))
             if audio_array.ndim > 1:
@@ -1866,8 +2548,20 @@ class TTSEngine:
             print("Clone prompt cached for LoRA adapter.")
         return self._lora_prompt_cache[cache_key]
 
+    def _generate_prepared_batch_parent(self, chunk, voice_config, output_dir, batch_seed):
+        idx = chunk["index"]
+        output_path = get_synthesis_batch_output_path(output_dir, idx)
+        resolved = get_batch_voice_config(voice_config, chunk.get("speaker"), idx, batch_seed)
+        with (ensure_synthesis_recovery_batch_parent(chunk.get("uid")),
+              ensure_synthesis_receipts() as receipts):
+            success = self._dispatch_prepared_voice(
+                chunk["text"], chunk.get("instruct", ""), chunk.get("speaker"), resolved, output_path)
+        return success, receipts[-1] if success and receipts else None
+
     # ── Batch generation ─────────────────────────────────────────
 
+    @capture_tts_operation("generate_batch")
+    @capture_batch_speech_inputs
     def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
         """Generate multiple audio files.
 
@@ -1885,21 +2579,17 @@ class TTSEngine:
         """
         results = {"completed": [], "failed": []}
 
-        if not chunks:
+        if not chunks or is_audio_generation_cancelled():
             return results
 
-        # Normalised once here so every downstream path - including
-        # _local_batch_lora, which does not go through the single-item
-        # methods - sees speakable text. Copies rather than mutating the
-        # caller's chunk dicts (Rule 17); the caller still owns the originals.
-        chunks = [{**c, **get_speech_preparation(c.get("text"), c.get("instruct", ""))}
-                  for c in chunks]
-        # Resolve narrator strategy once per chunk while retaining the existing
-        # batching paths for ordinary speakers.
+        # Resolve each row before its one canonical speech preparation. Stable
+        # UID/rules remain on copies through native, external and fallback paths.
         dynamic_chunks = []
         for chunk in chunks:
-            speaker = chunk.get("speaker")
+            source_speaker = chunk.get("_source_speaker", chunk.get("speaker"))
             try:
+                speaker = get_resolved_speaker(chunk.get("speaker"), voice_config)
+                chunk = {**chunk, "speaker": speaker, "_source_speaker": source_speaker}
                 resolved = resolve_narrator_voice_config(speaker, voice_config, chunk)
                 if not is_voice_config_present(speaker, resolved):
                     results["failed"].append((chunk["index"],
@@ -1910,7 +2600,14 @@ class TTSEngine:
             except (UnsupportedVoiceBackendError, ValueError, TypeError, OverflowError) as error:
                 results["failed"].append((chunk["index"], str(error)))
                 continue
-            dynamic_chunks.append((chunk, resolved))
+            context = (get_pronunciation_render_context(
+                voice_config, chunk, chunk["index"],
+                {"mode": self._mode, "language": self._language},
+                source_speaker=chunk.get("_source_speaker", chunk.get("speaker")))
+                if chunk.get("pronunciation_rules") else None)
+            with ensure_occurrence_pronunciation_context(chunk, context):
+                prepared = get_speech_preparation(chunk.get("text"), chunk.get("instruct", ""))
+            dynamic_chunks.append(({**chunk, **prepared}, resolved))
         chunks = [chunk for chunk, _ in dynamic_chunks]
         if not chunks:
             return results
@@ -1918,14 +2615,17 @@ class TTSEngine:
             # A dynamic narrator may use different configs per chunk; keep those
             # chunks on the established single-item path to avoid mixing voices.
             for chunk, resolved in dynamic_chunks:
+                if is_audio_generation_cancelled():
+                    return results
                 if resolved is voice_config:
                     continue
                 idx = chunk["index"]
-                output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
-                resolved = get_batch_voice_config(resolved, chunk.get("speaker"), idx, batch_seed)
                 try:
-                    if self.generate_voice(chunk["text"], chunk.get("instruct", ""), chunk.get("speaker"), resolved, output_path):
+                    success, receipt = self._generate_prepared_batch_parent(chunk, resolved, output_dir, batch_seed)
+                    if success:
                         results["completed"].append(idx)
+                        if receipt is not None:
+                            results.setdefault("synthesis_receipts", {})[idx] = receipt
                     else:
                         results["failed"].append((idx, "Narrator voice generation failed"))
                 except Exception as e:
@@ -1938,6 +2638,34 @@ class TTSEngine:
         # from dynamo guard accumulation across batches
         if self._compile_codec_enabled:
             self._reset_compile_cache()
+
+        # Split parents keep their original index/config; unsplit rows retain
+        # native list batching. Speech preparation has already run exactly once.
+        if getattr(self, "_synthesis_windows", None) is not None:
+            native_chunks = []
+            for chunk in chunks:
+                if is_audio_generation_cancelled():
+                    return results
+                idx, speaker = chunk["index"], chunk.get("speaker")
+                try:
+                    effective = get_batch_voice_config(voice_config, speaker, idx, batch_seed)
+                    data = effective.get(speaker, {})
+                    plan = self._get_synthesis_window_plan(chunk["text"], voice_category(data), data, effective)
+                    if plan is None:
+                        native_chunks.append(chunk)
+                        continue
+                    success, receipt = self._generate_prepared_batch_parent(chunk, voice_config, output_dir, batch_seed)
+                    if success:
+                        results["completed"].append(idx)
+                        if receipt is not None:
+                            results.setdefault("synthesis_receipts", {})[idx] = receipt
+                    else:
+                        results["failed"].append((idx, "Internal synthesis window generation failed"))
+                except Exception as error:
+                    results["failed"].append((idx, str(error)))
+            chunks = native_chunks
+            if not chunks:
+                return results
 
         # Separate chunks by voice type
         custom_chunks = []
@@ -1965,6 +2693,8 @@ class TTSEngine:
         # Ensemble chunks need several different voices each, so they can't join
         # a same-voice batch — render them one at a time.
         if ensemble_chunks:
+            if is_audio_generation_cancelled():
+                return results
             batch_results = self._sequential_ensemble(ensemble_chunks, voice_config, output_dir, batch_seed)
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
@@ -1972,6 +2702,8 @@ class TTSEngine:
 
         # Process custom voice chunks
         if custom_chunks:
+            if is_audio_generation_cancelled():
+                return results
             if self.get_voice_backend("custom") == "local":
                 batch_results = self._local_batch_custom(custom_chunks, voice_config, output_dir, batch_seed)
             else:
@@ -1982,6 +2714,8 @@ class TTSEngine:
 
         # Process clone voice chunks (batched by speaker in local mode)
         if clone_chunks:
+            if is_audio_generation_cancelled():
+                return results
             if self.get_voice_backend("clone") == "local":
                 batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir, batch_seed)
             else:
@@ -1992,6 +2726,8 @@ class TTSEngine:
 
         # Process LoRA voice chunks (batched by adapter in local mode)
         if lora_chunks:
+            if is_audio_generation_cancelled():
+                return results
             batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir, batch_seed)
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
@@ -1999,18 +2735,26 @@ class TTSEngine:
 
         # Process design voice chunks (sequential — each line has unique description)
         if design_chunks:
+            if is_audio_generation_cancelled():
+                return results
             for chunk in design_chunks:
+                if is_audio_generation_cancelled():
+                    return results
                 idx = chunk["index"]
-                output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+                output_path = get_synthesis_batch_output_path(output_dir, idx)
                 speaker = chunk.get("speaker")
                 voice_data = get_batch_voice_config(voice_config, speaker, idx, batch_seed).get(speaker, {})
                 try:
-                    success = self.generate_design_voice(
-                        text=chunk["text"],
-                        instruct_text=chunk.get("instruct", ""),
-                        voice_data=voice_data,
-                        output_path=output_path,
-                    )
+                    render = self.generate_design_voice
+                    if (isinstance(render, MethodType) and render.__self__ is self
+                            and render.__func__ is _RAW_DESIGN_VOICE):
+                        render = self._generate_design_voice_prepared
+                    from synthesis_recovery_context import ensure_synthesis_recovery_batch_parent
+                    with ensure_synthesis_recovery_batch_parent(chunk.get("uid")):
+                        success = render(
+                            text=chunk["text"], instruct_text=chunk.get("instruct", ""),
+                            voice_data=voice_data, output_path=output_path,
+                        )
                     if success:
                         results["completed"].append(idx)
                     else:
@@ -2026,10 +2770,12 @@ class TTSEngine:
         """Set the sub-batch size for benchmarking. Public wrapper for _sub_batch_max_items."""
         self._sub_batch_max_items = max_items
 
+    @capture_tts_operation("run_benchmark_batch")
     def run_benchmark_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
         """Run a benchmark batch generation. Public wrapper for _local_batch_custom."""
         return self._local_batch_custom(chunks, voice_config, output_dir, batch_seed)
 
+    @capture_tts_operation("run_clone_benchmark_batch")
     def run_clone_benchmark_batch(self, chunks, voice_config, output_dir,
                                   batch_seed=-1):
         """Run a benchmark batch through the production clone implementation."""
@@ -2051,17 +2797,14 @@ class TTSEngine:
         try:
             import torch
 
-            voice_data = voice_config.get(speaker)
-            if not voice_data:
+            request = get_custom_voice_request(voice_config, speaker, instruct_text)
+            if request is None:
                 print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
                 apply_tts_failure(f"No voice configuration for '{speaker}'.", "missing_configuration",
                                   "Assign a voice to this speaker before retrying.")
                 return False
 
-            voice = voice_data.get("voice", "Ryan")
-            seed = int(voice_data.get("seed", -1))
-
-            instruct = anchored_instruct(voice_data, instruct_text)
+            voice, seed, instruct = request.voice, request.seed, request.instruct
 
             import time
 
@@ -2069,18 +2812,20 @@ class TTSEngine:
 
             model = self._init_local_custom()
 
+            ensure_native_recovery_serving_current(self, request)
             if seed >= 0:
                 torch.manual_seed(seed)
 
             t_start = time.time()
-            wavs, sr = model.generate_custom_voice(
-                text=text,
-                language=self._language,
-                speaker=voice,
-                instruct=instruct,
-                non_streaming_mode=True,
-                max_new_tokens=self._max_new_tokens,
-            )
+            with measure_tts_stage_time("inference_decode"):
+                wavs, sr = model.generate_custom_voice(
+                    text=text,
+                    language=self._language,
+                    speaker=voice,
+                    instruct=instruct,
+                    non_streaming_mode=True,
+                    max_new_tokens=self._max_new_tokens,
+                )
             gen_time = time.time() - t_start
 
             if wavs is None or len(wavs) == 0:
@@ -2094,8 +2839,11 @@ class TTSEngine:
             rtf = duration / gen_time if gen_time > 0 else 0
             print(f"TTS [local] done: {gen_time:.1f}s -> {duration:.1f}s audio ({rtf:.2f}x real-time)")
             self._save_wav(audio, sr, output_path)
+            capture_speech_input(output_path, text, self._language, 'local_custom_api')
             return True
 
+        except SynthesisRecoveryDependencyChanged:
+            raise
         except Exception as e:
             import traceback
             print(f"Error generating custom voice for '{speaker}': {e}")
@@ -2129,13 +2877,14 @@ class TTSEngine:
                 torch.manual_seed(seed)
 
             t_start = time.time()
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                language=self._language,
-                voice_clone_prompt=prompt,
-                non_streaming_mode=True,
-                max_new_tokens=self._max_new_tokens,
-            )
+            with measure_tts_stage_time("inference_decode"):
+                wavs, sr = model.generate_voice_clone(
+                    text=text,
+                    language=self._language,
+                    voice_clone_prompt=prompt,
+                    non_streaming_mode=True,
+                    max_new_tokens=self._max_new_tokens,
+                )
             gen_time = time.time() - t_start
 
             if wavs is None or len(wavs) == 0:
@@ -2148,6 +2897,7 @@ class TTSEngine:
             rtf = duration / gen_time if gen_time > 0 else 0
             print(f"TTS [local clone] done: {gen_time:.1f}s -> {duration:.1f}s audio ({rtf:.2f}x real-time)")
             self._save_wav(audio, sr, output_path)
+            capture_speech_input(output_path, text, self._language, 'local_clone_api')
             return True
 
         except Exception as e:
@@ -2165,7 +2915,7 @@ class TTSEngine:
         duration = 0.0
         for waveform, index in zip(waveforms, indices):
             try:
-                path = os.path.join(output_dir, f"temp_batch_{index}.wav")
+                path = get_synthesis_batch_output_path(output_dir, index)
                 audio = self._concat_audio(waveform)
                 self._save_wav(audio, sample_rate, path)
                 result["completed"].append(index)
@@ -2176,6 +2926,20 @@ class TTSEngine:
             except Exception as error:
                 print(f"    Error saving chunk {index}: {error}")
                 result["failed"].append((index, str(error)))
+        return result, duration
+
+    def save_submitted_batch_waveforms(self, waveforms, indices, texts, sample_rate, output_dir,
+                                      category, log_saved=False):
+        result, duration = self.save_batch_waveforms(waveforms, indices, sample_rate, output_dir,
+                                                    log_saved=log_saved)
+        render = self.save_batch_waveforms
+        if (is_speech_input_capture_active() and len(waveforms) <= len(indices) == len(texts)
+                and isinstance(render, MethodType) and render.__func__ is _RAW_SAVE_BATCH_WAVEFORMS):
+            submitted = dict(zip(indices, texts))
+            for index in result['completed']:
+                if index in submitted:
+                    capture_speech_input(get_synthesis_batch_output_path(output_dir, index),
+                        submitted[index], self._language, 'local_' + category + '_batch_api')
         return result, duration
 
     @ensure_local_tts_serialized
@@ -2265,14 +3029,15 @@ class TTSEngine:
                 if measure_gpu_peak:
                     torch.cuda.reset_peak_memory_stats(self.get_memory_device(model))
                 t_start = time.time()
-                wavs_list, sr = model.generate_custom_voice(
-                    text=sb_texts,
-                    language=[self._language] * len(sb_texts),
-                    speaker=sb_speakers,
-                    instruct=sb_instructs,
-                    non_streaming_mode=True,
-                    max_new_tokens=self._max_new_tokens,
-                )
+                with measure_tts_stage_time("inference_decode"):
+                    wavs_list, sr = model.generate_custom_voice(
+                        text=sb_texts,
+                        language=[self._language] * len(sb_texts),
+                        speaker=sb_speakers,
+                        instruct=sb_instructs,
+                        non_streaming_mode=True,
+                        max_new_tokens=self._max_new_tokens,
+                    )
                 gen_time = time.time() - t_start
                 if measure_gpu_peak:
                     peak_gb = torch.cuda.max_memory_allocated(self.get_memory_device(model)) / 1e9
@@ -2284,8 +3049,8 @@ class TTSEngine:
                         results["failed"].append((idx, "Batch returned None"))
                     continue
 
-                saved, sb_audio_duration = self.save_batch_waveforms(
-                    wavs_list, sb_indices, sr, output_dir, log_saved=True)
+                saved, sb_audio_duration = self.save_submitted_batch_waveforms(
+                    wavs_list, sb_indices, sb_texts, sr, output_dir, 'custom', log_saved=True)
                 results["completed"].extend(saved["completed"])
                 results["failed"].extend(saved["failed"])
 
@@ -2389,13 +3154,14 @@ class TTSEngine:
                     if measure_gpu_peak:
                         torch.cuda.reset_peak_memory_stats(self.get_memory_device(model))
                     t_start = time.time()
-                    wavs_list, sr = model.generate_voice_clone(
-                        text=sb_texts,
-                        language=self._language,
-                        voice_clone_prompt=prompt,
-                        non_streaming_mode=True,
-                        max_new_tokens=self._max_new_tokens,
-                    )
+                    with measure_tts_stage_time("inference_decode"):
+                        wavs_list, sr = model.generate_voice_clone(
+                            text=sb_texts,
+                            language=self._language,
+                            voice_clone_prompt=prompt,
+                            non_streaming_mode=True,
+                            max_new_tokens=self._max_new_tokens,
+                        )
                     gen_time = time.time() - t_start
                     if measure_gpu_peak:
                         peak_gb = torch.cuda.max_memory_allocated(self.get_memory_device(model)) / 1e9
@@ -2407,8 +3173,8 @@ class TTSEngine:
                             results["failed"].append((idx, "Batch returned None"))
                         continue
 
-                    saved, sb_audio_duration = self.save_batch_waveforms(
-                        wavs_list, sb_indices, sr, output_dir)
+                    saved, sb_audio_duration = self.save_submitted_batch_waveforms(
+                        wavs_list, sb_indices, sb_texts, sr, output_dir, 'clone')
                     results["completed"].extend(saved["completed"])
                     results["failed"].extend(saved["failed"])
 
@@ -2564,14 +3330,15 @@ class TTSEngine:
                         gen_extra["instruct_ids"] = instruct_ids
 
                     t_start = time.time()
-                    wavs_list, sr = model.generate_voice_clone(
-                        text=sb_texts,
-                        language=self._language,
-                        voice_clone_prompt=prompt,
-                        non_streaming_mode=True,
-                        max_new_tokens=self._max_new_tokens,
-                        **gen_extra,
-                    )
+                    with measure_tts_stage_time("inference_decode"):
+                        wavs_list, sr = model.generate_voice_clone(
+                            text=sb_texts,
+                            language=self._language,
+                            voice_clone_prompt=prompt,
+                            non_streaming_mode=True,
+                            max_new_tokens=self._max_new_tokens,
+                            **gen_extra,
+                        )
                     gen_time = time.time() - t_start
 
                     if wavs_list is None:
@@ -2579,8 +3346,8 @@ class TTSEngine:
                             results["failed"].append((idx, "Batch returned None"))
                         continue
 
-                    saved, sb_audio_duration = self.save_batch_waveforms(
-                        wavs_list, sb_indices, sr, output_dir)
+                    saved, sb_audio_duration = self.save_submitted_batch_waveforms(
+                        wavs_list, sb_indices, sb_texts, sr, output_dir, 'lora')
                     results["completed"].extend(saved["completed"])
                     results["failed"].extend(saved["failed"])
 
@@ -2606,6 +3373,7 @@ class TTSEngine:
     # ── External backend methods ─────────────────────────────────
 
     @staticmethod
+    @measure_tts_stage("audio_validation_save")
     def _save_external_audio(source_path, output_path, cancelled=None):
         """Validate the copied response before replacing a published render."""
         from audio_validation import validate_generated_audio
@@ -2615,10 +3383,36 @@ class TTSEngine:
             validate_generated_audio(staging_path, "external TTS")
             if cancelled and cancelled.is_set():
                 return False
-            return publish_audio_output(staging_path, output_path, cancelled)
+            published = publish_audio_output(staging_path, output_path, cancelled)
+            if published:
+                record_tts_audio(output_path)
+            return published
         finally:
             if os.path.exists(staging_path):
                 os.remove(staging_path)
+
+    def _save_external_prediction(self, result, output_path, cancelled, text):
+        """Consume a provider result while its client is still serialized."""
+        try:
+            generated_audio_filepath = result[0]
+            if not generated_audio_filepath or not os.path.exists(generated_audio_filepath):
+                print(f"Error: No audio file generated for: '{text[:50]}...'")
+                apply_tts_failure("External TTS returned no audio file.", "invalid_audio",
+                                  "Check the TTS server logs before retrying.")
+                return False
+
+            if os.path.getsize(generated_audio_filepath) == 0:
+                print(f"Error: Generated audio file is empty for: '{text[:50]}...'")
+                apply_tts_failure("External TTS returned an empty audio file.", "invalid_audio",
+                                  "Check the TTS server logs before retrying.")
+                return False
+
+            if cancelled and cancelled.is_set():
+                return False
+            return self._save_external_audio(generated_audio_filepath, output_path, cancelled)
+        finally:
+            if isinstance(result, ExternalPrediction):
+                result.close()
 
     def _external_generate_custom(self, text, instruct_text, speaker, voice_config, output_path,
                                   endpoint=None, cancelled=None):
@@ -2644,32 +3438,21 @@ class TTSEngine:
             with lock:
                 if cancelled and cancelled.is_set():
                     return False
-                result = client.predict(
-                    text=text,
-                    language=self._language,
-                    speaker=voice,
-                    instruct=instruct,
-                    model_size="1.7B",
-                    seed=seed,
-                    api_name="/generate_custom_voice"
-                )
+                with measure_tts_stage_time("external_request"):
+                    result = client.predict(
+                        text=text,
+                        language=self._language,
+                        speaker=voice,
+                        instruct=instruct,
+                        model_size="1.7B",
+                        seed=seed,
+                        api_name="/generate_custom_voice"
+                    )
 
-            generated_audio_filepath = result[0]
-            if not generated_audio_filepath or not os.path.exists(generated_audio_filepath):
-                print(f"Error: No audio file generated for: '{text[:50]}...'")
-                apply_tts_failure("External TTS returned no audio file.", "invalid_audio",
-                                  "Check the TTS server logs before retrying.")
-                return False
-
-            if os.path.getsize(generated_audio_filepath) == 0:
-                print(f"Error: Generated audio file is empty for: '{text[:50]}...'")
-                apply_tts_failure("External TTS returned an empty audio file.", "invalid_audio",
-                                  "Check the TTS server logs before retrying.")
-                return False
-
-            if cancelled and cancelled.is_set():
-                return False
-            return self._save_external_audio(generated_audio_filepath, output_path, cancelled)
+                success = self._save_external_prediction(result, output_path, cancelled, text)
+                if success:
+                    capture_speech_input(output_path, text, self._language, 'external_custom_api')
+                return success
 
         except Exception as e:
             import traceback
@@ -2706,7 +3489,9 @@ class TTSEngine:
             if not os.path.isabs(ref_audio):
                 ref_audio = _resolve_asset_path(ref_audio)
 
-            if not os.path.exists(ref_audio):
+            try:
+                ref_audio, reference_bytes = get_adapter_asset_snapshot(ref_audio)
+            except FileNotFoundError:
                 print(f"Warning: Reference audio not found for '{speaker}': {ref_audio}")
                 apply_tts_failure(f"Reference audio not found for '{speaker}': {ref_audio}", "missing_asset",
                                   "Restore the clone reference audio before retrying.")
@@ -2714,38 +3499,35 @@ class TTSEngine:
 
             client, lock = self._external_endpoint(endpoint)
 
+            # Gradio uploads lazily. Keep captured bytes private until predict
+            # exits, so renaming or replacing the source cannot change input.
             with lock:
                 if cancelled and cancelled.is_set():
                     return False
-                result = client.predict(
-                    handle_file(ref_audio),
-                    ref_text,
-                    text,
-                    self._language,
-                    False,       # use_xvector_only
-                    "1.7B",
-                    200,         # max_chunk_chars
-                    0,           # chunk_gap
-                    seed,
-                    api_name="/generate_voice_clone"
-                )
+                with tempfile.TemporaryDirectory(prefix="external_clone_ref_") as directory:
+                    reference_path = os.path.join(directory, os.path.basename(ref_audio))
+                    with open(reference_path, "wb") as handle:
+                        handle.write(reference_bytes)
+                    if cancelled and cancelled.is_set():
+                        return False
+                    with measure_tts_stage_time("external_request"):
+                        result = client.predict(
+                            handle_file(reference_path),
+                            ref_text,
+                            text,
+                            self._language,
+                            False,       # use_xvector_only
+                            "1.7B",
+                            200,         # max_chunk_chars
+                            0,           # chunk_gap
+                            seed,
+                            api_name="/generate_voice_clone"
+                        )
 
-            generated_audio_filepath = result[0]
-            if not generated_audio_filepath or not os.path.exists(generated_audio_filepath):
-                print(f"Error: No audio file generated for: '{text[:50]}...'")
-                apply_tts_failure("External TTS returned no audio file.", "invalid_audio",
-                                  "Check the TTS server logs before retrying.")
-                return False
-
-            if os.path.getsize(generated_audio_filepath) == 0:
-                print(f"Error: Generated audio file is empty for: '{text[:50]}...'")
-                apply_tts_failure("External TTS returned an empty audio file.", "invalid_audio",
-                                  "Check the TTS server logs before retrying.")
-                return False
-
-            if cancelled and cancelled.is_set():
-                return False
-            return self._save_external_audio(generated_audio_filepath, output_path, cancelled)
+                success = self._save_external_prediction(result, output_path, cancelled, text)
+                if success:
+                    capture_speech_input(output_path, text, self._language, 'external_clone_api')
+                return success
 
         except Exception as e:
             import traceback
@@ -2760,15 +3542,17 @@ class TTSEngine:
 
         for chunk in chunks:
             idx = chunk["index"]
-            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            output_path = get_synthesis_batch_output_path(output_dir, idx)
             try:
-                success = self.generate_voice(
-                    chunk.get("text", ""),
-                    chunk.get("instruct", ""),
-                    chunk.get("speaker"),
-                    get_batch_voice_config(voice_config, chunk.get("speaker"), idx, batch_seed),
-                    output_path,
-                )
+                from synthesis_recovery_context import ensure_synthesis_recovery_batch_parent
+                with ensure_synthesis_recovery_batch_parent(chunk.get("uid")):
+                    success = self._dispatch_prepared_voice(
+                        chunk.get("text", ""),
+                        chunk.get("instruct", ""),
+                        chunk.get("speaker"),
+                        get_batch_voice_config(voice_config, chunk.get("speaker"), idx, batch_seed),
+                        output_path,
+                    )
                 if success:
                     results["completed"].append(idx)
                 else:
@@ -2783,10 +3567,10 @@ class TTSEngine:
         pool endpoint. Each worker serializes requests through its client
         lock, with deadlines measured from submission. Same result shape as local batches.
 
-        A call that times out is reported failed; its thread finishes in the
-        background (gradio_client has no cancel), which is why the executor is
-        not joined - waiting for it would hold the whole batch hostage."""
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+        One engine pool serves all calls. SDK I/O runs in cached owned clients
+        and is stopped at the request deadline; queued cancellation removes work
+        without adding application threads or publishing late audio."""
+        from concurrent.futures import TimeoutError as FutureTimeout
         import time
         results = {"completed": [], "failed": []}
         if not chunks:
@@ -2799,9 +3583,8 @@ class TTSEngine:
                 c.get("text", ""), c.get("speaker", ""), get_batch_voice_config(voice_config, c.get("speaker", ""), c["index"], batch_seed), out,
                 endpoint=ep, cancelled=cancelled),
         }[kind]
-        workers = self._external_parallel_workers * len(self._external_urls)
-        executor = ThreadPoolExecutor(max_workers=workers)
         futures = {}
+        capture_inputs = is_speech_input_capture_active()
 
         def remove_staging_audio(staging_path):
             try:
@@ -2814,57 +3597,79 @@ class TTSEngine:
                 return diagnostic
             return None
 
-        def render_to_staging(chunk, staging_path, endpoint, cancelled):
+        def render_to_staging(chunk, staging_path, endpoint, cancelled, deadline):
             try:
-                success = generate(chunk, staging_path, endpoint, cancelled)
-                return success, time.monotonic()
+                if cancelled.is_set() or time.monotonic() >= deadline:
+                    return False, time.monotonic(), None
+                with (ensure_external_request_control(deadline, cancelled),
+                      ensure_speech_input_capture(capture_inputs)):
+                    success = generate(chunk, staging_path, endpoint, cancelled)
+                    proof = get_captured_speech_input(staging_path) if success else None
+                    return success, time.monotonic(), proof
             finally:
                 if cancelled.is_set():
                     remove_staging_audio(staging_path)
 
-        for chunk in chunks:
-            idx = chunk["index"]
-            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
-            staging_path = f"{output_path}.pending.{uuid.uuid4().hex}"
-            cancelled = threading.Event()
-            deadline = time.monotonic() + self._external_timeout
-            future = executor.submit(render_to_staging, chunk, staging_path,
-                                     self._next_external_url(), cancelled)
-            futures[idx] = (future, cancelled, staging_path, output_path, deadline)
-        for idx, (future, cancelled, staging_path, output_path, deadline) in futures.items():
-            try:
-                success, finished_at = future.result(timeout=max(0, deadline - time.monotonic()))
-                if finished_at > deadline:
-                    raise FutureTimeout()
-            except FutureTimeout:
-                cancelled.set()
-                future.cancel()
-                cleanup_error = remove_staging_audio(staging_path)
-                message = f"external TTS timed out after {self._external_timeout}s"
-                if cleanup_error:
-                    message += f"; {cleanup_error}"
-                results["failed"].append((idx, message))
-                continue
-            except Exception as e:                              # noqa: BLE001
-                results["failed"].append((idx, str(e)))
-                continue
-            if success and os.path.exists(staging_path):
-                if publish_audio_output(staging_path, output_path, cancelled):
-                    results["completed"].append(idx)
-                else:
+        try:
+            for chunk in chunks:
+                idx = chunk["index"]
+                output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+                staging_path = f"{output_path}.pending.{uuid.uuid4().hex}"
+                cancelled = threading.Event()
+                deadline = time.monotonic() + self._external_timeout
+                future = self._submit_external(render_to_staging, cancelled, chunk, staging_path,
+                                               self._next_external_url(), cancelled, deadline)
+                futures[idx] = (future, cancelled, staging_path, output_path, deadline)
+            for idx, (future, cancelled, staging_path, output_path, deadline) in futures.items():
+                try:
+                    success, finished_at, speech_input = future.result(timeout=max(0, deadline - time.monotonic()))
+                    if finished_at > deadline:
+                        raise FutureTimeout()
+                except FutureTimeout:
+                    cancelled.set()
+                    future.cancel()
                     cleanup_error = remove_staging_audio(staging_path)
-                    message = "external TTS cancelled before publication"
+                    message = f"external TTS timed out after {self._external_timeout}s"
                     if cleanup_error:
                         message += f"; {cleanup_error}"
                     results["failed"].append((idx, message))
-            else:
-                results["failed"].append((idx, f"{kind} voice generation failed"))
-        executor.shutdown(wait=False)
+                    continue
+                except Exception as e:                              # noqa: BLE001
+                    cancelled.set()
+                    cleanup_error = remove_staging_audio(staging_path)
+                    message = str(e) or type(e).__name__
+                    if cleanup_error:
+                        message += f"; {cleanup_error}"
+                    results["failed"].append((idx, message))
+                    continue
+                if success and os.path.exists(staging_path):
+                    if publish_audio_output(staging_path, output_path, cancelled):
+                        promote_speech_input(speech_input, output_path)
+                        results["completed"].append(idx)
+                    else:
+                        cleanup_error = remove_staging_audio(staging_path)
+                        message = "external TTS cancelled before publication"
+                        if cleanup_error:
+                            message += f"; {cleanup_error}"
+                        results["failed"].append((idx, message))
+                else:
+                    cleanup_error = remove_staging_audio(staging_path)
+                    message = f"{kind} voice generation failed"
+                    if cleanup_error:
+                        message += f"; {cleanup_error}"
+                    results["failed"].append((idx, message))
+        except BaseException:
+            for future, cancelled, staging_path, _, _ in futures.values():
+                cancelled.set()
+                future.cancel()
+                remove_staging_audio(staging_path)
+            raise
         return results
 
     # ── Utility ──────────────────────────────────────────────────
 
     @staticmethod
+    @measure_tts_stage("audio_validation_save")
     def _save_wav(audio_array, sample_rate, output_path):
         """Save a numpy audio array as a WAV file, and verify it is one.
 
@@ -2889,10 +3694,82 @@ class TTSEngine:
         experiment harnesses ignored.
         """
         from audio_validation import save_generated_wav
-        return save_generated_wav(audio_array, sample_rate, output_path,
-                                  f"TTS generation to {os.path.basename(output_path)}")
+        result = save_generated_wav(audio_array, sample_rate, output_path,
+                                    f"TTS generation to {os.path.basename(output_path)}")
+        record_tts_audio(output_path)
+        return result
+
+
+# Immutable references qualify the native recovery serving path. A public or
+# internal override remains an ordinary temporary renderer.
+_RAW_RECOVERY_METHODS = {name: getattr(TTSEngine, name) for name in (
+    'generate_voice_result', 'generate_voice', '_dispatch_prepared_voice', '_generate_voice_prepared',
+    'generate_custom_voice', '_generate_custom_voice_prepared', '_render_synthesis_windows',
+    '_get_synthesis_window_plan', '_generate_prepared_batch_parent', '_local_generate_custom',
+    'get_voice_backend', 'get_synthesis_recovery_policy', 'get_model_settings', 'generate_batch',
+    '_init_local_custom', '_load_model', '_load_model_attempt', '_release_inactive_models_after_oom',
+    '_release_inactive_local_models', '_release_local_model_families', '_release_local_model_family',
+    '_clear_gpu_cache', '_resolve_local_model_path', '_resolve_device', '_save_wav')}
+_RAW_RECOVERY_MODEL_IDS = dict(TTSEngine._LOCAL_MODEL_IDS)
+_RAW_RECOVERY_ALLOCATION_FAILURE = device_utils.is_allocation_failure
+from gpu_stats import OOM_MARKERS as _RAW_RECOVERY_ALLOCATION_MARKERS
+_RAW_RECOVERY_FUNCTIONS = {name: globals()[name] for name in (
+    'get_custom_voice_request', 'anchored_instruct', 'get_memory_bounded_codec_decode')}
 
 
 # Capture native wrappers once so class/instance replacements take the fallback.
 _RAW_CUSTOM_VOICE = TTSEngine.generate_custom_voice
 _RAW_CLONE_VOICE = TTSEngine.generate_clone_voice
+_RAW_LORA_VOICE = TTSEngine.generate_lora_voice
+_RAW_DESIGN_VOICE = TTSEngine.generate_design_voice
+_RAW_ENSEMBLE_VOICE = TTSEngine.generate_ensemble_voice
+_RAW_GENERATE_VOICE = TTSEngine.generate_voice
+_RAW_SAVE_BATCH_WAVEFORMS = TTSEngine.save_batch_waveforms
+_RAW_BATCH_WORKSPACE_METHODS = {name: getattr(TTSEngine, name) for name in (
+    '_local_batch_custom', 'save_batch_waveforms', 'save_submitted_batch_waveforms')}
+
+# Per-category writer identities. Registration is refused when any participating
+# method was replaced, so an overridden provider keeps its old lifetime.
+_RAW_COMMON_SINGLE_METHODS = {name: getattr(TTSEngine, name) for name in (
+    'generate_voice_result', 'generate_voice', '_dispatch_prepared_voice',
+    '_generate_voice_prepared', '_render_synthesis_windows',
+    '_get_synthesis_window_plan', '_save_wav', 'get_voice_backend')}
+
+_RAW_CLONE_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
+    name: getattr(TTSEngine, name) for name in (
+        'generate_clone_voice', '_generate_clone_voice_prepared',
+        '_local_generate_clone', '_init_local_clone', '_get_clone_prompt')}}
+
+_RAW_DESIGN_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
+    name: getattr(TTSEngine, name) for name in (
+        'generate_design_voice', '_generate_design_voice_prepared',
+        'generate_voice_design', '_init_local_design')}}
+
+_RAW_LORA_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
+    name: getattr(TTSEngine, name) for name in (
+        'generate_lora_voice', '_generate_lora_voice_prepared',
+        '_ensure_local_lora_generation', '_init_local_lora', '_ensure_lora_prompt')}}
+
+_RAW_ENSEMBLE_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
+    name: getattr(TTSEngine, name) for name in (
+        'generate_ensemble_voice', '_generate_ensemble_voice_prepared',
+        '_get_ensemble_members')}}
+
+_RAW_CLONE_BATCH_METHODS = {name: getattr(TTSEngine, name) for name in (
+    '_local_batch_clone', 'save_batch_waveforms', 'save_submitted_batch_waveforms',
+    'generate_batch', '_generate_prepared_batch_parent')}
+_RAW_LORA_BATCH_METHODS = {name: getattr(TTSEngine, name) for name in (
+    '_local_batch_lora', 'save_batch_waveforms', 'save_submitted_batch_waveforms',
+    'generate_batch', '_generate_prepared_batch_parent')}
+_RAW_DESIGN_BATCH_METHODS = {name: getattr(TTSEngine, name) for name in (
+    'generate_batch', 'generate_design_voice', '_generate_design_voice_prepared',
+    '_generate_prepared_batch_parent')}
+_RAW_ENSEMBLE_BATCH_METHODS = {name: getattr(TTSEngine, name) for name in (
+    'generate_batch', '_sequential_ensemble', '_dispatch_prepared_voice',
+    'generate_ensemble_voice', '_generate_ensemble_voice_prepared',
+    '_generate_prepared_batch_parent')}
+_RAW_MIX_TO_UNISON = mix_to_unison
+
+
+from loaded_module_code import get_current_loaded_module_code_sha256 as _get_loaded_recovery_code
+_LOADED_RECOVERY_CODE_SHA256 = _get_loaded_recovery_code()

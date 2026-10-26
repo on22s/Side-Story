@@ -1,10 +1,21 @@
+        /** @type {string|null} */
         let currentReportFilename = null;
         let reportViewRequest = 0;
         let reportExplanationPending = false;
+        /** @type {string|null} */
         let reportExplanationRunId = null;
+        /** @type {Map<string, boolean>} */
         const reportExplanationEligibility = new Map();
 
         // ── Reports ────────────────────────────────────────────────────
+        // Icon and label per report type from /api/reports; anything unknown shows as a review.
+        /** @type {Record<string, [string, string]>} */
+        const REPORT_KINDS = {
+            batch: ['fa-layer-group', 'Batch review'],
+            pauses: ['fa-wave-square', 'Comma pauses'],
+            review: ['fa-file-lines', 'Review'],
+        };
+
         async function loadReports() {
             const listEl = document.getElementById('reports-list');
             if (!listEl) { return; }
@@ -23,8 +34,7 @@
                 reports.forEach(r => { reportExplanationEligibility.set(r.filename, r.can_explain === true); });
                 listEl.innerHTML = reports.map(r => {
                     const when = r.mtime ? new Date(r.mtime * 1000).toLocaleString() : '';
-                    const icon = r.type === 'batch' ? 'fa-layer-group' : 'fa-file-lines';
-                    const label = r.type === 'batch' ? 'Batch review' : 'Review';
+                    const [icon, label] = REPORT_KINDS[r.type] || REPORT_KINDS.review;
                     return `<a href="#" class="list-group-item list-group-item-action report-list-item" data-filename="${escapeHtml(r.filename)}" onclick="viewReport(this.dataset.filename); return false;">
                         <div><i class="fas ${icon} me-2"></i>${label}</div>
                         <div class="text-muted small">${escapeHtml(when)}</div>
@@ -77,6 +87,7 @@
             }
         }
 
+        /** @param {string} filename */
         async function viewReport(filename) {
             currentReportFilename = filename;
             const viewRequest = ++reportViewRequest;
@@ -169,6 +180,7 @@
         }
         loadBuildBadge();
 
+        /** @param {RunStatus} status */
         function runStatusBadge(status) {
             const cls = { running: 'bg-primary', completed: 'bg-success', failed: 'bg-danger',
                           interrupted: 'bg-warning text-dark', cancelled: 'bg-secondary' }[status] || 'bg-secondary';
@@ -188,7 +200,7 @@
                 listEl.innerHTML = runs.map(r => {
                     const started = r.started_at ? new Date(r.started_at).toLocaleString() : '';
                     const took = (r.started_at && r.finished_at)
-                        ? `${Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000)} s` : '';
+                        ? `${Math.round((new Date(r.finished_at).getTime() - new Date(r.started_at).getTime()) / 1000)} s` : '';
                     return `<div class="list-group-item small py-2">
                         <div class="d-flex justify-content-between align-items-center">
                             <div><strong>${escapeHtml(r.task || '')}</strong> ${runStatusBadge(r.status)}</div>
@@ -202,12 +214,15 @@
             }
         }
 
+        /** @type {string|null} */
         let _benchmarkPreflightId = null;
+        /** @type {string|null} */
         let _benchmarkPreflightManifest = null;
         let _benchmarkPreflightGeneration = 0;
         let _benchmarkStarting = false;
         let _benchmarkRunning = false;
         let _benchmarkRunRevision = 0;
+        /** @type {(()=>void)|null} */
         let _benchmarkPoll = null;
         let _benchmarkStatusPending = false;
 
@@ -234,9 +249,10 @@
         function readBenchmarkManifest() {
             const raw = document.getElementById('benchmark-manifest')?.value || '';
             try {
+                /** @type {unknown} */
                 const manifest = JSON.parse(raw);
                 if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) { throw new Error('manifest must be a JSON object'); }
-                return manifest;
+                return /** @type {Manifest} */ (manifest);
             } catch (e) {
                 showActionError('Manifest is not valid JSON', e, 'Keep the manifest text and correct the JSON syntax. It must be an object, then pass Preflight before Start.');
                 return null;

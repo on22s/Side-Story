@@ -1,17 +1,24 @@
 """Bounded PCM WAV writers; unsupported layouts retain the existing builder."""
+import copy
 import os
+from contextlib import contextmanager
 from pathlib import Path
-import tempfile
+import struct
 import wave
 
 from pydub import AudioSegment
 from pydub.audio_segment import audioop
 
+from audio_export_plan import get_combined_pcm_plan
 from audio_pcm_producer import (PCMProducer, is_bounded_pcm_supported,
-                                iter_raw_pcm, iter_default_silence_pcm)
+                                iter_raw_pcm, iter_default_silence_pcm, iter_converted_pcm,
+                                get_pcm_source_shape, get_pcm_source_byte_count, is_plain_pcm_source,
+                                get_promoted_pcm_shape, get_joined_pcm_shape, get_silence_pcm_shape,
+                                get_audio_duration_ms)
 
 from tts import (ensure_audio_export_active, get_pause_duration_ms,
                  trim_edge_silence)
+from export_staging import create_export_staging
 
 
 # Python wave and Pydub's plain-WAV exporter write a 44-byte PCM header:
@@ -28,41 +35,14 @@ def ensure_riff_pcm_size(data_bytes):
 
 def get_pcm_shape(segment):
     """Return (layout, frames) for ordinary PCM, without copying its data."""
-    if not isinstance(segment, AudioSegment):
-        return None
-    layout = (segment.channels, segment.frame_rate, segment.sample_width)
-    if (any(type(value) is not int or value <= 0 for value in layout)
-            or layout[2] not in (1, 2, 4)
-            or len(segment.raw_data) % (layout[0] * layout[2])):
-        return None
-    return layout, len(segment.raw_data) // (layout[0] * layout[2])
+    return get_pcm_source_shape(segment)
 
 
-def get_promoted_pcm_shape(shape, layout):
-    source, frames = shape
-    if source[0] != layout[0] and source[0] != 1:
-        # Pydub cannot promote a multichannel source to more channels.
-        return None
-    if frames and source[1] != layout[1]:
-        frames = ((frames - 1) * layout[1]) // source[1] + 1
-    return layout, frames
+def is_plain_pcm_sequence(segments):
+    """Whether every input has the ordinary native channel-conversion contract."""
+    return all(is_plain_pcm_source(segment) and get_pcm_shape(segment) is not None
+               for segment in segments)
 
-
-def get_joined_pcm_shape(left, right):
-    """Mirror builder/Pydub promotion, including fresh-state ratecv rounding."""
-    if left is None or right is None:
-        return None
-    layout = tuple(max(a, b) for a, b in zip(left[0], right[0]))
-    left = get_promoted_pcm_shape(left, layout)
-    right = get_promoted_pcm_shape(right, layout)
-    if left is None or right is None:
-        return None
-    return layout, left[1] + right[1]
-
-
-def get_silence_pcm_shape(duration_ms):
-    # AudioSegment.silent() defaults; zero/negative pauses produce empty PCM.
-    return (1, 11025, 2), max(0, int(11025 * (duration_ms / 1000.0)))
 
 
 def ensure_pcm_shape_fits_riff(shape):
@@ -71,8 +51,17 @@ def ensure_pcm_shape_fits_riff(shape):
         ensure_riff_pcm_size(frames * layout[0] * layout[2])
 
 
+def ensure_pcm_wav_header(layout, *, ordinary_pcm):
+    """Reject an unrepresentable native WAV header before assembling its PCM."""
+    if layout is not None and ordinary_pcm:
+        channels, rate, width = layout
+        # Match wave.Wave_write's unsigned field order without writing a file.
+        struct.pack('<HLLHH', channels, rate, channels * rate * width,
+                    channels * width, width * 8)
+
+
 def get_streamable_layout(segments):
-    if not segments or any(type(segment) is not AudioSegment for segment in segments):
+    if not segments or any(not is_plain_pcm_source(segment) for segment in segments):
         return None
     first = segments[0]
     layout = (first.channels, first.frame_rate, first.sample_width)
@@ -83,45 +72,70 @@ def get_streamable_layout(segments):
     if any(any(type(value) is not int for value in
                (segment.channels, segment.frame_rate, segment.sample_width))
            or (segment.channels, segment.frame_rate, segment.sample_width) != layout
-           or len(segment.raw_data) % segment.frame_width for segment in segments):
+           or get_pcm_source_byte_count(segment) % segment.frame_width for segment in segments):
         return None
     return layout
 
 
 def iter_silence_pcm(duration_ms, layout, cancel_check=None):
-    """Use Pydub's native ratecv, retaining its state across bounded zero blocks."""
+    """Retain silence rounding/state through the shared bounded converter."""
     channels, frame_rate, sample_width = layout
     frames = int(11025 * (duration_ms / 1000.0))
-    state = None
-    while frames > 0:
-        ensure_audio_export_active(cancel_check)
-        count = min(frames, 16384)
-        data = b'\0' * (count * channels * 2)
-        if frame_rate != 11025:
-            data, state = audioop.ratecv(data, 2, channels, 11025, frame_rate, state)
-        if sample_width != 2:
-            data = audioop.lin2lin(data, 2, sample_width)
-        yield data
-        frames -= count
+    if frames <= 0:
+        return
+
+    def iter_zeros():
+        remaining = frames
+        while remaining > 0:
+            ensure_audio_export_active(cancel_check)
+            count = min(remaining, 16384)
+            yield b'\0' * (count * channels * 2)
+            remaining -= count
+
+    check = lambda: ensure_audio_export_active(cancel_check)
+    yield from iter_converted_pcm(iter_zeros(), (channels, 11025, 2), layout, check)
 
 
 def iter_segment_pcm(segment, cancel_check=None):
-    data = memoryview(segment.raw_data)
-    for offset in range(0, len(data), 1024 * 1024):
+    for data in iter_raw_pcm(segment, 1024 * 1024):
         ensure_audio_export_active(cancel_check)
-        yield data[offset:offset + 1024 * 1024]
+        yield data
+
+
+def get_combined_source_plan(segments, speakers, pause_ms, same_speaker_pause_ms,
+                             pause_overrides, cancel_check):
+    """Plan sources that have already passed the assembler's trimming step."""
+    pauses = []
+    for index in range(1, len(segments)):
+        ensure_audio_export_active(cancel_check)
+        override = pause_overrides[index - 1] if pause_overrides else None
+        pauses.append(get_pause_duration_ms(
+            {'speaker': speakers[index - 1], 'pause_after': override},
+            {'speaker': speakers[index]}, pause_ms, same_speaker_pause_ms))
+    return get_combined_pcm_plan([get_pcm_shape(segment) for segment in segments], pauses,
+                                 lambda: ensure_audio_export_active(cancel_check))
+
+
+def _publish_pcm_plan(plan, layout, frames, callback):
+    if callback is None:
+        return
+    if (plan is None or (plan['channels'], plan['frame_rate'], plan['sample_width']) != layout
+            or plan['frames'] != frames):
+        raise ValueError('Assembled PCM disagrees with its source-frame plan.')
+    callback(copy.deepcopy(plan))
 
 
 def write_combined_wav(segments, speakers, path, pause_ms, same_speaker_pause_ms,
-                       pause_overrides=None, cancel_check=None):
+                       pause_overrides=None, cancel_check=None, source_store=None,
+                       pcm_plan_callback=None):
     """Return rounded duration, or None without writing for a legacy fallback."""
     ensure_audio_export_active(cancel_check)
-    layout = get_streamable_layout(segments)
-    bounded_supported = is_bounded_pcm_supported(segments)
     if len(speakers) != len(segments):
-        return None
-    segments = [trim_edge_silence(segment, cancel_check=cancel_check)
-                for segment in segments]
+        raise ValueError('Audio segments and speakers must have the same length.')
+    layout = get_streamable_layout(segments)
+    ordinary_pcm = is_plain_pcm_sequence(segments)
+    segments = save_trimmed_pcm_sources(segments, cancel_check, source_store)
+    ordinary_pcm = ordinary_pcm and is_plain_pcm_sequence(segments)
     shape = get_pcm_shape(segments[0]) if segments else None
     frames = shape[1] if shape is not None else 0
     for index, segment in enumerate(segments[1:], 1):
@@ -132,25 +146,34 @@ def write_combined_wav(segments, speakers, path, pause_ms, same_speaker_pause_ms
             {'speaker': speakers[index]}, pause_ms, same_speaker_pause_ms)
         if layout is not None:
             frames += (get_silence_frame_count(duration, layout[1])
-                       + len(segment.raw_data) // (layout[0] * layout[2]))
+                       + get_pcm_source_byte_count(segment) // (layout[0] * layout[2]))
         else:
             # Legacy combine appends (gap + segment), then promotes the prefix.
             piece = get_joined_pcm_shape(get_silence_pcm_shape(duration),
-                                         get_pcm_shape(segment))
-            shape = get_joined_pcm_shape(shape, piece)
+                                         get_pcm_shape(segment),
+                                         reject_impossible_channels=ordinary_pcm)
+            shape = get_joined_pcm_shape(shape, piece,
+                                         reject_impossible_channels=ordinary_pcm)
     ensure_audio_export_active(cancel_check)
-    ensure_pcm_shape_fits_riff((layout, frames) if layout is not None else shape)
+    final_shape = (layout, frames) if layout is not None else shape
+    ensure_pcm_shape_fits_riff(final_shape)
+    ensure_pcm_wav_header(final_shape[0] if final_shape is not None else None,
+                          ordinary_pcm=ordinary_pcm)
     if layout is None:
-        if bounded_supported and is_bounded_pcm_supported(segments) and shape is not None:
+        if ordinary_pcm and shape is not None and is_bounded_pcm_supported(segments, shape[0]):
             return write_spooled_combined_wav(segments, speakers, path, pause_ms,
                                              same_speaker_pause_ms, pause_overrides,
-                                             cancel_check)
+                                             cancel_check, pcm_plan_callback=pcm_plan_callback)
         return None
+    plan = (get_combined_source_plan(segments, speakers, pause_ms, same_speaker_pause_ms,
+                                      pause_overrides, cancel_check)
+            if pcm_plan_callback is not None else None)
     destination = Path(path)
     channels, frame_rate, sample_width = layout
     frames = 0
-    with tempfile.TemporaryDirectory(prefix='.stream-wave-', dir=destination.parent) as directory:
-        staged = Path(directory) / 'output.wav'
+    with create_export_staging(destination.parent, 'wave') as staging:
+        directory = staging.path
+        staged = directory / 'output.wav'
         stream = wave.open(str(staged), 'wb')
         try:
             stream.setnchannels(channels)
@@ -178,6 +201,7 @@ def write_combined_wav(segments, speakers, path, pause_ms, same_speaker_pause_ms
             raise
         else:
             stream.close()
+        _publish_pcm_plan(plan, layout, frames, pcm_plan_callback)
         ensure_audio_export_active(cancel_check)
         os.replace(staged, destination)
     return round(1000 * (frames / frame_rate))
@@ -185,14 +209,44 @@ def write_combined_wav(segments, speakers, path, pause_ms, same_speaker_pause_ms
 
 def iter_track_pieces(entries, total_duration_ms, cancel_check=None):
     cursor = 0
+    shape = get_pcm_shape(AudioSegment.empty())
     for segment, start_ms in entries:
         ensure_audio_export_active(cancel_check)
         if start_ms > cursor:
-            yield 'silence', start_ms - cursor
+            gap = start_ms - cursor
+            yield 'silence', gap
+            shape = get_joined_pcm_shape(shape, get_silence_pcm_shape(gap))
         yield 'audio', segment
-        cursor = start_ms + len(segment)
+        shape = get_joined_pcm_shape(shape, get_pcm_shape(segment))
+        cursor = (1000 * shape[1] / shape[0][1]
+                  if shape is not None else start_ms + get_audio_duration_ms(segment))
     if total_duration_ms > cursor:
         yield 'silence', total_duration_ms - cursor
+
+
+def iter_track_frame_pieces(entries, total_duration_ms, layout, cancel_check=None):
+    """Align uniform PCM directly to the shared frame clock, without ratecv gaps."""
+    cursor = 0
+    for segment, start_ms in entries:
+        ensure_audio_export_active(cancel_check)
+        start = round(start_ms * layout[1] / 1000)
+        if start > cursor:
+            yield 'silence', start - cursor
+            cursor = start
+        yield 'audio', segment
+        cursor += get_pcm_source_byte_count(segment) // (layout[0] * layout[2])
+    remaining = round(total_duration_ms * layout[1] / 1000) - cursor
+    if remaining > 0:
+        yield 'silence', remaining
+
+
+def iter_frame_silence_pcm(frames, layout, cancel_check=None):
+    frame_width = layout[0] * layout[2]
+    while frames > 0:
+        ensure_audio_export_active(cancel_check)
+        count = min(frames, 16384)
+        yield b'\0' * (count * frame_width)
+        frames -= count
 
 
 def get_silence_frame_count(duration_ms, frame_rate):
@@ -201,10 +255,11 @@ def get_silence_frame_count(duration_ms, frame_rate):
     return 0 if frames <= 0 else ((frames - 1) * frame_rate) // 11025 + 1
 
 
-def get_track_wav_plan(entries, total_duration_ms, cancel_check=None):
-    """Count silence frames without generating or resampling their PCM."""
+def get_track_pcm_plan(entries, total_duration_ms, cancel_check=None, *, legacy=False):
+    """Plan the selected direct-frame or legacy-piece track without reading PCM."""
     ensure_audio_export_active(cancel_check)
-    layout = get_streamable_layout([segment for segment, _ in entries])
+    layout = None if legacy else get_streamable_layout([segment for segment, _ in entries])
+    ordinary_pcm = is_plain_pcm_sequence(segment for segment, _ in entries)
     if layout is None:
         # Preserve valid legacy layouts, but count their final promoted PCM
         # before the caller allocates silence or joins the complete track.
@@ -212,21 +267,32 @@ def get_track_wav_plan(entries, total_duration_ms, cancel_check=None):
         for kind, value in iter_track_pieces(entries, total_duration_ms, cancel_check):
             piece = (get_pcm_shape(value) if kind == 'audio'
                      else get_silence_pcm_shape(value))
-            shape = get_joined_pcm_shape(shape, piece)
+            shape = get_joined_pcm_shape(shape, piece,
+                                         reject_impossible_channels=ordinary_pcm)
         ensure_audio_export_active(cancel_check)
         ensure_pcm_shape_fits_riff(shape)
-        if shape is not None and is_bounded_pcm_supported([segment for segment, _ in entries]):
-            return shape
-        return None
+        ensure_pcm_wav_header(shape[0] if shape is not None else None,
+                              ordinary_pcm=ordinary_pcm)
+        return shape
     data_bytes = 0
-    for kind, value in iter_track_pieces(entries, total_duration_ms, cancel_check):
+    for kind, value in iter_track_frame_pieces(entries, total_duration_ms, layout, cancel_check):
         if kind == 'audio':
-            data_bytes += len(value.raw_data)
+            data_bytes += get_pcm_source_byte_count(value)
         else:
-            data_bytes += get_silence_frame_count(value, layout[1]) * layout[0] * layout[2]
+            data_bytes += value * layout[0] * layout[2]
     ensure_audio_export_active(cancel_check)
     ensure_riff_pcm_size(data_bytes)
+    ensure_pcm_wav_header(layout, ordinary_pcm=ordinary_pcm)
     return layout, data_bytes // (layout[0] * layout[2])
+
+
+def get_track_wav_plan(entries, total_duration_ms, cancel_check=None):
+    """Keep transport eligibility separate from the independent PCM geometry."""
+    plan = get_track_pcm_plan(entries, total_duration_ms, cancel_check)
+    if plan is not None and is_bounded_pcm_supported(
+            [segment for segment, _ in entries], plan[0]):
+        return plan
+    return None
 
 
 def write_track_wav(stream, entries, total_duration_ms, plan, cancel_check=None,
@@ -253,9 +319,9 @@ def write_track_wav(stream, entries, total_duration_ms, plan, cancel_check=None,
         wav.setframerate(frame_rate)
         wav.setsampwidth(sample_width)
         wav.setnframes(frames)
-        for kind, value in iter_track_pieces(entries, total_duration_ms, cancel_check):
+        for kind, value in iter_track_frame_pieces(entries, total_duration_ms, layout, cancel_check):
             pieces = (iter_segment_pcm(value, cancel_check) if kind == 'audio'
-                      else iter_silence_pcm(value, layout, cancel_check))
+                      else iter_frame_silence_pcm(value, layout, cancel_check))
             for data in pieces:
                 ensure_audio_export_active(cancel_check)
                 wav.writeframesraw(data)
@@ -298,29 +364,96 @@ def write_producer_wav(stream, producer, plan, cancel_check=None):
     ensure_audio_export_active(cancel_check)
 
 
-def write_spooled_combined_wav(segments, speakers, path, pause_ms,
-                              same_speaker_pause_ms, pause_overrides, cancel_check):
-    destination = Path(path)
+@contextmanager
+def ensure_combined_pcm(segments, speakers, directory, pause_ms,
+                        same_speaker_pause_ms, pause_overrides, cancel_check):
+    """Produce the existing (gap + segment) promotion order, one block per write."""
     check = lambda: ensure_audio_export_active(cancel_check)
-    with tempfile.TemporaryDirectory(prefix='.stream-wave-', dir=destination.parent) as directory:
-        staged = Path(directory) / 'output.wav'
-        with PCMProducer(directory, check) as producer:
-            first = segments[0]
-            producer.append(iter_raw_pcm(first), (first.channels, first.frame_rate, first.sample_width))
-            for index, segment in enumerate(segments[1:], 1):
-                override = pause_overrides[index - 1] if pause_overrides else None
-                duration = get_pause_duration_ms(
-                    {'speaker': speakers[index - 1], 'pause_after': override},
-                    {'speaker': speakers[index]}, pause_ms, same_speaker_pause_ms)
-                # Preserve (gap + segment) before promoting the accumulated prefix.
-                with PCMProducer(directory, check) as piece:
-                    piece.append(iter_default_silence_pcm(duration), (1, 11025, 2))
-                    piece.append(iter_raw_pcm(segment), (segment.channels, segment.frame_rate, segment.sample_width))
-                    producer.append(piece.read(), piece.layout)
+    with PCMProducer(directory, check) as producer:
+        first = segments[0]
+        producer.append(iter_raw_pcm(first), (first.channels, first.frame_rate, first.sample_width))
+        for index, segment in enumerate(segments[1:], 1):
+            override = pause_overrides[index - 1] if pause_overrides else None
+            duration = get_pause_duration_ms(
+                {'speaker': speakers[index - 1], 'pause_after': override},
+                {'speaker': speakers[index]}, pause_ms, same_speaker_pause_ms)
+            with PCMProducer(directory, check) as piece:
+                piece.append(iter_default_silence_pcm(duration), (1, 11025, 2))
+                piece.append(iter_raw_pcm(segment), (segment.channels, segment.frame_rate, segment.sample_width))
+                producer.append(piece.read(), piece.layout)
+        yield producer
+
+
+def write_spooled_combined_wav(segments, speakers, path, pause_ms,
+                              same_speaker_pause_ms, pause_overrides, cancel_check,
+                              pcm_plan_callback=None):
+    destination = Path(path)
+    plan = (get_combined_source_plan(segments, speakers, pause_ms, same_speaker_pause_ms,
+                                      pause_overrides, cancel_check)
+            if pcm_plan_callback is not None else None)
+    with create_export_staging(destination.parent, 'wave') as staging:
+        directory = staging.path
+        staged = directory / 'output.wav'
+        with ensure_combined_pcm(segments, speakers, directory, pause_ms,
+                                 same_speaker_pause_ms, pause_overrides, cancel_check) as producer:
             frames = producer.get_frame_count()
             layout = producer.layout
             write_producer_wav(str(staged), producer, (layout, frames), cancel_check)
-        # All spool/WAV handles must close successfully before publication.
-        check()
+        _publish_pcm_plan(plan, layout, frames, pcm_plan_callback)
+        ensure_audio_export_active(cancel_check)
         os.replace(staged, destination)
     return round(1000 * (frames / layout[1]))
+
+
+def save_trimmed_pcm_sources(segments, cancel_check, source_store):
+    trimmed_sources = []
+    for segment in segments:
+        ensure_audio_export_active(cancel_check)
+        loaded = source_store.load_segment(segment) if source_store is not None else segment
+        trimmed = trim_edge_silence(loaded, cancel_check=cancel_check)
+        trimmed_sources.append(source_store.save_segment(trimmed) if source_store is not None else trimmed)
+        del segment, loaded, trimmed
+    return trimmed_sources
+
+
+def write_combined_pcm(segments, speakers, path, pause_ms, same_speaker_pause_ms,
+                       pause_overrides=None, cancel_check=None, source_store=None,
+                       pcm_plan_callback=None):
+    """Write a bounded raw PCM stage or return None for the native compatibility path."""
+    ensure_audio_export_active(cancel_check)
+    if len(speakers) != len(segments):
+        raise ValueError('Audio segments and speakers must have the same length.')
+    if not is_bounded_pcm_supported(segments):
+        return None
+    segments = save_trimmed_pcm_sources(segments, cancel_check, source_store)
+    if not is_bounded_pcm_supported(segments):
+        return None
+    plan = (get_combined_source_plan(segments, speakers, pause_ms, same_speaker_pause_ms,
+                                      pause_overrides, cancel_check)
+            if pcm_plan_callback is not None else None)
+    destination = Path(path)
+    with create_export_staging(destination.parent, 'pcm') as staging:
+        directory = staging.path
+        staged = directory / 'output.pcm'
+        with ensure_combined_pcm(segments, speakers, directory, pause_ms,
+                                 same_speaker_pause_ms, pause_overrides, cancel_check) as producer:
+            layout, frames = producer.layout, producer.get_frame_count()
+            ensure_pcm_wav_header(layout, ordinary_pcm=True)
+            stream = staged.open('wb')
+            try:
+                for data in producer.read():
+                    ensure_audio_export_active(cancel_check)
+                    if stream.write(data) != len(data):
+                        raise OSError('Incomplete PCM staging write')
+            except BaseException:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+                raise
+            else:
+                stream.close()
+        _publish_pcm_plan(plan, layout, frames, pcm_plan_callback)
+        ensure_audio_export_active(cancel_check)
+        os.replace(staged, destination)
+    return {'sample_width': layout[2], 'frame_rate': layout[1], 'channels': layout[0], 'frames': frames}

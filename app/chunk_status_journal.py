@@ -1,5 +1,6 @@
 """Durable per-UID render updates; callers hold the chunks-file lock."""
 import copy
+from collections import Counter
 import hashlib
 import json
 import logging
@@ -9,13 +10,24 @@ import uuid
 
 from adapter_publication import save_adapter_publication_bytes, sync_adapter_directory
 from utils import file_lock
+from take_retention import (KEY as RETAINED_TAKE_KEY, get_retained_audio_paths,
+    get_retained_take_bytes, MAX_BOOK_RECEIPT_BYTES)
 
-FIELDS = frozenset(("status", "audio_path", "audio_revision", "error", "drift"))
+FIELDS = frozenset(("status", "audio_path", "audio_revision", "take", "error", "drift", "pronunciation_receipt", "synthesis_receipt",
+                    "speech_verification", "speech_verification_failure", "speech_verification_recheck", "take_publication", RETAINED_TAKE_KEY))
 logger = logging.getLogger(__name__)
 
 
 def get_chunk_status_journal_path(chunks_path):
     return os.fspath(chunks_path) + ".status.jsonl"
+
+
+def get_chunk_audio_key(chunks_path, audio_path):
+    """Compare persisted audio aliases using their actual filesystem target."""
+    if not isinstance(audio_path, str) or not audio_path:
+        return None
+    return os.path.normcase(os.path.realpath(os.path.join(
+        os.path.dirname(os.path.abspath(chunks_path)), audio_path)))
 
 
 def remove_chunk_snapshot(chunks_path):
@@ -49,6 +61,7 @@ class ChunkStatusJournal:
         self._versions = None
         self._rows = None
         self._by_uid = None
+        self._audio_references = None
         self._sequence = 0
         self._prefix = None
         self._compacted = False
@@ -62,6 +75,20 @@ class ChunkStatusJournal:
             return
         self._versions = None
         raw = self.snapshot.read_bytes()
+        journal = self.path.read_bytes() if self.path.exists() else None
+        self._load_bytes(raw, journal)
+        if versions != self._get_versions():
+            self._rows = None
+            raise ValueError("Chunk status files changed while reading")
+        self._versions = versions
+
+    def get_rows_from_bytes(self, snapshot_bytes, journal_bytes):
+        """Replay caller-bound immutable file snapshots using the native rules."""
+        self._versions = None
+        self._load_bytes(snapshot_bytes, journal_bytes)
+        return copy.deepcopy(self._rows)
+
+    def _load_bytes(self, raw, journal):
         rows = json.loads(raw)
         if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
                 or any(not isinstance(row.get("uid"), str) or not row["uid"] for row in rows)
@@ -69,8 +96,7 @@ class ChunkStatusJournal:
             raise ValueError("Chunk status snapshot requires unique nonempty UIDs")
         by_uid = {row["uid"]: row for row in rows}
         sequence, prefix, compacted = 0, None, False
-        if self.path.exists():
-            journal = self.path.read_bytes()
+        if journal is not None:
             complete = journal[:journal.rfind(b"\n") + 1]
             lines = complete.splitlines()
             if not lines:
@@ -111,11 +137,14 @@ class ChunkStatusJournal:
                 logger.warning("Ignoring uncommitted trailing chunk status bytes: %s", self.path)
                 if prefix is None:
                     prefix = complete
-        if versions != self._get_versions():
-            raise ValueError("Chunk status files changed while reading")
         self._rows, self._by_uid = rows, by_uid
+        self._audio_references = Counter(
+            get_chunk_audio_key(self.snapshot, path) for row in rows
+            for path in (row.get("audio_path"), *get_retained_audio_paths(row)))
+        self._retained_bytes = sum(get_retained_take_bytes(row) for row in rows)
+        if self._retained_bytes > MAX_BOOK_RECEIPT_BYTES:
+            raise ValueError('Retained prior-take metadata exceeds its book limit.')
         self._sequence, self._prefix, self._compacted = sequence, prefix, compacted
-        self._versions = versions
 
     def get_rows(self):
         self._load()
@@ -124,6 +153,10 @@ class ChunkStatusJournal:
     def get_row(self, uid):
         self._load()
         return copy.deepcopy(self._by_uid.get(uid))
+
+    def is_audio_path_referenced(self, audio_path):
+        self._load()
+        return self._audio_references[get_chunk_audio_key(self.snapshot, audio_path)] > 0
 
     def ensure_writable(self):
         """Preserve a torn journal before repairing; finish published compaction."""
@@ -162,7 +195,21 @@ class ChunkStatusJournal:
         if (uid not in self._by_uid or not isinstance(changes, dict) or not changes
                 or not set(changes).issubset(FIELDS)):
             raise ValueError("Invalid chunk status update")
+        previous = self._by_uid[uid]
+        updated = {**previous, **copy.deepcopy(changes)}
+        retained_bytes = self._retained_bytes - get_retained_take_bytes(previous) + get_retained_take_bytes(updated)
+        if retained_bytes > MAX_BOOK_RECEIPT_BYTES:
+            raise ValueError('Prior-take metadata is full. Disable automatic history before editing more lines.')
+        before_paths = (previous.get('audio_path'), *get_retained_audio_paths(previous))
+        after_paths = (updated.get('audio_path'), *get_retained_audio_paths(updated))
         self._append({"type": "update", "uid": uid, "changes": changes})
+        for path in before_paths:
+            key = get_chunk_audio_key(self.snapshot, path)
+            self._audio_references[key] -= 1
+            if not self._audio_references[key]: del self._audio_references[key]
+        for path in after_paths:
+            self._audio_references[get_chunk_audio_key(self.snapshot, path)] += 1
+        self._retained_bytes = retained_bytes
         self._by_uid[uid].update(copy.deepcopy(changes))
         return copy.deepcopy(self._by_uid[uid])
 

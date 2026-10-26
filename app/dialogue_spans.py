@@ -22,8 +22,8 @@ The convention is detected per book rather than assumed, because assuming one
 is how a book with 6,925 quote marks in its source was recorded here as "a book
 that does not mark dialogue".
 """
-from bisect import bisect_left
-from collections import deque
+from bisect import bisect_left, bisect_right
+from collections import Counter, deque
 import logging
 import re
 
@@ -43,6 +43,22 @@ INTERIOR_DASH_TURN = re.compile(
 LABEL_LINE = re.compile(r"^[ \t]*([A-Z][A-Z .'’-]{1,30}):[ \t]+(\S.*)$", re.M)
 
 
+# The longest distinct-mark pair allowed to cross a blank line.
+MAX_CROSSING_CHARS = 2000
+
+# Speech marked in a way the book does not mainly use. A line found inside one
+# lies outside the detected quotes without being narration: ‘single’ quotes in
+# a “double”-quote book, a dash-opened line, «guillemets», or an opening mark
+# the author never closed. `’` is also the apostrophe, so a ‘…’ pair closes
+# only at a `’` that no letter follows ("‘I don’t know,’ she said").
+OTHER_PAIRED = [
+    re.compile(r"‘((?:[^‘’\n]|’(?=\w))+)’(?!\w)"),
+    re.compile(r"«([^«»]+)»"),
+    re.compile(r"‹([^‹›\n]+)›"),
+]
+UNCLOSED_OPENERS = {"“": "”", "「": "」", "『": "』"}
+
+
 def _paired_spans(text):
     spans = []
     for opener, closer in PAIRED:
@@ -59,7 +75,7 @@ def _paired_spans(text):
                     continue
                 positions.append(position)
             for start, end in zip(positions[0::2], positions[1::2]):
-                if not 1 < end - start < 2000:
+                if end - start <= 1:
                     continue
                 # A SPAN MAY NOT CROSS A PARAGRAPH BREAK. Straight quotes are
                 # identical opening and closing, so they can only be paired by
@@ -75,10 +91,35 @@ def _paired_spans(text):
                     continue
                 spans.append((start + 1, end))
         else:
-            for match in re.finditer(
-                    re.escape(opener) + r"([^" + re.escape(closer) + r"]{1,2000})"
-                    + re.escape(closer), text):
-                spans.append((match.start(1), match.end(1)))
+            # Pair each opener with the next closer. A pair longer than
+            # MAX_CROSSING_CHARS is kept only inside one paragraph: a long
+            # speech is fine (#1533, 9 of Dorian Gray's speeches run past
+            # 2,000 characters), a long span across a blank line is a
+            # mis-pair swallowing narration. Shorter pairs keep the old rule,
+            # so a multi-paragraph speech closed within the limit still counts.
+            # A rejected pair advances to the next opener, as the old bounded
+            # regex did.
+            position = text.find(opener)
+            end, paragraph_break = 0, None
+            while position != -1:
+                # Rejected openers can share one distant closer/paragraph break.
+                # Cache both forward searches and inspect offsets without copying
+                # every remaining interior substring.
+                if end <= position:
+                    end = text.find(closer, position + 1)
+                if end == -1:
+                    break
+                length = end - position - 1
+                crosses_paragraph = False
+                if length > MAX_CROSSING_CHARS:
+                    if paragraph_break is None or 0 <= paragraph_break < position + 1:
+                        paragraph_break = text.find("\n\n", position + 1)
+                    crosses_paragraph = 0 <= paragraph_break < end - 1
+                if length and not crosses_paragraph:
+                    spans.append((position + 1, end))
+                    position = text.find(opener, end + 1)
+                else:
+                    position = text.find(opener, position + 1)
     return spans
 
 
@@ -123,6 +164,49 @@ def spoken_spans(text, convention=None):
         else:
             merged.append((start, end))
     return merged
+
+
+def get_other_speech_spans(text, convention):
+    """-> (start, end) offsets of speech marked other than by `convention`.
+
+    Only used to stop calling such a line narration; it is never marked spoken
+    from this, because which convention carries a book's dialogue is counted
+    by detect_convention, not guessed here. Spans do not cross a blank line.
+    """
+    if convention is None:
+        return []
+    spans = [(m.start(1), m.end(1)) for pattern in OTHER_PAIRED for m in pattern.finditer(text)
+             if "\n\n" not in m.group(1)]
+    if convention != "dash_lines":
+        spans += [(m.start(1), m.end(1)) for m in DASH_LINE.finditer(text)]
+    if convention != "paired_quotes":
+        spans += _paired_spans(text)
+    else:
+        # An opening mark with no partner: speech to the end of its paragraph.
+        # Membership is one bisect into the merged pairs, not a scan of all of
+        # them per opener, which made well-formed books quadratic.
+        merged = []
+        for begin, stop in sorted(_paired_spans(text)):
+            if merged and begin <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+            else:
+                merged.append((begin, stop))
+        starts = [begin for begin, _stop in merged]
+        for opener, closer in UNCLOSED_OPENERS.items():
+            paragraph_break = None
+            for match in re.finditer(re.escape(opener), text):
+                start = match.start() + 1
+                if text.startswith(closer, start):  # “” is closed, just empty
+                    continue
+                index = bisect_right(starts, start) - 1
+                if index >= 0 and merged[index][1] >= start:
+                    continue
+                # Openers are ordered: reuse this paragraph's end, including
+                # the absence of another break, as _paired_spans does.
+                if paragraph_break is None or 0 <= paragraph_break < start:
+                    paragraph_break = text.find("\n\n", start)
+                spans.append((start, len(text) if paragraph_break == -1 else paragraph_break))
+    return spans
 
 
 def get_interior_dash_ambiguities(text, convention):
@@ -211,6 +295,7 @@ def mark_entries(entries, source_text, convention=None, speaker_names=None):
     convention = detect_convention(source_text) if convention is None else convention
     spans = spoken_spans(source_text, convention)
     ambiguities = get_interior_dash_ambiguities(source_text, convention)
+    other_speech = get_other_speech_spans(source_text, convention)
     entries = list(entries)
     if speaker_names is None:
         speaker_names = {str(entry.get('speaker') or '') for entry in entries}
@@ -258,6 +343,11 @@ def mark_entries(entries, source_text, convention=None, speaker_names=None):
                 if not overlap and any(start < end and where < stop
                                        for start, stop in ambiguities):
                     row["dialogue_ambiguity"] = "interior_dash_turn"
+                elif not overlap and any(start < end and where < stop
+                                         for start, stop in other_speech):
+                    # Outside the main quotes, inside speech marked another
+                    # way: not established narration, so never voiced as it.
+                    row["dialogue_ambiguity"] = "other_convention"
                 else:
                     row["spoken"] = bool(overlap)
                 row["source_span"] = [where, end]
@@ -279,14 +369,17 @@ def apply_dialogue_map(entries, source_text, speaker_names=None):
     convention = detect_convention(source_text)
     if not convention:
         return {"entries": list(entries), "convention": None,
-                "located": 0, "spoken": 0, "ambiguous": 0, "speaker_changes": []}
+                "located": 0, "spoken": 0, "ambiguous": 0, "speaker_changes": [],
+                "narration_changes": []}
     mapped = mark_entries(entries, source_text, convention, speaker_names=speaker_names)
     mapped, speaker_changes = apply_source_speakers(mapped)
+    mapped, narration_changes = apply_source_narration(mapped)
     ambiguous = sum(1 for entry in mapped if entry.get("dialogue_ambiguity"))
     if ambiguous:
+        kinds = Counter(entry["dialogue_ambiguity"] for entry in mapped if entry.get("dialogue_ambiguity"))
         logging.getLogger(__name__).warning(
-            "Dialogue map: %s interior dash entries need review; spoken status is unestablished.",
-            ambiguous)
+            "Dialogue map: %s entries need review (%s); spoken status is unestablished.",
+            ambiguous, ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items())))
     return {
         "entries": mapped,
         "convention": convention,
@@ -294,7 +387,36 @@ def apply_dialogue_map(entries, source_text, speaker_names=None):
         "spoken": sum(1 for entry in mapped if entry.get("spoken")),
         "ambiguous": ambiguous,
         "speaker_changes": speaker_changes,
+        "narration_changes": narration_changes,
     }
+
+
+def get_source_narration(entry):
+    """True/False when the source says narration/speech, None when unestablished."""
+    spoken = entry.get("spoken")
+    return not spoken if type(spoken) is bool else None
+
+
+def apply_source_narration(entries):
+    """-> (entries, changes) with source-confirmed narration voiced by NARRATOR.
+
+    #1534: a model-split chunk can type narration as speech and the naming pass
+    then gives it a character. Where the source's quote marks place the line
+    outside every quotation, that is the fact and the character is the guess,
+    so the speaker becomes NARRATOR and the change is recorded. A printed
+    speaker label is the source too, so a line carrying one is left alone.
+    """
+    updated, changes = [], []
+    for entry in entries:
+        row = dict(entry)
+        current = str(row.get("speaker") or "")
+        if (get_source_narration(row) is True and current != "NARRATOR"
+                and not row.get("source_speaker")):
+            row["speaker"] = "NARRATOR"
+            changes.append({"type": "source_narration", "before": current,
+                            "after": "NARRATOR"})
+        updated.append(row)
+    return updated, changes
 
 # A NAME IMMEDIATELY BEFORE THE QUOTE. Web-novel transcripts often print the
 # speaker and then the line:

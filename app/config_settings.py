@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 from typing import Annotated, Dict, List, Literal, Optional, Union, get_args, get_origin
 from types import UnionType
 
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
+from pydantic import AfterValidator, BaseModel, Field, JsonValue, TypeAdapter, ValidationError
+from export_limits import MAX_PAUSE_MS
+from synthesis_settings import get_synthesis_window_settings, get_synthesis_recovery_settings
+from speech_verification_settings import get_speech_verification_settings
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,10 @@ class LLMConfig(BaseModel):
     base_url: str
     api_key: str
     model_name: str
+    # Blank limits inherit existing global settings / detected context.
+    context_length: Optional[int] = Field(default=None, gt=0, strict=True)
+    max_input_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
+    max_output_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
     provider_headers: Dict[str, str] = Field(default_factory=dict)
     provider_extra_body: Dict[str, JsonValue] = Field(default_factory=dict)
     # Does this LLM run on this machine's GPU? None = decide from the
@@ -81,6 +88,13 @@ class TTSConfig(BaseModel):
     language: str = "English"
     parallel_workers: int = Field(default=2, ge=1)
     batch_seed: Optional[int] = None
+    # Opt-in: single-chunk renders derive their seed from text + take.
+    reproducible_takes: bool = False
+    # Explicit per-backend internal windows; no automatic budget or seam changes.
+    synthesis_windows: Annotated[Dict[str, JsonValue], AfterValidator(get_synthesis_window_settings)] = Field(default_factory=get_synthesis_window_settings)
+    # Execution policy only; excluded from voice/acoustic identity.
+    synthesis_recovery: Annotated[Dict[str, JsonValue], AfterValidator(get_synthesis_recovery_settings)] = Field(default_factory=get_synthesis_recovery_settings)
+    speech_verification: Annotated[Dict[str, JsonValue], AfterValidator(get_speech_verification_settings)] = Field(default_factory=get_speech_verification_settings)
     compile_codec: bool = False
     max_new_tokens: int = Field(default=2048, ge=256, le=8192)
     sub_batch_enabled: bool = True
@@ -88,8 +102,12 @@ class TTSConfig(BaseModel):
     sub_batch_ratio: float = Field(default=5.0, ge=1)
     sub_batch_max_items: int = Field(default=0, ge=0)
     batch_group_by_type: bool = False
-    pause_between_speakers_ms: int = Field(default=500, ge=0)
-    pause_same_speaker_ms: int = Field(default=250, ge=0)
+    pause_between_speakers_ms: int = Field(default=500, ge=0, le=MAX_PAUSE_MS)
+    pause_same_speaker_ms: int = Field(default=250, ge=0, le=MAX_PAUSE_MS)
+    # Voice Design text length (#1232): the persona line a voice is designed
+    # from, and later cloned against, is chosen inside this character range.
+    design_text_min_chars: int = Field(default=12, ge=1, le=500)
+    design_text_max_chars: int = Field(default=500, ge=1, le=500)
 
 
 PromptVariant = Literal[
@@ -107,6 +125,8 @@ PromptVariant = Literal[
 # "Quote-aware", llm as "Model only". The stored values must not change without a migration.
 SegmentationMode = Literal["auto", "quotes", "lexical", "llm"]
 Pass1Format = Literal["ordinary", "compact"]
+# Pass 3 delivery direction (#1258); must match pass_quality.DELIVERY_DIRECTIONS.
+DeliveryDirection = Literal["off", "gaps", "directed", "action_only"]
 
 
 class ThreePassModelProfile(BaseModel):
@@ -122,6 +142,7 @@ class ThreePassModelProfile(BaseModel):
 class GenerationConfig(BaseModel):
     chunk_size: int = Field(default=3000, ge=500)
     max_tokens: int = Field(default=4096, ge=256)
+    max_input_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
     temperature: float = Field(default=0.6, ge=0, le=2)
     top_p: float = Field(default=0.8, ge=0, le=1)
     top_k: int = Field(default=0, ge=0, le=200)
@@ -157,6 +178,9 @@ class GenerationConfig(BaseModel):
     three_pass_segmentation: SegmentationMode = "auto"
     # #744 opt-in: compact labels with per-chunk fallback to full text
     three_pass_pass1_format: Pass1Format = "ordinary"
+    # #1258 opt-in: reply-aware Pass 3 notes and performed gaps. "off" until the
+    # blind listen and drift gate pick a mode; no UI control yet.
+    three_pass_delivery_direction: DeliveryDirection = "off"
     three_pass_quoted_must_be_spoken: bool = True
     three_pass_unquoted_must_be_narrator: bool = True
     # Pass 2: when a batch runs out of retries and the ONLY failures are a

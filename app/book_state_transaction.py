@@ -1,5 +1,9 @@
 """Recoverable publication of the active book's flat-file artifact set."""
 import contextlib
+import asyncio
+from contextvars import ContextVar
+from dataclasses import dataclass
+import threading
 import hashlib
 import json
 from editor_poll_snapshot import get_snapshot_digest
@@ -14,6 +18,41 @@ from adapter_publication import (get_adapter_bundle_sha256, sync_adapter_directo
                                  save_adapter_publication_bytes)
 
 JOURNAL = '.active_book_transaction.json'
+_held_books = ContextVar('held_book_state_scopes', default=())
+
+
+def _get_book_scope_owner():
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return os.getpid(), threading.get_ident(), task
+
+
+@dataclass
+class _BookScope:
+    root: str
+    owner: tuple
+    active: bool = True
+
+
+def is_book_state_admitted(data_dir):
+    root = os.path.normcase(os.path.realpath(data_dir))
+    owner = _get_book_scope_owner()
+    return any(scope.active and scope.root == root and scope.owner == owner
+               for scope in _held_books.get())
+
+
+@contextlib.contextmanager
+def reuse_book_state(data_dir, timeout=10):
+    """Reuse only this live task/thread/process's actual kernel admission."""
+    if is_book_state_admitted(data_dir):
+        if (Path(data_dir) / JOURNAL).exists():
+            raise ValueError('Book transaction must finish before reusing its state.')
+        yield
+    else:
+        with ensure_book_state(data_dir, timeout=timeout):
+            yield
 
 
 def _get_path(root, relative):
@@ -110,11 +149,20 @@ def recover_book_state_locked(data_dir):
 
 
 @contextlib.contextmanager
-def ensure_book_state(data_dir, timeout=10):
+def ensure_book_state(data_dir, timeout=10, *, recover=True):
     """Serialize book operations and recover pending switches before use."""
     with file_lock(str(Path(data_dir) / JOURNAL), timeout=timeout):
-        recover_book_state_locked(data_dir)
-        yield
+        if recover:
+            recover_book_state_locked(data_dir)
+        elif (Path(data_dir) / JOURNAL).exists():
+            raise ValueError("Book recovery is required before previewing saved state")
+        scope = _BookScope(os.path.normcase(os.path.realpath(data_dir)), _get_book_scope_owner())
+        token = _held_books.set((*_held_books.get(), scope))
+        try:
+            yield
+        finally:
+            scope.active = False
+            _held_books.reset(token)
 
 
 def apply_book_state_locked(data_dir, replacements, removals):
@@ -205,9 +253,16 @@ def require_book_snapshot_current(data_dir, snapshot):
 
 
 
-def apply_book_input_selection(data_dir, input_path, book_id, *, timeout=10):
-    """Select an input under the same book-operation contract as load/jobs."""
+def apply_book_input_selection(data_dir, input_path, book_id, *, timeout=10, before_publication=None):
+    """Select an input under the same book-operation contract as load/jobs.
+
+    `before_publication` notifies an upload owner after validation and before
+    the first write. After that handoff, errors may have an unknown commit
+    outcome; uploaded source/provenance must remain available for recovery.
+    """
     from utils import safe_load_json
+    from sound_design_registry import ACTIVE_CUES
+    from sound_design_renditions import ACTIVE_RENDITIONS, capture_sound_design_companions
     with ensure_book_state(data_dir, timeout=timeout):
         state_path = Path(data_dir) / "state.json"
         with file_lock(str(state_path)):
@@ -216,9 +271,29 @@ def apply_book_input_selection(data_dir, input_path, book_id, *, timeout=10):
                 raise ValueError("Book state must be an object")
             if input_path is None:
                 input_path = state.get("input_file_path")
+            previous_book_id = state.get('active_book_id')
             state.update(input_file_path=input_path, active_book_id=book_id,
                          book_generation=uuid.uuid4().hex)
-            save_adapter_publication_bytes(str(state_path), json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8"))
+            state.pop('_source_scope', None)
+            state.pop('_source_scope_exports', None)
+            from speech_numbers import STATE_KEY as date_order_key
+            state.pop(date_order_key, None)        # a new book starts on auto (#1546)
+            # An explicit input selection starts a new book context. Validate
+            # optional old metadata before clearing it in the same transaction;
+            # malformed/recoverable files must not disappear on a failed switch.
+            companions = [name for name in (ACTIVE_CUES, ACTIVE_RENDITIONS)
+                          if os.path.lexists(Path(data_dir) / name)]
+            if companions:
+                capture_sound_design_companions(data_dir, ACTIVE_CUES, ACTIVE_RENDITIONS,
+                                                expected_book_id=previous_book_id)
+            if before_publication is not None:
+                before_publication()
+            if companions:
+                apply_book_state_locked(data_dir, {
+                    'state.json': json.dumps(state, ensure_ascii=False, indent=2).encode('utf-8')},
+                    companions)
+            else:
+                save_adapter_publication_bytes(str(state_path), json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
 

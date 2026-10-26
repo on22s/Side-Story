@@ -1,40 +1,229 @@
 """Disk-backed PCM assembly preserving Pydub's incremental promotion order."""
 import array
+import math
+import sys
 import tempfile
+from dataclasses import dataclass
 
 from pydub import AudioSegment
 from pydub.audio_segment import audioop
 
 
 PCM_BLOCK_BYTES = 65536
+MAX_PCM_BLOCK_BYTES = 131072
 
 
-def is_bounded_pcm_supported(segments):
-    """Keep custom segment behavior and irreducibly large conversions on legacy."""
-    if not segments or any(type(segment) is not AudioSegment for segment in segments):
+def get_pcm_block_bytes(layout):
+    """Keep two ordinary PCM frames within a finite per-layout allowance."""
+    channels, _, width = layout
+    if (type(channels) is not int or channels <= 0
+            or type(width) is not int or width <= 0):
+        return None
+    frame = channels * width
+    if frame * 2 <= PCM_BLOCK_BYTES:
+        return PCM_BLOCK_BYTES
+    # A plain WAV's block-align field holds at most 65535 bytes per frame.
+    # Wide native layouts need two such frames, never a duration-sized buffer.
+    if width in (1, 2, 4) and frame <= 65535 and frame * 2 <= MAX_PCM_BLOCK_BYTES:
+        return frame * 2
+    return None
+
+
+@dataclass(frozen=True)
+class PCMSourceRange:
+    store: object
+    offset: int
+    byte_count: int
+    channels: int
+    frame_rate: int
+    sample_width: int
+    duration_ms: int
+
+    @property
+    def frame_width(self):
+        return self.channels * self.sample_width
+
+    def __len__(self):
+        return self.duration_ms
+
+
+def get_pcm_source_byte_count(segment):
+    return segment.byte_count if type(segment) is PCMSourceRange else len(segment.raw_data)
+
+
+def get_pcm_source_shape(segment):
+    """Normalize real segments and owned snapshots without materializing PCM."""
+    if not isinstance(segment, AudioSegment) and type(segment) is not PCMSourceRange:
+        return None
+    layout = (segment.channels, segment.frame_rate, segment.sample_width)
+    if (any(type(value) is not int or value <= 0 for value in layout)
+            or layout[2] not in (1, 2, 4)
+            or get_pcm_source_byte_count(segment) % (layout[0] * layout[2])):
+        return None
+    return layout, get_pcm_source_byte_count(segment) // (layout[0] * layout[2])
+
+
+def get_promoted_pcm_shape(shape, layout, *, reject_impossible_channels=False):
+    source, frames = shape
+    if source[0] != layout[0] and source[0] != 1:
+        # Pydub cannot promote a multichannel source to more channels.
+        if reject_impossible_channels:
+            raise ValueError('AudioSegment.set_channels only supports mono-to-multi channel and multi-to-mono channel conversion')
+        return None
+    if frames and source[1] != layout[1]:
+        frames = ((frames - 1) * layout[1]) // source[1] + 1
+    return layout, frames
+
+
+def get_joined_pcm_shape(left, right, *, reject_impossible_channels=False):
+    """Mirror builder/Pydub promotion, including fresh-state ratecv rounding."""
+    if left is None or right is None:
+        return None
+    layout = tuple(max(a, b) for a, b in zip(left[0], right[0]))
+    left = get_promoted_pcm_shape(left, layout, reject_impossible_channels=reject_impossible_channels)
+    right = get_promoted_pcm_shape(right, layout, reject_impossible_channels=reject_impossible_channels)
+    if left is None or right is None:
+        return None
+    return layout, left[1] + right[1]
+
+
+def get_silence_pcm_shape(duration_ms):
+    # AudioSegment.silent() defaults; zero/negative pauses produce empty PCM.
+    return (1, 11025, 2), max(0, int(11025 * (duration_ms / 1000.0)))
+
+
+
+def get_audio_duration_ms(segment):
+    """Return PCM duration without rounding each clip to a millisecond."""
+    shape = get_pcm_source_shape(segment)
+    return 1000 * shape[1] / shape[0][1] if shape is not None else len(segment)
+
+
+def is_plain_pcm_source(segment):
+    return type(segment) in (AudioSegment, PCMSourceRange)
+
+
+class PCMSourceStore:
+    """Own raw/trimmed source snapshots for one export, beside its destination."""
+    def __init__(self, directory, cancel_check):
+        self.cancel_check = cancel_check
+        self.stream = tempfile.TemporaryFile(prefix='.source-pcm-', dir=directory)
+        self.byte_count = 0
+
+    def save_segment(self, segment):
+        # Actual custom objects and unknown/very wide layouts keep their old
+        # behavior. This is a staging decision, never a new format rejection.
+        if type(segment) is not AudioSegment:
+            return segment
+        shape = get_pcm_source_shape(segment)
+        block_bytes = get_pcm_block_bytes(shape[0]) if shape is not None else None
+        if (block_bytes is None
+                or segment.frame_width != segment.channels * segment.sample_width):
+            return segment
+        view = memoryview(segment.raw_data)
+        try:
+            step = block_bytes // segment.frame_width * segment.frame_width
+            pieces = (view[start:start + step] for start in range(0, len(view), step))
+            source = self.save_pcm(pieces, *shape)
+            # Retain Pydub's exact duration metadata contract for existing callers.
+            return PCMSourceRange(self, source.offset, source.byte_count, *shape[0], len(segment))
+        finally:
+            view.release()
+
+    def save_pcm(self, pieces, layout, frames):
+        """Snapshot bounded frame-aligned blocks with an exact declared size."""
+        allowance = get_pcm_block_bytes(layout)
+        if (allowance is None or type(frames) is not int or frames < 0
+                or any(type(value) is not int or value <= 0 for value in layout)
+                or layout[2] not in (1, 2, 4)):
+            raise ValueError('Invalid PCM source shape')
+        self.cancel_check()
+        offset = self.byte_count
+        self.stream.seek(offset)
+        frame_width = layout[0] * layout[2]
+        expected = frames * frame_width
+        size = 0
+        for block in pieces:
+            self.cancel_check()
+            if len(block) > allowance or len(block) % frame_width or size + len(block) > expected:
+                raise ValueError('Source PCM blocks disagree with the declared bounded shape')
+            # Lazy pieces (or cancellation checks) may read this same store.
+            self.stream.seek(offset + size)
+            if self.stream.write(block) != len(block):
+                raise OSError('Incomplete source PCM snapshot write')
+            size += len(block)
+        if size != expected:
+            raise ValueError('Source PCM snapshot has missing frames')
+        self.stream.truncate(offset + size)
+        self.byte_count += size
+        duration_ms = round(1000 * frames / layout[1])
+        return PCMSourceRange(self, offset, size, *layout, duration_ms)
+
+    def iter_pcm(self, source, block_bytes):
+        if (source.store is not self or self.stream is None
+                or source.offset < 0 or source.byte_count < 0
+                or source.offset + source.byte_count > self.byte_count):
+            raise ValueError('Source PCM snapshot is unavailable')
+        step = max(source.frame_width, block_bytes // source.frame_width * source.frame_width)
+        position = 0
+        while position < source.byte_count:
+            self.cancel_check()
+            count = min(step, source.byte_count - position)
+            self.stream.seek(source.offset + position)
+            block = self.stream.read(count)
+            if len(block) != count:
+                raise OSError('Incomplete source PCM snapshot read')
+            yield block
+            position += count
+
+    def load_segment(self, source):
+        if type(source) is not PCMSourceRange:
+            return source
+        data = b''.join(self.iter_pcm(source, PCM_BLOCK_BYTES))
+        return AudioSegment(data=data, channels=source.channels,
+                            frame_rate=source.frame_rate, sample_width=source.sample_width)
+
+    def close(self):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        if kind is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except BaseException:
+                pass
         return False
-    layouts = [(segment.channels, segment.frame_rate, segment.sample_width)
-               for segment in segments]
-    if any(any(type(value) is not int or value <= 0 for value in layout)
-           or layout[2] not in (1, 2, 4)
-           or len(segment.raw_data) % (layout[0] * layout[2])
-           for segment, layout in zip(segments, layouts)):
+
+
+def is_bounded_pcm_supported(segments, layout=None):
+    """Keep custom segment behavior and very wide frames on legacy."""
+    if not segments or any(not is_plain_pcm_source(segment) or get_pcm_source_shape(segment) is None
+                           for segment in segments):
         return False
-    # Silence uses mono/11025 Hz/16-bit. Include every possible prefix layout;
-    # a single native resampling step must also fit the block allowance.
-    channels = max(layout[0] for layout in layouts)
-    rate = max(11025, *(layout[1] for layout in layouts))
-    width = max(2, *(layout[2] for layout in layouts))
-    source_rate = min([11025] + [layout[1] for segment, layout in zip(segments, layouts)
-                                  if segment.raw_data])
-    ratio = max(1, (rate + source_rate - 1) // source_rate)
-    return channels * width * (ratio + 1) <= PCM_BLOCK_BYTES
+    if layout is None:
+        layouts = [(segment.channels, segment.frame_rate, segment.sample_width)
+                   for segment in segments]
+        # Legacy callers may not have the final shape, including default silence.
+        layout = (max(item[0] for item in layouts), max(item[1] for item in layouts),
+                  max(2, *(item[2] for item in layouts)))
+    return get_pcm_block_bytes(layout) is not None
 
 
-def iter_raw_pcm(segment):
+
+def iter_raw_pcm(segment, block_bytes=PCM_BLOCK_BYTES):
+    if type(segment) is PCMSourceRange:
+        yield from segment.store.iter_pcm(segment, block_bytes)
+        return
     view = memoryview(segment.raw_data)
     frame = segment.channels * segment.sample_width
-    step = max(frame, PCM_BLOCK_BYTES // frame * frame)
+    step = max(frame, block_bytes // frame * frame)
     for start in range(0, len(view), step):
         yield view[start:start + step]
 
@@ -47,36 +236,122 @@ def iter_default_silence_pcm(duration_ms):
         remaining -= count
 
 
+def _iter_python_ratecv(pieces, width, channels, inrate, outrate,
+                        cancel_check, block_bytes):
+    """Mirror audioop's default filter without allocating a rate-sized buffer.
+
+    The termination value exposes the native-shaped state for differential tests.
+    Each logical conversion starts fresh; input pieces do not reset the state.
+    """
+    common = math.gcd(inrate, outrate)
+    input_step, output_step = inrate // common, outrate // common
+    phase = -output_step
+    previous = [0] * channels
+    current = [0] * channels
+    initialized = False
+    shift = (4 - width) * 8
+    frame_bytes = channels * width
+    output = bytearray()
+    for piece in pieces:
+        if not piece:
+            continue
+        if not initialized:
+            # Validate C arguments at the original first nonempty rate call.
+            # Empty input requests no native output buffer, even at huge ratios.
+            _, state = audioop.ratecv(b'', width, channels, inrate, outrate, None)
+            phase, pairs = state
+            previous = [pair[0] for pair in pairs]
+            current = [pair[1] for pair in pairs]
+            initialized = True
+        if len(piece) % frame_bytes:
+            raise audioop.error('not a whole number of frames')
+        for offset in range(0, len(piece), frame_bytes):
+            cancel_check()
+            previous, current = current, previous
+            for channel in range(channels):
+                start = offset + channel * width
+                current[channel] = int.from_bytes(
+                    piece[start:start + width], sys.byteorder, signed=True) << shift
+            phase += output_step
+            while phase >= 0:
+                cancel_check()
+                if len(output) + frame_bytes > block_bytes:
+                    yield bytes(output)
+                    output.clear()
+                for old, new in zip(previous, current):
+                    # C truncates the double interpolation before shifting width.
+                    value = int((float(old) * float(phase)
+                                 + float(new) * float(output_step - phase))
+                                / float(output_step))
+                    output.extend((value >> shift).to_bytes(
+                        width, sys.byteorder, signed=True))
+                phase -= input_step
+    if output:
+        cancel_check()
+        yield bytes(output)
+    return phase, tuple(zip(previous, current))
+
+
 def iter_converted_pcm(pieces, source, target, cancel_check):
     channels, rate, width = source
     target_channels, target_rate, target_width = target
     if target_channels != channels and channels != 1:
         raise ValueError('AudioSegment.set_channels only supports mono-to-multi channel and multi-to-mono channel conversion')
+    frame_bytes = target_channels * max(width, target_width)
+    allowance = get_pcm_block_bytes((target_channels, target_rate, max(width, target_width)))
+    block_bytes = allowance if allowance is not None else PCM_BLOCK_BYTES
     ratio = max(1, (target_rate + rate - 1) // rate)
-    frames = PCM_BLOCK_BYTES // (target_channels * max(width, target_width) * (ratio + 1))
-    step = max(1, frames) * channels * width
-    state = None
-    for piece in pieces:
-        if len(piece) and frames < 1:
-            raise ValueError('PCM conversion exceeds the bounded block allowance')
-        for start in range(0, len(piece), step):
-            cancel_check()
-            data = piece[start:start + step]
-            if target_channels != channels:
-                if target_channels == 2:
-                    data = audioop.tostereo(data, width, 1, 1)
-                else:
-                    samples = array.array({1: 'b', 2: 'h', 4: 'i'}[width])
-                    samples.frombytes(data)
-                    output = array.array(samples.typecode, [0]) * (len(samples) * target_channels)
-                    for channel in range(target_channels):
-                        output[channel::target_channels] = samples
-                    data = output.tobytes()
-            if rate != target_rate and len(data):
-                data, state = audioop.ratecv(data, width, target_channels, rate, target_rate, state)
-            if width != target_width:
-                data = audioop.lin2lin(data, width, target_width)
-            yield data
+    frames = max(1, block_bytes // (frame_bytes * (ratio + 1)))
+    native_ratecv = True
+    if rate != target_rate:
+        common = math.gcd(rate, target_rate)
+        input_step, output_step = rate // common, target_rate // common
+        # audioop allocates ceil(N / input_step) * output_step frames,
+        # even when its actual output is only a single sample.
+        groups = (block_bytes // (output_step * frame_bytes)
+                  if input_step > 0 and output_step > 0 else 0)
+        native_ratecv = groups > 0
+        if native_ratecv:
+            frames = min(frames, groups * input_step)
+    step = frames * channels * width
+
+    def iter_promoted():
+        for piece in pieces:
+            if len(piece) and allowance is None:
+                raise ValueError('PCM conversion exceeds the bounded block allowance')
+            for start in range(0, len(piece), step):
+                cancel_check()
+                data = piece[start:start + step]
+                if target_channels != channels:
+                    if target_channels == 2:
+                        data = audioop.tostereo(data, width, 1, 1)
+                    else:
+                        samples = array.array({1: 'b', 2: 'h', 4: 'i'}[width])
+                        samples.frombytes(data)
+                        output = array.array(samples.typecode, [0]) * (len(samples) * target_channels)
+                        for channel in range(target_channels):
+                            output[channel::target_channels] = samples
+                        data = output.tobytes()
+                yield data
+
+    promoted = iter_promoted()
+    if not native_ratecv:
+        output_bytes = block_bytes // frame_bytes * target_channels * width
+        converted = _iter_python_ratecv(promoted, width, target_channels,
+                                        rate, target_rate, cancel_check, output_bytes)
+    else:
+        def iter_native():
+            state = None
+            for data in promoted:
+                if rate != target_rate and len(data):
+                    data, state = audioop.ratecv(
+                        data, width, target_channels, rate, target_rate, state)
+                yield data
+        converted = iter_native()
+    for data in converted:
+        if width != target_width:
+            data = audioop.lin2lin(data, width, target_width)
+        yield data
 
 
 class PCMProducer:
@@ -96,7 +371,8 @@ class PCMProducer:
             replacement = tempfile.TemporaryFile(dir=self.directory)
             try:
                 for data in iter_converted_pcm(self.read(), self.layout, target, self.cancel_check):
-                    replacement.write(data)
+                    if replacement.write(data) != len(data):
+                        raise OSError('Incomplete promoted PCM write')
             except BaseException:
                 try:
                     replacement.close()
@@ -113,7 +389,8 @@ class PCMProducer:
                 raise
             self.stream = replacement
         for data in iter_converted_pcm(pieces, layout, target, self.cancel_check):
-            self.stream.write(data)
+            if self.stream.write(data) != len(data):
+                raise OSError('Incomplete producer PCM write')
         self.layout = target
         self.byte_count = self.stream.tell()
 
@@ -123,9 +400,11 @@ class PCMProducer:
     def read(self):
         self.stream.seek(0)
         frame = self.layout[0] * self.layout[2]
+        allowance = get_pcm_block_bytes(self.layout)
+        block_bytes = allowance if allowance is not None else PCM_BLOCK_BYTES
         while True:
             self.cancel_check()
-            data = self.stream.read(max(frame, PCM_BLOCK_BYTES // frame * frame))
+            data = self.stream.read(max(frame, block_bytes // frame * frame))
             if not data:
                 break
             yield data

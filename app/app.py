@@ -27,6 +27,7 @@ from run_history import mark_interrupted_runs
 import evaluation_reviews
 from book_state_transaction import ensure_book_state
 from task_ownership import ensure_startup_recovery
+from export_staging import reclaim_export_staging
 
 
 # Setup logging
@@ -56,6 +57,12 @@ async def lifespan(_app):
     with ensure_startup_recovery(DATA_DIR) as recovery_allowed:
         if recovery_allowed:
             with ensure_book_state(DATA_DIR):
+                from synthesis_workspace import apply_abandoned_synthesis_workspace_cleanup
+                apply_abandoned_synthesis_workspace_cleanup(DATA_DIR)
+                recovery = reclaim_export_staging((DATA_DIR, os.path.join(DATA_DIR, 'chapter_exports'),
+                                                   os.path.join(DATA_DIR, 'voicelines')))
+                for error in recovery['errors']:
+                    logger.warning('Export staging recovery: %s', error)
                 reset_stuck_chunks()
             interrupted = mark_interrupted_runs(RUN_HISTORY_DIR)
             if interrupted:
@@ -163,6 +170,10 @@ from routers.speaker_review import router as speaker_review_router
 
 app.include_router(speaker_review_router)
 
+from routers.character_roster import router as character_roster_router
+
+app.include_router(character_roster_router)
+
 from routers.voices import router as voices_router
 
 app.include_router(voices_router)
@@ -171,9 +182,19 @@ from routers.editor import router as editor_router
 
 app.include_router(editor_router)
 
+from routers.sound_design import router as sound_design_router
+app.include_router(sound_design_router)
+
+from routers.pronunciation_panel import router as pronunciation_router
+app.include_router(pronunciation_router)
+
 from routers.scripts_library import router as scripts_library_router
 
 app.include_router(scripts_library_router)
+
+from routers.project_scope import router as project_scope_router
+
+app.include_router(project_scope_router)
 
 from routers.voice_library import router as voice_library_router
 

@@ -14,12 +14,13 @@ import threading
 import time
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 from openai import OpenAI
+from manual_llm_context import (ManualRequestCancelled, apply_manual_cancellation,
+                                ensure_manual_request_active)
 
 
 _ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
-
 
 def is_api_key_reference(configured):
     """True for `env:NAME` / `${NAME}` - a pointer, not a secret, so the setup
@@ -127,29 +128,6 @@ def merge_provider_extra_body(provider_extra_body, request_extra_body):
     return merged
 
 
-OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens")
-
-
-def get_bounded_output_request(kwargs):
-    """Return request options whose body overrides cannot raise the typed output budget.
-
-    The OpenAI SDK applies extra_body after typed parameters, so a provider or
-    request body carrying max_tokens/max_completion_tokens would otherwise
-    replace the task's checked limit on the wire. Body values may lower it.
-    """
-    body = dict(kwargs.get("extra_body") or {})
-    body_budgets = [body.pop(key) for key in OUTPUT_LIMIT_KEYS if key in body]
-    typed_key = next((key for key in OUTPUT_LIMIT_KEYS if kwargs.get(key) is not None), None)
-    if not body_budgets or typed_key is None:
-        return kwargs
-    for value in body_budgets:
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError("Request output budget must be a positive integer")
-    result = dict(kwargs, extra_body=body)
-    result[typed_key] = min([kwargs[typed_key]] + body_budgets)
-    return result
-
-
 def classify_llm_error(error):
     """Classify a failed provider request for retry policy and recovery logs."""
     status_code = getattr(error, "status_code", None)
@@ -158,10 +136,8 @@ def classify_llm_error(error):
     body = getattr(error, "body", None)
     details = body.get("error", body) if isinstance(body, dict) else {}
     code = details.get("code") if isinstance(details, dict) else None
-    refusal_tokens = {"content_policy_violation", "content_filter", "safety_violation", "refusal"}
-    if isinstance(details, dict) and any(
-            isinstance(details.get(field), str) and details[field] in refusal_tokens
-            for field in ("code", "type")):
+    refusal_codes = ("content_filter", "content_policy_violation", "safety_violation", "refusal")
+    if isinstance(details, dict) and any(details.get(field) in refusal_codes for field in ("code", "type")):
         return {"category": "content_policy", "status_code": status_code, "retryable": False}
     if status_code in (400, 413) and (code == "context_length_exceeded" or any(
             token in lowered for token in ("context window exceeded", "maximum context length",
@@ -172,9 +148,15 @@ def classify_llm_error(error):
     if isinstance(status_code, int) and 500 <= status_code <= 599:
         return {"category": "server_error", "status_code": status_code, "retryable": True}
     error_type = type(error).__name__.lower()
-    if "timeout" in error_type or "timeout" in lowered:
+    if "timeout" in error_type:
         return {"category": "timeout", "status_code": status_code, "retryable": True}
-    if "connection" in error_type or "connect" in lowered:
+    if "connection" in error_type:
+        return {"category": "connection_error", "status_code": status_code, "retryable": True}
+    if any(token in lowered for token in ("safety", "policy", "content filter", "nsfw")):
+        return {"category": "content_policy", "status_code": status_code, "retryable": False}
+    if "timeout" in lowered:
+        return {"category": "timeout", "status_code": status_code, "retryable": True}
+    if "connect" in lowered:
         return {"category": "connection_error", "status_code": status_code, "retryable": True}
     if any(token in lowered for token in ("content policy", "content filter", "safety", "nsfw")):
         return {"category": "content_policy", "status_code": status_code, "retryable": False}
@@ -214,20 +196,24 @@ class _RequestPacer:
 
 
 class _ConfiguredCompletions:
-    def __init__(self, completions, provider_extra_body, pacer):
+    def __init__(self, completions, provider_extra_body, pacer, limits):
         self._completions = completions
         self._provider_extra_body = provider_extra_body
         self._pacer = pacer
+        self._limits = limits
 
     def create(self, *args, **kwargs):
         self._pacer.wait()
         provider_extra_body = {
             key: value for key, value in self._provider_extra_body.items()
-            if key not in kwargs
+            if key not in kwargs and not (
+                key in ("max_tokens", "max_completion_tokens")
+                and any(name in kwargs for name in ("max_tokens", "max_completion_tokens")))
         }
         kwargs["extra_body"] = merge_provider_extra_body(
             provider_extra_body, kwargs.get("extra_body"))
-        kwargs = get_bounded_output_request(kwargs)
+        from llm_request_budget import get_budgeted_request
+        kwargs = get_budgeted_request(kwargs, self._limits or {})
         return self._completions.create(*args, **adapt_request_for_reasoning_model(kwargs))
 
     def __getattr__(self, name):
@@ -235,9 +221,9 @@ class _ConfiguredCompletions:
 
 
 class _ConfiguredChat:
-    def __init__(self, chat, provider_extra_body, pacer):
+    def __init__(self, chat, provider_extra_body, pacer, limits):
         self._chat = chat
-        self.completions = _ConfiguredCompletions(chat.completions, provider_extra_body, pacer)
+        self.completions = _ConfiguredCompletions(chat.completions, provider_extra_body, pacer, limits)
 
     def __getattr__(self, name):
         return getattr(self._chat, name)
@@ -246,17 +232,18 @@ class _ConfiguredChat:
 class ConfiguredOpenAI:
     """Proxy an OpenAI client while applying one profile's completion defaults."""
     def __init__(self, client, provider_extra_body, request_interval_seconds=0,
-                 pacer=None):
+                 pacer=None, limits=None):
         self._client = client
         self._provider_extra_body = dict(provider_extra_body or {})
         self._pacer = pacer or _RequestPacer(request_interval_seconds)
-        self.chat = _ConfiguredChat(client.chat, self._provider_extra_body, self._pacer)
+        self._limits = limits
+        self.chat = _ConfiguredChat(client.chat, self._provider_extra_body, self._pacer, limits)
 
     def with_options(self, **kwargs):
         """Return a configured timeout/retry variant without losing body defaults."""
         return ConfiguredOpenAI(
             self._client.with_options(**kwargs), self._provider_extra_body,
-            pacer=self._pacer)
+            pacer=self._pacer, limits=self._limits)
 
     def __getattr__(self, name):
         return getattr(self._client, name)
@@ -269,7 +256,7 @@ def get_profile_timeout(llm_config, default_timeout):
     connect_timeout = llm_config.get("connect_timeout_seconds")
     if connect_timeout is None:
         return request_timeout
-    return httpx.Timeout(request_timeout, connect=connect_timeout)
+    return httpx2.Timeout(request_timeout, connect=connect_timeout)
 
 
 class RunProfileChanged(RuntimeError):
@@ -353,6 +340,8 @@ class FailoverClient:
                               "runtime_error": f"{type(error).__name__}: {error}"}
                 context = (status.get("context_length") if status.get("available")
                            and status.get("loaded") else None)
+                from llm_request_budget import get_request_limits
+                context = get_request_limits(config, context)["context_length"]
                 if not isinstance(context, int) or isinstance(context, bool) or context < 1:
                     context = 4096
                     print("[FAILOVER] secondary context could not be verified; "
@@ -626,7 +615,9 @@ class ManualClient:
             # the short file lock only while claiming it; human replies can take
             # hours, so the lock must not span the wait.
             while True:
+                ensure_manual_request_active()
                 with file_lock(self.pending_path):
+                    ensure_manual_request_active()
                     pending = safe_load_json(self.pending_path, None)
                     if os.path.exists(self.pending_path) and (
                             not isinstance(pending, dict) or not pending.get("id") or
@@ -641,6 +632,7 @@ class ManualClient:
                         break
                 time.sleep(self.POLL_SECONDS)
             while True:
+                ensure_manual_request_active()
                 try:
                     with open(self.response_path, "r", encoding="utf-8") as handle:
                         response = json.load(handle)
@@ -683,10 +675,17 @@ class _ManualChat:
 def make_llm_client(llm_config, timeout, respect_profile_timeout=True):
     """Create an OpenAI-compatible client with the profile's provider options."""
     llm_config = llm_config or {}
+    # Declared limits only: no runtime probe here. Construction stays pure and
+    # cacheable on config alone; detected context reaches each call through
+    # its params (ensure_run_request_params / context_length) instead.
+    from llm_request_budget import get_request_limits
+    limits = get_request_limits(llm_config)
+    limits = limits if any(limits.values()) else None
     if llm_config.get("transport") == "manual":
         from utils import get_runtime_data_dir
-        return ManualClient(get_runtime_data_dir(
+        client = ManualClient(get_runtime_data_dir(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        return ConfiguredOpenAI(client, get_provider_extra_body(llm_config), limits=limits) if limits else client
     client = OpenAI(
         base_url=llm_config.get("base_url", "http://localhost:11434/v1"),
         api_key=resolve_api_key(llm_config.get("api_key", "local")),
@@ -696,4 +695,4 @@ def make_llm_client(llm_config, timeout, respect_profile_timeout=True):
     )
     return ConfiguredOpenAI(
         client, get_provider_extra_body(llm_config),
-        request_interval_seconds=llm_config.get("request_interval_seconds", 0))
+        request_interval_seconds=llm_config.get("request_interval_seconds", 0), limits=limits)
