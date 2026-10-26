@@ -3,6 +3,7 @@ import copy
 from pathlib import Path
 import tempfile
 import unittest
+from tests.export_staging_assertions import delivery_names
 from unittest.mock import patch
 import wave
 
@@ -86,7 +87,7 @@ class ExportPCMPlanTests(unittest.TestCase):
                 self.assertEqual(native.raw_data, data)
                 self.assertEqual(len(data) // native.frame_width, plan['frames'])
                 self.assertEqual(before, [segment.raw_data for segment in segments])
-                self.assertEqual([path.name], [item.name for item in Path(tmp).iterdir()])
+                self.assertEqual([path.name], sorted(delivery_names(self, Path(tmp))))
 
     def test_many_authored_gaps_follow_fractional_pcm_clock_without_millisecond_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +128,7 @@ class ExportPCMPlanTests(unittest.TestCase):
                         writer(segments, ['A', 'B'], path, 75, 2,
                                cancel_check=lambda: cancelled, pcm_plan_callback=receive)
                     self.assertEqual(b'previous complete synthetic delivery', path.read_bytes())
-                    self.assertEqual([path.name], [item.name for item in Path(tmp).iterdir()])
+                    self.assertEqual([path.name], sorted(delivery_names(self, Path(tmp))))
 
     def test_bad_or_unbounded_plans_refuse_and_unknown_shapes_remain_explicit(self):
         shape = ((1, 24000, 2), 20)

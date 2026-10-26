@@ -31,7 +31,7 @@ class M4bSourcePublicationTests(unittest.TestCase):
                 before = self.prior(root,manager)
                 snapshot = export_publication.ExportSourceSnapshot
                 def changed(*args,**kwargs):
-                    selected = next(root.glob('.m4b-source-cover-*/cover.*'))
+                    selected = Path(kwargs['additional_sources'][0])
                     if fault == 'missing':
                         selected.unlink()
                     else:
@@ -90,7 +90,7 @@ class M4bSourcePublicationTests(unittest.TestCase):
                         index = command.index('1:v')
                         del command[index-1:index+1]
                     else:
-                        selected = next(root.glob('.m4b-source-cover-*/cover.*'))
+                        selected = Path([command[i+1] for i, value in enumerate(command) if value == '-i'][1])
                         command[command.index(str(selected))] = str(substitute)
                     return encode(command,*args,**kwargs)
                 with patch.object(m4b_encode,'encode_m4b',side_effect=changed):
@@ -250,7 +250,9 @@ class M4bSourcePublicationTests(unittest.TestCase):
                         path = root / 'state.json'; state = json.loads(path.read_bytes())
                         state['book_generation'] = 'changed'; path.write_text(json.dumps(state))
                     else:
-                        next(root.glob('.m4b-source-cover-*/cover.*')).write_bytes(b'changed cover')
+                        command = args[0]
+                        selected = Path([command[i+1] for i, value in enumerate(command) if value == '-i'][1])
+                        selected.write_bytes(b'changed cover')
                     return result
                 with patch.object(m4b_encode, 'encode_m4b', side_effect=changed):
                     with self.assertRaises(ValueError):

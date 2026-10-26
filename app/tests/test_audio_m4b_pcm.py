@@ -1,5 +1,6 @@
 """Actual AAC from captured PCM preserves chapter clock, tags and old output."""
 from pathlib import Path
+from tests.export_staging_assertions import delivery_names
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -35,7 +36,7 @@ class M4BPCMTests(unittest.TestCase):
                         self.assertEqual(2,reports[-1]['chapters_checked'])
                         self.assertEqual(6,reports[-1]['tags_checked'])
                     self.assertEqual(audio.raw_data,raw.read_bytes())
-                    self.assertEqual({'input.pcm','output.m4b'},{p.name for p in Path(tmp).resolve().iterdir()})
+                    self.assertEqual({'input.pcm','output.m4b'},delivery_names(self, Path(tmp).resolve()))
 
     def test_unsafe_inputs_refuse_before_loudness_or_worker(self):
         settings=dict(frames=8,frame_rate=24000,channels=1,sample_width=2,
@@ -86,7 +87,7 @@ class M4BPCMTests(unittest.TestCase):
                     export_pcm_m4b(raw,output,settings,None,quality_plan=quality,max_output_bytes=1024**2,
                         encoder_runtime=get_ffmpeg_runtime_digest(runtime))
             self.assertEqual(b'previous complete delivery',output.read_bytes())
-            self.assertEqual({'input.pcm','output.m4b'},{p.name for p in Path(tmp).resolve().iterdir()})
+            self.assertEqual({'input.pcm','output.m4b'},delivery_names(self, Path(tmp).resolve()))
 
     def test_large_moov_cover_faststart_reopen_preserves_exact_cover(self):
         import hashlib
@@ -118,4 +119,4 @@ class M4BPCMTests(unittest.TestCase):
                     self.assertGreaterEqual(size,len(header));atoms.append((name,size));stream.seek(size-len(header),1)
             self.assertGreater(dict(atoms)[b'moov'],1024**2)
             self.assertLess([name for name,_ in atoms].index(b'moov'),[name for name,_ in atoms].index(b'mdat'))
-            self.assertEqual({'input.pcm','cover.image','output.m4b'},{p.name for p in root.iterdir()})
+            self.assertEqual({'input.pcm','cover.image','output.m4b'},delivery_names(self, root))

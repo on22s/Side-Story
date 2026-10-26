@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from tests.export_staging_assertions import delivery_names
 
 import numpy as np
 import soundfile as sf
@@ -49,7 +50,7 @@ class MasteringOutputLayoutTests(unittest.TestCase):
                 self.assertTrue(math.isfinite(report['after']['integrated_lufs']))
                 self.assertAlmostEqual(-18, report['after']['integrated_lufs'], delta=1)
                 self.assert_encoded_media(path, rate, channels, 2304)
-                self.assertEqual(['delivery.mp3'], [item.name for item in Path(root).iterdir()])
+                self.assertEqual(['delivery.mp3'], sorted(delivery_names(self, Path(root))))
 
     def test_real_mastered_m4b_supports_192k_source_and_retains_aac_multichannel_layout(self):
         for source_rate, channels, rate in [(24000, 1, 24000), (192000, 1, 96000), (192000, 6, 96000)]:

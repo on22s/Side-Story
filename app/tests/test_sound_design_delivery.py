@@ -19,19 +19,28 @@ class SoundDeliveryStageTests(unittest.TestCase):
             minimum_output_bytes=100000, **kwargs)
 
     def test_copy_is_exact_and_allowance_charges_retained_candidate_and_raw(self):
+        from sound_design_staging import EXPORT_METADATA_RESERVE, get_sound_render_stage_files
+        from export_staging_retirement import DIRECTORY as REGISTRY
+        from tests.export_staging_assertions import delivery_names
         def check(candidate, revision):
             approval = self.approve(candidate, revision, full_mix_reviewed=True)
             before = {p.name:p.read_bytes() for p in candidate.iterdir()}
             charged = sum(len(value) for value in before.values())
             raw_size = len(before['mixed.pcm'])
-            cap = charged + raw_size + 100000
+            cap = charged + raw_size + EXPORT_METADATA_RESERVE + 100000 + 32768
             with self.stage(candidate, revision, approval, max_staged_bytes=cap) as staged:
                 self.assertEqual(before['mixed.pcm'], staged['raw'].read_bytes())
-                self.assertEqual(100000, staged['output_allowance'])
+                registry = candidate.parent / REGISTRY
+                charge_root = registry if registry.exists() else staged['directory']
+                actual, _, _ = get_sound_render_stage_files(charge_root, self.root)
+                self.assertEqual(cap - charged - actual - EXPORT_METADATA_RESERVE,
+                                 staged['output_allowance'])
+                self.assertGreaterEqual(staged['output_allowance'], 100000)
                 self.assertEqual(raw_size, staged['pcm_plan']['frames'] *
                     staged['pcm_plan']['channels'] * staged['pcm_plan']['sample_width'])
                 staged['source_snapshot'].verify_sources()
             self.assertEqual(before, {p.name:p.read_bytes() for p in candidate.iterdir()})
+            self.assertEqual({candidate.name, 'quota.lock'}, delivery_names(self, candidate.parent))
         self.run_owned(check)
 
     def test_insufficient_peak_quota_and_failed_encoder_preserve_candidate(self):

@@ -20,3 +20,18 @@ Before that native CI job succeeds, Windows kernel verification remains pending.
 The current macOS process-group fallback still lacks exclusive lifetime ownership
 of escaped descendants (review finding #369); neither Linux nor Windows results
 resolve that implementation gap.
+
+## Export staging ownership and cleanup
+
+The same `windows-owner` job also runs the existing export staging suite:
+
+```text
+python -m unittest tests.test_export_staging -v
+```
+
+This exercises normal cleanup, live-owner preservation, abandoned-owner
+reclamation, marker validation, and the Windows handle's rejection of directory
+retargeting. POSIX-only retirement tests are explicitly skipped on Windows;
+their Linux results do not qualify Windows behavior. The Windows interrupted
+finalization recovery protocol remains unfinished, so this gate does not
+establish recovery after every crash boundary or after power loss.

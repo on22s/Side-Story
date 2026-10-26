@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from tests.export_staging_assertions import delivery_names
 from unittest.mock import patch
 import zipfile
 from fastapi import FastAPI
@@ -94,7 +95,7 @@ class ExportTaskResultTests(unittest.TestCase):
                     self.assertTrue(entered.wait(2));self.assertEqual(200,client.post('/api/export_chapters/cancel').status_code)
                 finally:release.set();worker.join(timeout=3)
                 self.assertFalse(worker.is_alive());self.assertEqual(200,responses[0].status_code)
-                state=client.get('/api/status/chapter_export').json();self.assertEqual({'status':'cancelled','message':'Export cancelled'},state['result']);self.assertFalse(state['running']);self.assertFalse(state['cancel']);self.assertEqual(before,prior.read_bytes());self.assertEqual([prior],list(out.iterdir()))
+                state=client.get('/api/status/chapter_export').json();self.assertEqual({'status':'cancelled','message':'Export cancelled'},state['result']);self.assertFalse(state['running']);self.assertFalse(state['cancel']);self.assertEqual(before,prior.read_bytes());self.assertEqual({prior.name},delivery_names(self,out))
 
     def test_real_audacity_archive_and_chapter_pcm_match_native_success_results(self):
         with self.fixture() as (root,states,client):

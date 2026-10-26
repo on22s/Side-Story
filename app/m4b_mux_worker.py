@@ -9,10 +9,10 @@ import io
 import math
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import threading
+from export_staging import get_encoder_staging_source_root
 
 from audio_encoder_identity import require_ffmpeg_binary_identity
 from audio_take_history import _open_regular, _version
@@ -37,16 +37,13 @@ def _capture(root, name, identity, limit, *, include_bytes=False):
 
 def run_m4b_mux_worker(directory):
     directory = Path(directory).absolute()
-    if (directory.resolve() != directory or not directory.is_dir()
-            or re.fullmatch(r'\.pcm-encode-[A-Za-z0-9_-]+', directory.name) is None):
-        raise ValueError('M4B worker requires its private canonical directory')
+    source_root = get_encoder_staging_source_root(directory)
     request_facts, raw = capture_scope_file(directory, 'request.json',
         limit=MAX_REQUEST_BYTES, include_bytes=True)
     if not request_facts['exists']:
         raise ValueError('M4B worker request is missing')
     request = get_m4b_worker_request(raw)
     executable = require_ffmpeg_binary_identity(request.encoder.binary)
-    source_root = directory.parent
     raw_facts, _ = _capture(source_root, request.raw_name, request.raw, MAX_PCM_BYTES)
     metadata_facts, metadata = _capture(directory, 'chapters.txt', request.metadata,
         MAX_METADATA_BYTES, include_bytes=True)

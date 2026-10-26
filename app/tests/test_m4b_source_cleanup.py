@@ -1,6 +1,9 @@
 """An owned temporary cover cleanup failure must not change export status."""
 from contextlib import ExitStack
 import hashlib
+import json
+import export_staging
+from tests.export_staging_assertions import delivery_names
 import os
 from pathlib import Path
 import shutil
@@ -15,7 +18,7 @@ from tts import ExportCancelled
 class M4bSourceCleanupTests(unittest.TestCase):
     def test_cleanup_oserror_preserves_success_original_error_and_cancellation(self):
         fixture = source_fixture.M4bSourcePublicationTests()
-        original_unlink = os.unlink
+        original_remove = export_staging._remove_contents
         for fault in ('success', 'exception', 'cancel', 'encoder_failure'):
             with self.subTest(fault=fault), fixture.fixture() as (root, manager, row):
                 previous = fixture.prior(root, manager)
@@ -25,18 +28,17 @@ class M4bSourceCleanupTests(unittest.TestCase):
                 original_error = ValueError('synthetic original encoder failure')
 
                 cleanup_error = PermissionError('synthetic cover cleanup failure')
-                def remove_file(path):
+                def remove_contents(path, *, authority=None, **kwargs):
                     owned = Path(path)
-                    if (owned.parent.parent == root and owned.parent.name.startswith('.m4b-source-cover-')
-                            and owned.name not in ('.export-staging.json',
-                                                   '.export-staging.owner.lock')):
-                        remaining.append(owned.parent)
+                    marker = json.loads((owned / export_staging.MARKER).read_text())
+                    if marker['kind'] == 'cover':
+                        remaining.append(owned)
                         raise cleanup_error
-                    return original_unlink(path)
+                    return original_remove(path, authority=authority, **kwargs)
 
                 try:
                     with ExitStack() as stack:
-                        stack.enter_context(patch.object(os, 'unlink', side_effect=remove_file))
+                        stack.enter_context(patch.object(export_staging, '_remove_contents', side_effect=remove_contents))
                         if fault != 'success':
                             side_effect = original_error if fault == 'exception' else (
                                 ExportCancelled() if fault == 'cancel' else None)
@@ -59,8 +61,9 @@ class M4bSourceCleanupTests(unittest.TestCase):
                                          logs.records[0].getMessage())
                         self.assertIs(cleanup_error, logs.records[0].exc_info[1])
                     self.assertEqual(1, len(remaining))
-                    self.assertEqual(remaining, list(root.glob('.m4b-source-cover-*')))
-                    self.assertEqual(root, remaining[0].parent)
+                    marker = json.loads((remaining[0] / export_staging.MARKER).read_text())
+                    self.assertEqual(str(root.resolve()), marker['parent'])
+                    self.assertEqual('cover', marker['kind'])
                     covers = [path for path in remaining[0].iterdir()
                               if not path.name.startswith(('.export-staging.json',
                                                            '.export-staging.owner.lock'))]
@@ -84,22 +87,23 @@ class M4bSourceCleanupTests(unittest.TestCase):
 
     def test_non_oserror_cleanup_failure_still_surfaces_after_owned_cleanup(self):
         fixture = source_fixture.M4bSourcePublicationTests()
-        original_unlink = os.unlink
+        original_remove = export_staging._remove_contents
         error = RuntimeError('synthetic cleanup programming failure')
         with fixture.fixture() as (root, manager, _):
             previous = fixture.prior(root, manager)
             choice = fixture.selection(root)
-            def remove_file(path):
-                result = original_unlink(path)
-                owned = Path(path)
-                if (owned.parent.parent == root and owned.parent.name.startswith('.m4b-source-cover-')
-                        and owned.name not in ('.export-staging.json',
-                                               '.export-staging.owner.lock')):
+            def remove_contents(path, *, authority=None, **kwargs):
+                marker = json.loads((Path(path) / export_staging.MARKER).read_text())
+                result = original_remove(path, authority=authority, **kwargs)
+                if marker['kind'] == 'cover':
                     raise error
                 return result
-            with patch.object(os, 'unlink', side_effect=remove_file):
+            with patch.object(export_staging, '_remove_contents', side_effect=remove_contents):
                 with self.assertRaises(RuntimeError) as raised:
                     manager.merge_m4b(source_cover=choice)
             self.assertIs(error, raised.exception)
             self.assertNotEqual(previous, (root / 'audiobook.m4b').read_bytes())
             fixture.assert_clean(root)
+            recovery = export_staging.reclaim_export_staging([root])
+            self.assertFalse(recovery['errors'])
+            delivery_names(self, root)

@@ -206,9 +206,9 @@ class ChapterExportQualityTests(unittest.TestCase):
             manager, out = self.fixture(root, publish=True)
             before = self.saved(out)
             replace, moved = project.os.replace, False
-            def observe_move(source, target):
+            def observe_move(source, target, **kwargs):
                 nonlocal moved
-                result = replace(source, target)
+                result = replace(source, target, **kwargs)
                 if Path(target).parent == out and Path(target).suffix == '.wav':
                     moved = True
                 return result

@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from tests.export_staging_assertions import delivery_names
 from unittest.mock import patch
 
 from pydub import AudioSegment
@@ -32,7 +33,7 @@ class Mp3BackpressureTests(unittest.TestCase):
                 self.assertEqual((expected.sample_width, expected.frame_rate, expected.channels),
                     (settings['sample_width'], settings['frame_rate'], settings['channels']))
                 self.assertEqual(before, [s.raw_data for s in segments])
-                self.assertEqual(['combined.pcm'], sorted(p.name for p in Path(tmp).iterdir()))
+                self.assertEqual(['combined.pcm'], sorted(delivery_names(self, Path(tmp))))
 
     def test_real_encoded_output_matches_native_export_audio(self):
         for width in (1, 2, 4):
@@ -47,7 +48,7 @@ class Mp3BackpressureTests(unittest.TestCase):
                 native = AudioSegment.from_mp3(expected); actual = AudioSegment.from_mp3(root / 'actual.mp3')
                 self.assertEqual((native.frame_rate, native.channels), (actual.frame_rate, actual.channels))
                 self.assertEqual(native.raw_data, actual.raw_data)
-                self.assertFalse(any(p.is_dir() for p in root.iterdir()))
+                self.assertFalse(any((root/name).is_dir() for name in delivery_names(self, root)))
 
     def test_producer_does_not_pull_next_block_while_consumer_is_blocked(self):
         arrived, release = threading.Event(), threading.Event()
@@ -148,7 +149,7 @@ class Mp3BackpressureTests(unittest.TestCase):
             with patch.object(Path, 'open', open_file), self.assertRaisesRegex(ValueError, 'primary write failure'):
                 write_combined_pcm([segment], ['A'], target, 0, 0)
             self.assertEqual(b'previous complete stage', target.read_bytes())
-            self.assertEqual(['existing.pcm'], [p.name for p in Path(tmp).iterdir()])
+            self.assertEqual(['existing.pcm'], sorted(delivery_names(self, Path(tmp))))
 
     def test_mp3_cancel_reaps_real_encoder_tree_and_preserves_previous_output(self):
         import json, os, sys, time

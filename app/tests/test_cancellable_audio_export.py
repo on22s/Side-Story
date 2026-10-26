@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+from tests.export_staging_assertions import delivery_names
 import sys
 import tempfile
 import unittest
@@ -43,7 +44,7 @@ with tempfile.TemporaryDirectory() as tmp:
             loaded=AudioSegment.from_wav(path)
             self.assertEqual(segment.raw_data,loaded.raw_data)
             self.assertEqual(segment.frame_rate,loaded.frame_rate)
-            self.assertEqual(['chapter.wav'],sorted(p.name for p in Path(tmp).iterdir()))
+            self.assertEqual(['chapter.wav'],sorted(delivery_names(self, Path(tmp))))
 
     @unittest.skipUnless(sys.platform=='linux','native Linux descendant ownership test')
     def test_cancel_during_native_worker_reaps_child_and_preserves_previous_chapter(self):
@@ -127,7 +128,7 @@ time.sleep(60)
             with path.open('rb') as stream:loaded=AudioSegment.from_mp3(stream)
             self.assertAlmostEqual(len(segment),len(loaded),delta=2)
             self.assertGreater(loaded.rms,100)
-            self.assertEqual(['chapter.mp3'],sorted(p.name for p in directory.iterdir()))
+            self.assertEqual(['chapter.mp3'],sorted(delivery_names(self, directory)))
             self.assertFalse(report.exists())
 
     @unittest.skipUnless(sys.platform=='linux','native Linux descendant ownership test')
@@ -141,7 +142,7 @@ time.sleep(60)
                     ok,message=pm.export_chapters(fmt='wav')
                     self.assertTrue(ok,message)
                     output=root/CHAPTER_EXPORT_DIR
-                    before={path.name:path.read_bytes() for path in output.iterdir()}
+                    before={name:(output / name).read_bytes() for name in delivery_names(self, output)}
                     _tone(str(root/'voicelines/c1.wav'),.5,hz=800)
                     marker=root/'started';start=audio_export.start_owned_subprocess
                     processes=[]
@@ -155,4 +156,4 @@ time.sleep(60)
                     self.assertEqual((False,'Export cancelled'),result)
                     self.assertEqual(1,len(processes))
                     self.assertIsNotNone(processes[0].poll())
-                    self.assertEqual(before,{path.name:path.read_bytes() for path in output.iterdir()})
+                    self.assertEqual(before,{name:(output / name).read_bytes() for name in delivery_names(self, output)})
