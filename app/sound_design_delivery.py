@@ -13,7 +13,7 @@ from sound_design_assets import MAX_TOTAL_BYTES
 from sound_design_cues import _require_int, _require_digest
 from sound_design_publication import capture_sound_delivery_snapshot
 from sound_design_cover import get_sound_delivery_cover
-from sound_design_staging import (ensure_sound_render_stage, ensure_sound_render_quota,
+from sound_design_staging import (ensure_sound_export_stage, get_sound_render_usage,
                                   get_sound_render_stage_files)
 from tts import ensure_audio_export_active
 from utils import safe_load_json
@@ -108,8 +108,9 @@ def ensure_sound_delivery_stage(manager, stage_name, candidate_revision, approva
     _require_int(minimum_output_bytes, 1, MAX_TOTAL_BYTES, 'Delivery output reservation')
     root = Path(manager.root_dir).absolute()
     check = lambda: ensure_audio_export_active(cancel_check)
-    with ensure_sound_render_stage(root, cancel_check=check,
-                                   max_bytes=max_staged_bytes) as (stage, available):
+    with ensure_sound_export_stage(root, cancel_check=check,
+                                   max_bytes=max_staged_bytes) as (staging, available):
+        stage = staging.path
         # Snapshot construction owns chunk locks: never nest it inside the
         # approved-candidate context, which takes those same non-reentrant locks.
         snapshot = capture_sound_delivery_snapshot(manager, stage_name, candidate_revision,
@@ -162,7 +163,7 @@ def ensure_sound_delivery_stage(manager, stage_name, candidate_revision, approva
         # Successful approval-context exit fences its source, manifest and PCM.
         snapshot.verify_sources()
         check()
-        yield dict(directory=stage, raw=raw, pcm_plan=binding['pcm_plan'],
+        yield dict(directory=stage, staging=staging, raw=raw, pcm_plan=binding['pcm_plan'],
                    output_allowance=output_allowance, source_snapshot=snapshot,
                    check_active=check, integrity=integrity, dialogue=binding['dialogue'],cover=cover_path)
 
@@ -209,15 +210,15 @@ def save_sound_delivery(manager, stage_name, candidate_revision, approval_revisi
             max_output_bytes=staged['output_allowance'])
         report = get_admitted_export_report(output, quality, reports[-1] if reports else None,
                                             cancel_check=staged['check_active'])
+        from sound_design_staging import DIRECTORY as SOUND_DIRECTORY
+        get_sound_render_usage(Path(manager.root_dir) / SOUND_DIRECTORY,
+            Path(manager.root_dir).absolute(), cancel_check=staged['check_active'],
+            max_bytes=max_staged_bytes)
         staged['raw'].unlink()
         if staged['cover'] is not None:
             staged['cover'].unlink()
         snapshot = staged['source_snapshot']
-    # Finish stage exit checks before an irreversible publication. Reacquire
-    # the quota lease; a discarded/replaced private file fails the native
-    # output-version fence rather than publishing different bytes.
-    with ensure_sound_render_quota(manager.root_dir, cancel_check=cancel_check,
-                                   max_bytes=max_staged_bytes):
+        # Keep the original quota lease and stage owner through publication.
         snapshot.verify_sources()
         if get_sound_delivery_encoding(options,cancel_check=cancel_check) != encoding:
             raise ValueError('Sound encoder profile changed before publication')
@@ -237,16 +238,25 @@ def save_sound_delivery(manager, stage_name, candidate_revision, approval_revisi
             except (OSError,ValueError):
                 result['mastering'] = None
                 result['warnings'].append('Audio was published, but its current file identity could not be confirmed.')
-        # Only remove this now-empty stage. Unknown or retained contents remain
-        # charged for recovery, and cleanup failure cannot undo publication.
+        # Unknown payload remains charged and guarded for inspection. Normal
+        # cleanup retires nested registries and this stage under their owners.
         try:
-            _, files, directories = get_sound_render_stage_files(staged['directory'],Path(manager.root_dir).absolute())
-            if files or len(directories) != 1:
-                raise ValueError('Delivery stage has retained contents')
-            staged['directory'].rmdir()
-        except (OSError,ValueError):
-            result['warnings'].append('Audio was published; its delivery stage was retained for inspection.')
-    return result
+            from export_staging import MARKER, OWNER_LOCK
+            from export_staging_retirement import DIRECTORY as REGISTRY
+            get_sound_render_stage_files(staged['directory'], Path(manager.root_dir).absolute())
+            with os.scandir(staged['directory']) as entries:
+                if any(entry.name not in (MARKER, OWNER_LOCK + '.lock', REGISTRY)
+                       for entry in entries):
+                    staged['staging'].finish(remove=False)
+                    raise ValueError('Delivery stage has retained contents')
+            staged['staging'].finish(preserve_on_error=True)
+        except Exception:
+            try:
+                staged['staging'].finish(remove=False)
+            except Exception:
+                pass
+            result['warnings'].append('Audio was published, but temporary-file cleanup could not be confirmed.')
+        return result
 
 
 def save_sound_delivery_mp3(manager, stage_name, candidate_revision, approval_revision, delivery, **kwargs):

@@ -12,6 +12,9 @@ from audio_take_history import (MAX_AUDIO_BYTES, TakeAudioOutsideSnapshotBounds,
     _ensure_metadata_depth, _ensure_plain_path, _hash, _open_regular, _version)
 
 KEY = 'take_publication'
+NATIVE_TAKE_KINDS = {'native_custom_windows_v1': 'custom',
+                     'native_clone_windows_v1': 'clone',
+                     'native_lora_windows_v1': 'lora'}
 MAX_RECEIPT_BYTES = 4096
 _DIGEST = re.compile(r'[a-f0-9]{64}')
 _REVISION = re.compile(r'[a-f0-9]{32}')
@@ -41,7 +44,7 @@ def validate_take_publication(row):
     if (type(receipt) is not dict or set(receipt) != {'version','kind','book_token','uid',
             'audio_revision','index','dependencies','speech_sha256','pcm','audio','synthesis_sha256'}
             or type(receipt['version']) is not int or receipt['version'] != 1
-            or receipt['kind'] != 'native_custom_windows_v1'
+            or type(receipt['kind']) is not str or receipt['kind'] not in NATIVE_TAKE_KINDS
             or not _is_digest(receipt['book_token']) or type(receipt['uid']) is not str
             or not 0 < len(receipt['uid']) <= 128 or receipt['uid'] != row.get('uid')
             or type(receipt['audio_revision']) is not str
@@ -68,13 +71,15 @@ class TakePublicationAdmission:
     inputs_sha256: str
     voice_sha256: str
     model_sha256: str
+    category: str = 'custom'
 
 
 def get_take_publication_book_token(admission):
     from synthesis_recovery_context import RecoveryParent, get_recovery_claim_digest
     if (type(admission) is not TakePublicationAdmission or type(admission.parent) is not RecoveryParent
             or get_recovery_claim_digest() != admission.parent.claim_sha256
-            or not _is_digest(admission.book_token)):
+            or not _is_digest(admission.book_token)
+            or admission.category not in ('custom', 'clone', 'lora')):
         return None
     return admission.book_token
 
@@ -98,23 +103,37 @@ def capture_take_publication_admission(engine, parent, book_token, uid, index, i
     """
     from synthesis_recovery_context import RecoveryParent, get_recovery_claim_digest
     from synthesis_recovery_identity import get_recovery_digest
-    from tts import get_custom_voice_request, get_resolved_speaker, voice_category
+    from tts import get_resolved_speaker, voice_category
     if (type(parent) is not RecoveryParent or get_recovery_claim_digest() != parent.claim_sha256
             or not _is_digest(book_token) or type(uid) is not str or not 0 < len(uid) <= 128
             or type(index) is not int or not 0 <= index < 2**31 or not _is_current_engine(engine)):
         return None
     windows = getattr(engine, '_synthesis_windows', None)
     recovery = engine.get_synthesis_recovery_policy()
-    if (engine.get_voice_backend('custom') != 'local' or engine._compile_codec_enabled
+    if type(voice_config) is not dict:
+        return None
+    try:
+        resolved = get_resolved_speaker(speaker, voice_config)
+    except (AttributeError, TypeError, ValueError):
+        # Optional proof cannot admit malformed voice or alias entries.
+        return None
+    selected = voice_config.get(resolved)
+    if type(selected) is not dict:
+        return None
+    category = voice_category(selected)
+    if category not in ('custom', 'clone', 'lora'):
+        return None
+    if (engine.get_voice_backend(category) != 'local' or engine._compile_codec_enabled
             or type(windows) is not dict or windows.get('enabled') is not True
             or type(recovery) is not dict or recovery.get('enabled') is not True):
         return None
-    resolved = get_resolved_speaker(speaker, voice_config)
-    selected = voice_config.get(resolved)
-    if voice_category(selected) != 'custom':
+    # Seed admission is cheap; actual category/reference/adapter execution is
+    # certified by the native recovery guard during rendering, before proof.
+    try:
+        seed = int(selected.get('seed', -1))
+    except (TypeError, ValueError, OverflowError):
         return None
-    request = get_custom_voice_request(voice_config, resolved, inputs.get('instruct', ''))
-    if request is None or type(request.seed) is not int or not 0 <= request.seed < 2**64:
+    if not 0 <= seed < 2**64:
         return None
     with parent.admit():
         model = engine.get_model_settings()
@@ -128,7 +147,7 @@ def capture_take_publication_admission(engine, parent, book_token, uid, index, i
                 or parent.inputs_sha256 != get_recovery_digest(dict(index=index, inputs=inputs))):
             return None
         return TakePublicationAdmission(engine, parent, book_token, uid, index,
-            get_recovery_digest(inputs), get_recovery_digest(selected), get_recovery_digest(model))
+            get_recovery_digest(inputs), get_recovery_digest(selected), get_recovery_digest(model), category)
 
 
 def _read_audio(root, path, cancel_check, *, decode=True):
@@ -180,7 +199,7 @@ def get_take_publication_receipt(admission, inputs, preparation, speech_input, s
             or synthesis.get('audio_revision') != revision or synthesis.get('scope') != 'pre-encoding PCM'):
         return None, None
     text = preparation['text']
-    plan = admission.engine._get_synthesis_window_plan(text, 'custom')
+    plan = admission.engine._get_synthesis_window_plan(text, admission.category)
     policy = admission.engine.get_model_settings().get('synthesis_windows')
     if plan is None or policy != synthesis.get('policy'):
         return None, None
@@ -222,7 +241,7 @@ def get_take_publication_receipt(admission, inputs, preparation, speech_input, s
     except TakeAudioOutsideSnapshotBounds:
         return None, None
     with admission.parent.admit():
-        receipt = dict(version=1, kind='native_custom_windows_v1', book_token=admission.book_token,
+        receipt = dict(version=1, kind=next(kind for kind, category in NATIVE_TAKE_KINDS.items() if category == admission.category), book_token=admission.book_token,
             uid=admission.uid, audio_revision=revision, index=admission.index,
             dependencies=dict(inputs_sha256=admission.inputs_sha256, voice_sha256=admission.voice_sha256,
                 model_sha256=admission.model_sha256, pronunciation_sha256=get_recovery_digest(preparation),
