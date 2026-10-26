@@ -415,6 +415,23 @@ class CustomVoiceRequest:
     instruct: str
 
 
+@dataclass(frozen=True)
+class LoRARequest:
+    """Stable request identity for a LoRA adapter and its serving inputs."""
+    adapter_path: str
+    generation_sha256: str
+    seed: int
+    instruct: str
+
+
+@dataclass(frozen=True)
+class CloneRequest:
+    """Stable request identity for a cloned reference voice."""
+    ref_audio_path: str
+    ref_text: str
+    seed: int
+
+
 def get_custom_voice_request(voice_config, speaker, instruct_text):
     """The actual native speaker, seed and anchored instruction selection."""
     voice_data = voice_config.get(speaker)
@@ -1676,11 +1693,27 @@ class TTSEngine:
             # This model instance is fresh from _load_model and cached only
             # here, so merging in place cannot leak into the stock/clone
             # paths; switching adapters reloads the base anyway.
+            # A recovery certificate must describe the implementation that
+            # actually merged these tensors, not a later installed PEFT release.
+            merge_sha256 = None
+            if getattr(model, '_aa2_recovery_loaded_model', None) is not None:
+                from synthesis_recovery_serving import get_native_lora_merge_sha256
+                from synthesis_recovery_identity import RecoveryIdentityUnavailable
+                try:
+                    merge_sha256 = get_native_lora_merge_sha256()
+                except (RecoveryIdentityUnavailable, ImportError, AttributeError, ValueError, OSError):
+                    pass  # Optional recovery cannot prevent ordinary synthesis.
             model.model.talker = PeftModel.from_pretrained(
                 model.model.talker,
                 adapter_path,
             ).merge_and_unload()
             model.model.talker.eval()
+            if merge_sha256 is not None:
+                try:
+                    if get_native_lora_merge_sha256() == merge_sha256:
+                        model._aa2_recovery_lora_merge_sha256 = merge_sha256
+                except (RecoveryIdentityUnavailable, ImportError, AttributeError, ValueError, OSError):
+                    pass
 
             if self._compile_codec_enabled:
                 self._compile_codec(model)
@@ -1969,6 +2002,8 @@ class TTSEngine:
                 render_synthesis_windows(plan, render, output_path, self._synthesis_windows,
                                          cancel_check=is_audio_generation_cancelled, recovery=recovery, **options)
             return True
+        except (AudioGenerationCancelled, ExportCancelled):
+            raise
         except Exception as error:
             apply_tts_failure(error)
             return False
@@ -2069,11 +2104,28 @@ class TTSEngine:
         return self._generate_clone_voice_prepared(
             normalize_for_speech(text), speaker, voice_config, output_path)
 
-    def _generate_clone_voice_prepared(self, text, speaker, voice_config, output_path):
+    def _generate_clone_voice_prepared(self, text, speaker, voice_config, output_path,
+                                       recovery_request=None):
         """Render explicitly prepared input; public callers use the raw wrapper."""
+        request = recovery_request
+        voice_data = voice_config.get(speaker, {}) if isinstance(voice_config, dict) else {}
+        if (request is None and getattr(self, "_synthesis_recovery", None)
+                and getattr(self, "_synthesis_windows", None)
+                and self.get_voice_backend("clone") == "local"
+                and voice_data.get("ref_audio") and voice_data.get("ref_text")):
+            try:
+                ref_audio = voice_data["ref_audio"]
+                if not os.path.isabs(ref_audio):
+                    ref_audio = _resolve_asset_path(ref_audio)
+                seed = int(voice_data.get("seed", -1))
+                if isinstance(voice_data["ref_text"], str) and 0 <= seed < 2**64:
+                    request = CloneRequest(ref_audio, voice_data["ref_text"], seed)
+            except (TypeError, ValueError, OSError):
+                request = None
         windowed = self._render_synthesis_windows(
             text, "clone", lambda span, path: self._generate_clone_voice_prepared(
-                span, speaker, voice_config, path), output_path)
+                span, speaker, voice_config, path, recovery_request=request), output_path,
+            recovery_request=request)
         if windowed is not None:
             return windowed
         if self.get_voice_backend("clone") == "local":
@@ -2399,12 +2451,35 @@ class TTSEngine:
             prepared["text"], prepared["instruct"], voice_data, output_path)
 
     @ensure_local_tts_serialized
-    def _generate_lora_voice_prepared(self, text, instruct_text, voice_data, output_path):
+    def _generate_lora_voice_prepared(self, text, instruct_text, voice_data, output_path,
+                                      recovery_request=None):
         try:
             self.get_voice_backend("lora")
+            adapter_path = voice_data.get("adapter_path")
+            request = recovery_request
+            if (request is None and getattr(self, "_synthesis_recovery", None)
+                    and getattr(self, "_synthesis_windows", None) and adapter_path):
+                if not os.path.isabs(adapter_path):
+                    adapter_path = _resolve_asset_path(adapter_path)
+                adapter_path = get_resolved_adapter_path(adapter_path)
+                try:
+                    seed = int(voice_data.get("seed", -1))
+                except (TypeError, ValueError):
+                    seed = -1
+                character_style = (voice_data.get("character_style", "")
+                                   or voice_data.get("default_style", ""))
+                served_instruct = instruct_text or ""
+                if character_style:
+                    served_instruct = f"{served_instruct} {character_style}".strip()
+                if os.path.isdir(adapter_path) and 0 <= seed < 2**64:
+                    request = LoRARequest(
+                        adapter_path,
+                        voice_data.get("adapter_generation_sha256") or get_adapter_generation_sha256(adapter_path),
+                        seed, served_instruct)
             windowed = self._render_synthesis_windows(
                 text, "lora", lambda span, path: self._generate_lora_voice_prepared(
-                    span, instruct_text, voice_data, path), output_path)
+                    span, instruct_text, voice_data, path, recovery_request=request), output_path,
+                recovery_request=request)
             if windowed is not None:
                 return windowed
             import time
@@ -3738,7 +3813,8 @@ _RAW_COMMON_SINGLE_METHODS = {name: getattr(TTSEngine, name) for name in (
 _RAW_CLONE_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
     name: getattr(TTSEngine, name) for name in (
         'generate_clone_voice', '_generate_clone_voice_prepared',
-        '_local_generate_clone', '_init_local_clone', '_get_clone_prompt')}}
+        '_local_generate_clone', '_init_local_clone', '_get_clone_prompt',
+        '_prepare_clone_prompt')}}
 
 _RAW_DESIGN_METHODS = {**_RAW_COMMON_SINGLE_METHODS, **{
     name: getattr(TTSEngine, name) for name in (

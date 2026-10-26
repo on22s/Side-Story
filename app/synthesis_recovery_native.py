@@ -256,6 +256,7 @@ from synthesis_recovery_identity import (capture_recovery_model_snapshot,
 
 _capture_model_load = ContextVar('capture_native_recovery_model_load', default=None)
 _CUSTOM_MODEL_ID = 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice'
+_RECOVERY_MODEL_IDS = {_CUSTOM_MODEL_ID, 'Qwen/Qwen3-TTS-12Hz-1.7B-Base'}
 
 
 @dataclass(frozen=True)
@@ -296,7 +297,7 @@ def capture_native_recovery_load(model_cls, model_id, local_path, load_kwargs):
     scope = _capture_model_load.get()
     if scope is None or not scope.active:
         return None
-    if model_id != _CUSTOM_MODEL_ID or not local_path:
+    if model_id not in _RECOVERY_MODEL_IDS or not local_path:
         raise RecoveryIdentityUnavailable('unqualified_model_source')
     _ensure_supported_native_versions()
     try:
@@ -313,7 +314,7 @@ def capture_native_recovery_load(model_cls, model_id, local_path, load_kwargs):
     if dtype_name is None:
         raise RecoveryIdentityUnavailable('unsupported_native_load_options')
     device = load_kwargs.get('device_map', 'cpu')
-    if (type(device) is not str or device not in ('cpu', 'mps')
+    if (type(device) is not str or device not in ('cpu', 'mps', 'cuda')
             and not (device.startswith('cuda:') and device[5:].isascii() and device[5:].isdecimal())):
         raise RecoveryIdentityUnavailable('unsupported_native_load_device')
     from audio_generation_owner import ensure_audio_generation_active
