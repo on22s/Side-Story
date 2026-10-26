@@ -10,10 +10,13 @@ A directory name is never enough authority. Reclamation requires a direct
 child of a known export parent, a valid marker naming the same parent and a
 known prefix, and a lock that can be acquired. A live lock, missing/invalid
 marker, foreign parent, symlink, unknown sibling or failed removal preserves the
-directory. Discovery is bounded to direct children and a fixed entry count.
+directory. Discovery is bounded to direct children and a fixed number of
+examined entries per parent, and resumes where it stopped so repeated calls
+reach every entry.
 """
 from __future__ import annotations
 
+import atexit
 from contextlib import contextmanager
 import json
 import os
@@ -23,6 +26,7 @@ import secrets
 import stat
 import tempfile
 import time
+import threading
 
 from export_staging_directory import stage_directory, stage_owner_lock, identity
 
@@ -31,6 +35,11 @@ MARKER = '.export-staging.json'
 OWNER_LOCK = '.export-staging.owner'
 MAX_MARKER_BYTES = 4096
 MAX_SCAN_ENTRIES = 4096
+# An old advisory cursor, if present, is foreign evidence: never read or modify it.
+SCAN_CURSOR = '.export-staging-scan.json'
+MAX_OPEN_SCANS = 64
+_scan_lock = threading.RLock()
+_scan_iterators = {}
 MAX_RECLAIM = 64
 RECOVERY = '.export-staging-recovery'
 PREFIXES = {
@@ -389,13 +398,130 @@ def _matches_parent(marker, parent):
         return False
 
 
+def _open_scanned_stage(path, expected_identity, parent_identity):
+    authority = stage_directory(path, expected_identity)
+    authority.__enter__()
+    try:
+        # Bind admission to the parent actually enumerated, before retirement
+        # can create metadata in a replaced directory or symlink target.
+        if identity(os.stat(authority.path.parent, follow_symlinks=False)) != parent_identity:
+            raise OSError('Export discovery parent changed before admission')
+        if os.name != 'nt' and identity(os.fstat(authority.parent_fd)) != parent_identity:
+            raise OSError('Export discovery parent descriptor changed before admission')
+    except BaseException:
+        authority.__exit__(None, None, None)
+        raise
+    return authority
+
+
+def _close_scan_iterators():
+    with _scan_lock:
+        for _, entries in _scan_iterators.values():
+            entries.close()
+        _scan_iterators.clear()
+
+
+atexit.register(_close_scan_iterators)
+
+
+def _reset_scan_iterators_after_fork():
+    global _scan_lock
+    # A fork may inherit the lock held by another thread. Replace it first.
+    _scan_lock = threading.RLock()
+    _close_scan_iterators()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_scan_iterators_after_fork)
+
+
+@contextmanager
+def _scan_entries(parent, budget):
+    """Consume a bounded part of a serialized, identity-bound directory pass.
+
+    A live iterator avoids re-enumerating skipped names or collecting the whole
+    parent. No pathname is used to publish resume state. Unknown files remain
+    untouched, including cursor files left by earlier versions.
+    """
+    parent = Path(os.path.abspath(parent))
+    with _scan_lock:
+        # Bound retained descriptors. Missing/replaced roots release their
+        # handles. This maintenance examines at most MAX_OPEN_SCANS parents,
+        # never their directory entries.
+        for saved_parent, (saved_identity, entries) in list(_scan_iterators.items()):
+            try:
+                current = identity(os.stat(saved_parent))
+            except OSError:
+                current = None
+            if current != saved_identity:
+                entries.close()
+                del _scan_iterators[saved_parent]
+        parent_identity = identity(os.stat(parent))
+        saved = _scan_iterators.get(parent)
+        if saved is None:
+            if len(_scan_iterators) >= MAX_OPEN_SCANS:
+                oldest_parent = next(iter(_scan_iterators))
+                _, oldest = _scan_iterators.pop(oldest_parent)
+                oldest.close()
+            entries = os.scandir(parent)
+            try:
+                if identity(os.stat(parent)) != parent_identity:
+                    raise OSError('export parent changed while opening discovery')
+            except BaseException:
+                entries.close()
+                raise
+            _scan_iterators[parent] = (parent_identity, entries)
+        else:
+            _, entries = _scan_iterators.pop(parent)
+            _scan_iterators[parent] = saved
+
+        def bounded():
+            for _ in range(budget):
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    entries.close()
+                    _scan_iterators.pop(parent, None)
+                    return
+                if identity(os.stat(parent)) != parent_identity:
+                    raise OSError('export parent changed during discovery')
+                yield entry.name
+        try:
+            yield bounded()
+        except BaseException:
+            entries.close()
+            _scan_iterators.pop(parent, None)
+            raise
+
+
 def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
                            max_scan=MAX_SCAN_ENTRIES):
     """Remove verifiably abandoned marked staging directories.
 
     Returns ``{'removed': [...], 'preserved': [...], 'errors': [...]}``. The
-    scan is one level deep, over known direct children only, and stops at
-    ``max_scan`` entries and ``max_remove`` removals.
+    scan is one level deep, over known direct children only. Its bounds:
+
+    - Discovery: at most ``max_scan`` directory entries are enumerated and
+      examined per parent per call, whatever their type. A serialized in-memory
+      iterator continues each retained pass; a stable parent of N entries is
+      covered in ceil(N / max_scan) calls while its iterator remains retained. Restarting the process restarts the bounded pass.
+      At most 64 parent iterators are retained with least-recently-used eviction.
+      Continuation is guaranteed while a parent is revisited before 64 other
+      distinct parents; eviction restarts its bounded pass, never refuses a new
+      parent. Production recovery normally visits three roots. Parent replacement,
+      disappearance and iteration errors
+      discard that pass safely. An EOF probe may take one additional call.
+      Identity maintenance stats at most 64 retained parents per input parent and does
+      not enumerate their children. No resume file is read, written or deleted.
+    - Admission attempts: at most the examined candidates, so ``max_scan``
+      per parent.
+    - POSIX retirement slots: bounded separately by the private namespace
+      (128 slots plus one reserve, refused beyond that), not by
+      ``max_scan``. Each slot's recovery does its own receipt validation
+      and nested cleanup. Sharing ``max_scan`` would let repeatedly
+      preserved slots starve later ones, which visiting every slot avoids.
+    - Removals: at most ``max_remove`` successful removals per call, across
+      all parents. Attempts are bounded by the rows above, not by this.
     """
     if any(type(limit) is not int or limit < 0 for limit in (max_remove, max_scan)):
         raise ValueError('Export recovery budgets must be nonnegative integers')
@@ -403,111 +529,132 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
     if max_remove == 0 or max_scan == 0:
         return result
     removed = 0
-    scanned = 0
+    seen_parents = set()
     for parent in parents:
-        parent = Path(parent)
+        try:
+            parent = Path(parent)
+            scan_parent = Path(os.path.realpath(parent))
+        except (OSError, RuntimeError, ValueError) as error:
+            result['errors'].append(f'{parent}: {error}')
+            continue
+        # Preserve the caller's path spelling in result rows and diagnostics.
+        # Canonical paths also bind filesystem operations to scanned identity.
+        parent_key = os.path.normcase(str(scan_parent))
+        if parent_key in seen_parents:
+            continue
+        seen_parents.add(parent_key)
+        def display_path(value):
+            # Filesystem operations use the admitted canonical parent; only
+            # result rows use the first caller spelling for this parent.
+            prefix = os.path.join(str(scan_parent), '')
+            if value.startswith(prefix):
+                return os.path.join(str(parent), '') + value[len(prefix):]
+            if value == str(scan_parent) or value.startswith(str(scan_parent) + ':'):
+                return str(parent) + value[len(str(scan_parent)):]
+            return value
+
         if os.name != 'nt' and removed < max_remove:
             from export_staging_retirement import reclaim_retired_slots
             try:
-                retired = reclaim_retired_slots(parent, max_remove=max_remove - removed)
-            except OSError as error:
+                retired = reclaim_retired_slots(scan_parent, max_remove=max_remove - removed)
+            except (OSError, RuntimeError) as error:
                 result['errors'].append(f'{parent}: {error}')
                 continue
             for key in result:
-                result[key].extend(retired[key])
+                result[key].extend(display_path(value) for value in retired[key])
             removed += len(retired['removed'])
             if removed >= max_remove:
                 result['errors'].append('reclaim limit reached')
                 return result
         try:
-            entries = os.scandir(parent)
+            with _scan_entries(scan_parent, max_scan) as window:
+                parent_identity = _scan_iterators[scan_parent][0]
+                for name in window:
+                    entry_path = os.path.join(scan_parent, name)
+                    try:
+                        # Windows DirEntry.stat reports zero device/inode fields.
+                        # Admission requires the actual current filesystem identity.
+                        info = os.stat(entry_path, follow_symlinks=False)
+                    except FileNotFoundError:
+                        # Removed since it was listed: nothing left to reclaim.
+                        continue
+                    except OSError as error:
+                        result['errors'].append(f'{display_path(entry_path)}: {error}')
+                        continue
+                    if not stat.S_ISDIR(info.st_mode):
+                        continue
+                    if getattr(info, 'st_file_attributes', 0) & getattr(
+                            stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
+                        result['preserved'].append(display_path(entry_path))
+                        continue
+                    path = Path(entry_path)
+                    kind, prefix = _candidate(path)
+                    if kind is None:
+                        continue
+                    if ((path / OWNER_LOCK).is_symlink()
+                            or (path / (OWNER_LOCK + '.lock')).is_symlink()
+                            or (path / MARKER).is_symlink()):
+                        result['preserved'].append(display_path(str(path)))
+                        continue
+                    marker = _read_marker(path / MARKER)
+                    if (marker is None or marker.get('prefix') != prefix
+                            or not _matches_parent(marker, scan_parent)):
+                        result['preserved'].append(display_path(str(path)))
+                        continue
+                    try:
+                        authority = _open_scanned_stage(path, identity(info), parent_identity)
+                    except (OSError, RuntimeError) as error:
+                        result['preserved'].append(display_path(str(path)))
+                        result['errors'].append(f'{display_path(str(path))}: {error}')
+                        continue
+                    lock = stage_owner_lock(authority)
+                    try:
+                        owner_stream = lock.__enter__()
+                    except TimeoutError:
+                        authority.__exit__(None, None, None)
+                        result['preserved'].append(display_path(str(path)))
+                        continue
+                    except OSError as error:
+                        authority.__exit__(None, None, None)
+                        result['preserved'].append(display_path(str(path)))
+                        result['errors'].append(f'{display_path(str(path))}: {error}')
+                        continue
+                    except BaseException:
+                        authority.__exit__(None, None, None)
+                        raise
+                    try:
+                        if authority.has_recovery_guard() or authority.has_rollback_backup():
+                            result['preserved'].append(display_path(str(path)))
+                            continue
+                        current = _read_marker(path / MARKER, authority=authority)
+                        if current != marker or not owner_identity_matches(marker, owner_stream):
+                            result['preserved'].append(display_path(str(path)))
+                            continue
+                        def release_owner():
+                            nonlocal lock
+                            owned, lock = lock, None
+                            if owned is not None:
+                                owned.__exit__(None, None, None)
+                        _cleanup_admitted(path, authority=authority, release_owner=release_owner,
+                                          owner_stream=owner_stream)
+                        result['removed'].append(display_path(str(path)))
+                        removed += 1
+                    except (OSError, RuntimeError) as error:
+                        result['preserved'].append(display_path(str(path)))
+                        result['errors'].append(f'{display_path(str(path))}: {error}')
+                    finally:
+                        try:
+                            if lock is not None:
+                                lock.__exit__(None, None, None)
+                        finally:
+                            authority.__exit__(None, None, None)
+                    if removed >= max_remove:
+                        result['errors'].append('reclaim limit reached')
+                        return result
+                if scan_parent in _scan_iterators:
+                    result['errors'].append(f'{parent}: scan limit reached')
         except FileNotFoundError:
             continue
         except OSError as error:
             result['errors'].append(f'{parent}: {error}')
-            continue
-        with entries:
-            for entry in entries:
-                try:
-                    # Windows DirEntry.stat reports zero device/inode fields.
-                    # Admission requires the actual current filesystem identity.
-                    info = os.stat(entry.path, follow_symlinks=False)
-                except OSError as error:
-                    result['errors'].append(f'{entry.path}: {error}')
-                    continue
-                if not stat.S_ISDIR(info.st_mode):
-                    continue
-                if getattr(info, 'st_file_attributes', 0) & getattr(
-                        stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
-                    result['preserved'].append(entry.path)
-                    continue
-                path = Path(entry.path)
-                kind, prefix = _candidate(path)
-                if kind is None:
-                    continue
-                scanned += 1
-                if scanned > max_scan:
-                    result['errors'].append(f'{parent}: scan limit reached')
-                    break
-                if ((path / OWNER_LOCK).is_symlink()
-                        or (path / (OWNER_LOCK + '.lock')).is_symlink()
-                        or (path / MARKER).is_symlink()):
-                    result['preserved'].append(str(path))
-                    continue
-                marker = _read_marker(path / MARKER)
-                if (marker is None or marker.get('prefix') != prefix
-                        or not _matches_parent(marker, parent)):
-                    result['preserved'].append(str(path))
-                    continue
-                authority = stage_directory(path, identity(info))
-                try:
-                    authority.__enter__()
-                except OSError as error:
-                    result['preserved'].append(str(path))
-                    result['errors'].append(f'{path}: {error}')
-                    continue
-                lock = stage_owner_lock(authority)
-                try:
-                    owner_stream = lock.__enter__()
-                except TimeoutError:
-                    authority.__exit__(None, None, None)
-                    result['preserved'].append(str(path))
-                    continue
-                except OSError as error:
-                    authority.__exit__(None, None, None)
-                    result['preserved'].append(str(path))
-                    result['errors'].append(f'{path}: {error}')
-                    continue
-                except BaseException:
-                    authority.__exit__(None, None, None)
-                    raise
-                try:
-                    if authority.has_recovery_guard() or authority.has_rollback_backup():
-                        result['preserved'].append(str(path))
-                        continue
-                    current = _read_marker(path / MARKER, authority=authority)
-                    if current != marker or not owner_identity_matches(marker, owner_stream):
-                        result['preserved'].append(str(path))
-                        continue
-                    def release_owner():
-                        nonlocal lock
-                        owned, lock = lock, None
-                        if owned is not None:
-                            owned.__exit__(None, None, None)
-                    _cleanup_admitted(path, authority=authority, release_owner=release_owner,
-                                      owner_stream=owner_stream)
-                    result['removed'].append(str(path))
-                    removed += 1
-                except OSError as error:
-                    result['preserved'].append(str(path))
-                    result['errors'].append(f'{path}: {error}')
-                finally:
-                    try:
-                        if lock is not None:
-                            lock.__exit__(None, None, None)
-                    finally:
-                        authority.__exit__(None, None, None)
-                if removed >= max_remove:
-                    result['errors'].append('reclaim limit reached')
-                    return result
     return result
