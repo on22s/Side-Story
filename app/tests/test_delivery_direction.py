@@ -201,9 +201,22 @@ class GapPauseTests(unittest.TestCase):
         self.assertEqual([60, 900, 700, None, None], [e.get("pause_after") for e in out])
 
     def test_a_longer_existing_pause_survives(self):
-        entries = self.entries("normal", "cut_off")
-        entries[0]["pause_after"] = 2000
-        self.assertEqual(2000, tp.apply_gap_pauses(entries)[0]["pause_after"])
+        for gap in tp.GAP_PAUSE_MS:
+            for value in (0, 60, 250, 900, 2000, None, "60"):
+                with self.subTest(gap=gap, pause_after=value):
+                    entries = self.entries("normal", gap)
+                    entries[0]["pause_after"] = value
+                    out = tp.apply_gap_pauses(entries)
+                    self.assertEqual(value, out[0]["pause_after"])
+                    self.assertEqual(entries, out)
+                    self.assertIsNot(entries[0], out[0])
+                    self.assertEqual(out, tp.apply_gap_pauses(out))
+        for value, error in (("bad", ValueError), ({}, TypeError)):
+            with self.subTest(invalid=value):
+                entries = self.entries("normal", "beat")
+                entries[0]["pause_after"] = value
+                with self.assertRaises(error):
+                    tp.apply_gap_pauses(entries)
 
     def test_input_is_not_mutated_and_reapplying_changes_nothing(self):
         entries = self.entries("normal", "beat")
@@ -236,6 +249,30 @@ class RunThreePassTests(unittest.TestCase):
         self.assertEqual(3, len(chunks))
         self.assertEqual(900, tts.get_pause_duration_ms(chunks[0], chunks[1]))
         self.assertEqual(60, tts.get_pause_duration_ms(chunks[1], chunks[2]))
+
+        # Pass 3 must carry existing row choices into the actual chunk/timeline
+        # path, including None's default and an explicit no-gap choice.
+        from pydub import AudioSegment
+        audio = AudioSegment.silent(duration=100, frame_rate=24000)
+        for value in (0, 60, 250, 2000, None):
+            with self.subTest(pause_after=value):
+                prior = [dict(entry) for entry in PRIOR]
+                prior[0]["pause_after"] = value
+                directed = tp.instruct_batch(
+                    tpg._client_returning([DIRECTED_ROWS]), "m", prior,
+                    make_params("directed"))
+                entries = tp.apply_gap_pauses(directed)
+                self.assertEqual(value, entries[0]["pause_after"])
+                self.assertEqual(value, prior[0]["pause_after"])
+                chunks = project.group_into_chunks(entries)
+                expected = 500 if value is None else value
+                self.assertEqual(expected, tts.get_pause_duration_ms(chunks[0], chunks[1]))
+                timeline = list(tts.iter_timeline(
+                    [(chunk, audio) for chunk in chunks], already_trimmed=True))
+                # Silence is resampled from pydub's default frame rate; permit
+                # sub-millisecond PCM rounding, not a changed pause choice.
+                self.assertAlmostEqual(100 + expected, timeline[1][2], delta=0.5)
+                self.assertAlmostEqual(200 + expected + 60, timeline[2][2], delta=0.5)
 
     def test_off_book_has_no_gap_pauses(self):
         rows = [{"n": i, "instruct": "Quiet."} for i in range(3)]
