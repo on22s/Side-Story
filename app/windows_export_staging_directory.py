@@ -17,12 +17,6 @@ class _FileTime(ctypes.Structure):
     _fields_ = [('low', ctypes.c_uint32), ('high', ctypes.c_uint32)]
 
 
-class _FileRenameInformation(ctypes.Structure):
-    # WCHAR is always 16 bits, including when the boundary tests run on POSIX.
-    _fields_ = [('replace', ctypes.c_ubyte), ('root', ctypes.c_void_p),
-                ('name_bytes', ctypes.c_uint32), ('name', ctypes.c_uint16 * 1)]
-
-
 class _FileInformation(ctypes.Structure):
     _fields_ = [('attributes', ctypes.c_uint32), ('created', _FileTime),
                 ('accessed', _FileTime), ('written', _FileTime),
@@ -73,32 +67,6 @@ class _Handle:
             raise ctypes.WinError(ctypes.get_last_error())
         return info
 
-    def rename_child(self, destination, name):
-        """Rename this admitted object under an admitted directory, no overwrite.
-
-        The caller retains both handles and owns the surrounding receipt/lock
-        transaction. This primitive alone does not establish cleanup authority.
-        """
-        if (not isinstance(destination, _Handle) or self.handle is None
-                or destination.handle is None or not _member(name)):
-            raise ValueError('Invalid admitted rename target')
-        encoded = name.encode('utf-16-le', errors='strict')
-        if len(encoded) > 510:
-            raise ValueError('Staging rename member is too long')
-        parent = destination.information()
-        if not parent.attributes & 0x10 or parent.attributes & 0x400:
-            raise StageDirectoryChanged('Unsafe staging rename destination')
-        size = max(ctypes.sizeof(_FileRenameInformation),
-                   _FileRenameInformation.name.offset + len(encoded))
-        buffer = ctypes.create_string_buffer(size)
-        record = _FileRenameInformation.from_buffer(buffer)
-        record.replace = 0
-        record.root = destination.handle
-        record.name_bytes = len(encoded)
-        ctypes.memmove(ctypes.addressof(buffer) + _FileRenameInformation.name.offset,
-                       encoded, len(encoded))
-        if not self.api.SetFileInformationByHandle(self.handle, 3, buffer, size):
-            raise ctypes.WinError(ctypes.get_last_error())
 
     def delete(self):
         delete = ctypes.c_ubyte(1)

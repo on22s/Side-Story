@@ -411,93 +411,6 @@ raise RuntimeError('Expected pending-receipt hard exit')
                     pass
                 outer.finish(remove=False)
 
-    def test_windows_handle_rename_uses_bound_directory_without_overwrite(self):
-        import ctypes
-        from types import SimpleNamespace
-        from windows_export_staging_directory import _Handle, _FileRenameInformation
-        from export_staging_directory import StageDirectoryChanged
-        calls = []
-        def rename(handle, kind, buffer, size):
-            record = _FileRenameInformation.from_buffer(buffer)
-            raw = ctypes.string_at(ctypes.addressof(buffer) +
-                                   _FileRenameInformation.name.offset, record.name_bytes)
-            calls.append((handle, kind, record.replace, record.root,
-                          raw.decode('utf-16-le'), size))
-            return 1
-        source = _Handle.__new__(_Handle)
-        source.handle = 123
-        source.api = SimpleNamespace(SetFileInformationByHandle=rename)
-        destination = _Handle.__new__(_Handle)
-        destination.handle = 456
-        destination.information = lambda: SimpleNamespace(attributes=0x10)
-        source.rename_child(destination, 'stage-\U0001f3b5')
-        self.assertEqual((123, 3, 0, 456, 'stage-\U0001f3b5'), calls[0][:5])
-        self.assertGreaterEqual(calls[0][5], _FileRenameInformation.name.offset + 16)
-        for name in ('', '.', '..', '../stage', 'a/b', 'a\\b', 'a:b', 'a\x00b', 'x' * 256):
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                source.rename_child(destination, name)
-        destination.information = lambda: SimpleNamespace(attributes=0x410)
-        with self.assertRaises(StageDirectoryChanged):
-            source.rename_child(destination, 'stage')
-        destination.handle = None
-        with self.assertRaises(ValueError):
-            source.rename_child(destination, 'stage')
-        self.assertEqual(1, len(calls))
-        if os.name == 'nt':
-            from windows_export_staging_directory import _api, _identity
-            with tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                original = root / 'source'; original.mkdir()
-                (original / 'payload').write_bytes(b'owned')
-                occupied = root / 'occupied'; occupied.mkdir()
-                (occupied / 'keep').write_bytes(b'foreign')
-                api = _api()
-                parent_handle = _Handle(api, root)
-                try:
-                    stage_handle = _Handle(api, original, delete=True)
-                    try:
-                        from utils import file_lock
-                        contender = """
-import sys
-from utils import file_lock
-try:
-    with open(sys.argv[1], 'r+b') as stream:
-        with file_lock(sys.argv[1], timeout=0, lock_handle=stream):
-            print('acquired')
-except TimeoutError:
-    print('blocked')
-"""
-                        def check_contender(path, expected):
-                            result = subprocess.run([sys.executable, '-c', contender, str(path)],
-                                                    cwd=APP, capture_output=True, text=True, timeout=10)
-                            self.assertEqual(0, result.returncode, result.stderr)
-                            self.assertEqual(expected, result.stdout.strip())
-                        with (original / 'owner.lock').open('w+b') as owner:
-                            owner_identity = os.fstat(owner.fileno())
-                            with file_lock(original / 'owner', timeout=0, lock_handle=owner):
-                                check_contender(original / 'owner.lock', 'blocked')
-                                # Windows cannot rename a directory with an
-                                # open descendant. This is not a qualified
-                                # durable owner-relocation protocol.
-                                with self.assertRaises(OSError):
-                                    stage_handle.rename_child(parent_handle, 'moved')
-                                self.assertEqual(b'owned', (original / 'payload').read_bytes())
-                        before = _identity(stage_handle.information())
-                        with self.assertRaises(OSError):
-                            stage_handle.rename_child(parent_handle, 'occupied')
-                        self.assertEqual(b'foreign', (occupied / 'keep').read_bytes())
-                        stage_handle.rename_child(parent_handle, 'moved')
-                        self.assertEqual(before, _identity(stage_handle.information()))
-                        self.assertFalse(original.exists())
-                        self.assertEqual(b'owned', (root / 'moved' / 'payload').read_bytes())
-                        moved_owner = (root / 'moved' / 'owner.lock').stat()
-                        self.assertEqual((owner_identity.st_dev, owner_identity.st_ino),
-                                         (moved_owner.st_dev, moved_owner.st_ino))
-                        check_contender(root / 'moved' / 'owner.lock', 'acquired')
-                    finally:
-                        stage_handle.close()
-                finally:
-                    parent_handle.close()
 
     @unittest.skipIf(os.name == 'nt', 'POSIX registry lock contention')
     def test_busy_registry_preserves_recovery_and_worker_waits_for_release(self):
@@ -717,7 +630,7 @@ with PosixRetirement(parent=sys.argv[1], create=False):
                             ancestor_before = parent.stat()
                             with self.assertRaises(OSError) as ancestor_denied:
                                 parent.rename(root / 'admitted-export-parent')
-                            self.assertEqual(32, ancestor_denied.exception.winerror)
+                            self.assertIn(ancestor_denied.exception.winerror, (5, 32))
                             ancestor_after = parent.stat()
                             self.assertEqual((ancestor_before.st_dev, ancestor_before.st_ino),
                                              (ancestor_after.st_dev, ancestor_after.st_ino))
@@ -725,7 +638,7 @@ with PosixRetirement(parent=sys.argv[1], create=False):
                             before = path.stat()
                             with self.assertRaises(OSError) as denied:
                                 path.rename(root / 'admitted-stage')
-                            self.assertEqual(32, denied.exception.winerror)
+                            self.assertIn(denied.exception.winerror, (5, 32))
                             after = path.stat()
                             self.assertEqual((before.st_dev, before.st_ino),
                                              (after.st_dev, after.st_ino))
@@ -746,6 +659,20 @@ with PosixRetirement(parent=sys.argv[1], create=False):
                             result = reclaim_export_staging([parent])
                             self.assertEqual([], result['removed'])
                     self.assertEqual([True], calls)
+                    if os.name == 'nt':
+                        # Both sharing and access denial are valid while pinned.
+                        # Prove this was admission, not a permanent ACL failure:
+                        # after cleanup releases its handles both moves succeed.
+                        parent_id = (parent.stat().st_dev, parent.stat().st_ino)
+                        released_parent = root / 'released-export-parent'
+                        parent.rename(released_parent)
+                        self.assertEqual(parent_id, (released_parent.stat().st_dev,
+                                                     released_parent.stat().st_ino))
+                        released_stage = released_parent / staging.path.name
+                        stage_id = (released_stage.stat().st_dev, released_stage.stat().st_ino)
+                        released_stage.rename(root / 'released-stage')
+                        moved = (root / 'released-stage').stat()
+                        self.assertEqual(stage_id, (moved.st_dev, moved.st_ino))
                     self.assertEqual(expected, {name: (foreign / name).read_bytes()
                                      if (foreign / name).exists() else None for name in expected})
 
