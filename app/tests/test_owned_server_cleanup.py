@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -17,17 +18,29 @@ def is_running(pid):
     try:
         status=Path('/proc',str(pid),'stat').read_text().split(') ',1)[1].split()[0]
         return status!='Z'
-    except FileNotFoundError: return False
+    except (FileNotFoundError, ProcessLookupError): return False
 
 
 def cleanup_fixture(pid):
     if is_running(pid):
-        os.kill(pid,signal.SIGKILL)
+        try:
+            os.kill(pid,signal.SIGKILL)
+        except ProcessLookupError:
+            return
         deadline=time.monotonic()+3
         while is_running(pid) and time.monotonic()<deadline: time.sleep(.01)
 
 
 class OwnedServerCleanupRaceTests(unittest.TestCase):
+    def test_fixture_process_exit_during_proc_read_or_signal_is_already_clean(self):
+        for error in (FileNotFoundError, ProcessLookupError):
+            with self.subTest(operation='proc-read', error=error.__name__), \
+                    patch.object(Path, 'read_text', side_effect=error):
+                self.assertFalse(is_running(12345))
+        with patch(__name__ + '.is_running', return_value=True), \
+                patch.object(os, 'kill', side_effect=ProcessLookupError):
+            cleanup_fixture(12345)
+
     def test_exit_during_escalation_ownership_query_is_reaped_as_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / 'race.sh'

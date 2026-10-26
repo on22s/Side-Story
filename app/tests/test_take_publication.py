@@ -52,19 +52,19 @@ class TakePublicationTests(unittest.TestCase):
         with ensure_audio_generation_owner(AudioGenerationOwner('a' * 32, admit)):
             yield
 
-    def engine(self):
+    def engine(self, category='custom'):
         engine = tts.TTSEngine.__new__(tts.TTSEngine)
         engine._mode, engine._device, engine._language = 'local', 'cpu', 'English'
         engine._compile_codec_enabled, engine._max_new_tokens = False, 256
         engine._synthesis_windows = get_synthesis_window_settings({'enabled':True,
-            'budgets':{'local.custom':{'max_chars':12}}})
+            'budgets':{'local.'+category:{'max_chars':12}}})
         engine._synthesis_recovery = {'enabled':True, 'max_audio_mb':16}
         engine._speech_verification = None
         return engine
 
-    def render(self, root, engine, parent, chunk, seconds=None):
+    def render(self, root, engine, parent, chunk, seconds=None, category='custom'):
         preparation = get_speech_normalization(chunk['text'])
-        plan = engine._get_synthesis_window_plan(preparation['text'], 'custom')
+        plan = engine._get_synthesis_window_plan(preparation['text'], category)
         self.assertGreaterEqual(len(plan.windows), 2)
         descriptor = dict(version=1, parent=parent.get_semantic_identity(), plan=asdict(plan),
             policy=engine._synthesis_windows, serving_sha256='b' * 64, input_proof_version=1)
@@ -82,9 +82,9 @@ class TakePublicationTests(unittest.TestCase):
             observed = get_captured_speech_input(pcm)
         return pcm, preparation, receipt, observed
 
-    def admission(self, manager, engine, chunk):
+    def admission(self, manager, engine, chunk, voices=None):
         parent = manager._capture_synthesis_recovery_parent(engine, 0, chunk)
-        voices = {'NARRATOR':{'type':'custom','voice':'Ryan','seed':42}}
+        voices = voices or {'NARRATOR':{'type':'custom','voice':'Ryan','seed':42}}
         admitted = manager._capture_take_publication_admission(engine, parent, 0, chunk, voices, 'NARRATOR')
         self.assertIsNotNone(admitted)
         return parent, admitted
@@ -114,6 +114,30 @@ class TakePublicationTests(unittest.TestCase):
                 result = render(engine, [{'index':0,'text':'Actual batch input.'}], {}, tmp, capture_input=enabled)
                 self.assertEqual('speech_inputs' in result, enabled)
                 if enabled:self.assertEqual(result['speech_inputs'][0]['text'], 'Actual batch input.')
+
+    def test_missing_or_non_object_selected_voice_remains_unproven(self):
+        with self.fixture() as (_, manager, _, _), self.owner():
+            engine = self.engine()
+            chunk = manager.load_chunks()[0]
+            parent, admitted = self.admission(manager, engine, chunk)
+            for voices in ({}, {'NARRATOR':None}, {'NARRATOR':'invalid'},
+                           {'NARRATOR':[]}, {'NARRATOR':7}, {'NARRATOR':True},
+                           {'NARRATOR':0}, {'NARRATOR':False},
+                           {'NARRATOR':{'alias':'A'}, 'A':{'alias':'NARRATOR'}}):
+                with self.subTest(voices=voices):
+                    self.assertIsNone(capture_take_publication_admission(engine, parent,
+                        admitted.book_token, chunk['uid'], 0, get_chunk_generation_inputs(chunk),
+                        voices, 'NARRATOR'))
+            voices = {'NARRATOR':{'alias':'A0'}}
+            voices.update({f'A{index}':{'alias':f'A{index+1}'} for index in range(18)})
+            self.assertIsNone(capture_take_publication_admission(engine, parent,
+                admitted.book_token, chunk['uid'], 0, get_chunk_generation_inputs(chunk),
+                voices, 'NARRATOR'))
+            for seed in (float('inf'), float('-inf'), float('nan'), 1 << 256, -1, 'invalid'):
+                with self.subTest(seed=seed):
+                    self.assertIsNone(capture_take_publication_admission(engine, parent,
+                        admitted.book_token, chunk['uid'], 0, get_chunk_generation_inputs(chunk),
+                        {'NARRATOR':{'type':'custom','voice':'Ryan','seed':seed}}, 'NARRATOR'))
 
     def test_unknown_overridden_unowned_and_random_renderers_remain_unproven(self):
         with self.fixture() as (root, manager, _, _), self.owner():
@@ -149,6 +173,13 @@ class TakePublicationTests(unittest.TestCase):
             self.assertEqual(result['synthesis_sha256'], get_recovery_digest(synthesis))
             row={'uid':chunk['uid'],'audio_revision':revision,KEY:result}
             self.assertEqual(validate_take_publication(row), result)
+            # Preserve the v1 custom receipt shape while refusing unknown or
+            # malformed discriminators without touching the caller's evidence.
+            for kind in ('native_unknown_windows_v1', '', None, [], True):
+                bad={**row,KEY:{**result,'kind':kind}}
+                with self.subTest(kind=kind),self.assertRaises(ValueError):
+                    validate_take_publication(bad)
+                self.assertEqual(row[KEY],result)
             self.assertEqual(get_retained_take_bytes(row), len(json.dumps(result,sort_keys=True,
                 separators=(',',':'),ensure_ascii=True,allow_nan=False).encode('ascii')))
             for field, value in (('audio_revision','f'*32),('uid','other')):

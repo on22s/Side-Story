@@ -30,16 +30,34 @@ class TakeRestorationTests(unittest.TestCase):
     render=publication_cases.TakePublicationTests.render
 
     @contextmanager
-    def prepared(self,journal=False,encoded_suffix=None,before_retake=None):
+    def prepared(self,journal=False,encoded_suffix=None,before_retake=None,category='custom',chunk_changes=None):
         with self.fixture(journal) as (root,manager,_,fresh),self.owner():
-            engine=self.engine()
+            if chunk_changes:
+                rows=manager.load_chunks()
+                rows[0].update(copy.deepcopy(chunk_changes))
+                manager.save_chunks(rows)
+            engine=self.engine(category)
             Path(manager.config_path).write_text(json.dumps({'tts':{
                 **engine.get_model_settings(),'synthesis_recovery':engine._synthesis_recovery}}))
             manager.invalidate_config_cache()
-            Path(manager.voice_config_path).write_text(json.dumps(
-                {'NARRATOR':{'type':'custom','voice':'Ryan','seed':42}}))
-            chunk=manager.load_chunks()[0];parent,admitted=self.admission(manager,engine,chunk)
-            pcm,_,synthesis,observed=self.render(root,engine,parent,chunk)
+            voice={'type':'custom','voice':'Ryan','seed':42}
+            if category=='clone':
+                voice={'type':'clone','ref_audio':str(fresh),'ref_text':'Synthetic reference.', 'seed':42}
+            elif category=='lora':
+                adapter=root/'fixture-adapter';adapter.mkdir()
+                voice={'type':'lora','adapter_path':str(adapter), 'adapter_generation_sha256':'a'*64,
+                       'character_style':'quietly', 'seed':42}
+            voices={'NARRATOR':voice}
+            Path(manager.voice_config_path).write_text(json.dumps(voices))
+            chunk=manager.load_chunks()[0]
+            from pronunciation import ensure_occurrence_pronunciation_context
+            from project import get_pronunciation_render_context
+            if chunk.get('pronunciation_rules'):
+                chunk={**chunk,'_pronunciation_context':get_pronunciation_render_context(
+                    voices,chunk,0,engine.get_model_settings())}
+            parent,admitted=self.admission(manager,engine,chunk,voices)
+            with ensure_occurrence_pronunciation_context(chunk,chunk.get('_pronunciation_context')):
+                pcm,_,synthesis,observed=self.render(root,engine,parent,chunk,category=category)
             def encode(source,name):
                 import soundfile as sf
                 destination=root/'voicelines'/(name+encoded_suffix)
@@ -69,7 +87,7 @@ class TakeRestorationTests(unittest.TestCase):
                 expected_take=current['take'],version=saved['version'],sha256=saved['sha256'])
             identity=NativeRecoveryServingIdentity('b'*64,'c'*64,'d'*64)
             with patch.object(manager,'get_engine',return_value=engine), \
-                    patch('synthesis_recovery_serving.capture_native_custom_serving_identity',return_value=identity):
+                    patch('synthesis_recovery_serving.capture_native_'+category+'_serving_identity',return_value=identity):
                 yield root,manager,engine,request,origin,original,current,displaced,saved
 
     @unittest.skipUnless(is_synthesis_workspace_supported(), 'Registered restore staging currently qualifies Linux')
@@ -97,6 +115,38 @@ class TakeRestorationTests(unittest.TestCase):
                 with SynthesisWorkspaceRegistry(root) as registry:self.assertEqual(registry.body['rows'],{})
 
     @unittest.skipUnless(is_synthesis_workspace_supported(), 'Registered restore staging currently qualifies Linux')
+    def test_clone_and_lora_publication_kind_restore_and_cross_kind_refusal(self):
+        # Real PCM/render/receipt/archive/publication path, declared CPU serving
+        # identity only. This does not qualify native inference or voice quality.
+        for category in ('clone','lora'):
+            for journal in (False,True):
+                with self.subTest(category=category,journal=journal), self.prepared(journal,category=category) as args:
+                    root,manager,_,request,origin,original,current,displaced,saved=args
+                    kind='native_'+category+'_windows_v1'
+                    self.assertEqual(origin[KEY]['kind'],kind)
+                    history=AudioTakeHistory(root)
+                    with history._locked() as document:
+                        record=next(r for r in document['records'] if r['version']==saved['version'])
+                        record['captured'][KEY]['kind']='native_custom_windows_v1'
+                        history._save(document)
+                    expected=capture_restore_target(manager,0,request)
+                    with self.assertRaisesRegex(ValueError,'voice or seed'):
+                        restore_editor_take(manager,0,request,expected)
+                    self.assertEqual((root/current['audio_path']).read_bytes(),displaced)
+                    self.assertEqual(manager.load_chunks()[0]['audio_revision'],current['audio_revision'])
+                    with history._locked() as document:
+                        record=next(r for r in document['records'] if r['version']==saved['version'])
+                        record['captured'][KEY]['kind']=kind
+                        history._save(document)
+                    restored=restore_editor_take(manager,0,request,capture_restore_target(manager,0,request))
+                    self.assertEqual((root/restored['audio_path']).read_bytes(),original)
+                    self.assertEqual(restored[KEY],origin[KEY])
+                    self.assertEqual(restored['text'],current['text'])
+                    with history._locked() as document:
+                        displaced_record=next(r for r in document['records'] if r['audio_revision']==current['audio_revision'])
+                        self.assertEqual((root/'take_history'/f"{displaced_record['version']}{displaced_record['suffix']}").read_bytes(),displaced)
+
+    @unittest.skipUnless(is_synthesis_workspace_supported(), 'Registered restore staging currently qualifies Linux')
     def test_failed_final_metadata_keeps_displaced_bytes_revision_and_take(self):
         for journal in (False,True):
             with self.subTest(journal=journal),self.prepared(journal) as args:
@@ -113,6 +163,65 @@ class TakeRestorationTests(unittest.TestCase):
                 row=manager.load_chunks()[0]
                 for field in ('audio_path','audio_revision','take'):self.assertEqual(row[field],current[field])
                 self.assertEqual((root/row['audio_path']).read_bytes(),displaced)
+
+    @unittest.skipUnless(is_synthesis_workspace_supported(), 'Registered restore staging currently qualifies Linux')
+    def test_restore_request_matches_generation_with_delivery_cues_and_style(self):
+        from take_restoration import _get_matching_request
+        from speech_policy import SUNG_HINT
+        from speech_text import get_prelexicon_speech_normalization
+        from pronunciation import get_occurrence_pronunciation_candidates, ensure_occurrence_pronunciation_context
+        from project import get_pronunciation_render_context
+        text='♪ Original synthetic words. ♪'
+        anchor=get_occurrence_pronunciation_candidates(
+            get_prelexicon_speech_normalization(text)['text'],'line',text,'Original')['candidates'][0]
+        rule={**{key:value for key,value in anchor.items() if key not in ('before','after')},
+              'id':'fixture-rule','state':'approved','replacement':'Careful',
+              'restrictions':{'speaker':'NARRATOR','engine_mode':'local'}}
+        for category in ('custom', 'clone', 'lora'):
+            with self.subTest(category=category), self.prepared(category=category,
+                    chunk_changes={'text':text,'instruct':'Carefully.','pronunciation_rules':[rule]}) as args:
+                root,manager,engine,_,origin,_,current,_,_=args
+                # Observe the real public preparation and dispatch, stopping at
+                # the native window boundary before any model or GPU work.
+                voices=manager.get_voice_config_for_update()
+                selected=manager.get_chunk_render_voice_config(voices,'NARRATOR',origin,0)
+                with ensure_occurrence_pronunciation_context(origin,get_pronunciation_render_context(
+                        voices,origin,0,engine.get_model_settings())), \
+                        patch.object(engine,'_render_synthesis_windows',return_value=True) as render:
+                    self.assertTrue(engine.generate_voice(origin['text'],origin['instruct'],
+                        'NARRATOR',selected,str(root/'unused.wav')))
+                self.assertEqual(render.call_args.args[0],'Careful synthetic words.')
+                generated_request=render.call_args.kwargs['recovery_request']
+                candidate={**current,'take':origin['take']}
+                restored_request,plan=_get_matching_request(manager,engine,0,candidate,origin[KEY])
+                self.assertEqual(restored_request,generated_request)
+                self.assertEqual(plan.text_sha256,hashlib.sha256(render.call_args.args[0].encode('utf-8')).hexdigest())
+                if category!='clone':
+                    self.assertIn('Carefully.',restored_request.instruct)
+                    self.assertEqual(restored_request.instruct.count(SUNG_HINT),1)
+                if category=='lora':
+                    self.assertTrue(restored_request.instruct.endswith('quietly'))
+                self.assertEqual(manager.load_chunks()[0]['text'],origin['text'])
+
+    @unittest.skipUnless(is_synthesis_workspace_supported(), 'Registered restore staging currently qualifies Linux')
+    def test_native_request_asset_errors_preserve_selected_audio(self):
+        import tts
+        for category in ('clone', 'lora'):
+            with self.subTest(category=category), self.prepared(category=category) as args:
+                root,manager,_,request,_,_,current,displaced,_=args
+                expected=capture_restore_target(manager,0,request)
+                for error in (PermissionError('/private/asset'), TypeError('invalid path'), KeyError('ref_text'),
+                              ValueError('adapter publication recovery is required: /private/asset')):
+                    with self.subTest(error=type(error).__name__), \
+                            patch('tts.get_'+category+'_voice_request',side_effect=error) as failed_request, \
+                            patch.dict(tts._RAW_RECOVERY_FUNCTIONS,{'get_'+category+'_voice_request':failed_request}), \
+                            self.assertRaisesRegex(ValueError,'Current voice assets are unavailable') as caught:
+                        restore_editor_take(manager,0,request,expected)
+                    self.assertNotIn('/private/asset',str(caught.exception))
+                    self.assertEqual((root/current['audio_path']).read_bytes(),displaced)
+                    row=manager.load_chunks()[0]
+                    self.assertEqual(row['audio_revision'],current['audio_revision'])
+                    self.assertEqual(row['take'],current['take'])
 
     def test_stale_current_counter_or_path_is_refused_without_loading_engine(self):
         with self.prepared() as args:
@@ -318,9 +427,10 @@ class TakeRestorationTests(unittest.TestCase):
         from audio_generation_owner import (AudioGenerationOwner, AudioGenerationCancelled,
                                              ensure_audio_generation_owner)
         from synthesis_workspace import SynthesisWorkspaceRegistry
-        for journal in (False,True):
+        for category,journal in ((category,journal) for category in ('custom','clone','lora')
+                                 for journal in (False,True)):
             for case in ('cancelled','replaced'):
-                with self.subTest(journal=journal,case=case),self.prepared(journal) as args,ExitStack() as stack:
+                with self.subTest(category=category,journal=journal,case=case),self.prepared(journal,category=category) as args,ExitStack() as stack:
                     root,manager,_,request,_,_,current,displaced,_=args
                     active=[True];mutex=threading.Lock();calls=[]
                     @contextmanager
@@ -337,7 +447,7 @@ class TakeRestorationTests(unittest.TestCase):
                             if case=='cancelled':active[0]=False
                             else:stack.enter_context(ensure_audio_generation_owner(AudioGenerationOwner('f'*32,admit)))
                         return NativeRecoveryServingIdentity('b'*64,'c'*64,'d'*64)
-                    with patch('synthesis_recovery_serving.capture_native_custom_serving_identity',side_effect=identity), \
+                    with patch('synthesis_recovery_serving.capture_native_'+category+'_serving_identity',side_effect=identity), \
                             self.assertRaises((AudioGenerationCancelled,ValueError)):
                         restore_editor_take(manager,0,request,current)
                     active[0]=True

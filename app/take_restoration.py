@@ -14,7 +14,7 @@ from audio_generation_owner import (ensure_audio_generation_active,
     reuse_audio_generation_book)
 from audio_take_history import AudioTakeHistory, _version
 from book_state_transaction import ensure_book_state, get_book_operation_token
-from take_publication import KEY, _is_current_engine, _read_audio, validate_take_publication
+from take_publication import NATIVE_TAKE_KINDS, KEY, _is_current_engine, _read_audio, validate_take_publication
 from utils import file_lock
 
 
@@ -95,7 +95,8 @@ def _get_matching_request(manager, engine, index, candidate, proof):
     from lora_evidence import get_tts_model_settings
     from project import get_occurrence_speech_projection
     from synthesis_recovery_identity import get_recovery_digest
-    from tts import get_custom_voice_request, get_resolved_speaker, voice_category
+    from tts import (get_custom_voice_request, get_clone_voice_request,
+                     get_lora_voice_request, get_resolved_speaker, voice_category)
     if not _is_current_engine(engine):
         raise ValueError('The active renderer has no supported native restoration identity.')
     settings = engine.get_model_settings()
@@ -109,19 +110,37 @@ def _get_matching_request(manager, engine, index, candidate, proof):
     if type(batch_seed) is int:
         choices.append(manager.get_chunk_render_voice_config(
             voices, speaker, candidate, index, batch_seed=batch_seed))
+    category = NATIVE_TAKE_KINDS[proof['kind']]
+    projection = get_occurrence_speech_projection(candidate, index, voices, settings)
+    preparation = {key:value for key,value in projection.items() if key != 'context'}
+    from pronunciation import ensure_occurrence_pronunciation_context
+    from speech_text import get_speech_preparation
+    with ensure_occurrence_pronunciation_context(candidate, projection['context']):
+        prepared = get_speech_preparation(candidate['text'], candidate.get('instruct', ''))
+    if prepared['text'] != preparation['text']:
+        raise ValueError('Speech preparation changed during restoration.')
     request = None
     for choice in choices:
         selected = choice.get(get_resolved_speaker(speaker, choice))
-        if (voice_category(selected) == 'custom'
+        if (voice_category(selected) == category
                 and get_recovery_digest(selected) == proof['dependencies']['voice_sha256']):
-            request = get_custom_voice_request(choice, get_resolved_speaker(speaker, choice),
-                                               candidate.get('instruct', ''))
+            try:
+                if category == 'custom':
+                    request = get_custom_voice_request(choice, get_resolved_speaker(speaker, choice),
+                                                       prepared['instruct'])
+                elif category == 'clone':
+                    request = get_clone_voice_request(selected)
+                else:
+                    request = get_lora_voice_request(selected, prepared['instruct'])
+            except (OSError, TypeError, KeyError, ValueError) as error:
+                # A saved performance remains auditionable when its current
+                # reference/adapter can no longer construct a native request.
+                # Do not include paths or provider diagnostics in the UI error.
+                raise ValueError('Current voice assets are unavailable; the selected take was preserved.') from error
             break
     if request is None:
         raise ValueError('Current voice or seed selection differs from this saved performance.')
-    projection = get_occurrence_speech_projection(candidate, index, voices, settings)
-    preparation = {key:value for key,value in projection.items() if key != 'context'}
-    plan = engine._get_synthesis_window_plan(preparation['text'], 'custom')
+    plan = engine._get_synthesis_window_plan(preparation['text'], category)
     if (plan is None or get_recovery_digest(preparation) != proof['dependencies']['pronunciation_sha256']
             or plan.text_sha256 != proof['speech_sha256']
             or get_recovery_digest(dict(plan=asdict(plan),policy=settings.get('synthesis_windows')))
@@ -153,7 +172,7 @@ def _ensure_claim(claim):
 def restore_editor_take(manager, index, request, expected):
     """Retain the displaced take, verify compatibility, then atomically select."""
     from synthesis_recovery_native import ensure_native_recovery_model_capture
-    from synthesis_recovery_serving import capture_native_custom_serving_identity
+    from synthesis_recovery_serving import capture_native_serving_identity
     from synthesis_workspace import (SynthesisWorkspaceRegistry, ensure_synthesis_workspace,
                                      is_synthesis_workspace_supported)
     from tts import _LOCAL_TTS_LOCK
@@ -177,7 +196,7 @@ def restore_editor_take(manager, index, request, expected):
     _ensure_claim(claim)
     # Initialization/asset inspection happens outside book and owner locks.
     with ensure_native_recovery_model_capture(), _LOCAL_TTS_LOCK:
-        identity = capture_native_custom_serving_identity(engine, native_request)
+        identity = capture_native_serving_identity(engine, native_request)
     if identity.sha256 != proof['dependencies']['serving_sha256']:
         raise ValueError('Current native execution dependencies differ from this saved performance.')
     _ensure_claim(claim)
@@ -229,9 +248,11 @@ def restore_editor_take(manager, index, request, expected):
                 with manager._ensure_automatic_predecessor(current, required=True), _LOCAL_TTS_LOCK, \
                         file_lock(pronunciation.DEFAULT_PATH), \
                         pronunciation.ensure_pronunciation_audition(pronunciation.load_lexicon(force=True)):
+                    _ensure_claim(claim)
                     native_request, _ = _get_matching_request(manager, engine, index, candidate, proof)
+                    _ensure_claim(claim)
                     with ensure_native_recovery_model_capture():
-                        final = capture_native_custom_serving_identity(engine, native_request)
+                        final = capture_native_serving_identity(engine, native_request)
                     if final.sha256 != identity.sha256:
                         raise ValueError('Native execution dependencies changed before restoration publication.')
                     _ensure_claim(claim)

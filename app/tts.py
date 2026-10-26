@@ -441,6 +441,40 @@ def get_custom_voice_request(voice_config, speaker, instruct_text):
                               anchored_instruct(voice_data, instruct_text))
 
 
+def get_clone_voice_request(voice_data):
+    """Resolve the same reference and seed used by native clone windows."""
+    ref_audio = voice_data["ref_audio"]
+    if not os.path.isabs(ref_audio):
+        ref_audio = _resolve_asset_path(ref_audio)
+    seed = int(voice_data.get("seed", -1))
+    if isinstance(voice_data["ref_text"], str) and 0 <= seed < 2**64:
+        return CloneRequest(ref_audio, voice_data["ref_text"], seed)
+    return None
+
+
+def get_lora_voice_request(voice_data, prepared_instruct):
+    """Resolve native LoRA identity; instruction must already be speech-prepared."""
+    adapter_path = voice_data.get("adapter_path")
+    if not adapter_path:
+        return None
+    if not os.path.isabs(adapter_path):
+        adapter_path = _resolve_asset_path(adapter_path)
+    adapter_path = get_resolved_adapter_path(adapter_path)
+    try:
+        seed = int(voice_data.get("seed", -1))
+    except (TypeError, ValueError):
+        seed = -1
+    character_style = voice_data.get("character_style", "") or voice_data.get("default_style", "")
+    served_instruct = prepared_instruct or ""
+    if character_style:
+        served_instruct = f"{served_instruct} {character_style}".strip()
+    if os.path.isdir(adapter_path) and 0 <= seed < 2**64:
+        return LoRARequest(adapter_path,
+            voice_data.get("adapter_generation_sha256") or get_adapter_generation_sha256(adapter_path),
+            seed, served_instruct)
+    return None
+
+
 def voice_is_set(voice_data):
     """Does this character have a voice yet? True for any assigned LoRA /
     clone / designed / ensemble voice, and for a custom entry that carries a
@@ -969,6 +1003,10 @@ class TTSEngine:
         if not torch.cuda.is_available():
             return 9999
 
+        device = self.get_memory_device(model)
+        if device is None:
+            return 9999
+
         try:
             config = model.model.talker.config
             num_layers = config.num_hidden_layers
@@ -976,10 +1014,6 @@ class TTSEngine:
             head_dim = config.hidden_size // config.num_attention_heads
         except AttributeError:
             return 1  # cannot size GPU memory safely without model dimensions
-
-        device = self.get_memory_device(model)
-        if device is None:
-            return 9999
 
         dtype_bytes = 2  # bf16
         kv_per_token = num_layers * 2 * num_kv_heads * head_dim * dtype_bytes
@@ -2095,12 +2129,7 @@ class TTSEngine:
                 and self.get_voice_backend("clone") == "local"
                 and voice_data.get("ref_audio") and voice_data.get("ref_text")):
             try:
-                ref_audio = voice_data["ref_audio"]
-                if not os.path.isabs(ref_audio):
-                    ref_audio = _resolve_asset_path(ref_audio)
-                seed = int(voice_data.get("seed", -1))
-                if isinstance(voice_data["ref_text"], str) and 0 <= seed < 2**64:
-                    request = CloneRequest(ref_audio, voice_data["ref_text"], seed)
+                request = get_clone_voice_request(voice_data)
             except (TypeError, ValueError, OSError):
                 request = None
         windowed = self._render_synthesis_windows(
@@ -2440,23 +2469,7 @@ class TTSEngine:
             request = recovery_request
             if (request is None and getattr(self, "_synthesis_recovery", None)
                     and getattr(self, "_synthesis_windows", None) and adapter_path):
-                if not os.path.isabs(adapter_path):
-                    adapter_path = _resolve_asset_path(adapter_path)
-                adapter_path = get_resolved_adapter_path(adapter_path)
-                try:
-                    seed = int(voice_data.get("seed", -1))
-                except (TypeError, ValueError):
-                    seed = -1
-                character_style = (voice_data.get("character_style", "")
-                                   or voice_data.get("default_style", ""))
-                served_instruct = instruct_text or ""
-                if character_style:
-                    served_instruct = f"{served_instruct} {character_style}".strip()
-                if os.path.isdir(adapter_path) and 0 <= seed < 2**64:
-                    request = LoRARequest(
-                        adapter_path,
-                        voice_data.get("adapter_generation_sha256") or get_adapter_generation_sha256(adapter_path),
-                        seed, served_instruct)
+                request = get_lora_voice_request(voice_data, instruct_text)
             windowed = self._render_synthesis_windows(
                 text, "lora", lambda span, path: self._generate_lora_voice_prepared(
                     span, instruct_text, voice_data, path, recovery_request=request), output_path,
@@ -3770,7 +3783,8 @@ _RAW_RECOVERY_MODEL_IDS = dict(TTSEngine._LOCAL_MODEL_IDS)
 _RAW_RECOVERY_ALLOCATION_FAILURE = device_utils.is_allocation_failure
 from gpu_stats import OOM_MARKERS as _RAW_RECOVERY_ALLOCATION_MARKERS
 _RAW_RECOVERY_FUNCTIONS = {name: globals()[name] for name in (
-    'get_custom_voice_request', 'anchored_instruct', 'get_memory_bounded_codec_decode')}
+    'get_custom_voice_request', 'get_clone_voice_request', 'get_lora_voice_request',
+    'anchored_instruct', 'get_memory_bounded_codec_decode')}
 
 
 # Capture native wrappers once so class/instance replacements take the fallback.
