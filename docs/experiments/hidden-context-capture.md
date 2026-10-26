@@ -8,7 +8,11 @@ words from the following row; the other also prepends up to five words from the
 preceding row. The 256-character cap applies to each context side separately,
 excluding the added single-space separators. Over-cap context is refused without
 cutting a word. Offsets and character caps use Unicode code points. The authored
-text, case and punctuation remain unchanged in each request.
+text, case and punctuation remain unchanged in each request. The full raw
+request must also fit the existing `synthesis_input.MAX_TEXT` character limit;
+over-limit context expansion is refused before model initialization. Speech
+preparation can still change the submitted string, whose actual proof is
+checked after generation as described below.
 
 From `app/` in a clean committed checkout, using synthetic or rights-cleared
 source and the existing explicit local configuration:

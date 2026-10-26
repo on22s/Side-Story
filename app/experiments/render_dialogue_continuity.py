@@ -18,6 +18,7 @@ from audio_generation_owner import (ensure_audio_generation_active,
 from audio_validation import GeneratedAudioError, validate_generated_audio
 from experiments.plan_dialogue_continuity import get_continuity_experiment_packet
 from project_scope_files import capture_scope_file
+from synthesis_input import MAX_TEXT
 from synthesis_recovery_identity import get_recovery_digest
 from utils import file_lock
 from word_timing import MAX_AUDIO_BYTES
@@ -48,6 +49,8 @@ def get_hidden_context_capture_requests(packet, row_index):
     for arm, before in (('hidden_following', ''), ('hidden_sandwich', preceding)):
         prefix = before + ' ' if before else ''
         text = prefix + authored + ' ' + following
+        if len(text) > MAX_TEXT:
+            raise ValueError('Hidden context request exceeds synthesis input text limit')
         span = [len(prefix), len(prefix) + len(authored)]
         contract = {'version': 1, 'preceding': before, 'following': following,
                     'authored_text': authored, 'authored_span_in_request': span,

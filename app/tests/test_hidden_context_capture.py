@@ -17,6 +17,7 @@ from experiments.plan_dialogue_continuity import get_continuity_experiment_packe
 from experiments.render_dialogue_continuity import (get_hidden_context_capture_requests,
     save_hidden_context_capture_pair)
 from experiments.run_dialogue_continuity import run_owned_hidden_context_pair
+from synthesis_input import MAX_TEXT
 from tests import test_dialogue_continuity_render as render_fixtures
 from tests import test_dialogue_continuity_controller as owner_fixtures
 
@@ -96,6 +97,20 @@ class HiddenContextCaptureTests(unittest.TestCase):
         rows[2]['text'] = 'x' * 257
         _, packet = self.packet_for(rows)
         with self.assertRaisesRegex(ValueError, '256'):
+            get_hidden_context_capture_requests(packet, 1)
+        rows = copy.deepcopy(self.rows)
+        requests = get_hidden_context_capture_requests(self.packet, 1)
+        overhead = len(requests['hidden_sandwich']['text']) - len(rows[1]['text'])
+        rows[1]['text'] = 'x' * (MAX_TEXT - overhead)
+        _, packet = self.packet_for(rows)
+        self.assertEqual(MAX_TEXT, len(get_hidden_context_capture_requests(packet, 1)['hidden_sandwich']['text']))
+        rows[1]['text'] += 'x'
+        _, packet = self.packet_for(rows)
+        with self.assertRaisesRegex(ValueError, 'text limit'):
+            get_hidden_context_capture_requests(packet, 1)
+        rows[1]['text'] = 'x' * MAX_TEXT
+        _, packet = self.packet_for(rows)
+        with self.assertRaisesRegex(ValueError, 'text limit'):
             get_hidden_context_capture_requests(packet, 1)
 
     def test_owned_raw_pair_records_actual_bytes_and_target_voice_for_both_variants(self):
@@ -185,8 +200,14 @@ class HiddenContextCaptureTests(unittest.TestCase):
             (root / 'voices.json').write_text(json.dumps({'Anna': {'type': 'custom', 'seed': -1}}))
             (root / 'config.json').write_text(json.dumps({'tts': {'mode': 'local'}}))
             env = {key: value for key, value in os.environ.items() if key != 'ALEXANDRIA_DATA_DIR'}
-            for row, message in ((0, 'neighboring'), (1, 'seed')):
-                output = root / ('output-' + str(row))
+            long_rows = copy.deepcopy(self.rows)
+            long_rows[1]['text'] = 'x' * MAX_TEXT
+            long_raw, _ = self.packet_for(long_rows)
+            cases = ((0, 'neighboring', self.raw), (1, 'seed', self.raw),
+                     (1, 'text limit', long_raw))
+            for case, (row, message, raw) in enumerate(cases):
+                (root / 'source.json').write_bytes(raw)
+                output = root / ('output-' + str(case))
                 result = subprocess.run([sys.executable, '-m', 'experiments.run_dialogue_continuity',
                     '--input', str(root / 'source.json'), '--voices', str(root / 'voices.json'),
                     '--config', str(root / 'config.json'), '--out', str(output), '--row', str(row),
