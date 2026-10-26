@@ -94,6 +94,9 @@ from pathlib import Path
 # for the legacy ASR-only workflow because nothing in the chunker calls into
 # it unless source_state is populated.
 import alexandria_alignment as alignment
+sys.path.append(os.path.join(script_dir, "app"))
+from audio_channels import get_validated_audio_channel_filter
+from whisper_cpp_runtime import get_whisper_cpp_runtime, get_coalesced_whisper_cpp_segments
 from alexandria_zip_publication import apply_zip_volume_set
 from alexandria_run_manifest import (
     LOCK_ENV, RunStateError, acquire_run_lock, cleanup_run_artifacts, ensure_run_manifest,
@@ -209,26 +212,10 @@ WHISPERX_AVAILABLE = False
 TRANSFORMERS_WHISPER_AVAILABLE = False
 WAV2VEC2_MODEL_REVISION = "f6b48018ad95afcf85637f433dc0fc4f4672ce34"
 
-_WHISPER_CPP_BIN_CANDIDATES = (
-    os.path.join(script_dir, "whisper.cpp", "build", "bin", "whisper-cli"),
-    os.path.join(script_dir, "whisper.cpp", "build", "bin", "Release",
-                 "whisper-cli.exe"),
-    os.path.join(script_dir, "whisper.cpp", "build", "Release",
-                 "whisper-cli.exe"),
-)
-WHISPER_CPP_BIN = os.environ.get("ALEXANDRIA_WHISPER_CPP_BIN") or next(
-    (path for path in _WHISPER_CPP_BIN_CANDIDATES if os.path.isfile(path)),
-    _WHISPER_CPP_BIN_CANDIDATES[0],
-)
-WHISPER_CPP_MODEL = os.environ.get(
-    "ALEXANDRIA_WHISPER_CPP_MODEL",
-    os.path.join(script_dir, "models", "whisper.cpp", "ggml-small.en.bin"),
-)
-WHISPER_CPP_AVAILABLE = (
-    os.path.isfile(WHISPER_CPP_BIN)
-    and os.access(WHISPER_CPP_BIN, os.X_OK)
-    and os.path.isfile(WHISPER_CPP_MODEL)
-)
+_whisper_runtime = get_whisper_cpp_runtime(script_dir)
+WHISPER_CPP_BIN = _whisper_runtime['binary']
+WHISPER_CPP_MODEL = _whisper_runtime['model']
+WHISPER_CPP_AVAILABLE = _whisper_runtime['available']
 if WHISPER_CPP_AVAILABLE:
     logger.info("✓ whisper.cpp Small.en available")
 else:
@@ -389,7 +376,7 @@ def _wav_overflow_info(path):
     return is_oversized, true_dur if is_oversized else header_dur, header_dur
 
 
-def _ffmpeg_decode_to_wav(src_path, dst_wav_path, target_sr, mono=True):
+def _ffmpeg_decode_to_wav(src_path, dst_wav_path, target_sr, mono=True, channel="mix"):
     """Decode an audio file to a 16-bit PCM WAV via ffmpeg, ignoring any
     bogus WAV chunk-size header. Returns the resulting file's on-disk size.
     Raises subprocess.CalledProcessError on ffmpeg failure.
@@ -398,6 +385,7 @@ def _ffmpeg_decode_to_wav(src_path, dst_wav_path, target_sr, mono=True):
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-ignore_length", "1",
         "-i", src_path,
+        *get_validated_audio_channel_filter(src_path, channel),
         "-ac", "1" if mono else "2",
         "-ar", str(target_sr),
         "-c:a", "pcm_s16le",
@@ -408,12 +396,13 @@ def _ffmpeg_decode_to_wav(src_path, dst_wav_path, target_sr, mono=True):
     return os.path.getsize(dst_wav_path)
 
 
-def decode_audio_to_memmap(src_path, target_sr, output_path, mono=True):
+def decode_audio_to_memmap(src_path, target_sr, output_path, mono=True, channel="mix"):
     """Decode to a file-backed float32 array without capturing the full PCM."""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ignore_length", "1",
         "-i", src_path,
+        *get_validated_audio_channel_filter(src_path, channel),
         "-ac", "1" if mono else "2",
         "-ar", str(target_sr),
         "-f", "f32le", "-acodec", "pcm_f32le",
@@ -433,13 +422,15 @@ def get_decoded_audio_memmap(output_path):
     return np.memmap(output_path, dtype=np.float32, mode="r")
 
 
-def decode_audio_to_asr_streams(src_path, scratch_path, asr_path):
+def decode_audio_to_asr_streams(src_path, scratch_path, asr_path, channel="mix"):
     """Decode once into independently resampled scratch and ASR streams."""
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-ignore_length", "1", "-i", src_path,
+        *get_validated_audio_channel_filter(src_path, channel),
         "-ac", "1", "-ar", "24000",
         "-c:a", "pcm_s16le", scratch_path,
+        *get_validated_audio_channel_filter(src_path, channel),
         "-ac", "1", "-ar", "16000",
         "-f", "f32le", "-acodec", "pcm_f32le", asr_path,
     ]
@@ -750,64 +741,6 @@ def transcribe_with_wav2vec2(audio_16k: np.ndarray, language: str = "en", limit:
         logger.debug(traceback.format_exc())
         raise
 
-
-def get_coalesced_whisper_cpp_segments(transcription):
-    """Convert whisper.cpp JSON words without inventing word boundaries.
-
-    whisper.cpp can emit a real word with identical start/end offsets. Keep
-    its text by joining it to the next positive-duration word (or the prior
-    word at EOF). All other malformed values are left for the shared strict
-    validator to reject.
-    """
-    if not isinstance(transcription, list):
-        raise ValueError("whisper.cpp transcription must be a list")
-
-    converted = []
-    pending = []
-    for index, segment in enumerate(transcription):
-        if not isinstance(segment, dict):
-            raise ValueError(
-                f"whisper.cpp transcription segment {index} is not an object")
-        text = segment.get("text", "")
-        if not isinstance(text, str):
-            raise ValueError(
-                f"whisper.cpp transcription segment {index} has non-text data")
-        text = text.strip()
-        if not text:
-            continue
-
-        offsets = segment.get("offsets")
-        if not isinstance(offsets, dict):
-            converted.append({"word": text, "start": None, "end": None})
-            continue
-        start_ms = offsets.get("from")
-        end_ms = offsets.get("to")
-        numeric = (
-            isinstance(start_ms, Real) and not isinstance(start_ms, bool)
-            and isinstance(end_ms, Real) and not isinstance(end_ms, bool)
-        )
-        finite = (
-            numeric and math.isfinite(float(start_ms))
-            and math.isfinite(float(end_ms))
-        )
-        if finite and float(end_ms) == float(start_ms):
-            pending.append(text)
-            continue
-
-        converted.append({
-            "word": " ".join(pending + [text]),
-            "start": float(start_ms) / 1000.0 if numeric else start_ms,
-            "end": float(end_ms) / 1000.0 if numeric else end_ms,
-        })
-        pending = []
-
-    if pending:
-        if not converted:
-            raise ValueError(
-                "whisper.cpp returned only zero-duration word segments")
-        converted[-1] = dict(converted[-1])
-        converted[-1]["word"] += " " + " ".join(pending)
-    return converted
 
 
 def transcribe_with_whisper_cpp(audio_16k: np.ndarray,
@@ -3331,6 +3264,7 @@ def main():
     )
 
     parser.add_argument("--audio", required=True, help="Input audio file")
+    parser.add_argument("--audio-channel", choices=("mix", "left", "right"), default="mix")
     parser.add_argument("--model",
                         help="Primary GGUF model (recommended: Qwen2.5-14B-Instruct-Q6_K.gguf)")
     parser.add_argument("--fallback-model",
@@ -3575,13 +3509,14 @@ def main():
             load_t0 = time.monotonic()
             is_oversized, input_duration, _ = _wav_overflow_info(args.audio)
 
-            if is_oversized or input_duration > 600:
+            if is_oversized or input_duration > 600 or args.audio_channel != "mix":
                 logger.info("  Using file-backed ffmpeg loader for long audio")
                 decode_temp_dir = tempfile.TemporaryDirectory(
                     prefix="alexandria_asr_", dir=temp_dir)
                 audio_16k = decode_audio_to_asr_streams(
                     args.audio, audio_24k_path,
-                    os.path.join(decode_temp_dir.name, "audio_16k.f32"))
+                    os.path.join(decode_temp_dir.name, "audio_16k.f32"),
+                    **({"channel": args.audio_channel} if args.audio_channel != "mix" else {}))
                 sf_info_24k = sf.info(audio_24k_path)
                 duration_secs = sf_info_24k.duration
                 logger.info(f"  Audio: {duration_secs:.1f}s @ {sf_info_24k.frames} samples (loaded in {time.monotonic()-load_t0:.1f}s)")
@@ -3842,9 +3777,10 @@ def main():
             if not os.path.exists(audio_24k_path):
                 logger.info(f"▶ Scratch audio not found at {audio_24k_path}, recreating from source...")
                 is_oversized, input_duration, _ = _wav_overflow_info(args.audio)
-                if is_oversized or input_duration > 600:
+                if is_oversized or input_duration > 600 or args.audio_channel != "mix":
                     logger.info("  Using file-backed ffmpeg loader for long audio")
-                    _ffmpeg_decode_to_wav(args.audio, audio_24k_path, 24000, mono=True)
+                    _ffmpeg_decode_to_wav(args.audio, audio_24k_path, 24000, mono=True,
+                                          **({"channel": args.audio_channel} if args.audio_channel != "mix" else {}))
                 else:
                     l = _lazy_import_librosa()
                     audio_native, native_sr = l.load(args.audio, sr=None, mono=True)

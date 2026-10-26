@@ -1,10 +1,13 @@
-from merge_integrity import get_source_integrity
+from audio_generation_owner import AUDIO_GENERATION_CANCELLED
+from merge_integrity import get_source_integrity, is_source_integrity_admitted
 from pathlib import Path
 from review_report import get_review_report_info, apply_review_report_explanation
 from book_state_transaction import ensure_book_state, get_book_operation_identity
 from task_ownership import ensure_startup_recovery
 import asyncio
 import copy
+import hashlib
+import pronunciation
 import logging
 import json
 import os
@@ -12,16 +15,21 @@ import soundfile
 import tempfile
 import time
 import uuid
-import warnings
 import zipfile
 from contextlib import contextmanager
 from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, Query
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, Query, Path as PathParameter
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse, Response
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import BaseModel, Field, StrictInt, StrictBool, field_validator
+from publication_preview import get_publication_review, get_publication_preview, get_publication_selection
 from config_settings import load_app_config
+from export_limits import MAX_PAUSE_MS
+from audio_mastering import MasteringOptions, get_audio_sha256
+from export_quality import ExportQualityOptions
+from export_quality_session import ExportQualityAttempt, get_session_evidence
+from project_scope_exports import require_scope_export_current
 
 from core import (
     AUDIOBOOK_PATH,
@@ -29,6 +37,9 @@ from core import (
     DATA_DIR,
     M4B_PATH,
     REPORTS_DIR,
+    ROOT_DIR,
+    run_claimed_task_worker,
+    _validate_voicelab_path,
     SCRIPTS_DIR,
     SCRIPT_PATH,
     _load_voicelab_config, _llm_summarize_report, _is_evidence_bound_summary,
@@ -44,13 +55,17 @@ from core import (
 from generation_checkpoint_deltas import load_generation_checkpoint_document
 from generation_checkpoint_shards import get_generation_checkpoint_artifacts
 from editor_poll_snapshot import EditorPollSnapshots, get_snapshot_digest
+from editor_review_facts import get_editor_review_facts
+from speech_verification_receipt import get_speech_verification_chunk_view
 from utils import safe_load_json, is_path_inside
 from project import (CHAPTER_EXPORT_DIR, CHAPTER_TEMPLATE_FIELDS,
                      DEFAULT_CHAPTER_TEMPLATE, get_chapter_export_rows, get_index_selection,
-                     get_chunk_generation_requests)
+                     get_chunk_generation_requests, get_playback_pause_plan,
+                     get_playback_trim_plan, get_speaker)
 from runtime_estimate import get_book_runtime_estimate
 from routers.voices import get_script_speaker
-from tts import voice_config_for_chunk, resolve_narrator_voice_config, voice_category
+from tts import (voice_config_for_chunk, resolve_narrator_voice_config, voice_category,
+                 ExportCancelled, ensure_audio_export_active, get_pause_duration_ms)
 import voice_drift
 
 
@@ -73,13 +88,236 @@ def build_zip_download(members, filename):
                         background=BackgroundTask(os.unlink, path))
 
 
+class WordTimingRequest(BaseModel):
+    expected_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_uid: str = Field(min_length=1, max_length=128)
+    expected_audio_revision: Optional[str] = Field(default=None, max_length=128)
+
+
+@router.post("/api/chunks/{index}/word_timing")
+async def create_chunk_word_timing(index: int, request: WordTimingRequest):
+    from whisper_cpp_runtime import get_whisper_cpp_runtime
+    from editor_word_timing import publish_word_timing
+    if index < 0:
+        raise HTTPException(status_code=400, detail="Choose a valid Editor line.")
+    runtime = get_whisper_cpp_runtime(ROOT_DIR)
+    if not runtime['available']:
+        raise HTTPException(status_code=400, detail="Word timing needs the already installed whisper.cpp Small.en runtime. No model will be downloaded.")
+    for key in ('binary', 'model'):
+        _validate_voicelab_path(runtime[key], 'Word-timing ' + key)
+    runtime = {**runtime, **{key: str(Path(runtime[key]).resolve()) for key in ('binary', 'model')}}
+    def run():
+        state = process_state['word_timing']
+        state['logs'] = ['Word timing: one selected chunk, cached English provider, CPU only.']
+        try:
+            for key in ('binary', 'model'):
+                _validate_voicelab_path(runtime[key], 'Word-timing ' + key)
+            result = publish_word_timing(project_manager, index, request, runtime,
+                check_chunk_identity, lambda: state.get('cancel', False))
+            state['logs'].append('Timing ready. ASR spans do not certify pronunciation.')
+            return result
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            state['logs'].append('Timing failed: ' + str(error))
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    # Both the bounded ffmpeg decode and whisper.cpp --no-gpu provider are CPU
+    # work. Keep the per-task lease and cancellation ownership through cleanup.
+    return await run_claimed_task_worker('word_timing', run, cpu_only=True)
+
+
+from audio_stream_response import AudioStreamResponse as WordTimingAudioResponse
+
+
+@router.get("/api/chunks/{index}/word_timing/audio")
+def get_word_timing_audio(index: int,
+    expected_book_token: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+    expected_uid: Annotated[str, Query(min_length=1, max_length=128)],
+    sha256: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+    expected_audio_revision: Annotated[Optional[str], Query(max_length=128)] = None):
+    from editor_word_timing import open_verified_word_audio
+    try:
+        stream, size, suffix = open_verified_word_audio(project_manager, index, expected_book_token,
+            expected_uid, expected_audio_revision, sha256, check_chunk_identity)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return WordTimingAudioResponse(stream, size, suffix)
+
+
+class TakeHistoryPolicyRequest(BaseModel):
+    expected_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    enabled: bool = Field(strict=True)
+
+
+@router.get("/api/take_history_policy")
+async def get_take_history_policy_endpoint():
+    from editor_take_history import get_editor_take_policy
+    try:
+        return await asyncio.to_thread(get_editor_take_policy, project_manager)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/api/take_history_policy")
+async def change_take_history_policy_endpoint(request: TakeHistoryPolicyRequest):
+    from editor_take_history import change_editor_take_policy
+    try:
+        return await asyncio.to_thread(change_editor_take_policy, project_manager, request)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+class TakeSnapshotRequest(WordTimingRequest):
+    pass
+
+
+class TakeHistoryAction(BaseModel):
+    expected_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_uid: str = Field(min_length=1, max_length=128)
+    version: str = Field(pattern=r"^[0-9a-f]{32}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    action: str = Field(pattern=r"^(protect|unprotect|delete|undo|purge)$")
+
+
+class TakeRestoreRequest(WordTimingRequest):
+    source_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    version: str = Field(pattern=r"^[0-9a-f]{32}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_audio_path: Optional[str] = Field(..., max_length=4096)
+    expected_take: Optional[StrictInt] = Field(..., ge=0)
+
+
+@router.post("/api/chunks/{index}/take_restore")
+async def restore_take_snapshot(index: int, request: TakeRestoreRequest, background_tasks: BackgroundTasks):
+    from audio_generation_owner import AudioGenerationCancelled
+    from take_restoration import capture_restore_target, restore_editor_take
+    with ensure_audio_generation_claim() as claim_id:
+        try:
+            expected = await asyncio.to_thread(capture_restore_target, project_manager, index, request)
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+        def task():
+            state = process_state['audio']
+            state.update(start_time=time.time(), logs=[f'Checking saved take for line {index}...'],
+                         status='running', error=None)
+            try:
+                restore_editor_take(project_manager, index, request, expected)
+                state['status'] = 'done'
+                state['logs'].append('Restore complete. Original saved bytes selected; displaced take retained.')
+            except AudioGenerationCancelled:
+                state['status'] = 'cancelled'
+                state['logs'].append('Restoration cancelled. Selected line audio was preserved.')
+            except Exception as error:
+                logger.exception('Saved take restoration failed')
+                state['status'] = 'failed'
+                state['error'] = str(error)
+                state['logs'].append('Restoration refused: ' + str(error))
+            finally:
+                state['running'] = False
+
+        register_claimed_background_task(background_tasks, 'audio', claim_id, task)
+        return {'status': 'started'}
+
+
+@router.post("/api/chunks/{index}/take_snapshots")
+async def save_take_snapshot(index: int, request: TakeSnapshotRequest):
+    from editor_take_history import capture_editor_take
+    try:
+        return await asyncio.to_thread(capture_editor_take, project_manager, index, request)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/api/take_snapshots")
+async def list_take_snapshots(
+    expected_book_token: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+    uid: Annotated[Optional[str], Query(min_length=1, max_length=128)] = None,
+    all_books: bool = False, offset: Annotated[int, Query(ge=0, le=4096)] = 0):
+    from editor_take_history import get_editor_takes
+    try:
+        return await asyncio.to_thread(get_editor_takes, project_manager, expected_book_token,
+            uid, all_books=all_books, offset=offset)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/api/take_snapshots/action")
+async def change_take_snapshot(request: TakeHistoryAction):
+    from editor_take_history import change_editor_take
+    try:
+        return await asyncio.to_thread(change_editor_take, project_manager, request, _get_undo_take_rows)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/api/take_snapshots/{version}/audio")
+def audition_take_snapshot(version: Annotated[str, PathParameter(pattern=r"^[0-9a-f]{32}$")],
+    expected_book_token: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+    source_book_token: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+    expected_uid: Annotated[str, Query(min_length=1, max_length=128)],
+    sha256: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")]):
+    from editor_take_history import open_editor_take
+    try:
+        stream, size, suffix = open_editor_take(project_manager, expected_book_token, version, sha256, source_book_token, expected_uid)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return WordTimingAudioResponse(stream, size, suffix)
+
+
+@router.post("/api/word_timing/cancel")
+async def cancel_word_timing():
+    if not process_state['word_timing'].get('running'):
+        raise HTTPException(status_code=400, detail='No word-timing task is running.')
+    process_state['word_timing']['cancel'] = True
+    return {'status': 'cancellation requested'}
+
+
+class SpeechVerificationRequest(BaseModel):
+    expected_book_token: str = Field(pattern=r'^[0-9a-f]{64}$')
+    expected_uid: str = Field(min_length=1,max_length=128)
+    expected_audio_revision: str = Field(min_length=1,max_length=128)
+
+
+@router.post('/api/chunks/{index}/speech_verification')
+async def recheck_chunk_speech(index: int, request: SpeechVerificationRequest):
+    from editor_speech_verification import recheck_editor_speech
+    from speech_verification_runtime import get_verification_runtime
+    if index < 0:
+        raise HTTPException(status_code=400,detail='Choose a valid Editor line.')
+    def run():
+        state=process_state['speech_verification']
+        state['logs']=['Rechecking one saved take with its recorded synthesis input. CPU only.']
+        try:
+            result=recheck_editor_speech(project_manager,index,request,
+                get_verification_runtime(ROOT_DIR),get_verification_runtime(ROOT_DIR,confirmation=True),
+                check_chunk_identity)
+            state['logs'].append('Speech check: '+result['receipt']['status']+'. Listening review is still needed.')
+            return result
+        except (ValueError,OSError,KeyError,TypeError,RuntimeError) as error:
+            state['logs'].append('Speech check failed: '+str(error))
+            raise HTTPException(status_code=409,detail=str(error)) from error
+    return await run_claimed_task_worker('speech_verification',run,cpu_only=True)
+
+
+@router.post('/api/speech_verification/cancel')
+async def cancel_speech_verification():
+    with _gpu_lock:
+        state=process_state['speech_verification']
+        if not state.get('running'):
+            raise HTTPException(status_code=400,detail='No speech verification task is running.')
+        state['cancel']=True
+    return {'status':'cancellation requested'}
+
+
 class ChunkUpdate(BaseModel):
     expected_book_token: Optional[str] = Field(default=None, min_length=64, max_length=64)
     expected_uid: Optional[str] = None
     text: Optional[str] = None
     instruct: Optional[str] = None
     speaker: Optional[str] = None
-    pause_after: Optional[int] = None
+    take: Optional[int] = Field(default=None, ge=0, le=1_000_000)
+    pause_after: Optional[int] = Field(default=None, le=MAX_PAUSE_MS)
 
     @field_validator("text", "instruct", "speaker", mode="before")
     @classmethod
@@ -92,6 +330,77 @@ class BatchGenerateRequest(BaseModel):
     indices: List[StrictInt] = Field(min_length=1)
     expected_book_token: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     expected_uids: Optional[List[Annotated[str, Field(min_length=1, max_length=128)]]] = None
+    expected_repair_revision: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class AudioRepairSelection(BaseModel):
+    expected_options_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapter: Optional[Annotated[StrictInt, Field(ge=0)]] = None
+    speakers: List[Annotated[str, Field(max_length=500)]] = Field(min_length=1, max_length=10000)
+
+
+def get_audio_repair_revision(chunks):
+    """Bind a preview to rows and the voice/settings inputs generation will read."""
+    files = []
+    for path in (project_manager.voice_config_path,
+                 os.path.join(project_manager.root_dir, "character_aliases.json"), CONFIG_PATH,
+                 pronunciation.DEFAULT_PATH):
+        try:
+            value = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except FileNotFoundError:
+            value = None
+        files.append(value)
+    return get_snapshot_digest([chunks, files])
+
+
+def get_audio_repair_options(chunks):
+    groups = project_manager._chapter_groups(chunks, False) if chunks else []
+    return {"chapters": [{"index": i, "title": title, "first": first, "last": last}
+                         for i, (title, first, last) in enumerate(groups)],
+            "speakers": sorted({get_speaker(chunk) for chunk in chunks
+                                if chunk.get("text", "").strip()}),
+            "grouping_note": "Uses export chapter detection; without headings, each line is a chapter."}
+
+
+@router.get("/api/chunks/repair_options")
+async def get_audio_repair_options_endpoint(expected_book_token: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")]):
+    return await asyncio.to_thread(_get_audio_repair_options_sync, expected_book_token)
+
+
+def _get_audio_repair_options_sync(expected_book_token):
+    with ensure_book_state(os.path.dirname(SCRIPT_PATH)):
+        check_chunk_identity(0, expected_book_token)
+        chunks = _ensure_editor_chunks()
+        return {"book_token": expected_book_token, "options_revision": get_snapshot_digest(chunks),
+                **get_audio_repair_options(chunks)}
+
+
+@router.post("/api/chunks/repair_preview")
+async def get_audio_repair_preview_endpoint(request: AudioRepairSelection):
+    return await asyncio.to_thread(_get_audio_repair_preview_sync, request)
+
+
+def _get_audio_repair_preview_sync(request):
+    with ensure_book_state(os.path.dirname(SCRIPT_PATH)):
+        check_chunk_identity(0, request.expected_book_token)
+        chunks = _ensure_editor_chunks()
+        if request.expected_options_revision != get_snapshot_digest(chunks):
+            raise HTTPException(status_code=409, detail="Chapter options are stale. Load current chapters and speakers again.")
+        options = get_audio_repair_options(chunks)
+        first, last = 0, len(chunks) - 1
+        if request.chapter is not None:
+            if request.chapter >= len(options["chapters"]):
+                raise HTTPException(status_code=409, detail="Chapter selection changed; refresh repair options.")
+            chapter = options["chapters"][request.chapter]
+            first, last = chapter["first"], chapter["last"]
+        if not set(request.speakers).issubset(options["speakers"]):
+            raise HTTPException(status_code=409, detail="Speaker selection changed; refresh repair options.")
+        selected = [chunk for i, chunk in enumerate(chunks) if first <= i <= last
+                    and chunk.get("text", "").strip() and get_speaker(chunk) in request.speakers]
+        return {"book_token": request.expected_book_token,
+                "repair_revision": get_audio_repair_revision(chunks), "rows": selected,
+                "rendered_count": sum(bool(chunk.get("audio_path")) for chunk in selected)}
 
 
 class DriftCheckRequest(BaseModel):
@@ -103,9 +412,59 @@ class DriftCheckRequest(BaseModel):
 async def get_audiobook():
     if not os.path.exists(AUDIOBOOK_PATH):
         raise HTTPException(status_code=404, detail="Audiobook not found")
+    require_scope_export_current(DATA_DIR, AUDIOBOOK_PATH)
     return FileResponse(AUDIOBOOK_PATH, filename="audiobook.mp3", media_type="audio/mpeg")
 
 # --- Chunk Management Endpoints ---
+
+@router.get("/api/chunks/playback_plan")
+async def get_playback_plan():
+    return await asyncio.to_thread(_ensure_playback_plan)
+
+
+def _ensure_playback_plan():
+    root = os.path.dirname(SCRIPT_PATH)
+    with ensure_book_state(root):
+        chunks = _ensure_editor_chunks()
+        pause_ms, same_speaker_pause_ms = project_manager._load_pause_defaults()
+    # Decoding every clip can take seconds. Do it outside the book journal
+    # lock so chunk edits, status polls and export publication are not blocked
+    # behind the read-only playback plan.
+    try:
+        plan = get_playback_pause_plan(chunks, pause_ms, same_speaker_pause_ms,
+                                       has_audio=project_manager.has_chunk_audio_file)
+        trims = get_playback_trim_plan(
+            chunks, project_manager.get_chunk_audio_segment,
+            has_audio=project_manager.has_chunk_audio_file)
+    except (TypeError, ValueError) as error:
+        # A stored pause export would also refuse; say which, as export does.
+        raise HTTPException(status_code=422, detail=f"Playback pauses unavailable: {error}") from error
+    return {'pauses': [{'chunk_id': chunk_id, 'pause_ms': pause}
+                       for chunk_id, pause in sorted(plan.items())],
+            'trims': [{'chunk_id': chunk_id, 'start_ms': start_ms, 'end_ms': end_ms}
+                      for chunk_id, (start_ms, end_ms) in sorted(trims.items())]}
+
+
+@router.get("/api/chunks/playback_gap")
+async def get_playback_gap(from_id: int, to_id: int):
+    return await asyncio.to_thread(_ensure_playback_gap, from_id, to_id)
+
+
+def _ensure_playback_gap(from_id, to_id):
+    root = os.path.dirname(SCRIPT_PATH)
+    with ensure_book_state(root):
+        chunks = _ensure_editor_chunks()
+        by_id = {chunk.get('id'): chunk for chunk in chunks}
+        pause_ms, same_speaker_pause_ms = project_manager._load_pause_defaults()
+    if from_id not in by_id or to_id not in by_id:
+        raise HTTPException(status_code=404, detail="Playback chunk not found")
+    try:
+        pause = get_pause_duration_ms(by_id[from_id], by_id[to_id],
+                                      pause_ms, same_speaker_pause_ms)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=f"Playback pause unavailable: {error}") from error
+    return {'pause_ms': max(0, pause)}
+
 
 @router.get("/api/chunks")
 async def get_chunks():
@@ -113,14 +472,26 @@ async def get_chunks():
 
 
 def _ensure_chunk_listing():
-    with ensure_book_state(os.path.dirname(SCRIPT_PATH)):
-        chunks = _ensure_editor_chunks()
+    root=os.path.dirname(SCRIPT_PATH)
+    with ensure_book_state(root):
+        chunks = _get_editor_chunk_views(_ensure_editor_chunks(),get_snapshot_digest(get_editor_book_identity(root)))
     return chunks
+
+
+def _get_editor_chunk_views(chunks, book_token):
+    views = [get_speech_verification_chunk_view(chunk,book_token,project_manager.get_chunk_audio_path)
+             for chunk in chunks]
+    for view in views:
+        view.pop('_retained_take', None)
+    return views
 
 
 def _ensure_editor_chunks():
     """Load rows without inventing IDs or discarding persisted progress."""
-    chunks = project_manager.load_chunks()
+    try:
+        chunks = project_manager.load_chunks()
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     seen = set()
     for position, chunk in enumerate(chunks):
         chunk_id = chunk.get('id')
@@ -189,6 +560,7 @@ def _ensure_chunk_status_snapshot(revision):
     with ensure_book_state(root):
         chunks = _ensure_editor_chunks()
         identity = get_editor_book_identity(root)
+        chunks = _get_editor_chunk_views(chunks, get_snapshot_digest(identity))
         return {**_editor_poll_snapshots.ensure_snapshot(chunks, identity, revision),
                 "book_token": get_snapshot_digest(identity)}
 
@@ -198,7 +570,33 @@ def get_editor_book_identity(root):
     return get_book_operation_identity(root)
 
 
+@router.get("/api/chunks/quality")
+async def get_editor_quality(expected_book_token: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")]):
+    return await asyncio.to_thread(_get_editor_quality_sync, expected_book_token)
+
+
+def _get_editor_quality_sync(expected_book_token):
+    root = os.path.dirname(SCRIPT_PATH)
+    with ensure_book_state(root):
+        identity = get_editor_book_identity(root)
+        if get_snapshot_digest(identity) != expected_book_token:
+            raise HTTPException(status_code=409, detail="The selected book changed. Refresh Editor before reviewing its lines.")
+        chunks = _get_editor_chunk_views(_ensure_editor_chunks(),expected_book_token)
+        snapshot = _editor_poll_snapshots.ensure_snapshot(chunks, identity, None)
+        return {'book_token': snapshot['book_token'], 'revision': snapshot['revision'],
+                'rows': get_editor_review_facts(chunks, project_manager.get_chunk_audio_path,expected_book_token)}
+
+
 _deleted_chunk_receipts = {}
+
+
+def _get_undo_take_rows():
+    """Caller holds the book lock; unexpired deletion undo still owns its audio."""
+    book = get_editor_book_identity(os.path.dirname(SCRIPT_PATH))
+    now = time.monotonic()
+    return [receipt['chunk'] for receipt in _deleted_chunk_receipts.values()
+            if receipt['book'] == book and now - receipt['created'] <= 60]
+
 
 
 def check_chunk_identity(index, expected_book_token=None, expected_uid=None):
@@ -224,7 +622,8 @@ def ensure_audio_generation_claim():
         raise
 
 
-def ensure_audio_generation_requests(indices, expected_book_token=None, expected_uids=None):
+def ensure_audio_generation_requests(indices, expected_book_token=None, expected_uids=None,
+                                     expected_repair_revision=None):
     """Read and bind selection once while its caller owns the audio reservation."""
     root = os.path.dirname(SCRIPT_PATH)
     with ensure_book_state(root):
@@ -234,6 +633,10 @@ def ensure_audio_generation_requests(indices, expected_book_token=None, expected
         chunks = project_manager.load_chunks()
         if get_snapshot_digest(get_editor_book_identity(root)) != identity:
             raise HTTPException(status_code=409, detail="Active book changed; reload before rendering")
+        if expected_repair_revision is not None:
+            if (expected_book_token is None or expected_uids is None
+                    or expected_repair_revision != get_audio_repair_revision(chunks)):
+                raise HTTPException(status_code=409, detail="Repair preview changed; preview the selection again.")
         selected = get_index_selection(indices, len(chunks))
         if expected_uids is not None:
             if len(expected_uids) != len(indices):
@@ -292,7 +695,10 @@ def _apply_chunk_edit(operation, *args):
     """Keep the conflict check and chunk mutation atomic with task claims."""
     with _gpu_lock:
         check_global_gpu_lock("audio")
-        return operation(*args)
+        try:
+            return operation(*args)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
 @router.post("/api/chunks/restore")
 async def restore_chunk(request: ChunkRestoreRequest):
@@ -365,7 +771,15 @@ def apply_guarded_chunk_update(index, update):
 
 
 @router.post("/api/chunks/{index}")
-async def update_chunk(index: int, update: ChunkUpdate):
+async def update_chunk(index: int, update: ChunkUpdate,
+                       expected_book_token: Annotated[Optional[str], Query(min_length=64, max_length=64)] = None,
+                       expected_uid: Annotated[Optional[str], Query(max_length=128)] = None):
+    # Editor saves send the guard in the body; row actions send it as a query.
+    guard = {key: value for key, value in (("expected_book_token", expected_book_token),
+                                           ("expected_uid", expected_uid))
+             if value is not None and getattr(update, key) is None}
+    if guard:
+        update = update.model_copy(update=guard)
     updates = update.model_dump(exclude_unset=True)
     logger.info(f"Updating chunk {index} with data: {updates}")
     chunk = await asyncio.to_thread(_apply_chunk_edit, apply_guarded_chunk_update, index, update)
@@ -419,8 +833,9 @@ async def generate_chunk_endpoint(index: int, background_tasks: BackgroundTasks,
             state["error"] = None
             try:
                 success, message = project_manager.generate_chunk_audio(index, admitted_chunk=requested[index])
-                state["status"] = "done" if success else "failed"
-                state["error"] = None if success else message
+                cancelled = not success and message == AUDIO_GENERATION_CANCELLED
+                state["status"] = "cancelled" if cancelled else ("done" if success else "failed")
+                state["error"] = None if success or cancelled else message
                 state["logs"].append(
                     f"Generation {'complete' if success else 'failed'}: {message}")
             except Exception as exc:
@@ -436,6 +851,8 @@ async def generate_chunk_endpoint(index: int, background_tasks: BackgroundTasks,
         return {"status": "started"}
 
 class MergeRequest(BaseModel):
+    export_quality: Optional[ExportQualityOptions] = None
+    mastering: Optional[MasteringOptions] = None
     integrity_confirmation: Optional[str] = Field(None, min_length=64, max_length=64,
                                                   pattern="^[0-9a-f]{64}$")
 
@@ -462,6 +879,94 @@ async def get_editor_integrity():
     return await asyncio.to_thread(_ensure_editor_integrity)
 
 
+def get_export_quality_attempt(request, state, *, audacity=False):
+    # A cancelled queued worker must not start book I/O for evidence capture.
+    ensure_audio_export_active(lambda: state.get('cancel', False))
+    with ensure_book_state(DATA_DIR):
+        token = get_snapshot_digest(get_editor_book_identity(DATA_DIR))
+    options = getattr(request, 'export_quality', None)
+    return ExportQualityAttempt(state, token,
+        options.model_dump() if options is not None else None, audacity=audacity)
+
+
+def record_export_quality_error(attempt, error):
+    if attempt is None:
+        return
+    if isinstance(error, ExportCancelled):
+        attempt.finish(False, 'Export cancelled')
+    else:
+        attempt.fail(error)
+
+
+@router.get('/api/export_quality')
+async def get_export_quality(expected_book_token: Annotated[str, Query(pattern=r'^[0-9a-f]{64}$')]):
+    return await asyncio.to_thread(_get_export_quality_sync, expected_book_token)
+
+
+def _get_export_quality_sync(token):
+    with ensure_book_state(DATA_DIR):
+        check_chunk_identity(0, token)
+    result = get_session_evidence(DATA_DIR, process_state, token)
+    with ensure_book_state(DATA_DIR):
+        check_chunk_identity(0, token)
+    return result
+
+
+def ensure_export_mastering_context(request, state):
+    """Initialize measurements only after this worker owns its task slot."""
+    state['mastering_reports'] = []
+    if request is None or request.mastering is None:
+        return {}
+    with ensure_book_state(DATA_DIR):
+        token = get_snapshot_digest(get_editor_book_identity(DATA_DIR))
+    def publish(report):
+        state['mastering_reports'].append({**report, 'book_token': token})
+    return {'mastering': request.mastering.model_dump(), 'mastering_callback': publish}
+
+
+@router.get('/api/export_mastering')
+async def get_export_mastering(expected_book_token: Annotated[str, Query(pattern=r'^[0-9a-f]{64}$')]):
+    return await asyncio.to_thread(_get_export_mastering_sync, expected_book_token)
+
+
+def _get_export_mastering_sync(token):
+    with ensure_book_state(DATA_DIR):
+        check_chunk_identity(0, token)
+        captured = [(name, copy.deepcopy(state.get('mastering_reports', [])))
+                    for name in ('audio', 'm4b_export', 'chapter_export')
+                    if not (state := process_state[name]).get('running')]
+    reports, unavailable = [], 0
+    for name, candidates in captured:
+        for report in candidates:
+            if report.get('book_token') != token:
+                continue
+            path = os.path.join(DATA_DIR, report['file'])
+            if not is_path_inside(path, DATA_DIR):
+                unavailable += 1
+                continue
+            try:
+                stat = os.stat(path)
+                before = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                digest = get_audio_sha256(path)
+                stat = os.stat(path)
+                after = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                if digest != report['sha256'] or before != after:
+                    unavailable += 1
+                    continue
+            except OSError:
+                unavailable += 1
+                continue
+            # A newly admitted export invalidates an older measurement snapshot.
+            state = process_state[name]
+            if state.get('running') or report not in state.get('mastering_reports', []):
+                unavailable += 1
+                continue
+            reports.append(report)
+    with ensure_book_state(DATA_DIR):
+        check_chunk_identity(0, token)
+    return {'book_token': token, 'reports': reports, 'unavailable': unavailable}
+
+
 @router.post("/api/merge")
 async def merge_audio_endpoint(background_tasks: BackgroundTasks, request: Optional[MergeRequest] = None):
     return await asyncio.to_thread(_start_merge_audio, background_tasks, request)
@@ -471,23 +976,26 @@ def _start_merge_audio(background_tasks, request):
     with ensure_book_state(DATA_DIR):
         report, _chunks = _ensure_editor_integrity_locked()
         confirmation = request.integrity_confirmation if request is not None else None
-        if ((confirmation is not None and confirmation != report["snapshot"])
-                or (report["status"] != "verified" and confirmation is None)):
+        if not is_source_integrity_admitted(report, confirmation):
             raise HTTPException(status_code=409, detail=report)
         admitted_snapshot = report["snapshot"]
 
         def task():
             process_state["audio"]["start_time"] = time.time()
             process_state["audio"]["logs"] = ["Starting merge..."]
+            quality_attempt = None
             try:
                 with ensure_book_state(DATA_DIR):
                     current, chunks = _ensure_editor_integrity_locked()
                     if current["snapshot"] != admitted_snapshot:
                         raise ValueError("Source or editor chunks changed after merge admission; review again.")
+                quality_attempt = get_export_quality_attempt(request, process_state["audio"])
                 success, msg = project_manager.merge_audio(
                     cancel_check=lambda: process_state["audio"]["cancel"],
                     progress_callback=lambda m: process_state["audio"]["logs"].append(m),
-                    chunks=chunks)
+                    chunks=chunks, **ensure_export_mastering_context(request, process_state["audio"]),
+                    **quality_attempt.kwargs)
+                quality_attempt.finish(success, msg)
                 if success:
                     process_state["audio"]["logs"].append(f"Merge complete: {msg}")
                 elif msg == "Merge cancelled":
@@ -495,7 +1003,9 @@ def _start_merge_audio(background_tasks, request):
                 else:
                     process_state["audio"]["logs"].append(f"Merge failed: {msg}")
             except Exception as e:
-                process_state["audio"]["logs"].append(f"Merge error: {e}")
+                record_export_quality_error(quality_attempt, e)
+                process_state["audio"]["logs"].append('Merge cancelled' if isinstance(e, ExportCancelled)
+                                                    else f"Merge error: {e}")
             finally:
                 process_state["audio"]["running"] = False
                 process_state["audio"]["cancel"] = False
@@ -510,6 +1020,12 @@ def get_export_task_result(success, message):
             "message": str(message)}
 
 
+def get_export_task_error(error):
+    if isinstance(error, ExportCancelled):
+        return {'status': 'cancelled', 'message': 'Export cancelled'}
+    return {'status': 'failed', 'message': str(error)}
+
+
 @router.post("/api/export_audacity")
 async def export_audacity_endpoint(background_tasks: BackgroundTasks):
     # Atomic check-and-set on the request thread (closes the double-start TOCTOU
@@ -518,16 +1034,21 @@ async def export_audacity_endpoint(background_tasks: BackgroundTasks):
 
     def task():
         process_state["audacity_export"]["logs"] = ["Starting Audacity export..."]
+        quality_attempt = None
         try:
+            quality_attempt = get_export_quality_attempt(None, process_state["audacity_export"], audacity=True)
             success, msg = project_manager.export_audacity(
-                progress_callback=lambda m: process_state["audacity_export"]["logs"].append(m))
+                progress_callback=lambda m: process_state["audacity_export"]["logs"].append(m),
+                **quality_attempt.kwargs)
+            quality_attempt.finish(success, msg)
             process_state["audacity_export"]["result"] = get_export_task_result(success, msg)
             if success:
                 process_state["audacity_export"]["logs"].append(f"Export complete: {msg}")
             else:
                 process_state["audacity_export"]["logs"].append(f"Export failed: {msg}")
         except Exception as e:
-            process_state["audacity_export"]["result"] = {"status": "failed", "message": str(e)}
+            record_export_quality_error(quality_attempt, e)
+            process_state["audacity_export"]["result"] = get_export_task_error(e)
             process_state["audacity_export"]["logs"].append(f"Export error: {e}")
         finally:
             process_state["audacity_export"]["running"] = False
@@ -547,6 +1068,8 @@ def _build_export_zip_response():
                if os.path.exists(path)]
     if not members:
         raise HTTPException(status_code=404, detail="No exported audio found. Merge or export first.")
+    for path, _name in members:
+        require_scope_export_current(DATA_DIR, path)
     return build_zip_download(members, "alexandria_export.zip")
 
 @router.get("/api/export_audacity")
@@ -554,6 +1077,7 @@ async def get_audacity_export():
     zip_path = os.path.join(DATA_DIR, "audacity_export.zip")
     if not os.path.exists(zip_path):
         raise HTTPException(status_code=404, detail="Audacity export not found. Generate it first.")
+    require_scope_export_current(DATA_DIR, zip_path)
     return FileResponse(zip_path, filename="audacity_export.zip", media_type="application/zip")
 
 def get_unready_export_speakers():
@@ -603,13 +1127,81 @@ async def validate_export_readiness(require_ready):
                 "message": "Mark every speaker ready before exporting.", "speakers": missing})
 
 
+from m4b_metadata import PublicationCoverSelection
+
+
+class PublicationSelectionRequest(PublicationCoverSelection):
+    title_index: Annotated[int, Field(strict=True, ge=0, le=31)] | None = None
+    author_index: Annotated[int, Field(strict=True, ge=0, le=31)] | None = None
+    select_cover: StrictBool = False
+
+
+def _get_publication_review_sync(selection=None):
+    try:
+        with ensure_book_state(DATA_DIR, recover=False):
+            review = get_publication_review(DATA_DIR)
+            return (get_publication_selection(review, selection.model_dump()) if selection is not None
+                    else get_publication_preview(review))
+    except (OSError, ValueError, RecursionError) as error:
+        raise HTTPException(status_code=409, detail=str(error)[:500]) from error
+
+
+@router.get('/api/m4b_publication')
+async def preview_m4b_publication():
+    return await asyncio.to_thread(_get_publication_review_sync)
+
+
+def _get_uploaded_cover_preview_sync(data_dir, expected_book_token, sha256):
+    from book_state_transaction import get_book_operation_token
+    from m4b_cover import MAX_COVER_BYTES, get_validated_cover_bytes
+    from project_scope_files import capture_scope_file
+    try:
+        with ensure_book_state(data_dir, recover=False):
+            if get_book_operation_token(data_dir) != expected_book_token:
+                raise ValueError('Selected book changed')
+            facts, raw = capture_scope_file(data_dir, 'm4b_cover.jpg',
+                limit=MAX_COVER_BYTES, include_bytes=True)
+            if not raw or facts['sha256'] != sha256:
+                raise ValueError('Selected cover changed')
+            media_type = 'image/png' if raw.startswith(b'\x89PNG\r\n\x1a\n') else 'image/jpeg'
+            get_validated_cover_bytes(raw, media_type)
+            current, _ = capture_scope_file(data_dir, 'm4b_cover.jpg', limit=MAX_COVER_BYTES)
+            if current != facts or get_book_operation_token(data_dir) != expected_book_token:
+                raise ValueError('Selected cover or book changed')
+            return raw, media_type
+    except (OSError, ValueError, RecursionError) as error:
+        raise HTTPException(status_code=409,
+            detail='Selected cover is unavailable or changed. Refresh cover options.',
+            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'}) from error
+
+
+@router.get('/api/m4b_cover/preview')
+async def preview_uploaded_m4b_cover(
+        expected_book_token: str = Query(pattern=r'^[0-9a-f]{64}$', max_length=64),
+        sha256: str = Query(pattern=r'^[0-9a-f]{64}$', max_length=64)):
+    data_dir = DATA_DIR
+    raw, media_type = await asyncio.to_thread(_get_uploaded_cover_preview_sync,
+        data_dir, expected_book_token, sha256)
+    return Response(raw, media_type=media_type,
+        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
+
+@router.post('/api/m4b_publication/resolve')
+async def resolve_m4b_publication(request: PublicationSelectionRequest):
+    return await asyncio.to_thread(_get_publication_review_sync, request)
+
+
 class M4bExportRequest(BaseModel):
+    export_quality: Optional[ExportQualityOptions] = None
+    mastering: Optional[MasteringOptions] = None
     per_chunk_chapters: bool = False
-    title: str = ""
-    author: str = ""
-    narrator: str = ""
-    year: str = ""
-    description: str = ""
+    title: str | None = Field(default=None, max_length=20000)
+    author: str | None = Field(default=None, max_length=20000)
+    narrator: str | None = Field(default=None, max_length=20000)
+    year: str | None = Field(default=None, max_length=20000)
+    description: str | None = Field(default=None, max_length=20000)
+    source_cover: PublicationCoverSelection | None = None
+    expected_book_token: str | None = Field(default=None, strict=True, pattern=r'^[0-9a-f]{64}$')
     require_ready: bool = False
 
 @router.post("/api/merge_m4b")
@@ -620,26 +1212,33 @@ async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: Backgr
 
     def task():
         process_state["m4b_export"]["logs"] = ["Starting M4B export..."]
+        quality_attempt = None
         try:
-            meta = {
-                "title": request.title,
-                "author": request.author,
-                "narrator": request.narrator,
-                "year": request.year,
-                "description": request.description,
-                "cover_path": os.path.join(DATA_DIR, "m4b_cover.jpg") if os.path.exists(os.path.join(DATA_DIR, "m4b_cover.jpg")) else "",
-            }
+            quality_attempt = get_export_quality_attempt(request, process_state["m4b_export"])
+            meta = {name: getattr(request, name) for name in ('title', 'author', 'narrator', 'year', 'description')
+                    if getattr(request, name) is not None}
+            meta['cover_path'] = os.path.join(DATA_DIR, 'm4b_cover.jpg') if os.path.exists(os.path.join(DATA_DIR, 'm4b_cover.jpg')) else ''
+            publication_options = {}
+            if request.source_cover is not None:
+                publication_options['source_cover'] = request.source_cover.model_dump()
+            if request.expected_book_token is not None:
+                publication_options['expected_book_token'] = request.expected_book_token
             success, msg = project_manager.merge_m4b(
                 per_chunk_chapters=request.per_chunk_chapters, metadata=meta,
                 cancel_check=lambda: process_state["m4b_export"].get("cancel", False),
-                progress_callback=lambda message: process_state["m4b_export"]["logs"].append(message))
+                progress_callback=lambda message: process_state["m4b_export"]["logs"].append(message),
+                **ensure_export_mastering_context(request, process_state["m4b_export"]),
+                **publication_options,
+                **quality_attempt.kwargs)
+            quality_attempt.finish(success, msg)
             process_state["m4b_export"]["result"] = get_export_task_result(success, msg)
             if success:
                 process_state["m4b_export"]["logs"].append(f"Export complete: {msg}")
             else:
                 process_state["m4b_export"]["logs"].append(f"Export failed: {msg}")
         except Exception as e:
-            process_state["m4b_export"]["result"] = {"status": "failed", "message": str(e)}
+            record_export_quality_error(quality_attempt, e)
+            process_state["m4b_export"]["result"] = get_export_task_error(e)
             process_state["m4b_export"]["logs"].append(f"Export error: {e}")
         finally:
             process_state["m4b_export"]["running"] = False
@@ -648,16 +1247,23 @@ async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: Backgr
     process_state["m4b_export"]["result"] = None
     return {"status": "started"}
 
-@router.post("/api/merge_m4b/cancel")
-async def cancel_m4b_export():
-    state = process_state["m4b_export"]
-    if not state["running"]:
-        raise HTTPException(status_code=400, detail="No M4B export is running.")
-    state["cancel"] = True
+def _cancel_cpu_export(task_name, missing_message):
+    with _gpu_lock:
+        state = process_state[task_name]
+        if not state["running"]:
+            raise HTTPException(status_code=400, detail=missing_message)
+        state["cancel"] = True
     return {"status": "cancelling"}
 
 
+@router.post("/api/merge_m4b/cancel")
+async def cancel_m4b_export():
+    return await asyncio.to_thread(_cancel_cpu_export, 'm4b_export', 'No M4B export is running.')
+
+
 class ChapterExportRequest(BaseModel):
+    export_quality: Optional[ExportQualityOptions] = None
+    mastering: Optional[MasteringOptions] = None
     format: str = "mp3"
     per_chunk_chapters: bool = False
     template: str = DEFAULT_CHAPTER_TEMPLATE
@@ -696,7 +1302,9 @@ async def export_chapters(request: ChapterExportRequest, background_tasks: Backg
 
     def task():
         state["logs"] = ["Starting chapter export..."]
+        quality_attempt = None
         try:
+            quality_attempt = get_export_quality_attempt(request, state)
             success, msg = project_manager.export_chapters(
                 fmt=request.format, per_chunk_chapters=request.per_chunk_chapters,
                 template=request.template, padding=request.padding,
@@ -704,11 +1312,14 @@ async def export_chapters(request: ChapterExportRequest, background_tasks: Backg
                 volume_number=request.volume_number, chapters=chapters,
                 changed_only=request.changed_only,
                 progress_callback=lambda m: state["logs"].append(m),
-                cancel_check=lambda: state["cancel"])
+                cancel_check=lambda: state["cancel"], **ensure_export_mastering_context(request, state),
+                **quality_attempt.kwargs)
+            quality_attempt.finish(success, msg)
             state["result"] = get_export_task_result(success, msg)
             state["logs"].append(f"Export complete: {msg}" if success else f"Export failed: {msg}")
         except Exception as e:
-            state["result"] = {"status": "failed", "message": str(e)}
+            record_export_quality_error(quality_attempt, e)
+            state["result"] = get_export_task_error(e)
             state["logs"].append(f"Export error: {e}")
         finally:
             state["running"] = False
@@ -721,11 +1332,7 @@ async def export_chapters(request: ChapterExportRequest, background_tasks: Backg
 
 @router.post("/api/export_chapters/cancel")
 async def cancel_chapter_export():
-    state = process_state["chapter_export"]
-    if not state["running"]:
-        raise HTTPException(status_code=400, detail="No chapter export is running.")
-    state["cancel"] = True
-    return {"status": "cancelling"}
+    return await asyncio.to_thread(_cancel_cpu_export, 'chapter_export', 'No chapter export is running.')
 
 
 @router.get("/api/export_chapters/preview")
@@ -733,7 +1340,8 @@ async def preview_chapter_filenames(format: str = "mp3", per_chunk_chapters: boo
                                     template: str = DEFAULT_CHAPTER_TEMPLATE, padding: int = 2,
                                     book_name: str = "", series_name: str = "",
                                     volume_number: str = "", chapters: Annotated[Optional[List[int]], Query()] = None,
-                                    changed_only: bool = False, require_ready: bool = False):
+                                    changed_only: bool = False, require_ready: bool = False,
+                                    mastering: Annotated[Optional[str], Query(max_length=512)] = None):
     """The selected filenames an export would write after existing-file reuse."""
     if format not in ("mp3", "wav"):
         raise HTTPException(status_code=400, detail="format must be mp3 or wav")
@@ -741,11 +1349,16 @@ async def preview_chapter_filenames(format: str = "mp3", per_chunk_chapters: boo
         raise HTTPException(status_code=400, detail="padding must be 0-6 digits")
     await validate_export_readiness(require_ready)
     try:
+        mastering_options = MasteringOptions.model_validate_json(mastering).model_dump() if mastering is not None else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail='Invalid mastering options.') from exc
+    try:
         rows = await asyncio.to_thread(project_manager.preview_chapter_filenames,
             fmt=format, per_chunk_chapters=per_chunk_chapters, template=template,
             padding=padding, book_name=book_name,
             series_name=series_name, volume_number=volume_number,
-            chapters=chapters, changed_only=changed_only)
+            chapters=chapters, changed_only=changed_only,
+            **({"mastering": mastering_options} if mastering_options is not None else {}))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"fields": list(CHAPTER_TEMPLATE_FIELDS), "chapters": rows}
@@ -777,6 +1390,7 @@ def _exported_chapter_path(name):
             or not is_path_inside(path, _chapter_export_dir())
             or not os.path.isfile(path)):
         raise HTTPException(status_code=404, detail="No such exported chapter")
+    require_scope_export_current(DATA_DIR, path)
     return path, safe
 
 
@@ -822,35 +1436,25 @@ def _build_chapter_zip_response(names: Optional[str] = None):
 async def get_audiobook_m4b():
     if not os.path.exists(M4B_PATH):
         raise HTTPException(status_code=404, detail="M4B audiobook not found. Export it first.")
+    require_scope_export_current(DATA_DIR, M4B_PATH)
     return FileResponse(M4B_PATH, filename="audiobook.m4b", media_type="audio/mp4")
 
 def _apply_m4b_cover(cover_tmp, cover_path):
     """Validate uploaded image data before publishing an MP4-compatible cover."""
-    from PIL import Image, ImageOps, UnidentifiedImageError
+    from m4b_cover import CoverValidationError, MAX_COVER_BYTES, get_normalized_cover
     normalized = cover_tmp + ".jpg"
     try:
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(cover_tmp) as image:
-                    image.verify()
-                with Image.open(cover_tmp) as image:
-                    image.load()
-                    cover_format = "PNG" if image.format == "PNG" else "JPEG"
-                    converted = ImageOps.exif_transpose(image)
-                    if cover_format == "JPEG" and converted.mode != "RGB":
-                        try:
-                            rgb = converted.convert("RGB")
-                        finally:
-                            converted.close()
-                        converted = rgb
-        except (UnidentifiedImageError, OSError, ValueError,
-                Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            with open(cover_tmp, 'rb') as source:
+                raw = source.read(MAX_COVER_BYTES + 1)
+        except OSError as exc:
             raise HTTPException(status_code=400, detail="Cover must contain a complete, decodable image") from exc
         try:
-            converted.save(normalized, format=cover_format)
-        finally:
-            converted.close()
+            cover = get_normalized_cover(raw)
+        except CoverValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        with open(normalized, 'wb') as output:
+            output.write(cover['data'])
         os.replace(normalized, cover_path)
     finally:
         for path in (cover_tmp, normalized):
@@ -895,7 +1499,7 @@ async def generate_batch_endpoint(request: BatchGenerateRequest, background_task
         try:
             indices, requested = await asyncio.to_thread(
                 ensure_audio_generation_requests, request.indices,
-                request.expected_book_token, request.expected_uids)
+                request.expected_book_token, request.expected_uids, request.expected_repair_revision)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         total = len(indices)
@@ -966,7 +1570,7 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
         try:
             indices, requested = await asyncio.to_thread(
                 ensure_audio_generation_requests, request.indices,
-                request.expected_book_token, request.expected_uids)
+                request.expected_book_token, request.expected_uids, request.expected_repair_revision)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         total = len(indices)
@@ -1077,7 +1681,8 @@ def _get_reports():
             filepath = _get_report_path(f)
             entry = {
                 "filename": f,
-                "type": "batch" if f.startswith("batch_review_") else "review",
+                "type": ("batch" if f.startswith("batch_review_")
+                         else "pauses" if f.startswith("comma_pauses_") else "review"),
                 "mtime": os.path.getmtime(filepath),
                 "size": os.path.getsize(filepath),
             }
@@ -1111,21 +1716,25 @@ async def explain_report(filename: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=409, detail="Incomplete reviews retain their deterministic summary")
 
     def run():
+        from manual_llm_context import ManualRequestCancelled, apply_manual_cancellation
         state = process_state["report_explanation"]
         state.update(status="running", filename=filename, error=None, logs=[])
         try:
             if state.get("cancel"):
                 state["status"] = "cancelled"
                 return
-            candidate = _llm_summarize_report(info["content"])
-            if not candidate or not _is_evidence_bound_summary(candidate):
-                raise ValueError("Explanation unavailable or unsupported; the original report was retained")
+            with apply_manual_cancellation(lambda: state.get("cancel")):
+                candidate = _llm_summarize_report(info["content"])
             if state.get("cancel"):
                 state["status"] = "cancelled"
                 return
+            if not candidate or not _is_evidence_bound_summary(candidate):
+                raise ValueError("Explanation unavailable or unsupported; the original report was retained")
             apply_review_report_explanation(filepath, info["sha256"], candidate)
             state["status"] = "done"
             state["logs"].append("Report explanation saved")
+        except ManualRequestCancelled:
+            state["status"] = "cancelled"
         except Exception as exc:
             state["status"] = "failed"
             state["error"] = str(exc)

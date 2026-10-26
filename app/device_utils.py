@@ -16,7 +16,7 @@ import sys
 # possibly invoked from a sibling repo's cwd), so the path is resolved from
 # __file__, not cwd.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_stats import system_has_gpu, is_oom_failure  # noqa: F401
+from gpu_stats import system_has_gpu, is_oom_failure, is_allocation_failure  # noqa: F401
 
 
 def normalize_device(device_str, allow_auto=True):
@@ -32,6 +32,55 @@ def normalize_device(device_str, allow_auto=True):
         return value
     allowed = "auto, cpu, cuda, cuda:N, mps, rocm, or hip"
     raise ValueError(f"Unsupported device '{device_str}'; expected {allowed}")
+
+
+def get_available_gpu_device(torch):
+    """Read the supported Torch GPU backend, without loading a model."""
+    if torch is None:
+        return None
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return None
+
+
+def get_loaded_torch_device_observation():
+    """Probe an already imported runtime; metadata reads never import Torch."""
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return {"state": "runtime_not_loaded", "gpu_backend": None}
+    try:
+        return {"state": "observed", "gpu_backend": get_available_gpu_device(torch)}
+    except (AttributeError, ImportError, OSError, RuntimeError):
+        return {"state": "unavailable", "gpu_backend": None}
+
+
+def get_loaded_torch_memory_observation(device):
+    """Observe allocator counters without importing Torch or equating memory domains."""
+    torch = sys.modules.get('torch')
+    kind = ('apple_unified' if device == 'mps' else 'cpu' if device == 'cpu'
+            else 'rocm_vram' if str(device).startswith('cuda') and getattr(getattr(torch, 'version', None), 'hip', None)
+            else 'cuda_vram' if str(device).startswith('cuda') else 'unknown')
+    metrics = {}
+    def observe(name, callback):
+        try:
+            value = callback()
+            metrics[name] = value if type(value) is int and value >= 0 else None
+        except Exception:
+            metrics[name] = None
+    if kind in ('cuda_vram', 'rocm_vram'):
+        observe('allocated_bytes', lambda: torch.cuda.memory_allocated(device))
+        observe('reserved_bytes', lambda: torch.cuda.memory_reserved(device))
+        observe('driver_free_bytes', lambda: torch.cuda.mem_get_info(device)[0])
+        observe('driver_total_bytes', lambda: torch.cuda.mem_get_info(device)[1])
+    elif kind == 'apple_unified':
+        observe('allocated_bytes', lambda: torch.mps.current_allocated_memory())
+        observe('driver_allocated_bytes', lambda: torch.mps.driver_allocated_memory())
+        observe('recommended_max_bytes', lambda: torch.mps.recommended_max_memory())
+    else:
+        metrics['model_allocated_bytes'] = None
+    return {'device': device, 'kind': kind, 'metrics': metrics}
 
 
 def resolve_device(device_str):
@@ -50,11 +99,10 @@ def resolve_device(device_str):
     torch_unavailable_reason = None
     try:
         import torch
-        if torch.cuda.is_available():
-            return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        torch_unavailable_reason = "torch.cuda.is_available() is False"
+        available = get_available_gpu_device(torch)
+        if available is not None:
+            return available
+        torch_unavailable_reason = "no CUDA or MPS backend is available"
     except ImportError:
         torch_unavailable_reason = "torch isn't importable in this environment"
 
@@ -139,3 +187,7 @@ def enable_rocm_optimizations():
             triton_compiler.triton_key = lambda: f"triton-rocm-{triton.__version__}"
     except ImportError:
         pass
+
+
+from loaded_module_code import get_current_loaded_module_code_sha256 as _get_loaded_recovery_code
+_LOADED_RECOVERY_CODE_SHA256 = _get_loaded_recovery_code()

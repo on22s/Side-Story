@@ -5,27 +5,31 @@ import logging
 import os
 import time
 import traceback
-from device_utils import normalize_device
+from contextlib import nullcontext
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from config_settings import (AppConfig, GenerationConfig, LLMConfig, PromptConfig, PromptVariant,
                              TTSConfig, backup_damaged_app_config, load_app_config,
                              load_app_config_result)
+from export_limits import MAX_PAUSE_MS
 
 from default_prompts import load_default_prompts, load_instruct_prompts, load_segment_prompts
 from llm_provider import is_api_key_reference
+from device_utils import get_available_gpu_device, normalize_device
 from review_prompts import load_review_prompts
+from diagnostics import redact_text
 from persona_prompts import load_persona_prompts
 from lmstudio_settings import (get_lmstudio_status, apply_lmstudio_settings, is_remote_llm,
                                get_failover_llm_config,
                                apply_remote_lmstudio_settings, is_local_llm_endpoint,
-                               get_active_llm_config, get_current_status)
+                               get_active_llm_config, get_current_status,
+                               get_saved_llm_profile)
 
 from core import (
     API_LOG_DIR,
@@ -63,10 +67,30 @@ from utils import (atomic_json_write, file_lock,
                    run_rocm_smi_json, system_has_gpu)
 from run_history import get_run, list_runs
 from runtime_info import get_runtime_info
+from book_state_transaction import ensure_book_state
+from chunk_status_journal import get_chunk_status_journal_path
+from lora_evidence import get_tts_model_settings
+from pronunciation import get_pronunciation_model_context, is_pronunciation_settings_dependent
+from synthesis_settings import (get_enabled_synthesis_window_settings, get_enabled_synthesis_recovery_settings,
+                                get_synthesis_execution_policy)
+from project import ProjectManager
+from core import ensure_book_switch_allowed
 
 
 logger = logging.getLogger("AlexandriaUI")
 router = APIRouter()
+
+
+@router.get("/api/tts/diagnostics")
+def get_tts_diagnostics():
+    """Read bounded operational observations without initializing a model."""
+    from tts_diagnostics import get_tts_diagnostics_bundle
+    from tts import TTSEngine
+    from device_utils import get_loaded_torch_device_observation
+    return get_tts_diagnostics_bundle(residency=project_manager.get_model_residency(),
+                                      runtime=get_runtime_info(ROOT_DIR),
+                                      assets=TTSEngine.get_local_model_inventory(),
+                                      device=get_loaded_torch_device_observation())
 
 
 def _builtin_prompt_presets() -> list[dict]:
@@ -176,7 +200,7 @@ def _resolve_redacted_api_key(api_key, base_url, existing=None):
 
 def get_config_local_profile(config: dict):
     """Read the local profile, including the legacy single-profile shape."""
-    return get_active_llm_config({**config, "llm_mode": "local"})
+    return get_saved_llm_profile({**config, "llm_mode": "local"})
 
 
 def _restore_redacted_secrets(config: AppConfig, existing: dict) -> AppConfig:
@@ -610,7 +634,7 @@ async def llm_models(request: LlmModelsRequest):
     try:
         return {"models": await asyncio.to_thread(fetch)}
     except Exception as exc:                                    # noqa: BLE001
-        return {"models": [], "error": str(exc)[:200]}
+        return {"models": [], "error": redact_text(str(exc))[:200]}
 
 @router.post("/api/llm/test")
 async def llm_test(profile: Optional[LLMConfig] = None):
@@ -784,6 +808,7 @@ async def get_config():
 
     # Always include current_file (null when no state or file missing)
     config["current_file"] = None
+    config["max_pause_ms"] = MAX_PAUSE_MS
     state_path = os.path.join(DATA_DIR, "state.json")
     if os.path.exists(state_path):
         try:
@@ -816,7 +841,9 @@ async def get_config():
     config["config_needs_backup"] = load_result.needs_backup
     # What this host can do, for the page to grey out rather than fail on
     # click. Not a config field: AppConfig has no such key, so a save drops it.
-    config["capabilities"] = {"pause_resume": pause_resume_supported()}
+    from tts_capabilities import get_tts_capability_modes
+    config["capabilities"] = {"pause_resume": pause_resume_supported(),
+                              "tts_modes": get_tts_capability_modes()}
 
     safe = _redact_config_secrets(config)
     # The public local placeholder was synthesized, not loaded from storage;
@@ -882,13 +909,19 @@ def keep_unsent_fields(config: AppConfig, existing: dict) -> AppConfig:
     the merge is decided by the request, not by whether a value happens to
     equal its default."""
     merged = config
-    for section in ("tts", "generation", "prompts"):
+    for section in ("tts", "generation", "prompts", "llm_local", "llm_remote"):
         sent = getattr(config, section)
-        saved = (existing or {}).get(section)
+        saved = (get_config_local_profile(existing or {}) if section == "llm_local"
+                 else (existing or {}).get(section))
         if sent is None or not isinstance(saved, dict):
             continue
+        # This hidden response-format option is absent from the Setup form.
+        # Other profile options (especially credential-bearing headers) remain
+        # explicit inputs, rather than following an edit to another endpoint.
+        preserved_fields = ({"structured_output"} if section.startswith("llm_")
+                            else type(sent).model_fields)
         keep = {key: value for key, value in saved.items()
-                if key not in sent.model_fields_set and key in type(sent).model_fields}
+                if key not in sent.model_fields_set and key in preserved_fields}
         if keep:
             merged = merged.model_copy(update={section: sent.model_copy(update=keep)}, deep=False)
     if "prompt_presets" not in config.model_fields_set:
@@ -898,62 +931,209 @@ def keep_unsent_fields(config: AppConfig, existing: dict) -> AppConfig:
     return merged
 
 
-@router.post("/api/config")
-async def save_config(config: AppConfig):
-    def _save():
-        normalized_config = config.model_copy(deep=True)
+def get_config_to_save(config: AppConfig, existing: dict) -> AppConfig:
+    """Return the exact validated Save proposal without writing or resetting.
 
-        # Normalize/validate whichever profiles were sent. The local/remote profiles
-        # are persisted side-by-side so toggling never loses the other one's settings.
-        if normalized_config.llm_local is not None and normalized_config.llm_local.base_url.strip():
-            normalized_config.llm_local = _normalize_and_validate_llm(normalized_config.llm_local)
-        if normalized_config.llm_remote is not None and normalized_config.llm_remote.base_url.strip():
-            normalized_config.llm_remote = _normalize_and_validate_llm(normalized_config.llm_remote)
+    Callers hold the config lock while reading and using existing settings.
+    """
+    # Preserve hidden settings in each named profile before deriving the active
+    # mirror. The old `llm` mirror may belong to the other mode after a switch.
+    normalized_config = keep_unsent_fields(config.model_copy(deep=True), existing)
+    if normalized_config.tts.design_text_min_chars > normalized_config.tts.design_text_max_chars:
+        raise HTTPException(status_code=400, detail=(
+            "Voice Design text length: the minimum is larger than the maximum."))
 
-        # Pick the active profile from the toggle, then mirror it into `llm` - the
-        # section every consumer (review/generate/personas/nicknames) reads.
-        active = (normalized_config.llm_remote if normalized_config.llm_mode == "remote"
-                  else normalized_config.llm_local)
-        if active is None:
-            raise HTTPException(status_code=400, detail=(
-                f"llm_mode is '{normalized_config.llm_mode}' but no llm_{normalized_config.llm_mode} "
-                f"profile was provided - refusing to save a config where llm_mode "
-                f"and the active llm profile would disagree."))
+    # Normalize/validate whichever profiles were sent. The local/remote profiles
+    # are persisted side-by-side so toggling never loses the other one's settings.
+    if normalized_config.llm_local is not None and normalized_config.llm_local.base_url.strip():
+        normalized_config.llm_local = _normalize_and_validate_llm(normalized_config.llm_local)
+    if normalized_config.llm_remote is not None and normalized_config.llm_remote.base_url.strip():
+        normalized_config.llm_remote = _normalize_and_validate_llm(normalized_config.llm_remote)
+
+    # Pick the active profile from the toggle, then mirror it into `llm` - the
+    # section every consumer (review/generate/personas/nicknames) reads.
+    active = (normalized_config.llm_remote if normalized_config.llm_mode == "remote"
+              else normalized_config.llm_local)
+    if active is None:
+        raise HTTPException(status_code=400, detail=(
+            f"llm_mode is '{normalized_config.llm_mode}' but no llm_{normalized_config.llm_mode} "
+            f"profile was provided - refusing to save a config where llm_mode "
+            f"and the active llm profile would disagree."))
+    # The form mirrors the newly selected profile into llm. Its stored key
+    # belongs to that named profile, not to the previously active mirror.
+    normalized_config.llm = active.model_copy(deep=True)
+    saved_active = existing.get('llm_remote') if normalized_config.llm_mode == 'remote' else get_config_local_profile(existing)
+    normalized_config = _restore_redacted_secrets(
+        normalized_config, {**existing, 'llm': saved_active})
+    active = (normalized_config.llm_remote if normalized_config.llm_mode == "remote"
+              else normalized_config.llm_local)
+    normalized_config.llm = _normalize_and_validate_llm(active)
+    # The active attribution preset decides the variant the run uses;
+    # derive the generation key from it (after the merge, so a preset the
+    # client did not resend is still found) so the CLI agrees with Setup,
+    # and refuse a preset whose template lost its placeholders.
+    from attribution_prompt_variants import resolve_attribution_preset, validate_preset_texts
+    try:
+        variant, texts, _ = resolve_attribution_preset(normalized_config.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    problem = validate_preset_texts(variant, texts)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    generation = normalized_config.generation or GenerationConfig()
+    normalized_config.generation = generation.model_copy(
+        update={"three_pass_attribute_prompt_variant": variant})
+    return normalized_config
+
+
+@router.post("/api/config/preview")
+async def preview_config(proposed: Any = Body(...)):
+    """Compare supported saved settings with the normalized Save proposal."""
+    if not isinstance(proposed, dict):
+        raise HTTPException(status_code=400, detail="Preview requires a settings object.")
+    try:
+        config = AppConfig.model_validate(proposed)
+        return await asyncio.to_thread(_get_config_preview_sync, config)
+    except (ValidationError, HTTPException) as error:
+        # Validation errors can include submitted credentials or URL text.
+        raise HTTPException(status_code=400, detail=(
+            "Settings preview did not pass Save validation. Check the model profiles, "
+            "prompt presets, number ranges and JSON fields; no settings were applied.")) from error
+
+
+def _get_config_preview_sync(config):
+    from config_change_preview import get_config_change_preview
+    with file_lock(CONFIG_PATH):
+        existing = load_app_config_result(CONFIG_PATH)
+        proposal = get_config_to_save(config, existing.data)
+        return get_config_change_preview(existing, proposal, get_config_local_profile,
+                                         exists=os.path.isfile(CONFIG_PATH))
+
+
+def apply_config_save(existing, normalized_config):
+    """The caller holds the config lock; preserve existing damaged-file backup policy."""
+    if existing.needs_backup:
+        try:
+            backup_damaged_app_config(CONFIG_PATH)
+        except OSError as exc:
+            raise HTTPException(status_code=500,
+                                detail=f"Could not preserve damaged config before saving: {exc}") from exc
+    atomic_json_write(normalized_config.model_dump(), CONFIG_PATH)
+
+
+def is_pronunciation_config_change(before, after):
+    return (get_pronunciation_model_context(get_tts_model_settings(before)) !=
+            get_pronunciation_model_context(get_tts_model_settings(after)))
+
+
+
+def get_synthesis_window_model_context(settings):
+    return get_enabled_synthesis_window_settings(settings.get("synthesis_windows"))
+
+
+def is_synthesis_window_config_change(before, after):
+    return (get_synthesis_window_model_context(get_tts_model_settings(before)) !=
+            get_synthesis_window_model_context(get_tts_model_settings(after)))
+
+
+def is_synthesis_execution_config_change(before, after, engine):
+    saved = get_synthesis_execution_policy(before.get('tts', {}))
+    proposed = get_synthesis_execution_policy(after.get('tts', {}))
+    active = get_synthesis_execution_policy({key: getattr(engine, '_' + key, None) for key in proposed})
+    return saved != proposed or engine is not None and active != proposed
+
+
+def save_config_document(config):
+    """Fence effective window policies and conditional pronunciation dependencies."""
+    manager = project_manager
+    bound = (isinstance(manager, ProjectManager) and
+             os.path.abspath(manager.config_path) == os.path.abspath(CONFIG_PATH))
+    with file_lock(CONFIG_PATH):
+        existing = load_app_config_result(CONFIG_PATH)
+        normalized = get_config_to_save(config, existing.data)
+        if not bound:
+            apply_config_save(existing, normalized)
+            return False
+
+    try:
+        return apply_pronunciation_config_change(config, manager)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=(
+            "Settings could not be applied safely. Check saved book/config files and retry; "
+            "affected lines may require regeneration.")) from error
+
+
+def apply_pronunciation_config_change(config, manager):
+    """Preserve unrelated saves; fence changed captured synthesis dependencies."""
+    root = manager.root_dir
+    # Inspect rules before consulting the engine: legacy saves must reach
+    # reset even while a constructor holds its lock. Book ownership keeps rule
+    # approval from racing the configuration write and reset.
+    with ensure_book_state(root, recover=False):
+        with manager._chunks_lock, file_lock(manager.chunks_path), file_lock(CONFIG_PATH):
+            existing = load_app_config_result(CONFIG_PATH)
+            normalized = get_config_to_save(config, existing.data)
+            rows = []
+            if (os.path.exists(manager.chunks_path) or
+                    os.path.exists(get_chunk_status_journal_path(manager.chunks_path))):
+                try:
+                    rows = manager._get_saved_chunk_rows_locked()
+                except ValueError:
+                    if is_pronunciation_config_change(existing.data, normalized.model_dump()):
+                        raise
+                    # An unrelated save keeps the legacy damaged-chunks policy.
+            dependent = any(is_pronunciation_settings_dependent(row) for row in rows)
+            active_policy = getattr(manager.engine, "_synthesis_windows", None)
+            windows_relevant = (
+                get_synthesis_window_model_context(get_tts_model_settings(existing.data)) is not None or
+                get_synthesis_window_model_context(get_tts_model_settings(normalized.model_dump())) is not None or
+                isinstance(active_policy, dict) and active_policy.get("enabled") is True)
+        before = manager.get_pronunciation_preview_settings()["settings"] if dependent or windows_relevant else None
         with file_lock(CONFIG_PATH):
             existing = load_app_config_result(CONFIG_PATH)
-            normalized_config = _restore_redacted_secrets(normalized_config, existing.data)
-            active = (normalized_config.llm_remote if normalized_config.llm_mode == "remote"
-                      else normalized_config.llm_local)
-            normalized_config.llm = _normalize_and_validate_llm(active)
-            normalized_config = keep_unsent_fields(normalized_config, existing.data)
-            # The active attribution preset decides the variant the run uses;
-            # derive the generation key from it (after the merge, so a preset the
-            # client did not resend is still found) so the CLI agrees with Setup,
-            # and refuse a preset whose template lost its placeholders.
-            from attribution_prompt_variants import resolve_attribution_preset, validate_preset_texts
-            try:
-                variant, texts, _ = resolve_attribution_preset(normalized_config.model_dump())
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            problem = validate_preset_texts(variant, texts)
-            if problem:
-                raise HTTPException(status_code=400, detail=problem)
-            generation = normalized_config.generation or GenerationConfig()
-            normalized_config.generation = generation.model_copy(
-                update={"three_pass_attribute_prompt_variant": variant})
-            if existing.needs_backup:
-                try:
-                    backup_damaged_app_config(CONFIG_PATH)
-                except OSError as exc:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Could not preserve damaged config before saving: {exc}",
-                    ) from exc
-            atomic_json_write(normalized_config.model_dump(), CONFIG_PATH)
+            normalized = get_config_to_save(config, existing.data)
+            after = get_tts_model_settings(normalized.model_dump())
+            requires_fence = (
+                is_synthesis_execution_config_change(existing.data, normalized.model_dump(), manager.engine) or
+                dependent and (is_pronunciation_config_change(existing.data, normalized.model_dump()) or
+                               get_pronunciation_model_context(before) != get_pronunciation_model_context(after)) or
+                is_synthesis_window_config_change(existing.data, normalized.model_dump()) or
+                windows_relevant and get_synthesis_window_model_context(before) != get_synthesis_window_model_context(after))
+            if not requires_fence:
+                # Preserve legacy write failures and cached engines on failure.
+                apply_config_save(existing, normalized)
+        if not requires_fence:
+            manager.reset_engine()
+            return True
 
-    await asyncio.to_thread(_save)
-    # Serialize reset with construction without blocking the event loop.
-    await asyncio.to_thread(project_manager.reset_engine)
+    with ensure_book_switch_allowed(operation="change synthesis window, recovery, speech verification or conditional pronunciation settings"):
+        with ensure_book_state(root, recover=False):
+            before = manager.get_pronunciation_preview_settings()["settings"]
+            try:
+                with manager._chunks_lock, file_lock(manager.chunks_path), file_lock(CONFIG_PATH):
+                    existing = load_app_config_result(CONFIG_PATH)
+                    normalized = get_config_to_save(config, existing.data)
+                    after = get_tts_model_settings(normalized.model_dump())
+                    if get_pronunciation_model_context(before) != get_pronunciation_model_context(after):
+                        rows = (manager._get_saved_chunk_rows_locked()
+                                if os.path.exists(manager.chunks_path) or
+                                os.path.exists(get_chunk_status_journal_path(manager.chunks_path)) else [])
+                        if any(is_pronunciation_settings_dependent(row) for row in rows):
+                            manager._apply_pronunciation_settings_invalidation_locked(before, after)
+                    apply_config_save(existing, normalized)
+            except OSError as error:
+                raise HTTPException(status_code=409, detail=(
+                    "Settings could not be applied safely. Check saved book/config files and retry; "
+                    "affected lines may require regeneration.")) from error
+            manager.reset_engine()
+            return True
+
+
+@router.post("/api/config")
+async def save_config(config: AppConfig):
+    reset = await asyncio.to_thread(save_config_document, config)
+    if not reset:
+        await asyncio.to_thread(project_manager.reset_engine)
     return {"status": "saved"}
 
 
@@ -974,3 +1154,39 @@ async def unload_models_endpoint():
         return {"status": "noop", "unloaded": []}
     unloaded = await asyncio.to_thread(engine.unload_models)
     return {"status": "ok", "unloaded": unloaded}
+
+
+class ClearSynthesisRecoveryRequest(BaseModel):
+    expected_book_token: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@router.post('/api/tts/recovery/clear')
+async def clear_synthesis_recovery(request: ClearSynthesisRecoveryRequest):
+    return await asyncio.to_thread(_clear_synthesis_recovery_sync, request.expected_book_token)
+
+
+def _clear_synthesis_recovery_sync(expected_book_token):
+    from book_state_transaction import get_book_operation_identity
+    from editor_poll_snapshot import get_snapshot_digest
+    from synthesis_recovery_cache import CACHE_DIRECTORY, RecoveryCacheStorage, RecoveryCacheUnavailable
+    root = project_manager.root_dir
+    with ensure_book_switch_allowed(operation='clear retained synthesis recovery windows'):
+        with ensure_book_state(root):
+            if get_snapshot_digest(get_book_operation_identity(root)) != expected_book_token:
+                raise HTTPException(status_code=409, detail='Active book changed; reload Editor before clearing recovery windows.')
+            removed = 0
+            if os.path.lexists(os.path.join(root, CACHE_DIRECTORY)):
+                try:
+                    # The task/startup fence and book lock remain live across
+                    # this admission. No audio-owner callback may reenter them.
+                    with RecoveryCacheStorage(root, nullcontext) as storage:
+                        with storage.read_transaction() as transaction:
+                            keys = list(transaction.data['requests'])
+                        for key in keys:
+                            storage.retire_request(key)
+                            removed += 1
+                except (RecoveryCacheUnavailable, OSError) as error:
+                    raise HTTPException(status_code=409, detail=(
+                        'Recovery cache could not be cleared safely. Existing takes were kept; '
+                        'damaged or unknown cache files require inspection.')) from error
+            return {'status': 'cleared', 'removed_requests': removed, 'book_token': expected_book_token}

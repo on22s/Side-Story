@@ -2,20 +2,26 @@
 # which install.js runs BEFORE this file. Do NOT pin torch here — on AMD/ROCm
 # machines it would pull a CUDA build from PyPI and break GPU detection.
 # (peft below requires torch, but torch.js has already satisfied it.)
-fastapi==0.128.0
-uvicorn==0.40.0
-pydantic==2.12.5
+fastapi==0.143.3
+starlette==1.3.1
+uvicorn==0.54.0
+pydantic==2.14.1
 pydub==0.25.1
 # Validate uploaded M4B cover bytes before replacing the current cover.
-Pillow==12.2.0
-requests==2.33.0
-openai==2.16.0
+Pillow==12.3.0
+requests==2.34.2
+openai==3.33.0
+# llm_provider builds its timeouts with httpx2, the HTTP client openai 3 sends through.
+httpx2>=2.12.0,<3
 gradio_client==2.0.3
-soundfile==0.13.1
+soundfile==0.14.0
 numpy==2.2.6
 # Exact word-level edit alignment without repetitive-book SequenceMatcher scans.
 rapidfuzz==3.14.5
 librosa==0.11.0
+# Praat pitch tracking for experiments/final_word_tune.py and voice_compare_view.py.
+# Was already installed in app/env but undeclared, so CI lacked it.
+praat-parselmouth==0.4.7
 # Speaker embeddings (ECAPA) for the voice-drift check and the LoRA identity
 # gate. Pure-Python on top of the torch that torch.js installed; the worker
 # (experiments/_ecapa_batch.py) pins CPU on purpose.
@@ -29,10 +35,47 @@ seaborn==0.13.2
 # (gfx1201); the PyPI wheel is CPU-only and would overwrite it on every update.
 # install-voice-tools.js provisions the optional backend-specific build through llama_cpp.js.
 transformers==4.57.3
-peft==0.18.1
+peft==0.21.2
 python-multipart==0.0.32
 aiofiles==24.1.0
 # Only consumed by alexandria_preparer_rocm_compatible.py's WAV tagging, which
 # runs in the Voice Lab "rocm_python" interpreter env - install it there too
 # (it is optional: the preparer skips tagging with a warning when missing).
 mutagen==1.47.0
+# Kanji -> kana readings, for scoring Japanese ASR on sound rather than script.
+# Optional: only app/experiments/asr_backends.py --score-readings uses it, and
+# that flag refuses to run without it rather than silently reporting a
+# character score. Measured 2026-08-16: CER 28.7% as written, 9.9% on readings
+# for identical audio and identical model output.
+pykakasi==2.3.0
+# Expected pitch from text, for languages where pitch carries lexical meaning.
+# Optional: only app/experiments/expected_prosody.py uses them, and it reports
+# "not installed" rather than guessing. Japanese pitch accent (箸 vs 橋) and
+# Chinese tone are invisible to CER - the characters transcribed back are the
+# same - so these are the only way to check them without a native listener.
+# pyopenjtalk downloads its ~23 MB OpenJTalk dictionary on first use.
+pypinyin==0.55.0
+pyopenjtalk==0.4.1
+# Discovery only, for app/experiments/discover_foreign_terms.py: finding
+# Latinized Japanese vocabulary that needs a pronunciation entry. The test is
+# membership in a Japanese dictionary AND absence from an English one, because
+# `same` is サメ (shark) and `made` is まで - both real Japanese, both English.
+# SudachiDict is Apache-2.0 (JMdict is CC BY-SA, which share-alikes a shipped
+# app). Nothing at generation time imports these.
+sudachipy==0.6.11
+sudachidict_core==20260723
+# The original romkan setup imports imp, removed in Python 3.12.
+romkan2==0.1.1
+pyspellchecker==0.9.0
+
+# Security floors for transitive dependencies (published advisories fixed in
+# these releases). Floors, not pins: the packages that pull them in choose
+# the exact version.
+urllib3>=2.8.0
+anyio>=4.14.2
+msgpack>=1.2.1
+multidict>=6.9.1
+fsspec>=2026.6.0
+
+# Seekable, pre-write bounded muxing for mixed M4B delivery (Python 3.10).
+av==17.0.0

@@ -2,6 +2,7 @@
 See docs/superpowers/specs/2026-07-21-three-pass-script-generation-design.md."""
 
 import argparse
+from script_recovery_facts import three_pass_manifest_path
 import hashlib
 import json
 import math
@@ -19,7 +20,8 @@ from types import MappingProxyType
 from core import llm_timeout_seconds
 from source_encoding import read_source_text, get_normalized_source_newlines
 from llm_provider import (make_llm_client, make_run_client, get_run_model_binding,
-                          get_run_fingerprint_identity, is_manual_client)
+                          get_run_fingerprint_identity, get_provider_extra_body,
+                          is_manual_client)
 from llm_request_budget import get_prompt_token_estimate
 
 from judge_reason_log import record_judge_run
@@ -45,7 +47,9 @@ from pass_quality import (is_attested_name, strip_roster_alias_echo,
                           classify_lexical_quote_regions,
                           validate_segment_quality, validate_attribution,
                           get_attribution_tag_evidence,
+                          get_attribution_shift_feedback_report,
                           validate_instruct, index_head_check,
+                          DELIVERY_DIRECTIONS,
                           analyze_outer_quote_regions, split_outer_quote_regions,
                           QUOTE_MARKS)
 from review_script import normalize_text
@@ -137,7 +141,8 @@ def resolve_hard_max_tokens(configured_max_tokens):
 
 def resolve_three_pass_generation_settings(config, chunk_size_override=None,
                                            segmentation_override=None,
-                                           pass1_format_override=None):
+                                           pass1_format_override=None,
+                                           delivery_direction_override=None):
     """Resolve model-profile-sensitive settings shared by runtime and preflight."""
     llm = get_active_llm_config(config)
     gen = config.get("generation") or {}
@@ -150,7 +155,10 @@ def resolve_three_pass_generation_settings(config, chunk_size_override=None,
         "chunk_size": resolve_chunk_size(
             chunk_size_override, gen.get("three_pass_chunk_size", 3000),
             model_profile.get("chunk_size")),
-        "max_tokens": gen.get("max_tokens", 10000),
+        "max_tokens": llm.get("max_output_tokens") or gen.get("max_tokens", 10000),
+        "max_input_tokens": llm.get("max_input_tokens"),
+        "profile_context_length": llm.get("context_length"),
+        "profile_output_ceiling": llm.get("max_output_tokens"),
         "segment_output_ratio": model_profile.get(
             "segment_output_ratio", gen.get("three_pass_segment_output_ratio", 3.0)),
         "segmentation": segmentation_override or model_profile.get(
@@ -170,7 +178,23 @@ def resolve_three_pass_generation_settings(config, chunk_size_override=None,
         "instruct_target_chars": int(gen.get("three_pass_instruct_target_chars", 0)),
         "instruct_context_chars": int(gen.get("three_pass_instruct_context_chars", 0)),
         "attribute_prompt_variant": gen.get("three_pass_attribute_prompt_variant") or "michel2_full",
+        "delivery_direction": resolve_delivery_direction(config, delivery_direction_override),
     }
+
+
+def resolve_delivery_direction(config, cli_value=None):
+    """-> the Pass 3 delivery-direction mode (#1258): the CLI value, else
+    generation.three_pass_delivery_direction, else "off". Unknown modes raise, and
+    so does a mode with a custom Pass 3 preset: that prompt does not ask for the
+    direction fields, so every window would fail and fall back to defaults."""
+    value = (cli_value if cli_value is not None
+             else (config.get("generation") or {}).get("three_pass_delivery_direction") or "off")
+    if value not in DELIVERY_DIRECTIONS:
+        raise ValueError(f"delivery direction must be one of {DELIVERY_DIRECTIONS} (got {value!r})")
+    if value != "off" and any(resolve_three_pass_prompt(config, "pass3")):
+        raise ValueError("Delivery direction needs the default Pass 3 prompt; select the "
+                         "default Pass 3 preset or set the direction to off")
+    return value
 
 
 LARGE_CONTEXT_CHARS = 20000
@@ -200,21 +224,20 @@ def get_three_pass_run_params(config, lm_status, reasoning_effort=None, generati
     gen = config.get("generation") or {}
     llm = get_active_llm_config(config)
     model_profile = generation_settings["model_profile"]
+    from llm_request_budget import get_request_limits
+    limits = get_request_limits(llm, lm_status.get("context_length"))
     params = LLMGenParams(
-        max_tokens=generation_settings["max_tokens"],
-        # The escalation ceiling follows the configured budget. It used to stay
-        # at the dataclass default (16384) whatever Setup said, so a hosted
-        # reasoning model that thinks for 16k tokens was cut off at exactly
-        # that point with "cannot grow beyond 16384" while the user had set
-        # 65536 (reported 2026-09-17 against an OpenRouter model via a
-        # GPT-Load gateway). Never below the default, so local setups keep
-        # their headroom; get_effective_max_tokens still clamps to the
-        # server's real context when one is known.
-        hard_max_tokens=resolve_hard_max_tokens(generation_settings["max_tokens"]),
+        task_max_tokens=gen.get("max_tokens", 10000),
+        task_hard_max_tokens=resolve_hard_max_tokens(gen.get("max_tokens", 10000)),
+        max_tokens=min(generation_settings["max_tokens"], limits["max_output_tokens"] or generation_settings["max_tokens"]),
+        max_input_tokens=limits["max_input_tokens"],
+        # Profile override / global fallback bounds every retry. Raw legacy
+        # harness configs without either retain their existing task ceiling.
+        hard_max_tokens=limits["max_output_tokens"] or resolve_hard_max_tokens(generation_settings["max_tokens"]),
         temperature=gen.get("temperature", 0.6),
         top_p=gen.get("top_p", 0.8),
         top_k=gen.get("top_k"), min_p=gen.get("min_p"),
-        context_length=lm_status.get("context_length"),
+        context_length=limits["context_length"],
         segment_temperature=model_profile.get(
             # Segmentation and attribution are classification, not writing:
             # each has one right answer, so sampling only adds noise. Measured
@@ -236,14 +259,15 @@ def get_three_pass_run_params(config, lm_status, reasoning_effort=None, generati
         quoted_must_be_spoken=generation_settings["quoted_must_be_spoken"],
         unquoted_must_be_narrator=generation_settings["unquoted_must_be_narrator"],
         reasoning_effort=reasoning_effort,
-        provider_extra_body=llm.get("provider_extra_body"),
+        provider_extra_body=(get_provider_extra_body(llm) or llm.get("provider_extra_body")),
         structured_output=llm.get("structured_output", "auto"),
         api_retry_limit=llm.get("api_retry_limit"),
         retry_initial_delay_seconds=llm.get("retry_initial_delay_seconds", 1),
         retry_multiplier=llm.get("retry_multiplier", 2),
         retry_max_delay_seconds=llm.get("retry_max_delay_seconds", 30),
         retry_jitter=llm.get("retry_jitter", 0.2),
-        on_api_exhaustion=llm.get("on_api_exhaustion", "fail"))
+        on_api_exhaustion=llm.get("on_api_exhaustion", "fail"),
+        delivery_direction=generation_settings.get("delivery_direction", "off"))
     params.segment_system_prompt, params.segment_user_prompt_template = resolve_three_pass_prompt(
         config, "pass1")
     params.instruct_system_prompt, params.instruct_user_prompt_template = resolve_three_pass_prompt(
@@ -543,6 +567,63 @@ def get_cast_from_data(data):
 def default_instruct(entry):
     speaker = (entry.get("speaker") or "").strip().upper()
     return NARRATOR_DEFAULT_INSTRUCT if speaker == "NARRATOR" else CHARACTER_DEFAULT_INSTRUCT
+
+
+# Silence after the previous line when a line's gap asks for it (#1258). Starting
+# values to tune by ear in the listening test, not measurements; "normal" keeps
+# tts.get_pause_duration_ms's speaker rule (500 ms, 250 ms same speaker).
+GAP_PAUSE_MS = {"cut_off": 60, "beat": 900, "trailing": 700}
+
+
+def compose_directed_instruct(action, delivery, delivery_direction):
+    """The instruct the TTS receives from a directed row: "Reassuring: soft, warm."
+    In action_only the delivery note is dropped, testing the verb alone."""
+    action = action.strip().rstrip(".")
+    label = action[:1].upper() + action[1:]
+    if delivery_direction == "action_only":
+        return f"{label}."
+    return f"{label}: {delivery.strip().rstrip('.')}."
+
+
+def get_directed_entry(prior, item, delivery_direction):
+    """Merge one validated Pass 3 row onto its frozen entry (speaker and text
+    stay the prior's). Directed modes keep the raw fields under `direction`
+    for review; the TTS reads only `instruct`."""
+    entry = {key: value for key, value in prior.items() if key != "instruct_unchecked"}
+    if delivery_direction == "off":
+        return {**entry, "instruct": item.get("instruct")}
+    if delivery_direction == "gaps":
+        return {**entry, "instruct": item["instruct"], "direction": {"gap": item["gap"]}}
+    return {**entry,
+            "instruct": compose_directed_instruct(item["action"], item.get("delivery") or "",
+                                                  delivery_direction),
+            "direction": {"answers": item.get("answers"), "action": item["action"],
+                          "delivery": item.get("delivery"), "gap": item["gap"]}}
+
+
+def apply_gap_pauses(entries):
+    """Return copies with each line's gap placed on the previous entry's pause_after,
+    which is the silence after that entry. A longer pause already there (a scene
+    break) is kept, so cut_off never shortens one."""
+    result = [dict(entry) if isinstance(entry, dict) else entry for entry in entries]
+    for previous, current in zip(result, result[1:]):
+        if not isinstance(previous, dict) or not isinstance(current, dict):
+            continue
+        pause = GAP_PAUSE_MS.get((current.get("direction") or {}).get("gap"))
+        if pause is not None:
+            existing = previous.get("pause_after")
+            previous["pause_after"] = pause if existing is None else max(int(existing), pause)
+    return result
+
+
+def get_gap_counts(entries):
+    """Count of each gap label, plus entries with none (fallback or nonverbal)."""
+    counts = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            gap = (entry.get("direction") or {}).get("gap") or "none"
+            counts[gap] = counts.get(gap, 0) + 1
+    return counts
 
 
 def get_deterministic_named_entry(entry, cast=None):
@@ -855,7 +936,8 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
                     max_retries=3, on_exhaustion="fail", neighbor_contexts=None,
                     attempt_observer=None, source_text=None,
                     exhaustion_sink=None, entries_provider=None, surround=None,
-                    cast=None, keep_scope="line", speaker_traits=False, roster_traits=None):
+                    cast=None, keep_scope="line", speaker_traits=False, roster_traits=None,
+                    *, repair_exact_shift=False, targeted_shift_feedback=False):
     """Assign speakers to one batch of frozen {type,text} entries. Enforces the
     text freeze; retries on invalid output. On exhaustion: 'fail' raises
     PassExhausted (testing default); 'fallback' keeps frozen text and labels
@@ -864,13 +946,30 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
     entry, returns keep_exhausted_answer instead of aborting the book. With
     keep_scope='batch' a multi-entry batch whose last answer failed only
     keepable checks is kept whole instead of subdivided (#668: one rejected
-    label otherwise costs a halving per level, ~25 requests for 25 lines)."""
+    label otherwise costs a halving per level, ~25 requests for 25 lines).
+    targeted_shift_feedback is an evaluation-only retry-wording opt-in; it
+    does not repair labels or change validation, prompts on first attempts,
+    schemas or retry budgets."""
     params = ensure_run_request_params(client, params)
     sys_prompt, user_prompt = build_attribute_request(
         frozen_batch, params, roster, neighbor_contexts, surround)
-    tag_evidence = get_attribution_tag_evidence(
-        frozen_batch, source_text, set(roster or ()) | set((cast or {}).get("known_names") or ()),
-        (cast or {}).get("alias_to_name"))
+    from pass_quality import (get_attribution_tag_proofs, get_attribution_snapshot_digest,
+                              get_exact_attribution_shift_repair)
+    if (repair_exact_shift and entries_provider is not None
+            and not getattr(entries_provider, "supports_attribution_transform", False)):
+        raise ValueError("This attribution provider does not support exact-shift transforms")
+    known_names = set((cast or {}).get("known_names") or ())
+    established_names = set(roster or ())
+    aliases = (cast or {}).get("alias_to_name") or {}
+    if repair_exact_shift:
+        proofs = get_attribution_tag_proofs(
+            frozen_batch, source_text, established_names | known_names, aliases)
+        tag_evidence = {index: proof["speaker"] for index, proof in proofs.items()}
+        snapshot = get_attribution_snapshot_digest([
+            frozen_batch, sorted(established_names), sorted(known_names), aliases])
+    else:
+        tag_evidence = get_attribution_tag_evidence(
+            frozen_batch, source_text, established_names | known_names, aliases)
     validated = {}
     attempts = []
 
@@ -879,15 +978,37 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
         if attempt_observer:
             attempt_observer(attempt)
 
-    def validate(entries):
-        validated["last"] = entries
+    def get_quality(entries):
         report = validate_attribution(frozen_batch, entries, source_text,
-                                      known_names=(cast or {}).get("known_names"),
+                                      known_names=known_names,
                                       tag_evidence=tag_evidence,
-                                      speaker_aliases=(cast or {}).get("alias_to_name"),
-                                      established_names=roster)
-        validated["last_report"] = report
-        if report["passed"]:
+                                      speaker_aliases=aliases,
+                                      established_names=established_names)
+        return (get_attribution_shift_feedback_report(frozen_batch, entries, report)
+                if targeted_shift_feedback else report)
+
+    def transform(entries):
+        # Keep original parsed evidence even when a later provider gate rejects
+        # the native-valid copied candidate. No candidate enters keep/fallback.
+        from copy import deepcopy
+        validated["last"] = deepcopy(entries)
+        validated["last_report"] = get_quality(entries)
+        if getattr(entries_provider, "fills_immutable_narration", False):
+            # Sparse providers own narration expansion and its stricter gate;
+            # never repair raw named narration before that refusal runs.
+            return {"entries": entries, "raw_native_report": validated["last_report"]}
+        prepared = get_exact_attribution_shift_repair(
+            frozen_batch, entries, source_text, proofs, tag_evidence, snapshot,
+            known_names=known_names, established_names=established_names,
+            speaker_aliases=aliases, speaker_traits=speaker_traits)
+        return {**prepared, "raw_native_report": validated["last_report"]}
+
+    def validate(entries):
+        report = get_quality(entries)
+        if not repair_exact_shift or "last" not in validated:
+            validated["last"] = entries
+            validated["last_report"] = report
+        if report["passed"] and not repair_exact_shift:
             validated["ordered"] = index_head_check(frozen_batch, entries)[2]
         return report
 
@@ -912,6 +1033,7 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
     # binding, the exhaustion path - is shared by any provider, so an
     # alternative attribution strategy cannot quietly skip them. Default None
     # uses the canonical attribution prompt and the same role-bound schema.
+    transform_kwargs = {"transform_entries": transform} if repair_exact_shift else {}
     if entries_provider is None:
         call_params = replace(call_params, response_schema=get_exact_index_schema(
             call_params.response_schema, range(len(frozen_batch)), frozen_entries=frozen_batch))
@@ -919,7 +1041,7 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
             client, model_name, sys_prompt, user_prompt, call_params,
             log_name="llm_responses.log", label="ATTRIBUTE",
             max_retries=max_retries, validate_entries=validate,
-            attempt_observer=observe, retry_decider=decide_retry)
+            attempt_observer=observe, retry_decider=decide_retry, **transform_kwargs)
     else:
         # A provider also receives frozen_batch, because a strategy that
         # serialises WITHOUT a second model has to build {n, head, speaker}
@@ -929,7 +1051,7 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
             log_name="llm_responses.log", label="ATTRIBUTE",
             max_retries=max_retries, validate_entries=validate,
             attempt_observer=observe, retry_decider=decide_retry,
-            frozen_batch=frozen_batch,
+            frozen_batch=frozen_batch, **transform_kwargs,
             # what a provider that rebuilds the prompt its own way needs: the
             # roster and contexts the canonical prompt was built from, and the
             # surrounding text when the user asked for it
@@ -940,7 +1062,19 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
         # The model returned only {n, head, speaker} (never full text, so it can't
         # corrupt it). Bind by the validated index order and keep the frozen text
         # byte-exact; take only the assigned speaker.
-        ordered = validated.get("ordered")
+        if repair_exact_shift:
+            ordered = index_head_check(frozen_batch, named)[2]
+            if ordered is None or not get_quality(named)["passed"]:
+                raise RuntimeError("returned attribution lost its accepted native binding")
+            accepted_metadata = next((attempt["accepted_entry_transform"]
+                                      for attempt in reversed(attempts)
+                                      if attempt.get("outcome") == "accepted"
+                                      and "accepted_entry_transform" in attempt), None)
+            if (accepted_metadata is not None and accepted_metadata.get("answer_sha256")
+                    != get_attribution_snapshot_digest(named)):
+                raise RuntimeError("returned attribution differs from the accepted transform")
+        else:
+            ordered = validated.get("ordered")
         if ordered is None:
             raise RuntimeError("validated attribution response lost its index binding")
         return get_named_from_answer(frozen_batch, ordered, cast, speaker_traits)
@@ -955,7 +1089,9 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
                 attempt_observer=attempt_observer, source_text=source_text,
                 exhaustion_sink=exhaustion_sink, entries_provider=entries_provider,
                 surround=surround, cast=cast, keep_scope=keep_scope,
-                speaker_traits=speaker_traits, roster_traits=roster_traits))
+                speaker_traits=speaker_traits, roster_traits=roster_traits,
+                repair_exact_shift=repair_exact_shift,
+                targeted_shift_feedback=targeted_shift_feedback))
         return combined
     if exhaustion_sink is not None:
         exhaustion_sink.append(True)
@@ -976,15 +1112,20 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
 
 def build_instruct_request(prior_batch, params, neighbor_contexts=None, surround=None):
     """Build the canonical pass-3 system and user prompts."""
-    sys_prompt, usr_template = load_instruct_prompts()
-    if params.instruct_system_prompt:
-        sys_prompt = params.instruct_system_prompt
-    elif params.system_prompt:
-        sys_prompt = params.system_prompt
-    if params.instruct_user_prompt_template:
-        usr_template = params.instruct_user_prompt_template
-    elif params.user_prompt_template:
-        usr_template = params.user_prompt_template
+    direction = getattr(params, "delivery_direction", "off")
+    sys_prompt, usr_template = load_instruct_prompts(direction)
+    # A delivery-direction mode always sends its own prompt, which asks for its
+    # fields: get_three_pass_run_params refuses a custom Pass 3 preset with a
+    # mode, and the legacy prompt fallbacks would ask for an instruct alone.
+    if direction == "off":
+        if params.instruct_system_prompt:
+            sys_prompt = params.instruct_system_prompt
+        elif params.system_prompt:
+            sys_prompt = params.system_prompt
+        if params.instruct_user_prompt_template:
+            usr_template = params.instruct_user_prompt_template
+        elif params.user_prompt_template:
+            usr_template = params.user_prompt_template
     neighbor_contexts = neighbor_contexts or [{} for _ in prior_batch]
     batch_json = json.dumps([
         {"n": i, "speaker": e["speaker"], "text": e["text"], **neighbor_contexts[i]}
@@ -1030,8 +1171,10 @@ def instruct_batch(client, model_name, prior_batch, params, max_retries=3,
         prior_batch, params, neighbor_contexts, surround)
     validated = {}
 
+    direction = getattr(params, "delivery_direction", "off")
+
     def validate(entries):
-        report = validate_instruct(prior_batch, entries)
+        report = validate_instruct(prior_batch, entries, direction)
         if report["passed"]:
             validated["ordered"] = index_head_check(prior_batch, entries)[2]
         return report
@@ -1053,14 +1196,13 @@ def instruct_batch(client, model_name, prior_batch, params, max_retries=3,
         log_name="llm_responses.log", label="INSTRUCT", max_retries=max_retries,
         validate_entries=validate, attempt_observer=observe)
     if annotated:
-        # The model returned only {n, head, instruct}. Keep speaker+text byte-exact
-        # from prior (bound by validated index order); take only the instruct.
+        # The model returned only {n, head, instruct} (or its direction fields).
+        # Keep speaker+text byte-exact from prior (bound by validated index
+        # order); take only the direction.
         ordered = validated.get("ordered")
         if ordered is None:
             raise RuntimeError("validated instruct response lost its index binding")
-        return [{**{key: value for key, value in p.items()
-                    if key != "instruct_unchecked"}, "instruct": item.get("instruct")}
-                for p, item in zip(prior_batch, ordered)]
+        return [get_directed_entry(p, item, direction) for p, item in zip(prior_batch, ordered)]
     ranges = get_exhausted_runtime_batch_ranges(client, prior_batch, attempts)
     if ranges:
         combined = []
@@ -1143,22 +1285,21 @@ def retry_delivery_instructions(client, model_name, entries, params,
                 raise RuntimeError("instruct LLM unavailable; refusing fallback output")
             for (index, _), entry in zip(current, updated):
                 result[index] = entry
+    if getattr(params, "delivery_direction", "off") != "off":
+        result = apply_gap_pauses(result)
     return result
 
 
-def does_request_fit_context(system_prompt, user_prompt, params, output_tokens):
-    """Check whether the full request can fit within the allowed retry ceiling.
-
-    The initial completion allowance is not the capacity limit: truncation may
-    legitimately increase it. Dispatch still clamps each actual request using
-    its current allowance, the hard ceiling and the remaining context.
-    """
+def does_request_fit_context(system_prompt, user_prompt, params, output_tokens,
+                             allow_retry_growth=False):
+    """Use the production token-budget helper for the full assembled request."""
     try:
         available = get_effective_max_tokens(
-            params.hard_max_tokens, params.context_length,
+            params.hard_max_tokens if allow_retry_growth else params.max_tokens, params.context_length,
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_prompt}],
-            params.hard_max_tokens, scale_to_context=False)
+            params.hard_max_tokens, scale_to_context=False,
+            max_input_tokens=params.max_input_tokens)
     except TokenBudgetError:
         return False
     return available >= output_tokens + max(0, params.reasoning_allowance or 0)
@@ -1759,6 +1900,8 @@ def get_segment_chunk_records(source_text, chunk_size, params):
     user_template = params.segment_user_prompt_template or user_template
     while True:
         records = split_into_chunk_records(source_text, max_size=size)
+        if chunk_size <= 30000 or not params.context_length:
+            return records
         if all(does_request_fit_context(system_prompt, user_template.format(chunk=record["text"]),
                                         sizing_params, resolve_completion_ceiling(
                                             len(record["text"].split()), params,
@@ -1830,9 +1973,16 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
     validate_attribution_vote_settings(settings.get("attribution_votes", 1),
                                        settings.get("vote_temperature", 0.3))
     chunk_size = settings["chunk_size"]
+    from llm_request_budget import get_request_limits
+    limits = get_request_limits({"context_length": settings.get("profile_context_length"),
+                                 "max_input_tokens": settings.get("max_input_tokens"),
+                                 "max_output_tokens": settings.get("profile_output_ceiling")}, context_length)
+    context_length = limits["context_length"]
     params = params or LLMGenParams(
         literal_source_preserving=settings.get("literal_source_preserving", False),
         max_tokens=settings["max_tokens"], context_length=context_length,
+        max_input_tokens=limits["max_input_tokens"],
+        hard_max_tokens=limits["max_output_tokens"] or resolve_hard_max_tokens(settings["max_tokens"]),
         segment_output_ratio=settings["segment_output_ratio"],
         segmentation=settings["segmentation"],
         quoted_must_be_spoken=settings.get("quoted_must_be_spoken", True),
@@ -1852,6 +2002,8 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
         prompt_tokens = math.ceil((len(system_prompt) + len(user_prompt)) / 3)
         completion_tokens = int(completion_tokens) + max(0, params.reasoning_allowance or 0)
         total = prompt_tokens + completion_tokens + reserve
+        if params.max_input_tokens and prompt_tokens > params.max_input_tokens:
+            raise TokenBudgetError(f"{stage} prompt estimate ({prompt_tokens}) exceeds the input ceiling ({params.max_input_tokens}). Reduce the source/context target or adjust the profile input ceiling.")
         requests.append({"stage": stage, "prompt_tokens": prompt_tokens,
                          "predicted_completion_tokens": int(completion_tokens),
                          "predicted_total_tokens": total})
@@ -1862,7 +2014,8 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
             current = work.pop(0)
             system_prompt, user_prompt = build_request(current)
             output_tokens = max(256, output_per_entry * len(current))
-            if target_chars and not does_request_fit_context(system_prompt, user_prompt, params, output_tokens):
+            if not does_request_fit_context(system_prompt, user_prompt, params, output_tokens,
+                                            allow_retry_growth=stage == "attribute"):
                 if len(current) == 1:
                     raise TokenBudgetError(f"One {stage} entry plus context/output does not fit; reduce extra context or use a capable endpoint.")
                 midpoint = len(current) // 2
@@ -1884,25 +2037,31 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
     # The run's escalation ceiling is the most it can ever ask for; a chunk
     # whose predicted output exceeds it cannot succeed at any retry, and the
     # caller should refuse the run rather than let it fail chunk by chunk.
-    output_ceiling = resolve_hard_max_tokens(int(settings["max_tokens"]))
+    output_ceiling = params.hard_max_tokens
     largest_completion = 0
     for chunk in chunks:
         largest_completion = max(largest_completion, resolve_completion_ceiling(
             max(1, len(chunk.split())), params, source_text=chunk))
-    for chunk in unresolved_chunks:
+    unresolved = set(unresolved_chunks)
+    for index, chunk in enumerate(chunks):
+        if chunk not in unresolved:
+            continue
         completion = min(
             int(settings["max_tokens"]),
             resolve_completion_ceiling(
                 max(1, len(chunk.split())), params, source_text=chunk))
         add_request("segment", segment_system,
                     segment_template.format(chunk=chunk), completion)
-        windows = context_windows
-        if windows:
-            window = max(windows)
-            rescue_user = _CONTEXT_SEGMENT_USER.format(
-                before="x" * window, after="x" * window, chunk=chunk)
-            add_request("segment_context_rescue", segment_system,
-                        rescue_user, completion)
+        max_window = max(context_windows)
+        before_all = _tail_join(chunks[:index], max_window)
+        after_all = _head_join(chunks[index + 1:], max_window)
+        overhead_chars = len(segment_system) + len(_CONTEXT_SEGMENT_USER)
+        for window in context_windows:
+            before, after = before_all[-window:], after_all[:window]
+            if not _rescue_prompt_fits(chunk, before, after, overhead_chars, params):
+                continue
+            rescue_user = _CONTEXT_SEGMENT_USER.format(before=before, after=after, chunk=chunk)
+            add_request("segment_context_rescue", segment_system, rescue_user, completion)
 
     roster_chars = min(4096, 32 * sum(
         entry.get("type") == "SPOKEN" for entry in predicted_entries))
@@ -1915,9 +2074,8 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
     def build_planned_attribute(current):
         contexts = get_missing_attribute_contexts(
             predicted_entries, [index for index, _ in current], attribute_batch_size, attribute_bounds)
-        surround = (build_window_surround(predicted_entries, [index for index, _ in current], context_chars)
-                    if attribute_budgeted else
-                    {"before": "x" * context_chars, "after": "x" * context_chars})
+        surround = build_window_surround(
+            predicted_entries, [index for index, _ in current], context_chars)
         return get_attribute_sizing_request(
             [entry for _, entry in current], params, estimated_roster, contexts, surround,
             settings.get("attribute_prompt_variant") or "default",
@@ -2091,11 +2249,17 @@ def _head_join(parts, limit):
 def _rescue_prompt_fits(chunk, before, after, overhead_chars, params):
     """Estimate whether a context-rescue prompt for this window fits the model's
     context, leaving room to emit the chunk. Uses the pipeline's chars//3 token
-    estimate. Returns True when context_length is unknown (keep prior behavior)."""
+    estimate. A profile input ceiling bounds the prompt on its own; with
+    neither limit known, returns True (keep prior behavior). Deliberately not
+    does_request_fit_context: that caps the room at max_tokens, which a large
+    chunk's echo exceeds, and would drop every window however ample the context."""
     ctx_len = getattr(params, "context_length", None)
+    max_input = getattr(params, "max_input_tokens", None)
+    prompt_tokens = math.ceil((overhead_chars + len(chunk) + len(before) + len(after)) / 3)
+    if max_input and prompt_tokens > max_input:
+        return False
     if not ctx_len:
         return True
-    prompt_tokens = math.ceil((overhead_chars + len(chunk) + len(before) + len(after)) / 3)
     # Segment output reproduces the chunk text wrapped in JSON; reserve ~1.5x the
     # chunk's token estimate plus a small structural margin as the output budget.
     output_budget = math.ceil(len(chunk) / 3 * 1.5) + 64
@@ -2191,10 +2355,6 @@ def get_preflight_sample_info(label, index, output_path, planned_calls,
 
 def three_pass_checkpoint_path(output_path):
     return output_path + ".threepass_checkpoint.json"
-
-
-def three_pass_manifest_path(output_path):
-    return output_path + ".threepass_manifest.json"
 
 
 def _resolution_counts(resolutions):
@@ -2310,6 +2470,16 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
         # keep their identity; switching format restarts instead of mixing.
         if getattr(params, "pass1_format", "ordinary") != "ordinary":
             settings["pass1_format"] = params.pass1_format
+        # Only off the default, so existing checkpoints keep their identity; a
+        # resumed book cannot mix delivery-direction modes or prompt revisions.
+        if getattr(params, "delivery_direction", "off") != "off":
+            settings["delivery_direction"] = params.delivery_direction
+            settings["delivery_direction_prompts_sha256"] = hashlib.sha256("\n".join(
+                load_instruct_prompts(params.delivery_direction)).encode("utf-8")).hexdigest()
+        if getattr(params, "max_input_tokens", None) is not None:
+            settings["max_input_tokens"] = params.max_input_tokens
+        from llm_request_budget import get_task_output_fingerprint
+        settings.update(get_task_output_fingerprint(params))
         if not getattr(params, "quoted_must_be_spoken", True):
             settings["quoted_must_be_spoken"] = False
         if not getattr(params, "unquoted_must_be_narrator", True):
@@ -2566,6 +2736,21 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
         # A new attempt retries unresolved attribution while keeping accepted rows.
         diagnostic_failures = [failure for failure in diagnostic_failures
                                if failure.get("pass") != "attribute"]
+        retry_instructions = {index for index, entry in enumerate(annotated)
+                              if isinstance(entry, dict)
+                              and entry.get("instruct_unchecked") is True}
+        # Older diagnostic writers recorded the failed index without marking
+        # the fallback row. Those rows also remain pending on resume.
+        retry_instructions.update(failure["entry"] for failure in diagnostic_failures
+                                  if failure.get("pass") == "instruct"
+                                  and type(failure.get("entry")) is int
+                                  and 0 <= failure["entry"] < len(annotated))
+        for index in retry_instructions:
+            annotated[index] = None
+        diagnostic_failures = [failure for failure in diagnostic_failures
+                               if not (failure.get("pass") == "instruct"
+                                       and type(failure.get("entry")) is int
+                                       and failure.get("entry") in retry_instructions)]
     diagnostic_segment_resume = None
     if any(failure.get("pass") == "segment" for failure in diagnostic_failures):
         resume = state.get("diagnostic_segment_resume")
@@ -2622,6 +2807,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                                         diagnostic_segment_resume=diagnostic_segment_resume,
                                         checkpoint_writer=checkpoint_writer)
     passes = {}
+    narration_resets = None            # set once the dialogue map has run (#1534)
 
     def emit_manifest(status, failed_pass=None, failed_chunk=None):
         failure_counts = Counter(
@@ -2645,6 +2831,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                             "truncations": sum(
                                 f.get("finish_reason") == "length"
                                 for f in diagnostic_failures),
+                            "narration_speaker_resets": narration_resets,
                         },
                         failed_pass=failed_pass, failed_chunk=failed_chunk,
                         legacy_resume=legacy_resume, progress={
@@ -2821,7 +3008,6 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
         return current
 
     roster = get_attribution_roster()
-    roster_seen = set(roster)
     attr_start = time.time()
     attr_base = elapsed_s.get("attribute", 0)
     # The batch in flight, so a fail-fast can record exactly what failed for
@@ -2881,27 +3067,28 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                     segmented, [index for index, _ in current], attribute_batch_size, attribute_bounds)
                 surround = build_window_surround(
                     segmented, [index for index, _ in current], attribute_context_chars)
-                if attribute_target_chars or attribute_context_chars > 20000:
-                    request_params = ensure_run_request_params(client, replace(
+                request_params = ensure_run_request_params(client, replace(
                     params, request_params_resolver=get_attribute_params,
                     reasoning_reservation={"entry_count": len(current),
                                            "per_entry_tokens": ATTRIBUTE_TOKENS_PER_ENTRY}))
-                    system_prompt, user_prompt = get_attribute_sizing_request(
+                # Admission considers bounded retry growth, not just the starting allowance.
+                system_prompt, user_prompt = get_attribute_sizing_request(
+                    batch, request_params, roster, contexts, surround,
+                    attribute_prompt_variant, attribute_prompt_texts, cast,
+                    get_established_traits(named) if speaker_traits else None)
+                if hasattr(entries_provider, "build_request"):
+                    system_prompt, user_prompt = entries_provider.build_request(
                         batch, request_params, roster, contexts, surround,
-                        attribute_prompt_variant, attribute_prompt_texts, cast,
                         get_established_traits(named) if speaker_traits else None)
-                    if hasattr(entries_provider, "build_request"):
-                        system_prompt, user_prompt = entries_provider.build_request(
-                            batch, request_params, roster, contexts, surround,
-                            get_established_traits(named) if speaker_traits else None)
-                    if not does_request_fit_context(system_prompt, user_prompt, request_params,
-                                                    max(256, (128 if speaker_traits else 24) * len(batch))):
-                        if len(current) == 1:
-                            raise TokenBudgetError("One attribution entry plus context/output does not fit; reduce extra context or use a capable endpoint.")
-                        midpoint = len(current) // 2
-                        print(f"  Attribution request exceeds budget; subdividing {len(current)} entries")
-                        work[0:0] = [current[:midpoint], current[midpoint:]]
-                        continue
+                if not does_request_fit_context(system_prompt, user_prompt, request_params,
+                                                max(256, (128 if speaker_traits else 24) * len(batch)),
+                                                allow_retry_growth=True):
+                    if len(current) == 1:
+                        raise TokenBudgetError("One attribution entry plus context/output does not fit; reduce extra context or use a capable endpoint.")
+                    midpoint = len(current) // 2
+                    print(f"  Attribution request exceeds budget; subdividing {len(current)} entries")
+                    work[0:0] = [current[:midpoint], current[midpoint:]]
+                    continue
                 announce_step(2, "window", window_number, window_total)
                 if progress:
                     progress.note_call_started()
@@ -2956,22 +3143,16 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                     # Narration was sent as context only; its speaker is known
                     # without asking, so the model's answer never overwrites it.
                     named[index] = deterministic.get(index, entry)
-                if on_exhaustion == "fallback":
-                    admitted = set(attested_new_speakers(
-                        (named[index] for index, _ in current), set(), source_text))
-                    for index, _ in current:
-                        speaker = (named[index].get("speaker") or "").strip().upper()
-                        if speaker in admitted and not named[index].get("attribution_unchecked"):
-                            roster_positions[speaker] = min(index, roster_positions.get(speaker, index))
-                    roster = get_attribution_roster()
-                    roster_seen = set(roster)
-                else:
-                    # Same admission gate as build_roster above, applied
-                    # incrementally so a batch does not rescan every prior entry.
-                    for speaker in attested_new_speakers(
-                            new_named, roster_seen, source_text):
-                        roster_seen.add(speaker)
-                        roster.append(speaker)
+                # Coloring/subdivision accepts entries out of source order.
+                # Use the same earliest-source-position order as resume, for
+                # every exhaustion policy, without rescanning the named prefix.
+                admitted = set(attested_new_speakers(
+                    (named[index] for index, _ in current), set(), source_text))
+                for index, _ in current:
+                    speaker = (named[index].get("speaker") or "").strip().upper()
+                    if speaker in admitted and not named[index].get("attribution_unchecked"):
+                        roster_positions[speaker] = min(index, roster_positions.get(speaker, index))
+                roster = get_attribution_roster()
                 elapsed_s["attribute"] = attr_base + time.time() - attr_start
                 # Each accepted subdivision is durable; a later single-entry
                 # failure resumes after this work instead of replaying the batch.
@@ -3125,6 +3306,11 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                           "status": ("incomplete" if any(
                               f["pass"] == "instruct" for f in diagnostic_failures)
                               else "complete")}
+    if getattr(params, "delivery_direction", "off") != "off":
+        # #1258: performed gaps become pause_after on the line before them. The
+        # counts make a mode that only ever says "normal" visible in the manifest.
+        annotated = apply_gap_pauses(annotated)
+        passes["instruct"]["gaps"] = get_gap_counts(annotated)
     if unavailable_passes:
         failed_pass = next(pass_name for pass_name in ("attribute", "instruct")
                            if pass_name in unavailable_passes)
@@ -3142,6 +3328,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
     try:
         dialogue = apply_dialogue_map(annotated, source_text)
         annotated = dialogue["entries"]
+        narration_resets = len(dialogue["narration_changes"])
         if dialogue["convention"]:
             print(f"Dialogue map: {dialogue['convention']}, "
                   f"{dialogue['spoken']} spoken lines, "
@@ -3149,6 +3336,9 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             if dialogue["speaker_changes"]:
                 print(f"Source speaker labels applied to "
                       f"{len(dialogue['speaker_changes'])} entries")
+            if dialogue["narration_changes"]:
+                print(f"Source narration: {len(dialogue['narration_changes'])} entries "
+                      "had a character speaker and were set to NARRATOR")
         else:
             print("Dialogue map: convention could not be determined; entries "
                   "carry no `spoken` key rather than a guessed one")
@@ -3292,6 +3482,8 @@ def build_failure_record(pass_name, index, text, last_attempt=None):
         "prompt_tokens": attempt.get("prompt_tokens"),
         "completion_tokens": attempt.get("completion_tokens"),
         "reasoning_tokens": attempt.get("reasoning_tokens"),
+        **{key: attempt[key] for key in ('request_id', 'response_id', 'reasoning_tokens_source')
+           if key in attempt},
         "effective_max_tokens": attempt.get("effective_max_tokens"),
         "attempt": attempt.get("attempt"),
     }
@@ -3399,9 +3591,10 @@ def bound_index_request_params(call_params, entry_count, per_entry_tokens):
             **call_params.reasoning_reservation,
             "entry_count": entry_count, "per_entry_tokens": per_entry_tokens})
     ceiling = resolve_index_output_ceiling(entry_count, per_entry_tokens, call_params)
-    if ceiling is None or call_params.max_tokens <= ceiling:
+    if ceiling is None:
         return call_params
-    return replace(call_params, max_tokens=ceiling)
+    initial = min(call_params.max_tokens, ceiling)
+    return replace(call_params, max_tokens=initial, request_initial_max_tokens=initial)
 
 
 def resolve_completion_ceiling(source_words, params, reasoning_allowance=0, *,
@@ -3535,6 +3728,10 @@ def main():
                         help="Override generation.three_pass_pass1_format: ordinary "
                              "(full text, the default) or compact (numbered units in, "
                              "labels out; falls back to ordinary per chunk, #744)")
+    parser.add_argument("--delivery-direction", choices=DELIVERY_DIRECTIONS, default=None,
+                        help="Override generation.three_pass_delivery_direction (#1258): off "
+                             "(the default instruct notes), gaps (adds performed gaps), "
+                             "directed (action + delivery + gap) or action_only")
     parser.add_argument("--segmentation", choices=SEGMENTATION_MODES, default=None,
                         help="Override generation.three_pass_segmentation: auto "
                              "(shown to users as 'Quote marks first, model for the rest'; "
@@ -3632,7 +3829,8 @@ def main():
     try:
         generation_settings = resolve_three_pass_generation_settings(
             config, args.chunk_size, segmentation_override=args.segmentation,
-            pass1_format_override=args.pass1_format)
+            pass1_format_override=args.pass1_format,
+            delivery_direction_override=args.delivery_direction)
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)

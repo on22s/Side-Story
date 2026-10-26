@@ -4,12 +4,13 @@ import re
 import logging
 
 
+from speech_numbers import get_book_date_order, verbalize_numbers
 from speech_policy import (SPEECH_BREAKS, SPEECH_WORDS, VERBALIZED_SYMBOLS,
                            SPOKEN_SYMBOLS, get_spoken_symbol, get_spoken_word_text,
                            get_spoken_text_spacing, get_scene_break_text,
                            extract_delivery_cues, SCENE_BREAK_MARKER,
                            is_unspeakable_character, UNSPEAKABLE_CATEGORIES,
-                           REPLACEMENT_CHARACTER)
+                           REPLACEMENT_CHARACTER, is_sentence_terminated)
 
 # Unicode categories with no spoken form at all: symbols, private use,
 # unassigned, surrogates and non-whitespace controls. Currency (Sc) is deliberately excluded - "$" and
@@ -112,8 +113,8 @@ def verbalize_symbols(text):
     return (text.translate(table) if table else text), transformations
 
 
-def get_speech_normalization(text):
-    """Return normalized text and every applied transformation as new data."""
+def get_prelexicon_speech_normalization(text):
+    """Return the exact prepared coordinate space before pronunciation substitution."""
     if not text:
         return {"text": text, "changed": False, "transformations": [],
                 "risk_categories": get_speech_risks(text)}
@@ -142,6 +143,9 @@ def get_speech_normalization(text):
             transformations.append({"type": "spoken_symbol" if word else "dropped_reference_mark",
                                     "symbol": symbol, "replacement": word})
     normalized = re.sub(r"\s*" + re.escape(SCENE_BREAK_MARKER) + r"\s*", ". ", normalized)
+    # Money with cents, rising ranges and slash dates (#1546), before symbols.
+    normalized, number_transformations = verbalize_numbers(normalized, get_book_date_order())
+    transformations.extend(number_transformations)
     normalized, symbol_transformations = verbalize_symbols(normalized)
     transformations.extend(symbol_transformations)
     normalized, count = _ORPHAN_PUNCT_RE.subn(". ", normalized)
@@ -155,13 +159,29 @@ def get_speech_normalization(text):
         normalized, count = get_spoken_text_spacing(normalized)
         if count:
             transformations.append({"type": "normalized_punctuation_spacing", "count": count})
+    return {"text": normalized, "changed": normalized != original,
+            "transformations": transformations,
+            "risk_categories": get_speech_risks(original)}
+
+
+def get_speech_normalization(text):
+    """Return normalized text and every applied transformation as new data."""
+    prepared = get_prelexicon_speech_normalization(text)
+    if not text:
+        return prepared
+    original = str(text)
+    normalized = prepared["text"]
+    transformations = prepared["transformations"]
     # Proper-noun respellings, applied LAST so a lexicon entry is never
     # mangled by symbol or break handling. Recorded as a transformation like
     # everything else: a silent respelling would be untraceable, with the
     # listener hearing one thing and the script saying another.
+    pronunciation_decisions = []
     try:
-        from pronunciation import apply_pronunciation
-        spoken, applied = apply_pronunciation(normalized)
+        from pronunciation import ensure_speech_pronunciation_result, get_pronunciation_text_digest
+        resolution = ensure_speech_pronunciation_result(normalized)
+        spoken, applied = resolution["text"], resolution["substitutions"]
+        pronunciation_decisions = resolution["decisions"]
         if applied:
             normalized = spoken
             transformations.append({"type": "pronunciation_lexicon",
@@ -170,16 +190,21 @@ def get_speech_normalization(text):
         # A broken lexicon must never stop a book generating.
         logging.getLogger(__name__).warning(
             "Pronunciation processing failed; continuing without substitutions: %s", error)
-    stripped = normalized.strip(" .\t\n")
-    bounded = stripped + "." if stripped else ""
+    stripped = normalized.strip(" \t\n").lstrip(" .\t\n")
+    appended_period = bool(stripped) and not is_sentence_terminated(stripped)
+    bounded = stripped + "." if appended_period else stripped
     if bounded != normalized:
         transformations.append({"type": "normalized_sentence_boundary",
                                 "trimmed_characters": len(normalized) - len(stripped),
-                                "appended_period": bool(stripped)})
+                                "appended_period": appended_period})
     normalized = bounded
-    return {"text": normalized, "changed": normalized != original,
-            "transformations": transformations,
-            "risk_categories": get_speech_risks(original)}
+    result = {"text": normalized, "changed": normalized != original,
+              "transformations": transformations,
+              "risk_categories": get_speech_risks(original)}
+    if pronunciation_decisions:
+        result["pronunciation_decisions"] = pronunciation_decisions
+        result["pronunciation_prepared_sha256"] = get_pronunciation_text_digest(prepared["text"])
+    return result
 
 
 def normalize_for_speech(text):
@@ -198,3 +223,7 @@ def get_speech_preparation(text, instruct=None):
         additions = [hint for hint in hints if hint not in existing]
         instruction = " ".join(filter(None, [existing] + additions))
     return {"text": normalized["text"], "instruct": instruction}
+
+
+from loaded_module_code import get_current_loaded_module_code_sha256 as _get_loaded_recovery_code
+_LOADED_RECOVERY_CODE_SHA256 = _get_loaded_recovery_code()

@@ -11,6 +11,8 @@ import contextlib
 from pathlib import Path
 from book_state_transaction import (ensure_book_state, apply_book_state_locked,
                                     get_book_operation_token)
+from publication_source import (get_publication_source_path, get_publication_source_capture,
+                                get_saved_publication_source_bytes)
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -43,6 +45,12 @@ from speaker_repair import apply_speaker_selections, build_speaker_review
 from content_repair import apply_content_selections, build_content_review
 from utils import (atomic_json_write, backup_file_with_timestamp, file_lock,
                    get_timestamped_backup_path, is_generic_speaker, safe_load_json)
+from sound_design_registry import (ACTIVE_CUES, get_saved_sound_design_path,
+                                   MAX_REGISTRY_BYTES)
+from project_scope_files import capture_scope_file
+from speech_numbers import STATE_KEY as DATE_ORDER_KEY, DATE_ORDER_CHOICES
+from sound_design_renditions import (ACTIVE_RENDITIONS, get_saved_sound_renditions_path,
+                                     capture_sound_design_companions, MAX_RENDITION_BYTES)
 
 
 logger = logging.getLogger("AlexandriaUI")
@@ -54,6 +62,8 @@ def _get_saved_book_companions(path):
     stem = os.path.splitext(path)[0]
     return list(dict.fromkeys([
         stem + ".voice_config.json", stem + ".meta.json",
+        get_saved_sound_design_path(path), get_saved_sound_renditions_path(path),
+        get_publication_source_path(path),
         get_review_receipt_path(path),
         *get_generation_checkpoint_artifacts(_checkpoint_path(path)),
         *get_generation_checkpoint_artifacts(get_generation_checkpoint_path(path)),
@@ -70,7 +80,8 @@ def _get_saved_book_companions(path):
 
 def _is_saved_book_filename(filename):
     companion_suffixes = tuple(os.path.basename(path)[len("book"):]
-                               for path in _get_saved_book_companions("book.json"))
+                               for path in _get_saved_book_companions("book.json")
+                               if not os.path.basename(path).startswith('.'))
     return (filename.endswith(".json") and not filename.startswith(".")
             and not filename.endswith(companion_suffixes))
 
@@ -80,6 +91,25 @@ def _require_saved_book_name(name):
     if safe != name or not _is_saved_book_filename(safe + ".json"):
         raise HTTPException(status_code=400, detail="Invalid or reserved script name.")
     return safe
+
+
+def _capture_sound_companions(root, cue_relative, rendition_relative, book_id):
+    try:
+        return capture_sound_design_companions(root, cue_relative, rendition_relative,
+                                               expected_book_id=book_id)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=409, detail=(
+            'Sound-design metadata requires inspection; existing book files were preserved.')) from None
+
+
+def _validate_sound_destination(root, relative, *, limit):
+    # Save may intentionally overwrite stale/corrupt content, but its existing
+    # destination must still be a bounded, owned regular metadata file.
+    try:
+        capture_scope_file(root, relative, limit=limit)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=409, detail=(
+            'Sound-design destination requires inspection; existing book files were preserved.')) from None
 
 
 def _require_saved_book_idle():
@@ -119,14 +149,42 @@ def _build_saved_scripts_list():
 
 
 def _list_saved_scripts_sync():
-    with ensure_book_state(SCRIPTS_DIR):
-        return _build_saved_scripts_list()
+    try:
+        with ensure_book_state(SCRIPTS_DIR, recover=False):
+            return _build_saved_scripts_list()
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(status_code=409, detail=(
+            "Saved books could not be read. Complete any pending library recovery "
+            "before refreshing the list. No recovery was attempted.")) from error
 
 
 @router.get("/api/scripts", operation_id="list_saved_scripts")
 async def list_saved_scripts():
     """List saved scripts without blocking the FastAPI event loop on disk I/O."""
     return await asyncio.to_thread(_list_saved_scripts_sync)
+
+def _get_book_workspace_sync():
+    from book_workspace import get_book_workspace
+    from routers.voices import get_voice_rows
+    from core import project_manager
+
+    try:
+        with ensure_book_state(DATA_DIR, recover=False):
+            return get_book_workspace(DATA_DIR, {"MP3": AUDIOBOOK_PATH, "M4B": M4B_PATH},
+                                      get_voice_rows, project_manager.get_chunk_audio_path, export_states=process_state)
+    except (OSError, ValueError, TypeError) as error:
+        logger.warning("Book workspace inputs could not be read: %s", type(error).__name__)
+        raise HTTPException(status_code=409, detail=(
+            "Book workspace could not read the saved book. Complete any pending book recovery "
+            "or inspect the script and voice settings. No recovery was attempted. "
+            "No new chunks or audio were generated.")) from error
+
+
+@router.get("/api/workspace")
+async def get_book_workspace_status():
+    """Summarize selected-book progress without initializing chunks or generating audio."""
+    return await asyncio.to_thread(_get_book_workspace_sync)
+
 
 class ScriptSaveRequest(BaseModel):
     name: str
@@ -157,8 +215,27 @@ def _save_script_sync(request):
             if get_book_operation_token(DATA_DIR) != request.expected_book_token:
                 raise HTTPException(status_code=409, detail="Active book changed; reopen Save Current before saving")
         validate_book_json_bytes(script_bytes, list, 422, "Active script")
+        book_id = get_active_book_id() or safe_name
+        cue_bytes, rendition_bytes = _capture_sound_companions(DATA_DIR, ACTIVE_CUES, ACTIVE_RENDITIONS, book_id)
+        _validate_sound_destination(SCRIPTS_DIR, os.path.basename(get_saved_sound_design_path(dest)), limit=MAX_REGISTRY_BYTES)
+        _validate_sound_destination(SCRIPTS_DIR, os.path.basename(get_saved_sound_renditions_path(dest)), limit=MAX_RENDITION_BYTES)
+        meta = {"book_id": book_id}
+        active_state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), default={})
+        if isinstance(active_state, dict) and active_state.get(DATE_ORDER_KEY) in DATE_ORDER_CHOICES:
+            meta[DATE_ORDER_KEY] = active_state[DATE_ORDER_KEY]
         replacements = {os.path.basename(dest): script_bytes,
-            f"{safe_name}.meta.json": json.dumps({"book_id": get_active_book_id() or safe_name}).encode("utf-8")}
+            f"{safe_name}.meta.json": json.dumps(meta).encode("utf-8")}
+        if cue_bytes is not None:
+            replacements[os.path.basename(get_saved_sound_design_path(dest))] = cue_bytes
+        if rendition_bytes is not None:
+            replacements[os.path.basename(get_saved_sound_renditions_path(dest))] = rendition_bytes
+        source_state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), default={})
+        try:
+            publication = get_saved_publication_source_bytes(source_state.get('input_file_path'), script_bytes)
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=f'Publication provenance cannot be saved: {error}') from error
+        if publication is not None:
+            replacements[os.path.basename(get_publication_source_path(dest))] = publication
         voice_name = f"{safe_name}.voice_config.json"
         if os.path.isfile(VOICE_CONFIG_PATH):
             voice_bytes = Path(VOICE_CONFIG_PATH).read_bytes()
@@ -209,12 +286,36 @@ def _load_script_sync(request: ScriptLoadRequest):
                 detail=f"Cannot load a script while these tasks are running: {', '.join(busy)}.")
         script_bytes = Path(src).read_bytes()
         validate_book_json_bytes(script_bytes, list, 400, "Saved script")
+        try:
+            get_publication_source_capture(src)
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=f'Saved publication provenance requires review: {error}') from error
         state_path = os.path.join(DATA_DIR, "state.json")
         state = safe_load_json(state_path, default={})
-        state.update(active_book_id=_get_saved_book_id(safe_name), input_file_path=src,
+        book_id = _get_saved_book_id(safe_name)
+        cue_bytes, rendition_bytes = _capture_sound_companions(SCRIPTS_DIR,
+            os.path.basename(get_saved_sound_design_path(src)),
+            os.path.basename(get_saved_sound_renditions_path(src)), book_id)
+        # Refuse corrupt active metadata before replacing it, retaining recovery
+        # files. Valid old-book metadata may be replaced by the selected snapshot.
+        _capture_sound_companions(DATA_DIR, ACTIVE_CUES, ACTIVE_RENDITIONS, state.get('active_book_id'))
+        state.update(active_book_id=book_id, input_file_path=src,
                      book_generation=uuid.uuid4().hex)
+        state.pop('_source_scope', None)
+        state.pop('_source_scope_exports', None)
+        # The book's date order travels with it (#1546); absent means auto.
+        saved_order = safe_load_json(_saved_book_meta_path(safe_name), default={})
+        saved_order = saved_order.get(DATE_ORDER_KEY) if isinstance(saved_order, dict) else None
+        if saved_order in DATE_ORDER_CHOICES:
+            state[DATE_ORDER_KEY] = saved_order
+        else:
+            state.pop(DATE_ORDER_KEY, None)
         replacements = {os.path.relpath(SCRIPT_PATH, DATA_DIR): script_bytes,
                         "state.json": json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")}
+        if cue_bytes is not None:
+            replacements[ACTIVE_CUES] = cue_bytes
+        if rendition_bytes is not None:
+            replacements[ACTIVE_RENDITIONS] = rendition_bytes
         removals = [AUDIOBOOK_PATH, M4B_PATH, os.path.join(DATA_DIR, "audacity_export.zip"),
                     os.path.join(DATA_DIR, CHAPTER_EXPORT_DIR), CHUNKS_PATH,
                     get_chunk_status_journal_path(CHUNKS_PATH),
@@ -223,6 +324,10 @@ def _load_script_sync(request: ScriptLoadRequest):
                     three_pass_manifest_path(SCRIPT_PATH),
                     *get_generation_checkpoint_artifacts(get_generation_checkpoint_path(SCRIPT_PATH)),
                     get_generation_quality_path(SCRIPT_PATH)]
+        if cue_bytes is None:
+            removals.append(os.path.join(DATA_DIR, ACTIVE_CUES))
+        if rendition_bytes is None:
+            removals.append(os.path.join(DATA_DIR, ACTIVE_RENDITIONS))
         companion = os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json")
         if os.path.exists(companion):
             voice_bytes = Path(companion).read_bytes()
@@ -458,7 +563,10 @@ def _apply_speaker_repair_sync(name: str, request: SpeakerRepairRequest):
                 # Preserve the exact assignments for recovery, then require a
                 # fresh cast instead of carrying obsolete approvals forward.
                 removals = [os.path.basename(companion) for companion in _get_saved_book_companions(path)
-                            if companion != os.path.splitext(path)[0] + ".meta.json"]
+                            if companion not in (os.path.splitext(path)[0] + ".meta.json",
+                                                 get_publication_source_path(path),
+                                                 get_saved_sound_design_path(path),
+                                                 get_saved_sound_renditions_path(path))]
                 apply_book_state_locked(SCRIPTS_DIR, replacements, removals)
         except TimeoutError as exc:
             raise HTTPException(status_code=409, detail="Script is busy; preview it again.") from exc

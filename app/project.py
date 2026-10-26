@@ -1,5 +1,6 @@
 import os
 import copy
+from contextlib import contextmanager, ExitStack, nullcontext
 from collections import Counter
 import tempfile
 import hashlib
@@ -13,27 +14,58 @@ import re
 import time
 import logging
 import gc
+import math
 import unicodedata
 import uuid
+from pronunciation import (ensure_pronunciation_snapshot, ensure_occurrence_pronunciation_context,
+                           get_occurrence_pronunciation_inputs, get_pronunciation_text_digest,
+                           is_pronunciation_settings_dependent)
+from speech_text import get_speech_normalization
 from script_repair import EXPLICIT_SILENCE_MS
 from speech_policy import (get_spoken_symbol, get_spoken_word_text,
-                           get_spoken_text_spacing, get_scene_break_text)
+                           get_spoken_text_spacing, get_scene_break_text, is_sentence_terminated)
 from verbalization import (SET_APART_HINT, classify,
                            extract_delivery_cues, is_pictographic_kana,
                            split_bracketed_spans)
 from utils import (atomic_json_write, safe_load_json, is_oom_failure, is_path_inside,
                    get_app_config_path, is_nonverbal_text, secure_filename, file_lock)
-from chunk_status_journal import ChunkStatusJournal, get_chunk_status_journal_path
+from chunk_status_journal import (ChunkStatusJournal, get_chunk_status_journal_path,
+                                  get_chunk_audio_key)
+from adapter_publication import sync_adapter_directory
 from config_settings import load_app_config
+from export_limits import ensure_legacy_pcm_allowed
+from lora_evidence import get_tts_model_settings
 from literal_policy import (ensure_literal_narration, bind_literal_chunks,
-                            ensure_literal_chunk, CHUNK_POLICY_KEY)
+                            ensure_literal_chunk, ensure_literal_chunks, CHUNK_POLICY_KEY)
 from audio_validation import publish_audio_output, remove_stale_audio, validate_generated_audio
+from audio_generation_owner import (AUDIO_GENERATION_CANCELLED, AudioGenerationCancelled,
+                                    ensure_audio_generation_active, ensure_audio_generation_publication,
+                                    ensure_audio_generation_book, ensure_audio_generation_book_work, reuse_audio_generation_book,
+                                    get_audio_generation_owner, is_audio_generation_cancelled,
+                                    run_with_audio_generation_owner)
+from synthesis_recovery_context import (RecoveryParent, RecoveryAdmissionError, get_recovery_claim_digest,
+    ensure_synthesis_recovery_parent, ensure_synthesis_recovery_batch,
+    ensure_synthesis_batch_outputs, get_registered_synthesis_batch_output, get_synthesis_batch_output_path)
+from synthesis_recovery_identity import get_recovery_digest
+from speech_verification_settings import get_enabled_speech_verification_settings
+from book_state_transaction import get_book_operation_token
+from take_retention import (KEY as RETAINED_TAKE_KEY, POLICY as TAKE_HISTORY_POLICY, admit_take_history_edit,
+    get_take_history_policy, preserve_retained_takes, make_retained_take,
+    validate_retained_take, get_retained_audio_paths, get_retained_book_bytes)
+from audio_take_history import AudioTakeHistory
+from export_staging import (create_export_staging, reclaim_export_staging,
+                            MARKER, OWNER_LOCK)
 from tts import (
     TTSEngine,
+    get_chunk_seed,
+    get_pronunciation_render_context,
+    get_reproducible_voice_config,
     ExportCancelled,
     ensure_audio_export_active,
     combine_audio_with_pauses,
     compute_timeline,
+    iter_timeline,
+    get_trim_bounds_ms,
     get_pause_duration_ms,
     sanitize_filename,
     voice_category,
@@ -43,8 +75,10 @@ from tts import (
                  get_chunk_voice_inputs)
 from pydub import AudioSegment
 from audio_assembly import AudioSegmentBuilder
-from audio_streaming import (get_track_wav_plan, write_track_wav, write_combined_wav,
-                             get_streamable_layout)
+from audio_pcm_producer import PCMSourceStore, get_audio_duration_ms
+from audio_streaming import (get_track_wav_plan, get_track_pcm_plan, write_track_wav, write_combined_wav,
+                             get_streamable_layout, write_combined_pcm, iter_track_pieces,
+                             get_combined_source_plan, save_trimmed_pcm_sources, get_pcm_shape)
 
 MAX_CHUNK_CHARS = 500
 # Measured seconds of speech per character relative to English, Qwen3-TTS,
@@ -70,9 +104,15 @@ NARRATOR_GENERATION_FIELDS = (
     "focus_speaker", "character_focus", "narrator_version", "chapter_narrator_version",
     "narrator_gender", "focus_gender", "narrator_age_group", "focus_age_group")
 CHUNK_GENERATION_FIELDS = (
-    "text", "speaker", "instruct", *NARRATOR_GENERATION_FIELDS,
+    "text", "speaker", "instruct", "take", *NARRATOR_GENERATION_FIELDS,
     "character_style", "default_style", "style_timeline", "voice_revision", CHUNK_POLICY_KEY)
 GENERATION_INPUTS_CHANGED = "Chunk removed or generation inputs changed during generation"
+CHAPTER_SELECTION_AUDIO_ERROR = (
+    "Some chapter audio could not be decoded. Repair the affected clips before exporting selected chapters.")
+
+
+class ChunkTargetMissingError(LookupError):
+    """A captured publication target disappeared before its locked update."""
 
 
 def get_index_selection(indices, count):
@@ -84,25 +124,63 @@ def get_index_selection(indices, count):
     return sorted(set(indices))
 
 
+def get_chapter_output_digest(row):
+    """Read consistent recorded byte evidence, including older mastered exports."""
+    digests = [row["output_sha256"]] if "output_sha256" in row else []
+    report = row.get("mastering_report")
+    if isinstance(report, dict) and "sha256" in report:
+        digests.append(report["sha256"])
+    if not digests or any(not isinstance(value, str) or
+                          not re.fullmatch(r"[0-9a-f]{64}", value) for value in digests):
+        return None
+    return digests[0] if len(set(digests)) == 1 else None
+
+
 def get_chapter_reuse_duration(plan, old, wanted, changed_only, out_dir):
-    """Return the duration of an existing chapter that export will retain."""
+    """Return a metadata-valid reuse candidate; actual export verifies its bytes."""
     if not old:
         return None
     try:
-        duration = int(old["end_ms"]) - int(old["start_ms"])
-    except (KeyError, TypeError, ValueError):
+        duration = (float(old["duration_ms"]) if "duration_ms" in old
+                    else float(old["end_ms"]) - float(old["start_ms"]))
+        filename = old["file"]
+        if (not isinstance(filename, str) or not filename or
+                filename != os.path.basename(filename) or "\\" in filename):
+            return None
+        path = os.path.join(out_dir, filename)
+        if not is_path_inside(path, out_dir) or not os.path.isfile(path):
+            return None
+        size = os.path.getsize(path)
+    except (KeyError, TypeError, ValueError, OSError):
         return None
-    if duration < 0 or not os.path.isfile(os.path.join(out_dir, old["file"])):
+    if (not math.isfinite(duration) or duration < 0 or size <= 0 or
+            ("output_bytes" in old and (type(old["output_bytes"]) is not int or
+                                        old["output_bytes"] != size)) or
+            get_chapter_output_digest(old) is None):
         return None
     if plan["index"] not in wanted or (changed_only and
-            old.get("fingerprint") == plan["fingerprint"] and old.get("file") == plan["file"]):
+            old.get("fingerprint") == plan["fingerprint"] and old.get("file") == plan["file"] and
+            ('source_fingerprint' not in plan or
+             old.get('source_fingerprint') == plan['source_fingerprint'])):
         return duration
     return None
 
 
 def get_chunk_generation_inputs(chunk):
     """Fields whose changes make a captured render obsolete."""
-    return {field: chunk[field] for field in CHUNK_GENERATION_FIELDS if field in chunk}
+    inputs = {field: chunk[field] for field in CHUNK_GENERATION_FIELDS if field in chunk}
+    rules = get_occurrence_pronunciation_inputs(chunk.get("pronunciation_rules"))
+    if rules:
+        inputs["pronunciation_rules"] = rules
+    return inputs
+
+
+def get_occurrence_speech_projection(chunk, index, voices, model_settings):
+    """Read canonical words and decisions without changing source or loading models."""
+    context = get_pronunciation_render_context(voices, chunk, index, model_settings)
+    with ensure_occurrence_pronunciation_context(chunk, context):
+        preparation = get_speech_normalization(chunk.get("text", ""))
+    return {**preparation, "context": context}
 
 
 def get_narrator_generation_context(entry):
@@ -111,13 +189,46 @@ def get_narrator_generation_context(entry):
             if field in entry}
 
 
+# What the dialogue map found about where an entry's text sits in the source.
+# True of that text only: an edit to the text leaves none of it established.
+SOURCE_FACT_FIELDS = ("spoken", "source_speaker", "source_span", "dialogue_ambiguity")
+
+
+def is_same_chunk_context(first, second, *, coalesce_unlocated=True):
+    """Whether two entries may share a chunk.
+
+    Every reader of a chunk's `spoken` asks only "is this speech?", so an
+    unlocated entry (no `spoken`) and located narration (`spoken: false`) do
+    not split a run of narration; neither ever joins confirmed speech.
+    """
+    if not coalesce_unlocated:
+        return first == second
+    return ({**first, "spoken": first.get("spoken") is True}
+            == {**second, "spoken": second.get("spoken") is True})
+
+
 def get_chunk_context(entry):
     """Copy voice selection and explicit structural intent for chunk rebuilding."""
     context = get_narrator_generation_context(entry)
-    # Absent and False both mean "not established as speech"; normalizing them
-    # keeps an unlocated row from splitting a narration run.
-    context["spoken"] = bool(entry.get("spoken", False))
+    if "spoken" in entry:
+        context["spoken"] = copy.deepcopy(entry["spoken"])
+    if "_chapter_start" in entry:
+        context["_chapter_start"] = entry["_chapter_start"]
     return context
+
+
+def get_chapter_text_digest(text):
+    """Bind the source structural role to exact text, including reviewed surrogates."""
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def get_chunk_chapter_start(chunk):
+    """Return a source role only while its evidence matches the exact chunk text."""
+    origin = chunk.get("chapter_origin")
+    if (isinstance(origin, dict) and type(origin.get("is_heading")) is bool and
+            origin.get("text_sha256") == get_chapter_text_digest(chunk.get("text", ""))):
+        return origin["is_heading"]
+    return None
 
 
 def get_chunk_generation_requests(chunks, indices, admitted_requests=None):
@@ -233,11 +344,15 @@ def _is_structural_text(text, max_length=80):
         return True
     if is_numbered_heading(stripped):
         return True
-    sentence = stripped.rstrip('\"\'”’»」』)）]】')
     # Very short and not a full sentence (no sentence-ending punctuation)
-    if (max_length is None or len(stripped) < max_length) and (not sentence or sentence[-1] not in '.!?。！？'):
+    if (max_length is None or len(stripped) < max_length) and not is_sentence_terminated(stripped):
         return True
     return False
+
+
+def is_smart_chapter_text(text):
+    """Use the existing long keyword-title policy for source and export decisions."""
+    return _is_structural_text(text, max_length=None if CHAPTER_HEADING_RE.match(text.strip()) else 80)
 
 
 def _make_chunk(speaker, text, instruct, pause_after=None, source_indices=None,
@@ -344,6 +459,16 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
         allowed_labels = {label for label, count in original_counts.items()
                           if prepared_counts[label] == count}
 
+    original_headings = Counter(get_chapter_heading_offsets(original_text).values())
+    prepared_headings = Counter()
+    for index, part in enumerate(parts):
+        if index in plain_indices:
+            prepared_headings.update(get_chapter_heading_offsets(part["text"]).values())
+    source_headings = {label for label, count in original_headings.items()
+                       if prepared_headings[label] == count and (
+                           label not in UNNUMBERED_CHAPTER_HEADINGS or label in allowed_labels)}
+    source_title = (split_chapters and len(parts) == 1 and
+                    is_smart_chapter_text(original_text))
     prepared = []
     for index, part in enumerate(parts):
         text_parts = (get_chapter_text_parts(part["text"], allowed_labels)
@@ -356,6 +481,11 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
                 continue
             child = dict(part)
             child["text"] = cleaned_part
+            child["_chapter_start"] = bool(
+                split_chapters and index in plain_indices and (
+                    text_part.strip().casefold() in source_headings or
+                    (source_title and len(text_parts) == 1 and
+                     is_smart_chapter_text(cleaned_part))))
             if part_index < len(text_parts) - 1:
                 child.pop("pause_after", None)
             prepared.append(child)
@@ -496,8 +626,14 @@ def get_chunk_char_limit(text, base=MAX_CHUNK_CHARS):
 
 def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                       review_sink=None, include_source_indices=False,
-                      language_aware=True, legacy_chunking=False):
-    """Group consecutive entries by same speaker into chunks up to max_chars"""
+                      language_aware=True, legacy_chunking=False, coalesce_unlocated=True):
+    """Group consecutive entries by same speaker into chunks up to max_chars
+
+    language_aware=False with legacy_chunking=True reproduces grouping from
+    before the Chinese/Japanese limits, so chunks made then can still be
+    recognised. coalesce_unlocated=False preserves the older missing/False
+    spoken-context boundaries for delivery retry. Rebuilds keep the defaults.
+    """
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
     literal_policy = ensure_literal_narration(script_entries)
@@ -530,7 +666,8 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
         # paragraph then played its pause after both sentences instead of
         # between them, which is not audible as a break at all.
         if (speaker == current_speaker and instruct == current_instruct
-                and narrator_context == current_context
+                and is_same_chunk_context(narrator_context, current_context,
+                                          coalesce_unlocated=coalesce_unlocated)
                 and current_pause_after is None
                 and not _is_structural_text(current_text)
                 and not _is_structural_text(text)):
@@ -583,6 +720,7 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                 piece["pause_after"] = (None if remaining[:cut].rstrip().endswith(
                     (".", "!", "?", "。", "！", "？")) else 0)
             bounded.append(piece)
+            chunk = {**chunk, "_chapter_start": False}
             remaining = remaining[cut:]
         if (not legacy_chunking and remaining.strip()
                 and not any(ch.isalnum() for ch in remaining) and bounded):
@@ -590,8 +728,12 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
             bounded[-1]["pause_after"] = chunk.get("pause_after")
         else:
             bounded.append({**chunk, "text": remaining})
-    normalized = [{**chunk, "text": get_tts_chunk_text(chunk["text"])}
-                  for chunk in bounded]
+    normalized = []
+    for chunk in bounded:
+        chunk = {**chunk, "text": get_tts_chunk_text(chunk["text"])}
+        chunk["chapter_origin"] = {"is_heading": chunk.pop("_chapter_start", False),
+                                   "text_sha256": get_chapter_text_digest(chunk["text"])}
+        normalized.append(chunk)
     return bind_literal_chunks(normalized, literal_policy)
 
 logger = logging.getLogger(__name__)
@@ -613,19 +755,131 @@ def _load_audio_segment(path, **kwargs):
         return AudioSegment.from_file(source, **kwargs)
 
 
-def _export_audio_segment(segment, path, format_name, cancel_check=None, **kwargs):
+def _get_legacy_export_audio(segments, speakers, pause_ms, same_speaker_pause_ms,
+                             pause_overrides, cancel_check):
+    # Refuse an unmeasurable or oversized plan before copying trimmed sources
+    # or assembling the whole book. Trimming can only reduce the frame count,
+    # so the untrimmed plan is a safe upper bound; the exact plan is checked
+    # again after trimming.
+    upper = get_combined_source_plan(segments, speakers, pause_ms,
+        same_speaker_pause_ms, pause_overrides, cancel_check)
+    if upper is None:
+        raise ValueError(
+            'Legacy export contains a source with no independent PCM frame plan; '
+            'convert it to ordinary PCM or split the export.')
+    ensure_legacy_pcm_allowed(upper)
+    trimmed = save_trimmed_pcm_sources(segments, cancel_check, None)
+    pcm_plan = get_combined_source_plan(trimmed, speakers, pause_ms,
+        same_speaker_pause_ms, pause_overrides, cancel_check)
+    if pcm_plan is None:
+        raise ValueError(
+            'Legacy export contains a source with no independent PCM frame plan; '
+            'convert it to ordinary PCM or split the export.')
+    ensure_legacy_pcm_allowed(pcm_plan)
+    audio = combine_audio_with_pauses(segments, speakers, pause_ms,
+        same_speaker_pause_ms, pause_overrides, cancel_check=cancel_check)
+    if (pcm_plan is None or get_pcm_shape(audio) != ((pcm_plan['channels'],
+            pcm_plan['frame_rate'], pcm_plan['sample_width']), pcm_plan['frames'])):
+        raise ValueError('Legacy assembled PCM disagrees with its source-frame plan.')
+    return audio, pcm_plan
+
+
+def _export_audio_segment(segment, path, format_name, cancel_check=None, workspace=None, **kwargs):
     """Export audio with an explicitly owned output handle."""
-    easy_wav = (format_name == 'wav' and kwargs.get('codec') is None
-                and kwargs.get('parameters') is None)
-    if cancel_check is not None or not easy_wav:
-        from audio_export import export_audio_segment
+    from audio_export import export_audio_segment, is_easy_wav_export
+    if workspace is not None:
+        from audio_export import _RAW_EXPORT_AUDIO_SEGMENT
+        from synthesis_workspace import SynthesisWorkspaceUnavailable
+        if export_audio_segment is not _RAW_EXPORT_AUDIO_SEGMENT:
+            raise SynthesisWorkspaceUnavailable('Encoding writer changed after workspace admission')
+    if (workspace is not None or cancel_check is not None or kwargs.get("mastering") is not None
+            or kwargs.get("quality_plan") is not None or not is_easy_wav_export(format_name, kwargs)):
+        if workspace is not None:
+            return export_audio_segment(segment, path, format_name, cancel_check, workspace=workspace, **kwargs)
         return export_audio_segment(segment, path, format_name, cancel_check, **kwargs)
     with open(path, "wb+") as target:
         segment.export(target, format=format_name, **kwargs)
+
+
+def _can_register_chunk_encoding(manager, *, exporter=None):
+    from audio_export import export_audio_segment, _RAW_EXPORT_AUDIO_SEGMENT
+    from audio_validation import publish_audio_output as current_publisher, _RAW_PUBLISH_AUDIO_OUTPUT
+    from synthesis_workspace import encoding_checks_are_current
+    return (type(manager) is ProjectManager
+            and getattr(manager._export_chunk_audio if exporter is None else exporter,
+                        '__func__', None) is _RAW_CHUNK_EXPORT
+            and getattr(manager._update_chunk_fields_by_uid, '__func__', None) is _RAW_CHUNK_UPDATE
+            and getattr(manager.get_chunk_audio_path, '__func__', None) is _RAW_CHUNK_PATH
+            and validate_generated_audio is _RAW_CHUNK_VALIDATE
+            and (_load_audio_segment, _export_audio_segment, publish_audio_output) == _RAW_CHUNK_CODEC_HELPERS
+            and publish_audio_output is current_publisher is _RAW_PUBLISH_AUDIO_OUTPUT
+            and encoding_checks_are_current()
+            and export_audio_segment is _RAW_EXPORT_AUDIO_SEGMENT)
 CHAPTER_EXPORT_DIR = "chapter_exports"
+
+
+def _reclaim_export_staging(root_dir):
+    """Reclaim abandoned export staging and surface removal failures."""
+    result = reclaim_export_staging((root_dir, os.path.join(root_dir, CHAPTER_EXPORT_DIR),
+                                     os.path.join(root_dir, 'voicelines')))
+    for error in result['errors']:
+        logging.getLogger('AlexandriaUI').warning('Export staging recovery: %s', error)
+    return result
 DEFAULT_CHAPTER_TEMPLATE = "{chapter_number} - {chapter_name}"
 CHAPTER_TEMPLATE_FIELDS = ("chapter_number", "chapter_name", "book_name",
                            "series_name", "volume_number")
+
+
+def get_playback_pause_plan(chunks, pause_ms=DEFAULT_PAUSE_MS,
+                           same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS, has_audio=None):
+    """Resolve each playable row's gap to the next playable row for preview.
+
+    Uses the export pause helper, so overrides (including zero) and the
+    same/different-speaker defaults cannot drift from the rendered timeline.
+    Rows without audio are skipped as export skips them: `has_audio` is the
+    Project's own check (missing path, escaping path or missing file), so the
+    gap after a row is measured to the same next row export joins it to. A file
+    that exists but cannot be decoded is only discovered during playback or
+    export. The preview's trim plan excludes those rows and recomputes a gap
+    from the last actually played row through `/api/chunks/playback_gap`; this
+    plan supplies the no-skip fast path. The last planned row has no following
+    gap. The plan is pause policy: the browser applies the trim plan's edge
+    bounds, so the audible gap is between trimmed clips, but this remains
+    timing parity rather than sample-accurate acoustic parity.
+    """
+    has_audio = has_audio or (lambda chunk: bool(chunk.get('audio_path')))
+    playable = [index for index, chunk in enumerate(chunks)
+                if type(chunk.get('id')) is int and has_audio(chunk)]
+    plan = {}
+    for position, index in enumerate(playable[:-1]):
+        current = chunks[index]
+        following = chunks[playable[position + 1]]
+        plan[current['id']] = get_pause_duration_ms(
+            current, following, pause_ms, same_speaker_pause_ms)
+    return plan
+
+
+def get_playback_trim_plan(chunks, audio_provider, has_audio=None):
+    """Resolve each decodable playable row's canonical edge-trim bounds.
+
+    The plan is computed once for a sequence; callers must not poll this from
+    status endpoints. audio_provider is the Project's owned loader, so missing,
+    escaping or undecodable files are excluded rather than guessed.
+    """
+    has_audio = has_audio or (lambda chunk: bool(chunk.get('audio_path')))
+    trims = {}
+    for chunk in chunks:
+        chunk_id = chunk.get('id')
+        if type(chunk_id) is not int or not has_audio(chunk):
+            continue
+        segment = audio_provider(chunk)
+        if segment is None:
+            continue
+        start_ms, end_ms = get_trim_bounds_ms(segment)
+        if end_ms > start_ms:
+            trims[chunk_id] = (start_ms, end_ms)
+        del segment
+    return trims
 
 
 def get_chapter_export_rows(manifest):
@@ -747,6 +1001,10 @@ class ProjectManager:
         """Invalidate settings and the cached engine after pending construction."""
         with self._engine_lock:
             self.invalidate_config_cache()
+            if self.engine is not None:
+                close = getattr(self.engine, "close_external", None)
+                if callable(close):
+                    close()
             self.engine = None
 
     def _read_config(self):
@@ -761,6 +1019,27 @@ class ProjectManager:
                 self._config_cache = load_app_config(self.config_path)
                 self._config_mtime = mtime
             return self._config_cache
+
+    def get_model_residency(self):
+        """Read only the retained engine; never construct it for diagnostics."""
+        if not self._engine_lock.acquire(blocking=False):
+            return {"state": "busy", "active_leases": None, "residents": None}
+        try:
+            if self.engine is None:
+                return {"state": "not_initialized", "active_leases": 0, "residents": []}
+            return {**self.engine.get_model_residency(), "mode": self.engine.mode,
+                    "configured_device": self.engine._device}
+        finally:
+            self._engine_lock.release()
+
+    def ensure_idle_local_models_released(self):
+        """Release the current engine only while its identity is stable."""
+        if not self._engine_lock.acquire(blocking=False):
+            return False
+        try:
+            return self.engine is None or self.engine.ensure_idle_local_models_released()
+        finally:
+            self._engine_lock.release()
 
     def get_engine(self):
         with self._engine_lock:
@@ -786,8 +1065,69 @@ class ProjectManager:
 
         Uses _chunks_lock to prevent race conditions with concurrent saves.
         """
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             return self._read_chunks()
+
+    def get_saved_chunks(self):
+        """Read existing rows strictly; never regenerate, backfill or repair."""
+        with self._chunks_lock, file_lock(self.chunks_path):
+            return self._get_saved_chunks_locked()
+
+    def _get_saved_chunks_locked(self):
+        """Caller holds the existing thread and kernel chunk locks."""
+        chunks = self._get_saved_chunk_rows_locked()
+        uids, ids = set(), set()
+        for row in chunks:
+            uid, number = row.get("uid"), row.get("id")
+            if (not isinstance(uid, str) or not uid or len(uid) > 128 or uid in uids
+                    or type(number) is not int or number < 0 or number in ids
+                    or not isinstance(row.get("text", ""), str)
+                    or not isinstance(row.get("speaker", "NARRATOR"), str)):
+                raise ValueError("Saved chunk identity or text needs repair in Editor before preview")
+            uids.add(uid)
+            ids.add(number)
+        return chunks
+
+    def _get_saved_chunk_rows_locked(self):
+        """Read snapshot/journal objects without requiring legacy UID migration."""
+        if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
+            chunks = self._get_status_journal_locked().get_rows()
+        else:
+            with open(self.chunks_path, "r", encoding="utf-8") as source:
+                chunks = json.load(source)
+        if not isinstance(chunks, list) or any(not isinstance(row, dict) for row in chunks):
+            raise ValueError("Saved chunks must be an array of objects; open Editor to repair them")
+        get_retained_book_bytes(chunks)
+        return chunks
+
+    def get_pronunciation_preview_settings(self):
+        """Read active or configured settings without constructing a TTS engine."""
+        with self._engine_lock:
+            if self.engine is not None:
+                read = getattr(self.engine, "get_model_settings", None)
+                if callable(read):
+                    return {"settings": read(), "source": "active"}
+                return {"settings": {}, "source": "unknown"}
+        return {"settings": get_tts_model_settings(self._read_config()), "source": "configured"}
+
+    def _apply_pronunciation_settings_invalidation_locked(self, before, after):
+        """Fence changed scoped words before publishing settings; retain audio files."""
+        chunks = self._get_saved_chunks_locked()
+        voices = self.get_voice_config_for_update()
+        updated, changed = list(chunks), []
+        with ensure_pronunciation_snapshot():
+            for index, chunk in enumerate(chunks):
+                if not is_pronunciation_settings_dependent(chunk):
+                    continue
+                old = get_occurrence_speech_projection(chunk, index, voices, before)
+                new = get_occurrence_speech_projection(chunk, index, voices, after)
+                if old["text"] != new["text"]:
+                    updated[index] = {**chunk, "status": "pending", "audio_path": None,
+                                      "error": None, "drift": None, "voice_revision": uuid.uuid4().hex}
+                    changed.append(chunk["uid"])
+        if changed:
+            self._save_chunks_locked(updated, uids_backfilled=True)
+        return changed
 
     def _get_chunks_file_version(self):
         """Identify the file whose rows have already received stable UIDs."""
@@ -798,8 +1138,12 @@ class ProjectManager:
         return (stat.st_dev, stat.st_ino, stat.st_size,
                 stat.st_mtime_ns, stat.st_ctime_ns)
 
-    def _save_chunks_locked(self, chunks, uids_backfilled=False):
+    def _save_chunks_locked(self, chunks, uids_backfilled=False, *, retained_update_uid=None):
         """Publish rows and retain UID validation only for known-valid writes."""
+        if (os.path.lexists(os.path.join(self.root_dir, TAKE_HISTORY_POLICY))
+                or any(row.get(RETAINED_TAKE_KEY) is not None for row in chunks)):
+            previous = self._get_saved_chunk_rows_locked() if os.path.exists(self.chunks_path) else []
+            preserve_retained_takes(self.root_dir, previous, chunks, updated_uid=retained_update_uid)
         if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
             self._get_status_journal_locked().save_compacted(
                 chunks, save_snapshot=lambda rows: atomic_json_write(rows, self.chunks_path))
@@ -823,6 +1167,7 @@ class ProjectManager:
         if not isinstance(chunks, list) or not all(isinstance(c, dict) for c in chunks):
             chunks = None
         if chunks is not None:
+            get_retained_book_bytes(chunks)
             # Retain the backfill cache across ordinary status writes, but
             # revalidate a replaced saved book or an externally edited file.
             if (not self._uids_backfilled
@@ -931,7 +1276,7 @@ class ProjectManager:
         return [updated[index]["uid"] for index in changed]
 
     def save_chunks(self, chunks):
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             self._save_chunks_locked(chunks)
 
     def _modify_chunk(self, index, mutator):
@@ -941,7 +1286,7 @@ class ProjectManager:
         entire read-modify-write cycle, preventing concurrent threads from
         overwriting each other's updates.
         """
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
             if not (0 <= index < len(chunks)):
                 return None
@@ -977,11 +1322,12 @@ class ProjectManager:
 
     def insert_chunk(self, after_index):
         """Insert an empty chunk after the given index. Returns the new chunk list."""
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
             old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
             if not (0 <= after_index < len(chunks)):
                 return None
+            before = copy.deepcopy(chunks)
 
             # Copy speaker from the row we're splitting from
             source = chunks[after_index]
@@ -1006,13 +1352,14 @@ class ProjectManager:
 
     def delete_chunk(self, index):
         """Delete a chunk at the given index. Returns (deleted_chunk, updated_chunks) or None."""
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
             old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
             if not (0 <= index < len(chunks)):
                 return None
             if len(chunks) <= 1:
                 return None  # don't allow deleting the last chunk
+            before = copy.deepcopy(chunks)
 
             voices = self._get_chunk_edit_voices()
             deleted = chunks.pop(index)
@@ -1033,7 +1380,7 @@ class ProjectManager:
         audio_path = chunk_data.get("audio_path")
         if audio_path and not self._is_project_audio_path(audio_path):
             return None
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
             old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
 
@@ -1061,6 +1408,27 @@ class ProjectManager:
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk_data.get("uid")))
             return chunks
 
+    def get_voice_config_for_update(self):
+        """Read voice inputs without turning damaged state into empty inputs."""
+        try:
+            with open(self.voice_config_path, "r", encoding="utf-8") as handle:
+                voices = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        if not isinstance(voices, dict):
+            raise ValueError("Cannot update chunks with malformed voice configuration")
+        return voices
+
+    def _invalidate_reindexed_audio_locked(self, before, after):
+        """Keep completed renders only when reindexing preserves their voice."""
+        voices = self.get_voice_config_for_update()
+        previous = {row.get("uid"): (index, row) for index, row in enumerate(before)}
+        for index, row in enumerate(after):
+            old = previous.get(row.get("uid"))
+            if old is not None and self.get_chunk_voice_inputs(voices, old[1], old[0]) != self.get_chunk_voice_inputs(voices, row, index):
+                row.update(status="pending", audio_path=None, error=None, drift=None,
+                           voice_revision=uuid.uuid4().hex)
+
     def _is_project_audio_path(self, path):
         """Whether a persisted chunk audio path remains inside this project."""
         return isinstance(path, str) and is_path_inside(
@@ -1071,9 +1439,18 @@ class ProjectManager:
         def mutator(chunk):
             render_changed = any(field in data and chunk.get(field, "") != data[field]
                                  for field in ("text", "instruct", "speaker"))
+            if "text" in data and chunk.get("text", "") != data["text"]:
+                # The source located the old text, not this one.
+                for field in SOURCE_FACT_FIELDS:
+                    chunk.pop(field, None)
             if "text" in data: chunk["text"] = data["text"]
             if "instruct" in data: chunk["instruct"] = data["instruct"]
             if "speaker" in data: chunk["speaker"] = data["speaker"]
+            if "take" in data:
+                take = max(0, int(data["take"]))
+                if int(chunk.get("take") or 0) != take:
+                    render_changed = True
+                chunk["take"] = take
 
             # pause_after: set or clear (None removes the key)
             if "pause_after" in data:
@@ -1107,7 +1484,10 @@ class ProjectManager:
         return self._modify_chunk(index, mutator)
 
     def _update_chunk_fields_by_uid(self, uid, expected_chunk=None, required_status=None,
-                                    audio_source=None, expected_audio=None, expected_related_chunks=None, **kwargs):
+                                    audio_source=None, expected_fields=None, expected_audio=None,
+                                    expected_related_chunks=None, require_target=False,
+                                    publication_audio=None, restore_speech_receipt=False,
+                                    audio_source_authority=None, **kwargs):
         """Conditionally publish to the live UID under one lock, preserving other rows.
 
         Generation compares only captured render inputs. An owned converted temp
@@ -1116,6 +1496,13 @@ class ProjectManager:
         """
         if not uid:
             return None
+        if audio_source_authority is not None:
+            from synthesis_workspace import RegisteredEncodingSource, SynthesisWorkspaceUnavailable
+            if (type(audio_source_authority) is not RegisteredEncodingSource
+                    or audio_source != audio_source_authority.path):
+                raise SynthesisWorkspaceUnavailable('Invalid registered chunk publication source')
+            if os.path.realpath(self.root_dir) != str(audio_source_authority.stage.directory.parent.parent):
+                raise SynthesisWorkspaceUnavailable('Registered publication book changed')
         with self._chunks_lock, file_lock(self.chunks_path):
             use_journal = (self._active_journal_identity is not None
                            or os.path.exists(get_chunk_status_journal_path(self.chunks_path)))
@@ -1124,6 +1511,8 @@ class ProjectManager:
             chunk = (journal.get_row(uid) if journal
                      else next((item for item in chunks if item.get("uid") == uid), None))
             if chunk is None:
+                if require_target:
+                    raise ChunkTargetMissingError(uid)
                 return None
             if expected_chunk is not None and (
                     get_chunk_generation_inputs(chunk) != get_chunk_generation_inputs(expected_chunk)):
@@ -1142,33 +1531,399 @@ class ProjectManager:
                     return None
             if required_status is not None and chunk.get("status") != required_status:
                 return None
+            if expected_fields is not None and any(chunk.get(key) != value for key, value in expected_fields.items()):
+                return None
+            for expected in expected_related_chunks or ():
+                related = (journal.get_row(expected.get("uid")) if journal else
+                           next((row for row in chunks if row.get("uid") == expected.get("uid")), None))
+                if related is None or get_chunk_generation_inputs(related) != get_chunk_generation_inputs(expected):
+                    return None
+                if any(related.get(key) != expected.get(key) for key in ("status", "audio_path", "audio_revision")):
+                    return None
             if audio_source is not None:
-                publish_audio_output(audio_source, self.get_chunk_audio_path(kwargs["audio_path"]))
+                if get_take_history_policy(self.root_dir)['enabled'] and (chunk.get('audio_path') or chunk.get(RETAINED_TAKE_KEY)):
+                    held = validate_retained_take(chunk)
+                    if held is None or held['archive'] is None:
+                        raise ValueError('Retain the prior take under book admission before publishing replacement audio.')
+                if RETAINED_TAKE_KEY in chunk:
+                    kwargs[RETAINED_TAKE_KEY] = None
+                # Install only into an unreferenced slot. A failed metadata save
+                # leaves the prior take intact, including after process death.
+                # Reusing the inactive slot bounds abandoned audio to two files
+                # per UID/format without a separate rollback journal.
+                references = (None if journal else {
+                    get_chunk_audio_key(self.chunks_path, path) for row in chunks
+                    for path in (row.get("audio_path"), *get_retained_audio_paths(row))})
+                label = re.sub(r"[^A-Za-z0-9_-]", "_", str(uid))[:64]
+                digest = hashlib.sha256(str(uid).encode("utf-8")).hexdigest()[:16]
+                extension = os.path.splitext(audio_source)[1]
+                for slot in range(2):
+                    candidate = f"voicelines/voiceline_{label}_{digest}.slot-{slot}{extension}"
+                    referenced = (journal.is_audio_path_referenced(candidate) if journal else
+                                  get_chunk_audio_key(self.chunks_path, candidate) in references)
+                    if not referenced:
+                        break
+                else:
+                    raise ValueError("Both chunk audio publication slots are referenced; preserve the shared takes before retrying")
+                kwargs["audio_path"] = candidate
+                if audio_source_authority is not None:
+                    published_path = str(audio_source_authority.stage.directory.parent.parent / candidate)
+                    audio_source_authority.publish(published_path)
+                else:
+                    with open(audio_source, "rb+") as handle:
+                        os.fsync(handle.fileno())
+                    publish_audio_output(audio_source, self.get_chunk_audio_path(candidate))
+                sync_adapter_directory(self.voicelines_dir)
+                publication_version = None
+                if publication_audio is not None:
+                    from take_publication import validate_published_take_audio
+                    publication_version = validate_published_take_audio(self.root_dir,
+                        published_path if audio_source_authority is not None else self.get_chunk_audio_path(candidate),
+                        publication_audio, ensure_audio_generation_active)
+                if restore_speech_receipt:
+                    receipt = kwargs.get('speech_verification')
+                    if publication_audio is None or receipt is None or receipt.get('audio') != {
+                            key: publication_audio[key] for key in ('sha256', 'size')}:
+                        raise ValueError('Saved speech evidence differs from the restored audio.')
+                    kwargs['speech_verification'] = {**receipt,
+                        'audio_file_version': list(publication_version[:4])}
             if kwargs:
+                if audio_source_authority is not None:
+                    if os.path.realpath(self.root_dir) != str(audio_source_authority.stage.directory.parent.parent):
+                        raise SynthesisWorkspaceUnavailable('Registered publication book changed')
+                    audio_source_authority.check()
                 if journal:
+                    if audio_source is None and RETAINED_TAKE_KEY not in kwargs:
+                        changed = {**chunk, **kwargs}
+                        preserve_retained_takes(self.root_dir, [chunk], [changed])
+                        if changed.get(RETAINED_TAKE_KEY) != chunk.get(RETAINED_TAKE_KEY):
+                            kwargs[RETAINED_TAKE_KEY] = changed.get(RETAINED_TAKE_KEY)
                     chunk = journal.apply_update(uid, kwargs)
                 else:
                     chunk.update(kwargs)
-                    self._save_chunks_locked(chunks, uids_backfilled=bool(chunk.get("uid")))
+                    self._save_chunks_locked(chunks, uids_backfilled=bool(chunk.get("uid")),
+                        retained_update_uid=uid if RETAINED_TAKE_KEY in kwargs else None)
             return chunk
 
-    def _publish_generated_chunk_audio(self, chunk, temp_path, speaker):
+    def _publish_generated_chunk_audio(self, chunk, temp_path, speaker, recovery_parent=None, publication_admission=None):
         """Convert privately, then attach/promote audio only to unchanged inputs."""
+        ensure_audio_generation_active()
+        from synthesis_workspace import get_registered_encoding_stage, SynthesisWorkspaceUnavailable
+        workspace = get_registered_encoding_stage(temp_path)
+        if workspace is not None and not _can_register_chunk_encoding(self):
+            raise SynthesisWorkspaceUnavailable('Encoding writer changed after workspace admission')
+        with ensure_occurrence_pronunciation_context(chunk, chunk.get("_pronunciation_context")):
+            preparation = get_speech_normalization(chunk.get("text", ""))
+            validator = _RAW_CHUNK_VALIDATE if workspace is not None else validate_generated_audio
+            validator(temp_path, "generated speech", expected_text=preparation["text"])
+        revision = uuid.uuid4().hex
+        evidence = {}
+        if preparation.get("pronunciation_decisions"):
+            evidence["pronunciation_receipt"] = {
+                "audio_revision": revision,
+                "text_sha256": get_pronunciation_text_digest(chunk.get("text", "")),
+                "prepared_sha256": preparation["pronunciation_prepared_sha256"],
+                "speech_sha256": get_pronunciation_text_digest(preparation["text"]),
+                "context": chunk.get("_pronunciation_context", {}),
+                "decisions": preparation["pronunciation_decisions"]}
+        elif "pronunciation_receipt" in chunk:
+            evidence["pronunciation_receipt"] = None
+        synthesis_receipt = chunk.get("_synthesis_receipt")
+        if synthesis_receipt is not None:
+            if (not isinstance(synthesis_receipt, dict)
+                    or synthesis_receipt.get("prepared_text_sha256") != get_pronunciation_text_digest(preparation["text"])):
+                raise ValueError("Internal synthesis receipt does not match the rendered speech")
+            evidence["synthesis_receipt"] = {**copy.deepcopy(synthesis_receipt),
+                                              "audio_revision": revision, "scope": "pre-encoding PCM"}
+        elif "synthesis_receipt" in chunk:
+            evidence["synthesis_receipt"] = None
         staged_path = None
+        staging_scope = ExitStack()
         try:
-            staged_audio = self._export_chunk_audio(temp_path, f".render-{uuid.uuid4().hex}")
-            staged_path = self.get_chunk_audio_path(staged_audio)
-            extension = os.path.splitext(staged_audio)[1]
-            audio_path = f"voicelines/voiceline_{chunk['uid']}_{sanitize_filename(speaker)}{extension}"
-            updated = self._update_chunk_fields_by_uid(
-                chunk["uid"], expected_chunk=chunk, audio_source=staged_path,
-                status="done", audio_path=audio_path, audio_revision=uuid.uuid4().hex, error=None, drift=None)
+            exporter = self._export_chunk_audio
+            workspace = get_registered_encoding_stage(temp_path)
+            if workspace is not None and not _can_register_chunk_encoding(self, exporter=exporter):
+                raise SynthesisWorkspaceUnavailable('Encoding writer changed after workspace admission')
+            staged_audio = exporter(temp_path, f".render-{uuid.uuid4().hex}")
+            if workspace is not None and not _can_register_chunk_encoding(self):
+                raise SynthesisWorkspaceUnavailable('Encoding writer changed after export')
+            source_authority = None
+            if workspace is not None:
+                staged_path = workspace.completed_path(staged_audio)
+                source_authority = staging_scope.enter_context(workspace.open_completed(staged_path))
+            else:
+                staged_path = self.get_chunk_audio_path(staged_audio)
+            speech_receipt, staged_version = self._verify_generated_chunk_speech(
+                chunk, temp_path, staged_path, preparation, revision)
+            evidence.update(speech_verification=speech_receipt,speech_verification_failure=None,
+                            speech_verification_recheck=None)
+            from take_publication import (KEY as PUBLICATION_KEY, get_take_publication_receipt,
+                                          get_take_publication_book_token)
+            publication, publication_version = get_take_publication_receipt(
+                publication_admission, get_chunk_generation_inputs(chunk), preparation,
+                chunk.get('_speech_input'), evidence.get('synthesis_receipt'), temp_path,
+                staged_path, revision, ensure_audio_generation_active)
+            if publication is not None or PUBLICATION_KEY in chunk:
+                evidence[PUBLICATION_KEY] = publication
+            publication_book = get_take_publication_book_token(publication_admission)
+            with self._ensure_automatic_predecessor(chunk), self._ensure_chunk_generation_publication(
+                    chunk, publication_book=publication_book) as current_book:
+                if not current_book:
+                    raise ValueError(GENERATION_INPUTS_CHANGED)
+                if staged_version is not None and self._get_speech_staged_version(staged_path) != staged_version:
+                    raise ValueError('Finished audio changed before speech evidence publication')
+                if publication_version is not None and self._get_speech_staged_version(staged_path) != publication_version:
+                    raise ValueError('Finished audio changed before take evidence publication')
+                authority_options = {}
+                if source_authority is not None:
+                    if not _can_register_chunk_encoding(self):
+                        raise SynthesisWorkspaceUnavailable('Publication writer changed after workspace admission')
+                    source_authority.check()
+                    authority_options['audio_source_authority'] = source_authority
+                updated = self._update_chunk_fields_by_uid(
+                    chunk["uid"], expected_chunk=chunk, audio_source=staged_path,
+                    publication_audio=publication['audio'] if publication is not None else None,
+                    status="done", audio_revision=revision, error=None, drift=None, **authority_options, **evidence)
             if updated is None:
                 raise ValueError(GENERATION_INPUTS_CHANGED)
-            return audio_path
+            if recovery_parent is not None:
+                from synthesis_recovery import retire_committed_synthesis_recovery
+                retire_committed_synthesis_recovery(recovery_parent, synthesis_receipt)
+            return updated["audio_path"]
         finally:
-            if staged_path:
+            staging_scope.close()
+            from synthesis_workspace import defer_registered_encoding_cleanup
+            if staged_path and not defer_registered_encoding_cleanup(temp_path):
                 self._remove_temp_file(staged_path)
+
+    @contextmanager
+    def _ensure_automatic_predecessor(self, chunk, *, required=False):
+        if not required and not get_take_history_policy(self.root_dir)['enabled']:
+            yield {}
+            return
+        with ensure_audio_generation_book_work(self.root_dir):
+            token = get_book_operation_token(self.root_dir)
+            admission = chunk.get('_take_history_book_token')
+            if admission is not None and admission != token:
+                raise ValueError(GENERATION_INPUTS_CHANGED)
+            chunk['_take_history_book_token'] = token
+            with ensure_audio_generation_publication():
+                current = self._update_chunk_fields_by_uid(chunk.get('uid'), expected_chunk=chunk)
+                if current is None:
+                    raise ValueError(GENERATION_INPUTS_CHANGED)
+                receipt = validate_retained_take(current) or make_retained_take(self.root_dir, current)
+            if receipt is None:
+                yield {}
+                return
+            if receipt['book_token'] != token:
+                raise ValueError('Prior take belongs to another book generation; inspect its retained metadata.')
+            original = copy.deepcopy(current.get(RETAINED_TAKE_KEY))
+            history = AudioTakeHistory(self.root_dir)
+            history.enable_automatic_format(cancel_check=ensure_audio_generation_active)
+            if receipt['archive'] is not None:
+                archive = receipt['archive']
+                verified = history.verify_retained(archive['version'], archive['sha256'], token, current['uid'],
+                    receipt['captured'], cancel_check=ensure_audio_generation_active)
+                if verified['path'] != archive['path']:
+                    raise ValueError('Retained archive path differs from its verified manifest; inspect the receipt.')
+            else:
+                saved = history.capture(os.path.join(self.root_dir, receipt['path']), token, current['uid'],
+                    receipt['captured'], expected_source_version=receipt['source_version'],
+                    cancel_check=ensure_audio_generation_active)
+                receipt = {**receipt, 'archive': dict(version=saved['version'], sha256=saved['sha256'],
+                    path=f"take_history/{saved['version']}{os.path.splitext(receipt['path'])[1].lower()}")}
+            retained = {RETAINED_TAKE_KEY: receipt}
+            # A committed hold precedes any slot installation, even direct calls
+            # which did not enter generating before reaching this publisher.
+            with ensure_audio_generation_publication():
+                held = self._update_chunk_fields_by_uid(current['uid'], expected_chunk=chunk,
+                    expected_fields={RETAINED_TAKE_KEY: original, 'audio_revision': current.get('audio_revision')},
+                    **retained)
+                if held is None:
+                    raise ValueError(GENERATION_INPUTS_CHANGED)
+            yield retained
+
+    @contextmanager
+    def _ensure_chunk_generation_publication(self, chunk, publication_book=None):
+        admission = chunk.get('_speech_verification_admission')
+        retained_book = chunk.get('_take_history_book_token')
+        guard = (reuse_audio_generation_book(self.root_dir) if publication_book is not None or retained_book is not None or get_take_history_policy(self.root_dir)['enabled']
+                 else ensure_audio_generation_book(self.root_dir) if admission is not None
+                 else ensure_audio_generation_publication())
+        with guard:
+            token = get_book_operation_token(self.root_dir) if publication_book is not None or admission is not None or retained_book is not None else None
+            yield ((admission is None or token == admission['book_token'])
+                   and (retained_book is None or token == retained_book)
+                   and (publication_book is None or token == publication_book))
+
+    def _update_generation_fields(self, chunk, **fields):
+        if fields.get('status') == 'error':
+            fields.setdefault('speech_verification_failure',None)
+        scope = self._ensure_automatic_predecessor(chunk) if fields.get('status') == 'generating' else nullcontext({})
+        with scope as retained, self._ensure_chunk_generation_publication(chunk) as current_book:
+            if not current_book:
+                return None
+            return self._update_chunk_fields_by_uid(
+                chunk.get("uid"), expected_chunk=chunk, **fields, **retained)
+
+    def _capture_take_publication_admission(self, engine, parent, index, chunk, voice_config, speaker):
+        if parent is None or not get_take_history_policy(self.root_dir)['enabled']:
+            return None
+        # Disposable ownership alone must not acquire optional proof admission.
+        windows = getattr(engine, '_synthesis_windows', None)
+        if type(windows) is not dict or windows.get('enabled') is not True:
+            return None
+        policy_reader = getattr(engine, 'get_synthesis_recovery_policy', None)
+        recovery = policy_reader() if callable(policy_reader) else None
+        if type(recovery) is not dict or recovery.get('enabled') is not True:
+            return None
+        from take_publication import capture_take_publication_admission
+        with ensure_audio_generation_book_work(self.root_dir):
+            token = get_book_operation_token(self.root_dir)
+            if chunk.get('_take_history_book_token', token) != token:
+                raise ValueError(GENERATION_INPUTS_CHANGED)
+            return capture_take_publication_admission(engine, parent, token, chunk['uid'], index,
+                get_chunk_generation_inputs(chunk), voice_config, speaker)
+
+    def get_chunk_render_voice_config(self, voices, speaker, chunk, index, *, batch_seed=None):
+        """Materialize the same voice selection for rendering and take comparison."""
+        resolved = resolve_narrator_voice_config(speaker, voices, chunk)
+        if batch_seed is not None:
+            from tts import get_batch_voice_config
+            return get_batch_voice_config(resolved, speaker, index, batch_seed)
+        resolved = voice_config_for_chunk(resolved, speaker, index)
+        if self._load_tts_config().get('reproducible_takes') is True:
+            resolved = get_reproducible_voice_config(resolved,
+                get_chunk_seed(chunk['text'], chunk.get('take', 0)), take=chunk.get('take', 0))
+        return resolved
+
+    def _capture_speech_verification_admission(self, engine):
+        requested = get_enabled_speech_verification_settings(self._load_tts_config().get('speech_verification'))
+        reader = getattr(engine,'get_speech_verification_policy',None)
+        active = get_enabled_speech_verification_settings(reader()) if callable(reader) else None
+        if requested is None and active is None:
+            return None
+        with ensure_audio_generation_book(self.root_dir):
+            reason=None if active == requested else 'Execution settings differ from the active TTS engine.'
+            if get_recovery_claim_digest() is None:
+                reason=reason or 'Exact owned generation admission is unavailable for this render path.'
+            return {'book_token':get_book_operation_token(self.root_dir),
+                    'policy':copy.deepcopy(requested),
+                    'reason':reason}
+
+    @staticmethod
+    def _get_speech_staged_version(path):
+        info = os.stat(path)
+        return info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns
+
+    def _verify_generated_chunk_speech(self,chunk,temp_path,staged_path,preparation,revision):
+        admission=chunk.get('_speech_verification_admission')
+        if admission is None:
+            return None,None
+        from speech_verification import verify_finished_speech
+        from speech_verification_receipt import (get_validated_speech_input,
+            get_pronunciation_ambiguity_regions,get_speech_verification_receipt,SpeechContentMismatchError)
+        from speech_verification_runtime import get_verification_runtime,get_verifier_file_identity
+        from speech_verification_compare import SpeechComparisonUnavailable
+        from word_timing import MAX_AUDIO_BYTES
+        ensure_audio_generation_active()
+        speech_input=get_validated_speech_input(chunk.get('_speech_input'),temp_path,is_audio_generation_cancelled)
+        staged_version=self._get_speech_staged_version(staged_path)
+        reason=admission.get('reason')
+        if admission.get('policy') is None:
+            reason=reason or 'Speech verification is disabled in the saved execution settings.'
+        if speech_input is None:
+            reason=reason or 'Exact synthesis input is unavailable for this render path.'
+        if speech_input is not None and speech_input['text'] != preparation['text']:
+            raise ValueError('Actual synthesis input differs from the captured chunk preparation; regenerate the line.')
+        if staged_version[2] > MAX_AUDIO_BYTES:
+            reason='Finished audio exceeds the 64 MiB speech verification limit.'
+        regions=[]
+        if not reason:
+            try:
+                regions=get_pronunciation_ambiguity_regions(preparation,speech_input['text'])
+            except SpeechComparisonUnavailable as error:
+                reason='Speech comparison is unavailable: '+str(error)
+        if reason:
+            report={'version':1,'status':'unavailable','stage':'input_admission','reason':reason}
+        else:
+            runtime_root=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            report=verify_finished_speech(staged_path,speech_input['text'],speech_input['language'],
+                get_verification_runtime(runtime_root),get_verification_runtime(runtime_root,confirmation=True),
+                is_audio_generation_cancelled,
+                ambiguous_expected_regions=regions)
+        ensure_audio_generation_active()
+        if staged_version[2] > MAX_AUDIO_BYTES:
+            if self._get_speech_staged_version(staged_path) != staged_version:
+                raise ValueError('Finished audio changed during speech verification admission')
+            current={'file_version':staged_version}
+            binding={'sha256':None,'size':staged_version[2]}
+        else:
+            current=get_verifier_file_identity(staged_path,MAX_AUDIO_BYTES,is_audio_generation_cancelled)
+            binding={key:current[key] for key in ('sha256','size')}
+        if report.get('audio') is not None and report['audio'] != binding:
+            raise ValueError('Finished audio differs from the speech verification capture')
+        report={**report,'audio':binding}
+        receipt=get_speech_verification_receipt(report,chunk,admission['book_token'],revision,speech_input)
+        if report['status']=='corroborated_content_difference' and report.get('stage')=='complete':
+            raise SpeechContentMismatchError(receipt)
+        receipt['audio_file_version']=list(current['file_version'][:4])
+        return receipt,tuple(current['file_version'])
+
+    def _capture_synthesis_recovery_parent(self, engine, index, chunk):
+        """Capture owned parent admission for disposable spill and optional recovery."""
+        # Disposable ownership is independent of optional window/cache policy.
+        # Their consumers retain their own eligibility and disabled-path gates.
+        claim_digest = get_recovery_claim_digest()
+        if claim_digest is None or not chunk.get("uid"):
+            return None
+        owner = get_audio_generation_owner()
+        captured = copy.deepcopy(chunk)
+        with owner():
+            with self._chunks_lock, file_lock(self.chunks_path):
+                journal = self._get_status_journal_locked()
+                book = copy.deepcopy(journal.book_identity)
+                current = journal.get_row(captured["uid"])
+                if current is None or get_chunk_generation_inputs(current) != get_chunk_generation_inputs(captured):
+                    raise ValueError(GENERATION_INPUTS_CHANGED)
+        if not isinstance(book.get("active_book_id"), str) or not book["active_book_id"]:
+            return None
+
+        @contextmanager
+        def admit():
+            # Use the captured owner, never a new ContextVar owner or serialized
+            # claim. Kernel cache admission acquired inside this scope is try-only.
+            with owner():
+                with self._chunks_lock, ExitStack() as stack:
+                    try:
+                        stack.enter_context(file_lock(self.chunks_path))
+                        journal = self._get_status_journal_locked()
+                        current = journal.get_row(captured["uid"])
+                    except OSError as error:
+                        raise RecoveryAdmissionError('Recovery book authority is unavailable') from error
+                    if (journal.book_identity != book or current is None
+                            or get_chunk_generation_inputs(current) != get_chunk_generation_inputs(captured)):
+                        raise ValueError(GENERATION_INPUTS_CHANGED)
+                    yield
+
+        return RecoveryParent(str(self.root_dir), get_recovery_digest(captured["uid"]),
+                              get_recovery_digest(book), get_recovery_digest({
+                                  "index": index, "inputs": get_chunk_generation_inputs(captured)}),
+                              claim_digest, admit)
+
+    def _restore_cancelled_generation(self, chunk):
+        try:
+            with ensure_audio_generation_publication(allow_cancelled=True):
+                current = self._update_chunk_fields_by_uid(chunk.get("uid"), expected_chunk=chunk)
+                if current is not None and current.get("status") == "generating":
+                    return self._update_chunk_fields_by_uid(
+                        chunk.get("uid"), expected_chunk=chunk, required_status="generating",
+                        status=(chunk.get("status", "pending") if chunk.get("status") != "generating" else "pending"),
+                        error=chunk.get("error"))
+                return current
+        except AudioGenerationCancelled:
+            # A replaced/released owner has no authority even for cleanup.
+            return None
 
     def _reset_captured_generations(self, captured, indices, done_indices):
         """Reset generating owners; count unfinished requests and report stale inputs."""
@@ -1177,6 +1932,15 @@ class ProjectManager:
             if idx in done_indices:
                 continue
             chunk = get_captured_chunk(captured, idx)
+            if get_audio_generation_owner() is not None:
+                # One owner admission covers the entire read/reset; cancellation
+                # may arrive while cleanup waits, and stale owners cannot reset.
+                current = self._restore_cancelled_generation(chunk) if chunk else None
+                if current is None:
+                    failed.append((idx, GENERATION_INPUTS_CHANGED))
+                else:
+                    count += 1
+                continue
             current = (self._update_chunk_fields_by_uid(chunk.get("uid"), expected_chunk=chunk)
                        if chunk else None)
             if current is None:
@@ -1219,34 +1983,39 @@ class ProjectManager:
                 self._literal_script_policy = policy
                 self._literal_script_version = current
             policy = self._literal_script_policy
-        for index in indices:
-            if 0 <= index < len(chunks):
-                if policy is None and CHUNK_POLICY_KEY in chunks[index]:
-                    raise ValueError("Literal chunks have no matching source-policy script")
-                ensure_literal_chunk(chunks[index], policy)
+        selected = [chunks[index] for index in indices if 0 <= index < len(chunks)]
+        if policy is None and any(CHUNK_POLICY_KEY in chunk for chunk in selected):
+            raise ValueError("Literal chunks have no matching source-policy script")
+        ensure_literal_chunks(selected, policy)
 
+    @ensure_pronunciation_snapshot()
     def _generate_captured_chunk_audio(self, index, chunk):
         if not chunk:
             return False, "Invalid chunk index"
         ensure_literal_chunk(chunk)
-        updated = self._update_chunk_fields_by_uid(
-            chunk.get("uid"), expected_chunk=chunk, status="generating", error=None)
-        if updated is None:
-            return False, GENERATION_INPUTS_CHANGED
-
         temp_path = None
+        registered_temp = False
+        scratch = ExitStack()
         try:
+            updated = self._update_generation_fields(chunk, status="generating", error=None)
+            if updated is None:
+                return False, GENERATION_INPUTS_CHANGED
             engine = self.get_engine()
             if not engine:
                 message = "TTS engine not initialized"
-                updated = self._update_chunk_fields_by_uid(
-                    chunk["uid"], expected_chunk=chunk, status="error", error=message)
+                updated = self._update_generation_fields(
+                    chunk, status="error", error=message)
                 return False, message if updated is not None else GENERATION_INPUTS_CHANGED
 
             # atomic_json_write's write-temp+rename makes plain reads safe even
             # while app.py's voice_library endpoints hold file_lock(voice_config_path)
             # for a read-modify-write — no extra locking needed here.
             voice_config = safe_load_json(self.voice_config_path, default={})
+
+            if chunk.get("pronunciation_rules"):
+                settings = engine.get_model_settings() if callable(getattr(engine, "get_model_settings", None)) else {}
+                chunk = {**chunk, "_pronunciation_context": get_pronunciation_render_context(
+                    voice_config, chunk, index, settings)}
 
             speaker = chunk["speaker"]
             # Resolve aliases to canonical speaker used for TTS
@@ -1259,24 +2028,45 @@ class ProjectManager:
 
             print(f"Generating chunk {index}: speaker={speaker}, instruct='{instruct}', text='{text[:50]}...'")
 
-            # Generate to temp file (unique per chunk for parallel processing)
-            import tempfile
-            fd, temp_path = tempfile.mkstemp(prefix=f"chunk_{index}_", suffix=".wav", dir=self.root_dir)
-            os.close(fd)  # Close the file descriptor, we'll write via TTS engine
-
             # Pass canonical speaker to the TTS engine so it uses the aliased config;
             # the identity anchor in force at this line (a character can change
             # from a point in the book - tts.active_character_style)
-            generation_args = (text, instruct, speaker_to_use,
-                voice_config_for_chunk(resolve_narrator_voice_config(
-                    speaker_to_use, voice_config, chunk), speaker_to_use, index), temp_path)
+            chunk_voice_config = self.get_chunk_render_voice_config(
+                voice_config, speaker_to_use, chunk, index)
+            chunk={**chunk,'_speech_input':None,
+                   '_speech_verification_admission':self._capture_speech_verification_admission(engine)}
             failure = None
-            if callable(getattr(engine, "generate_voice_result", None)):
-                result = engine.generate_voice_result(*generation_args)
-                success, failure = result.success, result.failure
+            ensure_audio_generation_active()
+            recovery_parent = self._capture_synthesis_recovery_parent(engine, index, chunk)
+            publication_admission = self._capture_take_publication_admission(
+                engine, recovery_parent, index, chunk, chunk_voice_config, speaker_to_use)
+            from synthesis_workspace import get_synthesis_workspace_parent, ensure_synthesis_parent_output
+            workspace_parent = get_synthesis_workspace_parent(
+                engine, voice_category(chunk_voice_config.get(speaker_to_use, {})), recovery_parent)
+            if workspace_parent is not None:
+                temp_path = scratch.enter_context(ensure_synthesis_parent_output(
+                    workspace_parent, encoding=_can_register_chunk_encoding(self)))
+                registered_temp = True
             else:
-                success = engine.generate_voice(*generation_args)
+                fd, temp_path = tempfile.mkstemp(prefix=f"chunk_{index}_", suffix=".wav", dir=self.root_dir)
+                os.close(fd)
+            generation_args = (text, instruct, speaker_to_use, chunk_voice_config, temp_path)
+            with (ensure_synthesis_recovery_parent(recovery_parent),
+                  ensure_occurrence_pronunciation_context(chunk, chunk.get("_pronunciation_context"))):
+                if callable(getattr(engine, "generate_voice_result", None)):
+                    result = engine.generate_voice_result(*generation_args,
+                        **({'capture_input':True} if publication_admission is not None else {}))
+                    success, failure = result.success, result.failure
+                    receipt = getattr(result, "synthesis_receipt", None)
+                    if receipt is not None:
+                        chunk = {**chunk, "_synthesis_receipt": copy.deepcopy(receipt)}
+                    speech_input = getattr(result, "speech_input", None)
+                    if speech_input is not None:
+                        chunk = {**chunk, "_speech_input": copy.deepcopy(speech_input)}
+                else:
+                    success = engine.generate_voice(*generation_args)
 
+            ensure_audio_generation_active()
             if success:
                 validate_generated_audio(
                     temp_path, f"chunk {index} ({speaker_to_use})")
@@ -1284,28 +2074,39 @@ class ProjectManager:
                 print(f"Generated WAV size: {os.path.getsize(temp_path)} bytes")
 
                 audio_path = self._publish_generated_chunk_audio(
-                    chunk, temp_path, speaker_to_use)
+                    chunk, temp_path, speaker_to_use,
+                    **({'recovery_parent': recovery_parent}
+                       if recovery_parent is not None and chunk.get('_synthesis_receipt') is not None else {}),
+                    **({'publication_admission': publication_admission} if publication_admission is not None else {}))
 
                 return True, audio_path
             else:
                 message = failure.get_message() if failure else "Generation returned False"
-                updated = self._update_chunk_fields_by_uid(
-                    chunk["uid"], expected_chunk=chunk, status="error", error=message)
+                updated = self._update_generation_fields(
+                    chunk, status="error", error=message)
                 return False, message if updated is not None else GENERATION_INPUTS_CHANGED
 
         except Exception as e:
+            if isinstance(e, AudioGenerationCancelled) or is_audio_generation_cancelled():
+                self._restore_cancelled_generation(chunk)
+                return False, AUDIO_GENERATION_CANCELLED
             try:
-                updated = self._update_chunk_fields_by_uid(
-                    chunk["uid"], expected_chunk=chunk, status="error", error=str(e))
+                from speech_verification_receipt import get_speech_verification_error_fields
+                updated = self._update_generation_fields(
+                    chunk, status="error", error=str(e),**get_speech_verification_error_fields(e))
                 if updated is None:
                     return False, GENERATION_INPUTS_CHANGED
+            except AudioGenerationCancelled:
+                self._restore_cancelled_generation(chunk)
+                return False, AUDIO_GENERATION_CANCELLED
             except Exception as update_err:
                 print(f"Warning: Failed to update chunk {index} status to error: {update_err}")
             return False, str(e)
         finally:
-            # Cleanup runs on every exit path - success, early validation returns,
-            # and exceptions - so the temp wav never leaks.
-            if temp_path:
+            # Registered scratch retires only through its owner/identity proof;
+            # a revoked owner or substituted directory must defer, never unlink.
+            scratch.close()
+            if temp_path and not registered_temp:
                 self._remove_temp_file(temp_path)
 
     def _load_pause_defaults(self):
@@ -1325,14 +2126,30 @@ class ProjectManager:
             raise ValueError("Chunk audio path escapes the project directory")
         return full_path
 
-    def get_chunk_audio_segment(self, chunk):
-        """Decode one admitted audio file, or report an unreadable chunk as absent."""
+    def get_existing_chunk_audio_path(self, chunk):
+        """Full path of the chunk's existing admitted audio file, or None when absent.
+
+        The one answer export and sequence preview use for "has audio". An
+        invalid or escaping path raises ValueError, as get_chunk_audio_path does.
+        """
         path = chunk.get("audio_path")
         if not path:
             return None
+        full_path = self.get_chunk_audio_path(path)
+        return full_path if os.path.isfile(full_path) else None
+
+    def has_chunk_audio_file(self, chunk):
         try:
-            full_path = self.get_chunk_audio_path(path)
-            if not os.path.exists(full_path):
+            return self.get_existing_chunk_audio_path(chunk) is not None
+        except (TypeError, ValueError, OSError):
+            return False
+
+    def get_chunk_audio_segment(self, chunk):
+        """Decode one admitted audio file, or report an unreadable chunk as absent."""
+        path = chunk.get("audio_path")
+        try:
+            full_path = self.get_existing_chunk_audio_path(chunk)
+            if full_path is None:
                 return None
             extension = os.path.splitext(full_path)[1].lstrip(".").lower()
             load_kwargs = {}
@@ -1346,13 +2163,16 @@ class ProjectManager:
             print(f"Error loading audio segment {path}: {error}")
             return None
 
-    def _load_chunks_with_audio(self, cancel_check=None, progress_callback=None, chunks=None):
+    def _load_chunks_with_audio(self, cancel_check=None, progress_callback=None, chunks=None,
+                                segment_transform=None, audio_provider=None):
         """Load chunks and pair each with its AudioSegment.
 
         Returns (result, skipped_count): result is the list of (chunk, segment)
         pairs that loaded successfully; skipped_count is how many chunks were
         dropped (missing audio_path, missing file, or a failed audio load) so
         callers can report a partial export instead of a silent blanket success.
+        An optional transform returns an owned snapshot instead of retaining
+        decoded PCM. Its errors propagate; they are not corrupt-input skips.
         """
         chunks = self.load_chunks() if chunks is None else chunks
         result = []
@@ -1362,184 +2182,246 @@ class ProjectManager:
                 raise ExportCancelled()
             if progress_callback and position and position % 50 == 0:
                 progress_callback(position, len(chunks))
-            segment = self.get_chunk_audio_segment(chunk)
+            segment = (audio_provider or self.get_chunk_audio_segment)(chunk)
             if segment is not None:
-                result.append((chunk, segment))
+                result.append((chunk, segment_transform(segment) if segment_transform else segment))
             else:
                 skipped += 1
+            del segment
         return result, skipped
 
-    def merge_audio(self, cancel_check=None, progress_callback=None, chunks=None):
-        """progress_callback(message) reports loading progress; cancel_check()
-        returning True aborts before the merge is written."""
-        try:
-            chunks_with_audio, skipped = self._load_chunks_with_audio(
-                cancel_check=cancel_check,
-                progress_callback=_loading_progress(progress_callback), chunks=chunks)
-        except ExportCancelled:
-            return False, "Merge cancelled"
-        if not chunks_with_audio:
-            return False, "No audio segments found"
-
+    def merge_audio(self, cancel_check=None, progress_callback=None, chunks=None, mastering=None,
+                    mastering_callback=None, export_quality=None, export_quality_callback=None):
+        """Spool ordinary PCM instead of retaining every decoded source and the whole book."""
+        from export_quality import (get_export_quality_options, get_pcm_export_encoding_plan,
+            get_admitted_export_report, notify_completed_export, ensure_export_stage_current)
+        quality_options = get_export_quality_options(export_quality)
+        _reclaim_export_staging(self.root_dir)
         output_filename = "cloned_audiobook.mp3"
         output_path = os.path.join(self.root_dir, output_filename)
-        pending_output = output_path + f".pending.{uuid.uuid4().hex}"
+        staging = create_export_staging(self.root_dir, 'mp3')
+        pending_output = str(staging.path / output_filename)
         try:
+            from export_publication import ExportSourceSnapshot
+            source_snapshot = ExportSourceSnapshot(self, chunks, cancel_check)
+            chunks = source_snapshot.chunks
+            with PCMSourceStore(self.root_dir, lambda: ensure_audio_export_active(cancel_check)) as sources:
+                chunks_with_audio, skipped = self._load_chunks_with_audio(
+                    cancel_check=cancel_check, progress_callback=_loading_progress(progress_callback),
+                    chunks=chunks, segment_transform=sources.save_segment)
+                if not chunks_with_audio:
+                    return False, "No audio segments found"
+                pause_ms, same_speaker_pause_ms = source_snapshot.pause_defaults
+                decoded = ((chunk, sources.load_segment(segment)) for chunk, segment in chunks_with_audio)
+                timeline = []
+                for chunk, segment, start_ms in iter_timeline(
+                        decoded, pause_ms, same_speaker_pause_ms, cancel_check=cancel_check):
+                    timeline.append((chunk, sources.save_segment(segment), start_ms))
+                    del segment
+                audio_segments = [seg for _, seg, _ in timeline]
+                speakers = [chunk["speaker"] for chunk, _, _ in timeline]
+                pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
+                directory = staging.path
+                raw = os.path.join(directory, 'combined.pcm')
+                pcm_plans, quality_reports = [], []
+                settings = (write_combined_pcm(audio_segments, speakers, raw, pause_ms,
+                            same_speaker_pause_ms, pause_overrides, cancel_check, source_store=sources,
+                            pcm_plan_callback=pcm_plans.append)
+                            if os.path.basename(AudioSegment.converter).lower() in ('ffmpeg', 'ffmpeg.exe') else None)
+                if settings is None:
+                    print("  MP3: compatibility fallback (whole-buffer assembly)")
+                    legacy_segments = [sources.load_segment(segment) for segment in audio_segments]
+                    final_audio, pcm_plan = _get_legacy_export_audio(legacy_segments, speakers, pause_ms,
+                        same_speaker_pause_ms, pause_overrides, cancel_check)
+                    quality_plan = get_pcm_export_encoding_plan(pcm_plan, format_name='mp3', options=quality_options)
+                    mastering_report = _export_audio_segment(final_audio, pending_output, "mp3", bitrate=MP3_BITRATE,
+                        cancel_check=cancel_check, quality_plan=quality_plan, quality_callback=quality_reports.append,
+                        **({"mastering": mastering} if mastering is not None else {}))
+                else:
+                    if len(pcm_plans) != 1:
+                        raise ValueError('PCM assembler did not provide an independent source-frame plan.')
+                    quality_plan = get_pcm_export_encoding_plan(pcm_plans[0], format_name='mp3', options=quality_options)
+                    from audio_export import export_pcm_mp3
+                    mastering_report = export_pcm_mp3(raw, pending_output, settings, cancel_check,
+                        mastering=mastering, bitrate=MP3_BITRATE, quality_plan=quality_plan,
+                        quality_callback=quality_reports.append)
+                quality_report = get_admitted_export_report(pending_output, quality_plan,
+                    quality_reports[-1] if quality_reports else None, cancel_check)
             ensure_audio_export_active(cancel_check)
-            pause_ms, same_speaker_pause_ms = self._load_pause_defaults()
-            timeline = compute_timeline(chunks_with_audio, pause_ms, same_speaker_pause_ms,
-                                        cancel_check=cancel_check)
-            audio_segments = [seg for _, seg, _ in timeline]
-            speakers = [chunk["speaker"] for chunk, _, _ in timeline]
-            pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
-            final_audio = combine_audio_with_pauses(
-                audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides,
-                cancel_check=cancel_check)
-            ensure_audio_export_active(cancel_check)
-            _export_audio_segment(final_audio, pending_output, "mp3", bitrate=MP3_BITRATE,
-                                  cancel_check=cancel_check)
-            ensure_audio_export_active(cancel_check)
-            os.replace(pending_output, output_path)
+            ensure_export_stage_current(pending_output, quality_report, cancel_check)
+            source_snapshot.verify_sources()
+            with source_snapshot.ensure_publication(pending_output, quality_report):
+                os.replace(pending_output, output_path)
+            notify_completed_export(output_path, output_filename, quality_report, export_quality_callback)
+            if mastering_report and mastering_callback:
+                try:
+                    mastering_callback({**mastering_report, "file": output_filename})
+                except Exception:
+                    logging.getLogger('AlexandriaUI').warning(
+                        'MP3 was published, but its mastering callback failed.', exc_info=True)
         except ExportCancelled:
             return False, "Merge cancelled"
         finally:
             self._remove_temp_file(pending_output)
-
+            try:
+                staging.finish(remove=True)
+            except OSError as error:
+                logging.getLogger('AlexandriaUI').warning(
+                    'MP3 export staging cleanup failed: %s', error)
         if skipped:
             return True, f"{output_filename} ({skipped} chunk(s) skipped — missing/corrupt audio)"
         return True, output_filename
 
-    def export_audacity(self, progress_callback=None, cancel_check=None):
+    def export_audacity(self, progress_callback=None, cancel_check=None, export_quality_callback=None):
         """Export project as an Audacity-compatible zip with per-speaker WAV tracks,
         a LOF file for auto-import, and a labels file for chunk annotations."""
+        from audacity_export_quality import validate_audacity_export
+        from export_quality import ensure_export_stage_current, notify_completed_export
+        from export_publication import ExportSourceSnapshot
         try:
-            chunks_with_audio, skipped = self._load_chunks_with_audio(
-                cancel_check=cancel_check,
-                progress_callback=_loading_progress(progress_callback))
-        except ExportCancelled:
-            return False, "Export cancelled"
-        if not chunks_with_audio:
-            return False, "No audio segments found"
+            source_snapshot = ExportSourceSnapshot(self, cancel_check=cancel_check)
+            with PCMSourceStore(self.root_dir, lambda: ensure_audio_export_active(cancel_check)) as sources:
+                chunks_with_audio, skipped = self._load_chunks_with_audio(
+                    cancel_check=cancel_check, chunks=source_snapshot.chunks,
+                    progress_callback=_loading_progress(progress_callback),
+                    segment_transform=sources.save_segment)
+                if not chunks_with_audio:
+                    return False, "No audio segments found"
 
-        # Phase 1 — Compute timeline
-        pause_ms, same_speaker_pause_ms = self._load_pause_defaults()
-        try:
-            timeline = compute_timeline(chunks_with_audio, pause_ms, same_speaker_pause_ms,
-                                        cancel_check=cancel_check)
-        except ExportCancelled:
-            return False, "Export cancelled"
+                # Phase 1 — Compute timeline
+                pause_ms, same_speaker_pause_ms = source_snapshot.pause_defaults
+                decoded = ((chunk, sources.load_segment(segment)) for chunk, segment in chunks_with_audio)
+                timeline = []
+                for chunk, segment, start_ms in iter_timeline(
+                        decoded, pause_ms, same_speaker_pause_ms, cancel_check=cancel_check):
+                    timeline.append((chunk, sources.save_segment(segment), start_ms))
+                    del segment
 
-        if not timeline:
-            return False, "No audio segments found"
+                if not timeline:
+                    return False, "No audio segments found"
 
-        # Total duration = last chunk's start + its length
-        _, last_seg, last_start = timeline[-1]
-        total_duration_ms = last_start + len(last_seg)
+                # Total duration = last chunk's start + its length
+                _, last_seg, last_start = timeline[-1]
+                total_duration_ms = last_start + get_audio_duration_ms(last_seg)
 
-        # Phase 2 — Group once, retaining only the already-loaded segments.
-        speaker_chunks = {}
-        for chunk, segment, start_ms in timeline:
-            speaker_chunks.setdefault(chunk["speaker"], []).append((segment, start_ms))
-        speakers_ordered = list(speaker_chunks)
+                # Phase 2 — Group once, retaining only the already-loaded segments.
+                speaker_chunks = {}
+                for chunk, segment, start_ms in timeline:
+                    speaker_chunks.setdefault(chunk["speaker"], []).append((segment, start_ms))
+                speakers_ordered = list(speaker_chunks)
 
-        # Phase 3 — Build LOF and labels content
-        speaker_filenames = {}
-        used_filenames = set()
-        for speaker in speakers_ordered:
-            base_name = sanitize_filename(speaker)
-            safe_name = base_name
-            suffix = 2
-            while safe_name in used_filenames:
-                safe_name = f"{base_name}_{suffix}"
-                suffix += 1
-            speaker_filenames[speaker] = safe_name
-            used_filenames.add(safe_name)
-
-        lof_lines = []
-        for speaker in speakers_ordered:
-            lof_lines.append(f'file "{speaker_filenames[speaker]}.wav"')
-        lof_content = "\n".join(lof_lines) + "\n"
-
-        label_lines = []
-        for chunk, segment, start_ms in timeline:
-            start_sec = start_ms / 1000.0
-            end_sec = (start_ms + len(segment)) / 1000.0
-            text_preview = chunk.get("text", "")[:80]
-            label = f"[{chunk['speaker']}] {text_preview}"
-            # Audacity labels are tab-separated, one per line - a tab or newline
-            # inside the text would add a phantom column or split the row.
-            label = label.replace("\t", " ").replace("\r", " ").replace("\n", " ")
-            label_lines.append(f"{start_sec:.6f}\t{end_sec:.6f}\t{label}")
-        labels_content = "\n".join(label_lines) + "\n"
-
-        # Phase 4 — Zip everything to a temp path, then atomically replace, so a
-        # failure mid-write can't leave a truncated zip the download route serves
-        # as valid (or clobber a previous good export with garbage).
-        zip_path = os.path.join(self.root_dir, "audacity_export.zip")
-        tmp_zip = zip_path + f".pending.{uuid.uuid4().hex}"
-        try:
-            ensure_audio_export_active(cancel_check)
-            with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("project.lof", lof_content)
-                zf.writestr("labels.txt", labels_content)
-
+                # Phase 3 — Build LOF and labels content
+                speaker_filenames = {}
+                used_filenames = set()
                 for speaker in speakers_ordered:
-                    if progress_callback:
-                        progress_callback(f"Writing track: {speaker}")
+                    base_name = sanitize_filename(speaker)
+                    safe_name = base_name
+                    suffix = 2
+                    while safe_name in used_filenames:
+                        safe_name = f"{base_name}_{suffix}"
+                        suffix += 1
+                    speaker_filenames[speaker] = safe_name
+                    used_filenames.add(safe_name)
+
+                lof_lines = []
+                for speaker in speakers_ordered:
+                    lof_lines.append(f'file "{speaker_filenames[speaker]}.wav"')
+                lof_content = "\n".join(lof_lines) + "\n"
+
+                label_lines = []
+                for chunk, segment, start_ms in timeline:
+                    start_sec = start_ms / 1000.0
+                    end_sec = (start_ms + get_audio_duration_ms(segment)) / 1000.0
+                    text_preview = chunk.get("text", "")[:80]
+                    label = f"[{chunk['speaker']}] {text_preview}"
+                    # Audacity labels are tab-separated, one per line - a tab or newline
+                    # inside the text would add a phantom column or split the row.
+                    label = label.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+                    label_lines.append(f"{start_sec:.6f}\t{end_sec:.6f}\t{label}")
+                labels_content = "\n".join(label_lines) + "\n"
+
+                # Phase 4 — Zip everything to a temp path, then atomically replace, so a
+                # failure mid-write can't leave a truncated zip the download route serves
+                # as valid (or clobber a previous good export with garbage).
+                zip_path = os.path.join(self.root_dir, "audacity_export.zip")
+                tmp_zip = zip_path + f".pending.{uuid.uuid4().hex}"
+                track_shapes = {}
+                try:
                     ensure_audio_export_active(cancel_check)
-                    entries = speaker_chunks[speaker]
-                    plan = get_track_wav_plan(entries, total_duration_ms, cancel_check)
-                    if plan is not None:
-                        layout, frames = plan
-                        member = zipfile.ZipInfo(f"{speaker_filenames[speaker]}.wav", time.localtime()[:6])
-                        member.compress_type = zf.compression
-                        member._compresslevel = zf.compresslevel
-                        member.file_size = 44 + frames * layout[0] * layout[2]
-                        with zf.open(member, "w") as stream:
-                            if get_streamable_layout([segment for segment, _ in entries]) is None:
-                                write_track_wav(stream, entries, total_duration_ms, plan, cancel_check,
-                                                spool_directory=self.root_dir)
-                            else:
-                                write_track_wav(stream, entries, total_duration_ms, plan, cancel_check)
-                        continue
-                    track_cursor = 0
-                    track_builder = AudioSegmentBuilder(AudioSegment.empty())
-                    for segment, start_ms in speaker_chunks[speaker]:
-                        ensure_audio_export_active(cancel_check)
-                        gap = start_ms - track_cursor
-                        if gap > 0:
-                            track_builder.append(AudioSegment.silent(duration=gap))
-                        track_builder.append(segment)
-                        track_cursor = start_ms + len(segment)
-                    remaining = total_duration_ms - track_cursor
-                    if remaining > 0:
-                        track_builder.append(AudioSegment.silent(duration=remaining))
+                    with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr("project.lof", lof_content)
+                        zf.writestr("labels.txt", labels_content)
 
-                    track = track_builder.finish()
-                    del track_builder
-                    safe_name = speaker_filenames[speaker]
-                    with io.BytesIO() as wav_buffer:
-                        track.export(wav_buffer, format="wav")
-                        ensure_audio_export_active(cancel_check)
-                        zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
-                    del track
-            ensure_audio_export_active(cancel_check)
-            os.replace(tmp_zip, zip_path)
-        except BaseException as error:
-            try:
-                if os.path.exists(tmp_zip):
-                    os.remove(tmp_zip)
-            except OSError:
-                pass
-            if isinstance(error, ExportCancelled):
-                return False, "Export cancelled"
-            raise
+                        for speaker in speakers_ordered:
+                            if progress_callback:
+                                progress_callback(f"Writing track: {speaker}")
+                            ensure_audio_export_active(cancel_check)
+                            entries = speaker_chunks[speaker]
+                            plan = get_track_wav_plan(entries, total_duration_ms, cancel_check)
+                            filename = speaker_filenames[speaker] + '.wav'
+                            shape = plan if plan is not None else get_track_pcm_plan(
+                                entries, total_duration_ms, cancel_check, legacy=True)
+                            if shape is None:
+                                raise ValueError('Audacity track has no independent PCM frame plan.')
+                            track_shapes[filename] = shape
+                            if plan is not None:
+                                layout, frames = plan
+                                member = zipfile.ZipInfo(f"{speaker_filenames[speaker]}.wav", time.localtime()[:6])
+                                member.compress_type = zf.compression
+                                member._compresslevel = zf.compresslevel
+                                member.file_size = 44 + frames * layout[0] * layout[2]
+                                with zf.open(member, "w") as stream:
+                                    if get_streamable_layout([segment for segment, _ in entries]) is None:
+                                        write_track_wav(stream, entries, total_duration_ms, plan, cancel_check,
+                                                        spool_directory=self.root_dir)
+                                    else:
+                                        write_track_wav(stream, entries, total_duration_ms, plan, cancel_check)
+                                continue
+                            track_builder = AudioSegmentBuilder(AudioSegment.empty())
+                            for kind, value in iter_track_pieces(entries, total_duration_ms, cancel_check):
+                                ensure_audio_export_active(cancel_check)
+                                if kind == 'silence':
+                                    track_builder.append(AudioSegment.silent(duration=value))
+                                else:
+                                    track_builder.append(sources.load_segment(value))
 
-        if skipped:
-            return True, f"{zip_path} ({skipped} chunk(s) skipped — missing/corrupt audio)"
-        return True, zip_path
+                            track = track_builder.finish()
+                            del track_builder
+                            if get_pcm_shape(track) != shape:
+                                raise ValueError('Audacity track differs from its independent PCM frame plan.')
+                            safe_name = speaker_filenames[speaker]
+                            with io.BytesIO() as wav_buffer:
+                                track.export(wav_buffer, format="wav")
+                                ensure_audio_export_active(cancel_check)
+                                zf.writestr(f"{safe_name}.wav", wav_buffer.getvalue())
+                            del track
+                    sources.close()
+                    quality_report = validate_audacity_export(tmp_zip, track_shapes,
+                        {'project.lof': lof_content.encode('utf-8'),
+                         'labels.txt': labels_content.encode('utf-8')}, cancel_check, progress_callback)
+                    ensure_export_stage_current(tmp_zip, quality_report, cancel_check)
+                    source_snapshot.verify_sources()
+                    with source_snapshot.ensure_publication(tmp_zip, quality_report):
+                        os.replace(tmp_zip, zip_path)
+                    notify_completed_export(zip_path, 'audacity_export.zip', quality_report,
+                                            export_quality_callback)
+                except BaseException as error:
+                    try:
+                        if os.path.exists(tmp_zip):
+                            os.remove(tmp_zip)
+                    except OSError:
+                        pass
+                    raise
 
-    def merge_m4b(self, per_chunk_chapters=False, metadata=None, cancel_check=None, progress_callback=None):
+                if skipped:
+                    return True, f"{zip_path} ({skipped} chunk(s) skipped — missing/corrupt audio)"
+                return True, zip_path
+        except ExportCancelled:
+            return False, "Export cancelled"
+
+    def merge_m4b(self, per_chunk_chapters=False, metadata=None, cancel_check=None, progress_callback=None,
+                  mastering=None, mastering_callback=None, export_quality=None, export_quality_callback=None,
+                  source_cover=None, expected_book_token=None):
         """Merge audio chunks into an M4B audiobook with chapter markers.
 
         Args:
@@ -1551,71 +2433,96 @@ class ProjectManager:
         Returns:
             tuple: (success: bool, message: str)
         """
-        metadata = metadata or {}
+        from export_quality import (get_export_quality_options, get_pcm_export_encoding_plan,
+            get_admitted_export_report, ensure_export_stage_current, notify_completed_export)
+        from export_publication import ExportSourceSnapshot
+        quality_options = get_export_quality_options(export_quality)
+        _reclaim_export_staging(self.root_dir)
+        metadata = copy.deepcopy(metadata or {})
+        from m4b_metadata import get_m4b_tags, get_m4b_source_chapters, get_m4b_metadata_text
+        tags = get_m4b_tags(metadata)
+        cleanup = []
+        publication = ExitStack()
+        staging = None
         try:
-            chunks_with_audio, skipped = self._load_chunks_with_audio(cancel_check=cancel_check,
-                    progress_callback=_loading_progress(progress_callback))
-            if not chunks_with_audio:
-                return False, "No audio segments found"
+            staging = create_export_staging(self.root_dir, 'm4b')
+            cover_path = metadata.get('cover_path') or ''
+            from m4b_publication import ensure_m4b_publication
+            resolved = publication.enter_context(ensure_m4b_publication(self.root_dir, cover_path,
+                source_cover, expected_book_token, cancel_check))
+            cover_path = resolved['cover_path']
+            source_snapshot = ExportSourceSnapshot(self, cancel_check=cancel_check,
+                additional_sources=([cover_path] if cover_path else []) + list(resolved['expected_sources']))
+            captured_cover = source_snapshot.identities.get(cover_path) if cover_path else None
+            if cover_path and captured_cover is None:
+                raise ValueError('Selected M4B cover is missing before source capture')
+            selected_digest = resolved.get('cover_sha256')
+            if selected_digest is not None:
+                if captured_cover is None or captured_cover['sha256'] != selected_digest:
+                    raise ValueError('Selected source cover changed before M4B source capture')
+            if any(path not in source_snapshot.identities or source_snapshot.identities[path] != identity
+                   for path, identity in resolved['expected_sources'].items()):
+                raise ValueError('Publication source changed before M4B source capture')
+            with PCMSourceStore(self.root_dir, lambda: ensure_audio_export_active(cancel_check)) as sources:
+                chunks_with_audio, skipped = self._load_chunks_with_audio(cancel_check=cancel_check,
+                        progress_callback=_loading_progress(progress_callback),
+                        segment_transform=sources.save_segment, chunks=source_snapshot.chunks)
+                if not chunks_with_audio:
+                    return False, "No audio segments found"
 
-            # Phase 1 — Compute timeline
-            pause_ms, same_speaker_pause_ms = self._load_pause_defaults()
-            timeline = compute_timeline(chunks_with_audio, pause_ms, same_speaker_pause_ms, cancel_check=cancel_check)
+                # Phase 1 — Compute timeline
+                pause_ms, same_speaker_pause_ms = source_snapshot.pause_defaults
+                decoded = ((chunk, sources.load_segment(segment)) for chunk, segment in chunks_with_audio)
+                timeline = []
+                for chunk, segment, start_ms in iter_timeline(
+                        decoded, pause_ms, same_speaker_pause_ms, cancel_check=cancel_check):
+                    timeline.append((chunk, sources.save_segment(segment), start_ms))
+                    del segment
 
-            if not timeline:
-                return False, "No audio segments found"
+                if not timeline:
+                    return False, "No audio segments found"
 
-            # Phase 2 — Build chapters
-            chapters = self._build_m4b_chapters(timeline, per_chunk_chapters)
-            print(f"  M4B: {len(chapters)} chapters")
+                # Assemble using the exact post-trim source clock, including
+                # incremental prefix resampling and fractional-ms pauses.
+                audio_segments = [seg for _, seg, _ in timeline]
+                speakers = [chunk["speaker"] for chunk, _, _ in timeline]
+                pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
 
-            # Phase 3 — Combine audio and export to temp WAV
-            audio_segments = [seg for _, seg, _ in timeline]
-            speakers = [chunk["speaker"] for chunk, _, _ in timeline]
-            pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
+                temp_wav = str(staging.path / 'output.wav')
+                meta_path = str(staging.path / 'meta.txt')
+                output_path = os.path.join(self.root_dir, "audiobook.m4b")
+                pending_output = str(staging.path / 'audiobook.m4b')
 
-        except ExportCancelled:
-            return False, "Export cancelled"
+                cleanup = [temp_wav, meta_path]
 
-        staging_id = uuid.uuid4().hex
-        temp_wav = os.path.join(self.root_dir, f".m4b-{staging_id}.wav")
-        meta_path = os.path.join(self.root_dir, f".m4b-{staging_id}.txt")
-        output_path = os.path.join(self.root_dir, "audiobook.m4b")
-        pending_output = output_path + f".pending.{uuid.uuid4().hex}"
+                pcm_plans = []
+                duration_ms = write_combined_wav(audio_segments, speakers, temp_wav,
+                    pause_ms, same_speaker_pause_ms, pause_overrides, cancel_check,
+                    source_store=sources, pcm_plan_callback=pcm_plans.append)
+                if duration_ms is None:
+                    print("  M4B: compatibility fallback (whole-buffer assembly)")
+                    legacy_segments = [sources.load_segment(segment) for segment in audio_segments]
+                    final_audio, pcm_plan = _get_legacy_export_audio(legacy_segments, speakers,
+                        pause_ms, same_speaker_pause_ms, pause_overrides, cancel_check)
+                    _export_audio_segment(final_audio, temp_wav, "wav", cancel_check=cancel_check)
+                else:
+                    if len(pcm_plans) != 1:
+                        raise ValueError('WAV assembler did not provide an independent source-frame plan.')
+                    pcm_plan = pcm_plans[0]
+                groups = self._chapter_groups([chunk for chunk, _, _ in timeline], per_chunk_chapters)
+                chapters = get_m4b_source_chapters(pcm_plan, groups, len(timeline))
+                quality_plan = get_pcm_export_encoding_plan(pcm_plan, format_name='m4b',
+                    options=quality_options, chapters=chapters, chapter_time_base=1, expected_tags=tags)
+                print(f"  M4B: {len(chapters)} chapters")
+                sources.close()
 
-        try:
-            duration_ms = write_combined_wav(audio_segments, speakers, temp_wav,
-                pause_ms, same_speaker_pause_ms, pause_overrides, cancel_check)
-            if duration_ms is None:
-                final_audio = combine_audio_with_pauses(audio_segments, speakers,
-                    pause_ms, same_speaker_pause_ms, pause_overrides, cancel_check=cancel_check)
-                _export_audio_segment(final_audio, temp_wav, "wav", cancel_check=cancel_check)
-                duration_ms = len(final_audio)
-
+            ensure_audio_export_active(cancel_check)
             # Phase 4 — Write FFmpeg metadata file with book metadata
-            meta_lines = [";FFMETADATA1"]
-            meta_lines.append(f"title={self._escape_ffmeta(metadata.get('title') or 'Audiobook')}")
-            meta_lines.append(f"artist={self._escape_ffmeta(metadata.get('author') or '')}")
-            meta_lines.append(f"album_artist={self._escape_ffmeta(metadata.get('narrator') or '')}")
-            meta_lines.append(f"date={self._escape_ffmeta(metadata.get('year') or '')}")
-            meta_lines.append(f"comment={self._escape_ffmeta(metadata.get('description') or '')}")
-            meta_lines.append("genre=Audiobook")
-            meta_lines.append("")
-            for title, start_ms, end_ms in chapters:
-                safe_title = self._escape_ffmeta(title)
-                meta_lines.append("[CHAPTER]")
-                meta_lines.append("TIMEBASE=1/1000")
-                meta_lines.append(f"START={start_ms}")
-                meta_lines.append(f"END={end_ms}")
-                meta_lines.append(f"title={safe_title}")
-                meta_lines.append("")
-
             with open(meta_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(meta_lines))
+                f.write(get_m4b_metadata_text(tags, chapters, self._escape_ffmeta))
 
             # Phase 5 — FFmpeg: WAV + chapters → M4B (AAC)
-            cover_path = metadata.get("cover_path") or ""
-            has_cover = cover_path and os.path.exists(cover_path)
+            has_cover = captured_cover is not None
 
             cmd = ["ffmpeg", "-y", "-i", temp_wav]
             if has_cover:
@@ -1626,6 +2533,12 @@ class ProjectManager:
             if has_cover:
                 # Map cover as attached picture
                 cmd += ["-map", "1:v", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
+            mastering_before = None
+            if mastering is not None:
+                from audio_mastering import get_loudness_measurements, get_mastering_filter
+                mastering_before = get_loudness_measurements(['-i', temp_wav], mastering, cancel_check)
+                cmd += ['-af', get_mastering_filter(mastering, mastering_before)]
+            cmd += ['-ar', str(quality_plan['sample_rate']), '-ac', str(quality_plan['channels'])]
             cmd += [
                 "-c:a", "aac",
                 "-b:a", "128k",
@@ -1634,14 +2547,35 @@ class ProjectManager:
                 pending_output
             ]
             from m4b_encode import encode_m4b
-            result, stderr = encode_m4b(cmd, duration_ms / 1000, cancel_check, progress_callback)
+            result, stderr = encode_m4b(cmd, pcm_plan['frames'] / pcm_plan['frame_rate'], cancel_check, progress_callback)
             if result != 0:
                 if progress_callback:
                     progress_callback("FFmpeg stderr: " + stderr[-500:])
                 print(f"FFmpeg stderr: {stderr[-500:]}")
                 return False, f"FFmpeg failed (exit {result})"
-            ensure_audio_export_active(cancel_check)
-            os.replace(pending_output, output_path)
+            mastering_report = None
+            if mastering_before is not None:
+                from audio_mastering import get_mastering_report
+                mastering_report = get_mastering_report(pending_output, mastering, mastering_before, stderr, cancel_check)
+            quality_report = get_admitted_export_report(pending_output, quality_plan,
+                cancel_check=cancel_check, progress_callback=progress_callback)
+            from m4b_cover import ensure_m4b_output_cover
+            cover_identity = ensure_m4b_output_cover(pending_output,
+                captured_cover['sha256'] if captured_cover is not None else None, cancel_check)
+            if any(quality_report[key] != cover_identity[key]
+                   for key in ('sha256', 'file_version', 'output_bytes')):
+                raise ValueError('M4B changed after cover validation.')
+            ensure_export_stage_current(pending_output, quality_report, cancel_check)
+            source_snapshot.verify_sources()
+            with source_snapshot.ensure_publication(pending_output, quality_report):
+                os.replace(pending_output, output_path)
+            notify_completed_export(output_path, 'audiobook.m4b', quality_report, export_quality_callback)
+            if mastering_report and mastering_callback:
+                try:
+                    mastering_callback({**mastering_report, 'file': 'audiobook.m4b'})
+                except Exception:
+                    logging.getLogger('AlexandriaUI').warning(
+                        'M4B was published, but its mastering callback failed.', exc_info=True)
 
         except ExportCancelled:
             return False, "Export cancelled"
@@ -1649,13 +2583,25 @@ class ProjectManager:
         finally:
             # Only the unpublished staging output is ever removed here; a prior
             # complete audiobook remains available when an encode fails.
-            cleanup = [temp_wav, meta_path, pending_output]
             for tmp in cleanup:
                 if os.path.exists(tmp):
                     try:
                         os.remove(tmp)
                     except OSError:
                         pass
+            try:
+                if staging is not None:
+                    try:
+                        staging.finish(remove=True)
+                    except OSError as error:
+                        logging.getLogger('AlexandriaUI').warning(
+                            'M4B export staging cleanup failed: %s', error)
+            finally:
+                try:
+                    publication.close()
+                except OSError:
+                    logging.getLogger('AlexandriaUI').warning(
+                        'M4B source-cover temporary files could not be removed.', exc_info=True)
 
         if skipped:
             return True, f"audiobook.m4b ({skipped} chunk(s) skipped — missing/corrupt audio)"
@@ -1664,13 +2610,8 @@ class ProjectManager:
     @staticmethod
     def _escape_ffmeta(text):
         """Escape special characters for FFmpeg metadata format."""
-        text = text.replace("\\", "\\\\")
-        text = text.replace("=", "\\=")
-        text = text.replace(";", "\\;")
-        text = text.replace("#", "\\#")
-        text = text.replace("\n", " ")
-        text = text.replace("\r", " ")  # CRLF (e.g. pasted description) would else corrupt the key=value line
-        return text
+        from m4b_metadata import escape_m4b_metadata
+        return escape_m4b_metadata(text)
 
     def _chapter_groups(self, chunks, per_chunk_chapters):
         """Chapter boundaries from headings and narrator fragments: list of
@@ -1686,14 +2627,14 @@ class ProjectManager:
         heading_indices = []
         for i, chunk in enumerate(chunks):
             text = chunk.get("text", "").strip()
-            heading = CHAPTER_HEADING_RE.match(text)
-            numbered_heading = is_numbered_heading(text)
+            source_start = get_chunk_chapter_start(chunk)
             # Preserve explicit headings and unquoted narrator titles, while
             # keeping short dialogue and complete sentences in their chapter.
             if (get_speaker(chunk).upper() == "NARRATOR" and text
                     and chunk.get("spoken") is not True
+                    and source_start is not False
                     and '"' not in text
-                    and (numbered_heading or _is_structural_text(text, max_length=None if heading else 80))):
+                    and (source_start is True or is_smart_chapter_text(text))):
                 heading_indices.append(i)
 
         # If no headings detected, fall back to per-chunk
@@ -1725,7 +2666,7 @@ class ProjectManager:
         chapters = []
         for title, first, last in self._chapter_groups(chunks, per_chunk_chapters):
             start_ms = timeline[first][2]
-            end_ms = timeline[last][2] + len(timeline[last][1])
+            end_ms = timeline[last][2] + get_audio_duration_ms(timeline[last][1])
             chapters.append((title, start_ms, end_ms))
         return chapters
 
@@ -1739,82 +2680,146 @@ class ProjectManager:
             [chunk.get("pause_after") for chunk, _ in pairs],
             cancel_check=cancel_check)
 
-    def _get_chapter_export_plans(self, chunks, options, pause_defaults):
+    def _get_chapter_export_plans(self, chunks, options, pause_defaults,
+                                  get_source_fingerprint=None):
         """Plan shared names, source ranges and fingerprints without publication."""
         groups = self._chapter_groups(chunks, options["per_chunk_chapters"])
         filenames = build_chapter_filenames(
             groups, options["template"], options["format"], padding=options["padding"],
             book_name=options["book_name"], series_name=options["series_name"],
             volume_number=options["volume_number"])
-        return [{"index": index, "number": index + 1, "title": title,
+        plans = [{"index": index, "number": index + 1, "title": title,
                  "file": filenames[index], "chunks": [first, last],
                  "fingerprint": self._chapter_fingerprint(
                      chunks[first:last + 1], pause_defaults)}
                 for index, (title, first, last) in enumerate(groups)]
+        if get_source_fingerprint is not None:
+            for plan in plans:
+                first, last = plan['chunks']
+                plan['source_fingerprint'] = get_source_fingerprint(chunks[first:last + 1])
+        if options.get('mastering') is not None:
+            for plan in plans:
+                plan['fingerprint'] = hashlib.sha256(json.dumps(
+                    [plan['fingerprint'], options['mastering']], sort_keys=True).encode()).hexdigest()[:16]
+                plan['mastering_settings'] = options['mastering']
+        return plans
 
     def _apply_chapter_export_plans(self, plans, chunks, options, pause_defaults,
                                     previous, chapters, changed_only, get_pairs,
                                     durations=None, progress_callback=None,
-                                    cancel_check=None):
+                                    cancel_check=None, source_check=None, *, source_snapshot,
+                                    get_current_quality_plan=None):
         """Stage the selected set, then publish it with rollback on failure."""
         out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
         os.makedirs(out_dir, exist_ok=True)
         with file_lock(os.path.join(self.root_dir, ".chapter-export")):
-            staging_dir = tempfile.mkdtemp(prefix=".chapter-export-", dir=out_dir)
+            _reclaim_export_staging(self.root_dir)
+            if chapters is not None:
+                manifest_path = os.path.join(out_dir, "manifest.json")
+                if os.path.lexists(manifest_path):
+                    manifest = safe_load_json(manifest_path, None)
+                    rows = get_chapter_export_rows(manifest)
+                    if (not isinstance(manifest, dict) or
+                            not isinstance(manifest.get("chapters"), list) or
+                            len(rows) != len(manifest["chapters"])):
+                        return False, ("Chapter export manifest is invalid; export all chapters "
+                                       "without a selection to rebuild it.")
+                    if {row["index"]: row for row in rows} != previous:
+                        return False, "Chapter exports changed while preparing this selection. Retry the export."
+            staging = create_export_staging(out_dir, 'chapter')
+            staging_dir = str(staging.path)
             retain_backup = False
             try:
+                publication_outputs = []
                 result = self._stage_chapter_export_plans(
                     plans, chunks, options, pause_defaults, previous, chapters,
                     changed_only, get_pairs, durations, progress_callback,
-                    cancel_check, staging_dir)
+                    cancel_check, staging_dir, publication_outputs, get_current_quality_plan)
                 if not result or not result[0]:
                     return result
+                from export_quality import (get_export_file_identity, get_export_file_version,
+                                            ensure_export_stage_current)
+                # Final byte proofs precede every publication lock. Retained
+                # chapters participate in the same set admission as new files.
+                for path, report in publication_outputs:
+                    ensure_export_stage_current(path, report, cancel_check)
+                manifest_path = os.path.join(staging_dir, 'manifest.json')
+                publication_outputs.append((manifest_path,
+                    get_export_file_identity(manifest_path, cancel_check)))
+                outputs = dict(publication_outputs)
+                if source_check is not None:
+                    source_check()
+                source_snapshot.verify_sources()
                 ensure_audio_export_active(cancel_check)
                 backup_dir = os.path.join(staging_dir, "old")
                 os.mkdir(backup_dir)
                 names = sorted(name for name in os.listdir(staging_dir)
-                               if name not in ("old", "manifest.json")) + ["manifest.json"]
+                               if name not in ("old", "manifest.json",
+                                               MARKER, OWNER_LOCK + ".lock"))
                 touched = []
-                try:
-                    for name in names:
+
+                def publish(name):
+                    source = os.path.join(staging_dir, name)
+                    target = os.path.join(out_dir, name)
+                    backup = os.path.join(backup_dir, name)
+                    existed = os.path.lexists(target)
+                    if existed:
+                        os.replace(target, backup)
+                    touched.append((target, backup, existed))
+                    os.replace(source, target)
+                    report = outputs.pop(source)
+                    version = get_export_file_version(target)
+                    if version[:4] != report['file_version'][:4]:
+                        raise ValueError('Finished chapter changed during publication. Retry the export.')
+                    outputs[target] = {**report, 'file_version': version}
+
+                with source_snapshot.ensure_publication_transaction(outputs) as admit:
+                    try:
+                        with admit():
+                            for name in names:
+                                publish(name)
+                        # No chunk lock is held during this predicate. Exact
+                        # owner queries reuse this short transaction's lease.
                         ensure_audio_export_active(cancel_check)
-                        target = os.path.join(out_dir, name)
-                        backup = os.path.join(backup_dir, name)
-                        existed = os.path.lexists(target)
-                        if existed:
-                            os.replace(target, backup)
-                        touched.append((target, backup, existed))
-                        os.replace(os.path.join(staging_dir, name), target)
-                except BaseException as error:
-                    failures = []
-                    for target, backup, existed in reversed(touched):
-                        try:
-                            if existed:
-                                os.replace(backup, target)
-                            elif os.path.lexists(target):
-                                os.unlink(target)
-                        except OSError as rollback_error:
-                            failures.append(f"{target}: {rollback_error}")
-                    if failures:
-                        retain_backup = True
-                        raise RuntimeError(
-                            f"Chapter export rollback failed; recovery files kept at {staging_dir}: "
-                            + "; ".join(failures)) from error
-                    if isinstance(error, ExportCancelled):
-                        return False, "Export cancelled"
-                    raise
+                        with admit():
+                            publish('manifest.json')
+                    except BaseException as error:
+                        failures = []
+                        for target, backup, existed in reversed(touched):
+                            try:
+                                if existed:
+                                    os.replace(backup, target)
+                                elif os.path.lexists(target):
+                                    os.unlink(target)
+                            except OSError as rollback_error:
+                                failures.append(f"{target}: {rollback_error}")
+                        if failures:
+                            retain_backup = True
+                            raise RuntimeError(
+                                f"Chapter export rollback failed; recovery files kept at {staging_dir}: "
+                                + "; ".join(failures)) from error
+                        if isinstance(error, ExportCancelled):
+                            return False, "Export cancelled"
+                        raise
                 return result
             except ExportCancelled:
                 return False, "Export cancelled"
             finally:
-                if not retain_backup:
-                    shutil.rmtree(staging_dir)
+                try:
+                    staging.finish(remove=not retain_backup)
+                except OSError as error:
+                    logging.getLogger('AlexandriaUI').warning(
+                        'Chapter export staging cleanup failed: %s', error)
 
     def _stage_chapter_export_plans(self, plans, chunks, options, pause_defaults,
                                     previous, chapters, changed_only, get_pairs,
                                     durations, progress_callback, cancel_check,
-                                    staging_dir):
+                                    staging_dir, publication_outputs, get_current_quality_plan=None):
         """Write selected plans and one manifest with shared absolute offsets."""
+        from audio_mastering import get_audio_sha256
+        from chapter_export_quality import (get_chapter_pcm_plan, get_chapter_quality_plan,
+            ensure_chapter_piece_matches_plan, get_recorded_chapter_quality_plan, get_chapter_plan_duration_ms)
+        from export_quality import get_admitted_export_report
         try:
             wanted = set(range(len(plans))) if chapters is None else set(get_index_selection(chapters, len(plans)))
         except ValueError as exc:
@@ -1833,7 +2838,31 @@ class ProjectManager:
             old = previous.get(index)
             old_duration = get_chapter_reuse_duration(plan, old, wanted, changed_only, out_dir)
             if old_duration is not None:
+                try:
+                    path = os.path.join(out_dir, old["file"])
+                    digest = get_audio_sha256(path, cancel_check)
+                    output_bytes = os.path.getsize(path)
+                    if digest != get_chapter_output_digest(old):
+                        old_duration = None
+                except OSError:
+                    old_duration = None
+            if old_duration is not None:
+                quality_plan = get_recorded_chapter_quality_plan(old, options['export_quality'])
+                if (quality_plan is None and get_current_quality_plan is not None
+                        and get_chapter_reuse_duration(plan, old, {index}, True, out_dir) is not None):
+                    quality_plan = get_current_quality_plan(first, last)
+                if quality_plan is None:
+                    old_duration = None
+            if old_duration is not None:
+                quality_report = get_admitted_export_report(path, quality_plan,
+                    old.get('export_quality_report'), cancel_check, progress_callback)
+                if quality_report['sha256'] != digest or quality_report['output_bytes'] != output_bytes:
+                    raise ValueError('Retained chapter changed during quality admission. Retry the export.')
                 row, duration = dict(old), old_duration
+                duration = get_chapter_plan_duration_ms(quality_plan)
+                row.update(output_sha256=digest, output_bytes=output_bytes,
+                           export_quality_plan=quality_plan, export_quality_report=quality_report)
+                publication_outputs.append((path, quality_report))
                 if index in wanted:
                     reused += 1
             elif index in wanted:
@@ -1841,27 +2870,58 @@ class ProjectManager:
                 if skipped or not pairs:
                     return None
                 try:
-                    chapter_timeline = compute_timeline(
-                        pairs, *pause_defaults, cancel_check=cancel_check)
-                    duration = chapter_timeline[-1][2] + len(chapter_timeline[-1][1])
+                    # get_chapter_audio always assembles the whole chapter, so
+                    # the same finite ceiling applies before any trimmed copy
+                    # is materialized. The untrimmed plan is a safe upper bound.
+                    upper = get_combined_source_plan(
+                        [segment for _, segment in pairs],
+                        [chunk['speaker'] for chunk, _ in pairs],
+                        *pause_defaults,
+                        [chunk.get('pause_after') for chunk, _ in pairs],
+                        cancel_check)
+                    if upper is None:
+                        raise ValueError(
+                            'Chapter sources have no independent PCM frame plan; '
+                            'convert them to ordinary PCM or split the chapter.')
+                    ensure_legacy_pcm_allowed(upper)
+                    pcm_plan = get_chapter_pcm_plan(pairs, pause_defaults, cancel_check)
+                    if pcm_plan is not None:
+                        ensure_legacy_pcm_allowed(pcm_plan)
+                    quality_plan = get_chapter_quality_plan(pcm_plan, options['format'], options['export_quality'])
                     piece = self.get_chapter_audio(pairs, pause_defaults, cancel_check)
+                    ensure_chapter_piece_matches_plan(piece, pcm_plan)
+                    duration = get_chapter_plan_duration_ms(quality_plan)
                     if progress_callback:
                         progress_callback(
                             f"Writing chapter {index + 1}/{len(plans)}: {plan['title'][:60]}")
                     kwargs = {"bitrate": MP3_BITRATE} if options["format"] == "mp3" else {}
-                    _export_audio_segment(
+                    quality_reports = []
+                    mastering_report = _export_audio_segment(
                         piece, os.path.join(staging_dir, plan["file"]), options["format"],
-                        cancel_check=cancel_check, **kwargs)
+                        cancel_check=cancel_check, quality_plan=quality_plan, quality_callback=quality_reports.append, **kwargs,
+                        **({"mastering": options["mastering"]} if options.get("mastering") is not None else {}))
                 except ExportCancelled:
                     return False, "Export cancelled"
                 del piece
                 row = dict(plan)
+                if mastering_report:
+                    row["mastering_report"] = mastering_report
+                path = os.path.join(staging_dir, plan["file"])
+                quality_report = get_admitted_export_report(path, quality_plan,
+                    quality_reports[-1] if quality_reports else None, cancel_check, progress_callback)
+                row.update(output_sha256=quality_report['sha256'], output_bytes=quality_report['output_bytes'],
+                           export_quality_plan=quality_plan, export_quality_report=quality_report)
+                publication_outputs.append((path, quality_report))
                 written += 1
             else:
+                if old is not None:
+                    return False, (f"Chapter {index + 1} has an invalid or unverified retained output; "
+                                   "select it for export or export all chapters to rebuild its independent frame proof.")
                 if durations is None:
                     return None
                 row, duration = None, durations[index]
             if row is not None:
+                row["duration_ms"] = duration
                 row["start_ms"], row["end_ms"] = cursor, cursor + duration
                 rows.append(row)
             cursor += duration
@@ -1879,10 +2939,9 @@ class ProjectManager:
             note += f", {reused} unchanged and kept"
         return True, note
 
-    def _export_changed_chapters(self, options, chapters,
-                                 progress_callback=None, cancel_check=None):
+    def _export_changed_chapters(self, chunks, options, chapters,
+                                 progress_callback=None, cancel_check=None, *, source_snapshot):
         """Return None for incomplete/old exports, otherwise decode changed groups only."""
-        chunks = self.load_chunks()
         if not chunks:
             return None
         for chunk in chunks:
@@ -1898,7 +2957,7 @@ class ProjectManager:
         if manifest.get("chapter_plan_version") != options["chapter_plan_version"]:
             return None
         previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
-        pause_defaults = self._load_pause_defaults()
+        pause_defaults = source_snapshot.pause_defaults
         try:
             plans = self._get_chapter_export_plans(chunks, options, pause_defaults)
         except ValueError as exc:
@@ -1919,13 +2978,36 @@ class ProjectManager:
 
         return self._apply_chapter_export_plans(
             plans, chunks, options, pause_defaults, previous, chapters, True,
-            get_pairs, progress_callback=progress_callback, cancel_check=cancel_check)
+            get_pairs, progress_callback=progress_callback, cancel_check=cancel_check,
+            source_snapshot=source_snapshot)
 
-    def export_chapters(self, fmt="mp3", per_chunk_chapters=False,
+    def export_chapters(self, *args, mastering=None, mastering_callback=None,
+                        export_quality=None, export_quality_callback=None, **kwargs):
+        from export_quality import notify_completed_export
+        result = self._export_chapters(*args, **kwargs, mastering=mastering,
+                                       export_quality=export_quality)
+        if result and result[0] and (mastering_callback or export_quality_callback):
+            manifest = safe_load_json(os.path.join(self.root_dir, CHAPTER_EXPORT_DIR, 'manifest.json'), {})
+            for row in get_chapter_export_rows(manifest):
+                filename = CHAPTER_EXPORT_DIR + '/' + row['file']
+                report = row.get('export_quality_report')
+                if report and export_quality_callback:
+                    notify_completed_export(os.path.join(self.root_dir, filename), filename,
+                                            report, export_quality_callback)
+                report = row.get('mastering_report')
+                if report and mastering_callback:
+                    try:
+                        mastering_callback({**report, 'file': filename})
+                    except Exception:
+                        logger.warning('Chapters were published, but their mastering callback failed.', exc_info=True)
+        return result
+
+    def _export_chapters(self, fmt="mp3", per_chunk_chapters=False,
                         template=DEFAULT_CHAPTER_TEMPLATE, padding=2,
                         book_name="", series_name="", volume_number="",
                         chapters=None, changed_only=False,
-                        progress_callback=None, cancel_check=None):
+                        progress_callback=None, cancel_check=None, mastering=None,
+                        export_quality=None):
         """Write selected chapter files and shared source/timing metadata.
 
         Changed-only exports decode only changed groups when the prior manifest
@@ -1933,45 +3015,134 @@ class ProjectManager:
         """
         if fmt not in ("mp3", "wav"):
             return False, f"Unsupported format: {fmt}"
-        options = {"format": fmt, "template": template, "padding": padding,
+        from export_quality import get_export_quality_options, ExportQualityError
+        options = {"export_quality": get_export_quality_options(export_quality), "format": fmt, "template": template, "padding": padding,
                    "per_chunk_chapters": per_chunk_chapters, "book_name": book_name,
                    "series_name": series_name, "volume_number": volume_number,
                    "chapter_plan_version": 1}
-        if changed_only:
+        if mastering is not None:
+            from audio_mastering import get_mastering_options
+            options["mastering"] = get_mastering_options(mastering)
+        with PCMSourceStore(self.root_dir, lambda: ensure_audio_export_active(cancel_check)) as sources:
             try:
-                incremental = self._export_changed_chapters(
-                    options, chapters, progress_callback, cancel_check)
+                from export_publication import ExportSourceSnapshot
+                source_snapshot = ExportSourceSnapshot(self, cancel_check=cancel_check)
+                captured_chunks = source_snapshot.chunks
+                selected_sources = None
+                if chapters is not None:
+                    # Match preview numbering before a decoder can remove rows.
+                    # Keep order and multiplicity, including legacy rows without UIDs.
+                    selected_sources = []
+                    for chunk in captured_chunks:
+                        ensure_audio_export_active(cancel_check)
+                        if self.is_chunk_audio_available(chunk):
+                            selected_sources.append(chunk)
+                    get_index_selection(chapters, len(self._chapter_groups(
+                        selected_sources, per_chunk_chapters)))
+                from chapter_timing_cache import ensure_chapter_timing_facts
+                indexed = ensure_chapter_timing_facts(
+                    self.root_dir, captured_chunks, self.get_chunk_audio_path,
+                    self.get_chunk_audio_segment, sources.save_segment, cancel_check,
+                    self._get_chapter_decoder_codes(),
+                    _loading_progress(progress_callback))
+                if indexed is not None:
+                    if selected_sources is not None and [row for row, _ in indexed.pairs] != selected_sources:
+                        return False, CHAPTER_SELECTION_AUDIO_ERROR
+                    return self._export_indexed_chapters(
+                        indexed, sources, options, chapters, changed_only,
+                        progress_callback, cancel_check, source_snapshot=source_snapshot)
+                if changed_only and (selected_sources is None or captured_chunks == selected_sources):
+                    incremental = self._export_changed_chapters(
+                        captured_chunks, options, chapters, progress_callback, cancel_check,
+                        source_snapshot=source_snapshot)
+                    if incremental is not None:
+                        return incremental
+                pairs, skipped = self._load_chunks_with_audio(
+                    cancel_check=cancel_check, chunks=captured_chunks,
+                    progress_callback=_loading_progress(progress_callback),
+                    segment_transform=sources.save_segment)
+                if selected_sources is not None and [row for row, _ in pairs] != selected_sources:
+                    return False, CHAPTER_SELECTION_AUDIO_ERROR
+                if not pairs:
+                    return False, "No audio segments found"
+                pause_defaults = source_snapshot.pause_defaults
+                decoded = ((chunk, sources.load_segment(segment)) for chunk, segment in pairs)
+                timeline = []
+                for chunk, segment, start in iter_timeline(
+                        decoded, *pause_defaults, cancel_check=cancel_check):
+                    timeline.append((chunk, sources.save_segment(segment), start))
+                    del segment
+                chunks = [chunk for chunk, _, _ in timeline]
+                plans = self._get_chapter_export_plans(chunks, options, pause_defaults)
+                from chapter_export_quality import get_chapter_durations_ms
+                durations = get_chapter_durations_ms(plans,
+                    [(row, segment) for row, segment, _ in timeline], pause_defaults, cancel_check)
             except ExportCancelled:
                 return False, "Export cancelled"
-            if incremental is not None:
-                return incremental
-        try:
-            pairs, skipped = self._load_chunks_with_audio(
-                cancel_check=cancel_check,
-                progress_callback=_loading_progress(progress_callback))
-            if not pairs:
-                return False, "No audio segments found"
-            pause_defaults = self._load_pause_defaults()
-            timeline = compute_timeline(pairs, *pause_defaults, cancel_check=cancel_check)
-            chunks = [chunk for chunk, _, _ in timeline]
-            plans = self._get_chapter_export_plans(chunks, options, pause_defaults)
-        except ExportCancelled:
-            return False, "Export cancelled"
-        except ValueError as exc:
-            return False, str(exc)
+            except ExportQualityError:
+                raise
+            except ValueError as exc:
+                return False, str(exc)
+            out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
+            os.makedirs(out_dir, exist_ok=True)
+            manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
+            previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
+            result = self._apply_chapter_export_plans(
+                plans, chunks, options, pause_defaults, previous, chapters,
+                changed_only and manifest.get("chapter_plan_version") == 1,
+                lambda first, last: ([(chunk, sources.load_segment(segment))
+                                      for chunk, segment in pairs[first:last + 1]], 0), durations,
+                progress_callback, cancel_check, source_snapshot=source_snapshot)
+            if result and result[0] and skipped:
+                return True, result[1] + f" ({skipped} chunk(s) skipped - missing/corrupt audio)"
+            return result
+
+    def _export_indexed_chapters(self, indexed, sources, options, chapters,
+                                  changed_only, progress_callback, cancel_check, *, source_snapshot):
+        """Use verified trimmed shapes for offsets, decoding selected groups only."""
+        from chapter_timing_cache import read_source_identity
+        if not indexed.pairs:
+            return False, "No audio segments found"
+        pause_defaults = source_snapshot.pause_defaults
+        timeline = list(iter_timeline(indexed.pairs, *pause_defaults,
+                                      cancel_check=cancel_check, already_trimmed=True))
+        chunks = [chunk for chunk, _, _ in timeline]
+        plans = self._get_chapter_export_plans(
+            chunks, options, pause_defaults,
+            lambda selected: indexed.get_source_fingerprint(selected, self.get_chunk_audio_path))
         out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
-        os.makedirs(out_dir, exist_ok=True)
         manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
         previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
-        durations = [timeline[last][2] + len(timeline[last][1]) - timeline[first][2]
-                     for first, last in (plan["chunks"] for plan in plans)]
+        from chapter_export_quality import get_chapter_durations_ms
+        durations = get_chapter_durations_ms(plans, indexed.pairs, pause_defaults, cancel_check)
+
+        def get_audio(chunk):
+            path = self.get_chunk_audio_path(chunk['audio_path'])
+            if read_source_identity(path, cancel_check) != indexed.identities[path]:
+                raise ValueError('Audio changed after chapter timing was indexed. Retry the export.')
+            source = indexed.fresh_sources.get(path)
+            return sources.load_segment(source) if source is not None else self.get_chunk_audio_segment(chunk)
+
+        def get_pairs(first, last):
+            return self._load_chunks_with_audio(
+                cancel_check=cancel_check, chunks=chunks[first:last + 1], audio_provider=get_audio)
+
+        def get_current_quality_plan(first, last):
+            from chapter_export_quality import get_chapter_pcm_plan, get_chapter_quality_plan
+            pcm_plan = get_chapter_pcm_plan(indexed.pairs[first:last + 1], pause_defaults,
+                                            cancel_check, already_trimmed=True)
+            return get_chapter_quality_plan(pcm_plan, options['format'], options['export_quality'])
+
         result = self._apply_chapter_export_plans(
             plans, chunks, options, pause_defaults, previous, chapters,
-            changed_only and manifest.get("chapter_plan_version") == 1,
-            lambda first, last: (pairs[first:last + 1], 0), durations,
-            progress_callback, cancel_check)
-        if result and result[0] and skipped:
-            return True, result[1] + f" ({skipped} chunk(s) skipped - missing/corrupt audio)"
+            changed_only and manifest.get('chapter_plan_version') == 1,
+            get_pairs, durations, progress_callback, cancel_check,
+            source_check=indexed.verify_sources, source_snapshot=source_snapshot,
+            get_current_quality_plan=get_current_quality_plan)
+        if result is None:
+            return False, 'Selected chapter audio could not be decoded; retry the export.'
+        if result[0] and indexed.skipped:
+            return True, result[1] + f" ({indexed.skipped} chunk(s) skipped - missing/corrupt audio)"
         return result
 
     def _chapter_fingerprint(self, chunks, pause_defaults=None):
@@ -1980,7 +3151,7 @@ class ProjectManager:
         which is what changed-only export relies on."""
         if pause_defaults is None:
             pause_defaults = self._load_pause_defaults()
-        parts = [json.dumps(pause_defaults)]
+        parts = ["pcm-timeline-v2", json.dumps(pause_defaults)]
         for c in chunks:
             path = c.get("audio_path") or ""
             full = self.get_chunk_audio_path(path) if path else ""
@@ -1991,17 +3162,53 @@ class ProjectManager:
                 parts.append(f"{path}|missing|{c.get('pause_after')}")
         return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
+    def _get_chapter_decoder_codes(self):
+        return (getattr(ProjectManager.get_chunk_audio_segment, '__code__', None),
+                getattr(_load_audio_segment, '__code__', None))
+
+    def is_chunk_audio_available(self, chunk):
+        """Probe preview candidates without decoding or retaining their PCM.
+
+        Export still decodes each input; a filename preview is not an audio
+        integrity certificate. Use ffprobe for formats libsndfile cannot read.
+        """
+        path = chunk.get("audio_path")
+        if not path:
+            return False
+        try:
+            full_path = self.get_chunk_audio_path(path)
+            if not os.path.isfile(full_path):
+                return False
+            import soundfile
+            try:
+                info = soundfile.info(full_path)
+                return info.channels > 0 and info.samplerate > 0
+            except (RuntimeError, OSError):
+                from audio_channels import get_audio_channel_count
+                return get_audio_channel_count(full_path) > 0
+        except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, KeyError, TypeError):
+            return False
+
     def preview_chapter_filenames(self, fmt="mp3", per_chunk_chapters=False,
                                   template=DEFAULT_CHAPTER_TEMPLATE, padding=2,
                                   book_name="", series_name="", volume_number="",
-                                  chapters=None, changed_only=False):
+                                  chapters=None, changed_only=False, mastering=None):
         """Preview selected chapter files that export would write, excluding reuse."""
         chunks = [chunk for chunk in self.load_chunks()
-                  if self.get_chunk_audio_segment(chunk) is not None]
+                  if self.is_chunk_audio_available(chunk)]
         options = {"format": fmt, "per_chunk_chapters": per_chunk_chapters,
                    "template": template, "padding": padding, "book_name": book_name,
                    "series_name": series_name, "volume_number": volume_number}
-        plans = self._get_chapter_export_plans(chunks, options, self._load_pause_defaults()) if chunks else []
+        if mastering is not None:
+            from audio_mastering import get_mastering_options
+            options["mastering"] = get_mastering_options(mastering)
+        get_source_fingerprint = None
+        if changed_only:
+            from chapter_timing_cache import get_chapter_source_fingerprinter
+            get_source_fingerprint = get_chapter_source_fingerprinter(
+                chunks, self.get_chunk_audio_path, None, self._get_chapter_decoder_codes())
+        plans = self._get_chapter_export_plans(
+            chunks, options, self._load_pause_defaults(), get_source_fingerprint) if chunks else []
         wanted = set(range(len(plans))) if chapters is None else set(get_index_selection(chapters, len(plans)))
         out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
         manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
@@ -2015,7 +3222,7 @@ class ProjectManager:
     def generate_chunks_parallel(self, indices, max_workers=2, progress_callback=None,
                                   cancel_check=None, admitted_requests=None):
         """Accumulate durable UID transitions, compact after every worker stops."""
-        with self._chunks_lock, file_lock(self.chunks_path):
+        with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             if self._active_journal_identity is not None:
                 raise ValueError("Parallel chunk generation is already active")
             self._read_chunks()
@@ -2025,7 +3232,7 @@ class ProjectManager:
             return self._generate_chunks_parallel_with_status_journal(
                 indices, max_workers, progress_callback, cancel_check, admitted_requests)
         finally:
-            with self._chunks_lock, file_lock(self.chunks_path):
+            with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
                 try:
                     if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
                         self._save_chunks_locked(self._read_chunks(), uids_backfilled=True)
@@ -2069,6 +3276,7 @@ class ProjectManager:
             return results
 
         all_indices = list(indices)
+        audio_owner = get_audio_generation_owner()
 
         def _run_round(round_indices, workers):
             """One pass at `workers` concurrency.
@@ -2080,10 +3288,11 @@ class ProjectManager:
             completed, oom_failed, hard_failed = [], [], []
             was_cancelled = False
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(self._generate_captured_chunk_audio, idx, captured.get(idx)): idx
+                futures = {executor.submit(run_with_audio_generation_owner, audio_owner,
+                                           self._generate_captured_chunk_audio, idx, captured.get(idx)): idx
                            for idx in round_indices}
                 for future in as_completed(futures):
-                    if cancel_check and cancel_check() and not was_cancelled:
+                    if (is_audio_generation_cancelled() or (cancel_check and cancel_check())) and not was_cancelled:
                         was_cancelled = True
                         print("[CANCEL] Cancellation requested — stopping parallel generation")
                         for pending_future in futures:
@@ -2097,6 +3306,8 @@ class ProjectManager:
                         if success:
                             completed.append(idx)
                             print(f"Chunk {idx} completed: {msg}")
+                        elif audio_owner is not None and msg == AUDIO_GENERATION_CANCELLED:
+                            was_cancelled = True
                         elif is_oom_failure(msg):
                             oom_failed.append((idx, msg))
                             print(f"Chunk {idx} failed (VRAM): {msg}")
@@ -2200,9 +3411,44 @@ class ProjectManager:
         lacks an MP3 encoder. Returns the relative audio_path (under voicelines/).
         Raises ValueError if the source audio has zero duration.
         """
-        segment = _load_audio_segment(temp_path)
+        from synthesis_workspace import get_registered_encoding_stage, SynthesisWorkspaceUnavailable
+        workspace = get_registered_encoding_stage(temp_path)
+        if workspace is not None and not _can_register_chunk_encoding(self):
+            raise SynthesisWorkspaceUnavailable('Encoding writer changed after workspace admission')
+        if workspace is not None:
+            workspace.require_fresh_encoding()
+            with workspace.open_parent() as source:
+                segment = AudioSegment.from_file(source)
+        else:
+            segment = _load_audio_segment(temp_path)
         if len(segment) == 0:
             raise ValueError("Audio has 0 duration")
+
+        if workspace is not None:
+            # This intermediate stays under its original registered parent until
+            # final slot publication. It must never visit voicelines/.render-*.
+            try:
+                fd = workspace.create_file('encoded-parent.mp3')
+            except OSError as error:
+                raise SynthesisWorkspaceUnavailable('Encoded parent slot already exists or is unsafe') from error
+            os.close(fd)
+            try:
+                path = str(workspace.directory / 'encoded-parent.mp3')
+                _export_audio_segment(segment, path, 'mp3', workspace=workspace, bitrate=MP3_BITRATE)
+                if not _can_register_chunk_encoding(self):
+                    raise SynthesisWorkspaceUnavailable('Encoding writer changed during export')
+                workspace.check_completed(path)
+                if os.path.getsize(path) < 1024:
+                    raise RuntimeError('MP3 export produced invalid file')
+                _RAW_CHUNK_VALIDATE(path, 'MP3 chunk export')
+                workspace.check_completed(path)
+            except Exception as error:
+                if isinstance(error, (AudioGenerationCancelled, SynthesisWorkspaceUnavailable)):
+                    raise
+                print(f'MP3 conversion failed: {error}')
+                path = workspace.copy_wav()
+            workspace.check_completed(path)
+            return os.path.relpath(path, workspace.directory.parent.parent)
 
         try:
             mp3_filename = f"{filename_base}.mp3"
@@ -2257,7 +3503,13 @@ class ProjectManager:
                 else:
                     print(f"Warning: Could not delete temp file {temp_path}")
 
-    def _finalize_completed_chunk(self, idx, chunks):
+    def _remove_batch_temp_file(self, idx):
+        # Registered paths, including deferred/substituted ones, belong only to
+        # identity-based registry retirement. Never pass them to legacy unlink.
+        if get_registered_synthesis_batch_output(self.root_dir, idx) is None:
+            self._remove_temp_file(os.path.join(self.root_dir, f"temp_batch_{idx}.wav"))
+
+    def _finalize_completed_chunk(self, idx, chunks, recovery_parent=None, publication_admission=None):
         """Finalize from a captured row, conditionally publishing to the live UID.
 
         Returns (outcome, original_index, audio_path_or_error); never mutates the
@@ -2266,27 +3518,41 @@ class ProjectManager:
         chunk = get_captured_chunk(chunks, idx)
         if chunk is None:
             return "failed", idx, "Index out of range in captured generation"
-        temp_path = os.path.join(self.root_dir, f"temp_batch_{idx}.wav")
+        temp_path = get_synthesis_batch_output_path(self.root_dir, idx)
         try:
+            ensure_audio_generation_active()
             if not os.path.exists(temp_path):
                 raise ValueError("Temp audio file not found")
             validate_generated_audio(temp_path, f"batch chunk {idx}")
             audio_path = self._publish_generated_chunk_audio(
-                chunk, temp_path, chunk.get("speaker", "unknown"))
+                chunk, temp_path, chunk.get("speaker", "unknown"),
+                **({'recovery_parent': recovery_parent}
+                       if recovery_parent is not None and chunk.get('_synthesis_receipt') is not None else {}),
+                **({'publication_admission': publication_admission} if publication_admission is not None else {}))
             print(f"Chunk {idx} completed: {audio_path}")
             return "completed", idx, audio_path
         except Exception as e:
+            if isinstance(e, AudioGenerationCancelled) or is_audio_generation_cancelled():
+                self._restore_cancelled_generation(chunk)
+                return "cancelled", idx, AUDIO_GENERATION_CANCELLED
             print(f"Error processing chunk {idx}: {e}")
-            updated = self._update_chunk_fields_by_uid(
-                chunk.get("uid"), expected_chunk=chunk, status="error", error=str(e))
+            try:
+                from speech_verification_receipt import get_speech_verification_error_fields
+                updated = self._update_generation_fields(chunk, status="error", error=str(e),
+                    **get_speech_verification_error_fields(e))
+            except AudioGenerationCancelled:
+                self._restore_cancelled_generation(chunk)
+                return "cancelled", idx, AUDIO_GENERATION_CANCELLED
             return "failed", idx, str(e) if updated is not None else GENERATION_INPUTS_CHANGED
         finally:
-            self._remove_temp_file(temp_path)
+            self._remove_batch_temp_file(idx)
 
     def _record_batch_failures(self, batch_failed, chunks, current_batch_size):
         """Separate retryable OOM failures and conditionally mark live owners."""
         oom_failed, hard_failures = [], []
         for idx, error in batch_failed:
+            if is_audio_generation_cancelled():
+                break
             chunk = get_captured_chunk(chunks, idx)
             current = (self._update_chunk_fields_by_uid(chunk.get("uid"), expected_chunk=chunk)
                        if chunk else None)
@@ -2296,11 +3562,14 @@ class ProjectManager:
             if is_oom_failure(error) and current_batch_size > 1:
                 oom_failed.append(idx)
                 continue
-            updated = self._update_chunk_fields_by_uid(
-                chunk["uid"], expected_chunk=chunk, status="error", error=str(error))
+            try:
+                updated = self._update_generation_fields(chunk, status="error", error=str(error))
+            except AudioGenerationCancelled:
+                break
             hard_failures.append((idx, error if updated is not None else GENERATION_INPUTS_CHANGED))
         return oom_failed, hard_failures
 
+    @ensure_pronunciation_snapshot()
     def generate_chunks_batch(self, indices, batch_seed=-1, batch_size=4, progress_callback=None,
                                batch_group_by_type=False, cancel_check=None, admitted_requests=None):
         """Generate multiple chunks using batch TTS API with a single seed.
@@ -2343,6 +3612,24 @@ class ProjectManager:
         # for a read-modify-write — no extra locking needed here.
         voice_config = safe_load_json(self.voice_config_path, default={})
 
+        if is_audio_generation_cancelled():
+            results["cancelled"] = total
+            return results
+
+        if get_take_history_policy(self.root_dir)['enabled']:
+            try:
+                for idx in indices:
+                    chunk = captured.get(idx)
+                    if chunk is not None:
+                        with self._ensure_automatic_predecessor(chunk):
+                            pass
+            except AudioGenerationCancelled:
+                results['cancelled'] = total
+                return results
+            except (ValueError, OSError) as error:
+                results['failed'] = [(idx, str(error)) for idx in indices]
+                return results
+
         # Get TTS engine
         engine = self.get_engine()
         if not engine:
@@ -2350,15 +3637,33 @@ class ProjectManager:
                 results["failed"].append((idx, "TTS engine not initialized"))
             return results
 
+        speech_admission=self._capture_speech_verification_admission(engine)
+        captured={index:{**row,'_speech_input':None,
+                         '_speech_verification_admission':copy.deepcopy(speech_admission)}
+                  for index,row in captured.items()}
+
         # Reserve each captured row conditionally; never save the old whole list.
         active_indices = []
         for idx in indices:
             chunk = captured.get(idx)
-            if not chunk or self._update_chunk_fields_by_uid(
-                    chunk.get("uid"), expected_chunk=chunk, status="generating") is None:
+            try:
+                updated = self._update_generation_fields(chunk, status="generating") if chunk else None
+            except AudioGenerationCancelled:
+                break
+            except (ValueError, OSError) as error:
+                self._reset_captured_generations(captured, active_indices, set())
+                failed = {item[0] for item in results['failed']}
+                results['failed'].extend((item, str(error)) for item in indices if item not in failed)
+                return results
+            if updated is None:
                 results["failed"].append((idx, GENERATION_INPUTS_CHANGED))
             else:
                 active_indices.append(idx)
+        if is_audio_generation_cancelled():
+            reset_count, stale = self._reset_captured_generations(captured, indices, set())
+            results["cancelled"] += reset_count
+            results["failed"].extend(stale)
+            return results
         indices = active_indices
 
         # Optionally reorder indices so same voice-type chunks are contiguous.
@@ -2374,7 +3679,7 @@ class ProjectManager:
         current_batch_size = max(1, batch_size)
         batch_num = 0
         while pending:
-            if cancel_check and cancel_check():
+            if is_audio_generation_cancelled() or (cancel_check and cancel_check()):
                 print(f"[CANCEL] Cancellation requested before batch {batch_num + 1}")
                 break
 
@@ -2383,71 +3688,136 @@ class ProjectManager:
             batch_num += 1
             print(f"Batch {batch_num} ({len(batch_indices)} chunks, size={current_batch_size}, {len(pending)} queued)")
 
-            # Build batch request data
-            batch_chunks = []
-            cleanup_failures = []
-            for idx in batch_indices:
-                chunk = captured.get(idx)
-                if chunk:
-                    if self._update_chunk_fields_by_uid(
-                            chunk["uid"], expected_chunk=chunk, status="generating") is None:
-                        cleanup_failures.append((idx, GENERATION_INPUTS_CHANGED))
-                        continue
-                    temp_path = os.path.join(
-                        self.root_dir, f"temp_batch_{idx}.wav")
-                    try:
-                        remove_stale_audio(temp_path)
-                    except OSError as exc:
-                        message = f"Could not remove stale temp audio: {exc}"
-                        cleanup_failures.append((idx, message))
-                        continue
-                    # Resolve aliases so batch uses canonical speaker config
-                    speaker = chunk.get("speaker", "")
-                    canonical = self._resolve_alias(speaker, voice_config)
-                    batch_chunk = {
-                        "index": idx,
-                        "text": chunk.get("text", ""),
-                        "instruct": chunk.get("instruct", ""),
-                        "speaker": canonical
-                    }
-                    # Preserve narrator-selection metadata through the
-                    # project boundary; the TTS engine uses these fields to
-                    # resolve focus/chapter/gender strategies per chunk.
-                    batch_chunk.update(get_narrator_generation_context(chunk))
-                    batch_chunks.append(batch_chunk)
+            with ExitStack() as batch_stack:
+                batch_stack.enter_context(ensure_synthesis_batch_outputs(self.root_dir, {}))
+                # Build batch request data
+                batch_chunks = []
+                cleanup_failures = []
+                for idx in batch_indices:
+                    chunk = captured.get(idx)
+                    if chunk:
+                        try:
+                            updated = self._update_generation_fields(chunk, status="generating")
+                        except AudioGenerationCancelled:
+                            break
+                        except (ValueError, OSError) as error:
+                            self._restore_cancelled_generation(chunk)
+                            cleanup_failures.append((idx, str(error)))
+                            continue
+                        if updated is None:
+                            cleanup_failures.append((idx, GENERATION_INPUTS_CHANGED))
+                            continue
+                        temp_path = os.path.join(
+                            self.root_dir, f"temp_batch_{idx}.wav")
+                        try:
+                            remove_stale_audio(temp_path)
+                        except OSError as exc:
+                            message = f"Could not remove stale temp audio: {exc}"
+                            cleanup_failures.append((idx, message))
+                            continue
+                        # Resolve aliases so batch uses canonical speaker config
+                        speaker = chunk.get("speaker", "")
+                        canonical = self._resolve_alias(speaker, voice_config)
+                        if chunk.get("pronunciation_rules"):
+                            settings = engine.get_model_settings() if callable(getattr(engine, "get_model_settings", None)) else {}
+                            chunk = {**chunk, "_pronunciation_context": get_pronunciation_render_context(
+                                voice_config, chunk, idx, settings)}
+                            captured[idx] = chunk
+                        batch_chunk = {
+                            "index": idx,
+                            "uid": chunk.get("uid"),
+                            "text": chunk.get("text", ""),
+                            "instruct": chunk.get("instruct", ""),
+                            "speaker": canonical
+                        }
+                        if chunk.get("pronunciation_rules"):
+                            batch_chunk.update(pronunciation_rules=copy.deepcopy(chunk["pronunciation_rules"]),
+                                               _source_speaker=speaker)
+                        # Preserve narrator-selection metadata through the
+                        # project boundary; the TTS engine uses these fields to
+                        # resolve focus/chapter/gender strategies per chunk.
+                        batch_chunk.update(get_narrator_generation_context(chunk))
+                        batch_chunks.append(batch_chunk)
 
-            # Call batch TTS with single seed. If stale-output cleanup rejected
-            # every row, there is nothing safe to dispatch.
-            try:
-                batch_results = (engine.generate_batch(
-                    batch_chunks, voice_config, self.root_dir, batch_seed)
-                    if batch_chunks else {"completed": [], "failed": []})
-            except Exception:
-                self._reset_captured_generations(captured, indices, set())
-                raise
-            batch_results["failed"].extend(cleanup_failures)
+                # Call batch TTS with single seed. If stale-output cleanup rejected
+                # every row, there is nothing safe to dispatch.
+                try:
+                    recovery_parents = {}
+                    publication_admissions = {}
+                    batch_outputs = {}
+                    for row in batch_chunks:
+                        parent = self._capture_synthesis_recovery_parent(engine, row["index"], captured[row["index"]])
+                        if parent is not None:
+                            recovery_parents[row["uid"]] = parent
+                            materialized = self.get_chunk_render_voice_config(
+                                voice_config, row['speaker'], row, row['index'], batch_seed=batch_seed)
+                            admission = self._capture_take_publication_admission(engine, parent, row['index'],
+                                captured[row['index']], materialized, row['speaker'])
+                            if admission is not None:
+                                publication_admissions[row['index']] = admission
+                            from synthesis_workspace import get_synthesis_workspace_parent, ensure_synthesis_parent_output
+                            category = voice_category(materialized.get(row['speaker'], {}))
+                            registered = get_synthesis_workspace_parent(engine, category, parent, batch=True)
+                            if registered is not None:
+                                batch_outputs[row['index']] = os.path.abspath(batch_stack.enter_context(
+                                    ensure_synthesis_parent_output(registered,
+                                        encoding=_can_register_chunk_encoding(self))))
+                    batch_stack.enter_context(ensure_synthesis_batch_outputs(self.root_dir, batch_outputs))
+                    with ensure_synthesis_recovery_batch(recovery_parents):
+                        batch_results = (engine.generate_batch(
+                            batch_chunks, voice_config, self.root_dir, batch_seed,
+                            **({'capture_input':True} if publication_admissions else {}))
+                            if batch_chunks and not is_audio_generation_cancelled() else {"completed": [], "failed": []})
+                except Exception:
+                    if is_audio_generation_cancelled():
+                        for idx in batch_indices:
+                            self._remove_batch_temp_file(idx)
+                        break
+                    self._reset_captured_generations(captured, indices, set())
+                    raise
+                if is_audio_generation_cancelled():
+                    for idx in batch_indices:
+                        self._remove_batch_temp_file(idx)
+                    break
+                batch_results["failed"].extend(cleanup_failures)
 
-            # Process completed chunks - convert to MP3 and update status
-            for idx in batch_results["completed"]:
-                outcome, out_idx, payload = self._finalize_completed_chunk(idx, captured)
-                if outcome == "completed":
-                    results["completed"].append(out_idx)
-                else:
-                    results["failed"].append((out_idx, payload))
+                # Process completed chunks - convert to MP3 and update status
+                for idx in batch_results["completed"]:
+                    receipt = batch_results.get("synthesis_receipts", {}).get(idx)
+                    if receipt is not None and idx in captured:
+                        captured[idx] = {**captured[idx], "_synthesis_receipt": copy.deepcopy(receipt)}
+                    speech_input = batch_results.get("speech_inputs", {}).get(idx)
+                    if speech_input is not None and idx in captured:
+                        captured[idx] = {**captured[idx], "_speech_input": copy.deepcopy(speech_input)}
+                    recovery_parent = recovery_parents.get(captured[idx].get('uid')) if idx in captured else None
+                    publication_admission = publication_admissions.get(idx)
+                    outcome, out_idx, payload = self._finalize_completed_chunk(idx, captured,
+                        **({'recovery_parent': recovery_parent}
+                           if recovery_parent is not None and receipt is not None else {}),
+                        **({'publication_admission': publication_admission} if publication_admission is not None else {}))
+                    if outcome == "completed":
+                        results["completed"].append(out_idx)
+                    elif outcome != "cancelled":
+                        results["failed"].append((out_idx, payload))
 
-            oom_failed, hard_failures = self._record_batch_failures(
-                batch_results["failed"], captured, current_batch_size)
-            results["failed"].extend(hard_failures)
+                oom_failed, hard_failures = self._record_batch_failures(
+                    batch_results["failed"], captured, current_batch_size)
+                # Preserve failures durably recorded before cancellation admission.
+                results["failed"].extend(hard_failures)
+                if is_audio_generation_cancelled():
+                    for idx in batch_indices:
+                        self._remove_batch_temp_file(idx)
+                    break
 
-            if oom_failed:
-                gc.collect()
-                current_batch_size = max(1, current_batch_size - 1)
-                pending = oom_failed + pending  # retry the OOM chunks first
-                print(f"[VRAM] Out-of-memory on {len(oom_failed)} chunk(s) — stepping TTS "
-                      f"batch size down to {current_batch_size} and retrying.")
+                if oom_failed:
+                    gc.collect()
+                    current_batch_size = max(1, current_batch_size - 1)
+                    pending = oom_failed + pending  # retry the OOM chunks first
+                    print(f"[VRAM] Out-of-memory on {len(oom_failed)} chunk(s) — stepping TTS "
+                          f"batch size down to {current_batch_size} and retrying.")
 
-            if progress_callback:
-                progress_callback(len(results["completed"]), len(results["failed"]), total)
+                if progress_callback:
+                    progress_callback(len(results["completed"]), len(results["failed"]), total)
 
         # Reset remaining "generating" chunks to "pending" on cancel or completion
         done_indices = set(results["completed"]) | {idx for idx, _ in results["failed"]}
@@ -2459,3 +3829,13 @@ class ProjectManager:
         print(f"Batch generation complete: {len(results['completed'])} succeeded, "
               f"{len(results['failed'])} failed, {results['cancelled']} cancelled")
         return results
+
+
+_RAW_CHUNK_EXPORT = ProjectManager._export_chunk_audio
+_RAW_CHUNK_UPDATE = ProjectManager._update_chunk_fields_by_uid
+_RAW_CHUNK_PATH = ProjectManager.get_chunk_audio_path
+_RAW_CHUNK_VALIDATE = validate_generated_audio
+_RAW_CHUNK_CODEC_HELPERS = (_load_audio_segment, _export_audio_segment, publish_audio_output)
+
+from loaded_module_code import get_current_loaded_module_code_sha256 as _get_loaded_recovery_code
+_LOADED_RECOVERY_CODE_SHA256 = _get_loaded_recovery_code()

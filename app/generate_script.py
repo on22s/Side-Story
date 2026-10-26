@@ -14,10 +14,10 @@ from dataclasses import dataclass, field, replace
 from core import AUTO_PAUSE_MARKER, llm_timeout_seconds
 from generation_completion import get_file_sha256, get_generation_input
 from config_settings import load_app_config, get_generation_config
-from llm_provider import make_llm_client, make_run_client, merge_provider_extra_body
+from llm_provider import make_llm_client, make_run_client, merge_provider_extra_body, get_provider_extra_body
 from llm_provider import classify_llm_error, get_retry_delay, get_run_model_binding, get_run_fingerprint_identity
 from llm_provider import FailoverClient, RunProfileChanged, RunRequestAdmissionError
-from chunk_quality import validate_chunk_quality, is_trigram_only_near_miss
+from chunk_quality import validate_chunk_quality, is_trigram_only_near_miss, get_chunk_schema_findings
 from validation_reporting import format_validation_findings
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from dialogue_spans import apply_dialogue_map
@@ -76,9 +76,86 @@ REQUEST_LOG_MAX_BYTES = 50 * 1024 * 1024
 
 def get_request_log_path(response_log_path):
     """The request log beside a response log: llm_responses.log ->
-    llm_responses.requests.log, matched block-for-block by request id."""
+    llm_responses.requests.log, joined to replies by request id.
+
+    Blocks describe prepared logical attempts, which may fail before a reply
+    or contain multiple SDK retries or schema-fallback wire requests.
+    """
     stem, extension = os.path.splitext(response_log_path)
     return f"{stem}.requests{extension or '.log'}"
+
+
+def get_llm_request_log_metadata(request_id, model_name, params, requested_max,
+                                 effective_max, response_format, extra_body):
+    """Project prepared arguments/state; never inspect client credentials.
+
+    Provider wrappers can still add defaults, intersect budgets or adapt these
+    arguments. Unknown options are explicitly omitted, not treated as captured.
+    """
+    options = {}
+    for key in ('top_k', 'min_p', 'banned_tokens', 'reasoning_effort', 'seed'):
+        if key not in extra_body:
+            continue
+        value = extra_body[key]
+        valid = (value is None or
+                 (key in ('top_k', 'seed') and type(value) is int) or
+                 (key == 'min_p' and (type(value) is int
+                                     or type(value) is float and math.isfinite(value))) or
+                 (key == 'reasoning_effort' and type(value) is str) or
+                 (key == 'banned_tokens' and type(value) is list
+                  and all(type(item) is str for item in value)))
+        if valid:
+            options[key] = list(value) if isinstance(value, list) else value
+    omitted = bool(extra_body.keys() - options.keys())
+    if 'chat_template_kwargs' in extra_body:
+        template = extra_body['chat_template_kwargs']
+        if type(template) is dict:
+            projected = {}
+            if 'enable_thinking' in template and type(template['enable_thinking']) is bool:
+                projected['enable_thinking'] = template['enable_thinking']
+            options['chat_template_kwargs'] = projected
+            omitted = bool(extra_body.keys() - options.keys() or template.keys() - projected.keys())
+
+    budget, budget_omitted = {}, False
+    for name in ('context_length', 'hard_max_tokens', 'max_input_tokens',
+                 'request_output_ceiling', 'request_initial_max_tokens',
+                 'reasoning_allowance', 'observed_calls'):
+        value = getattr(params, name)
+        if value is None or type(value) is int:
+            budget[name] = value
+        else:
+            budget_omitted = True
+    budget.update(requested_max_tokens=requested_max, effective_max_tokens=effective_max)
+    reservation, reservation_omitted = None, False
+    original = getattr(params, 'reasoning_reservation', None)
+    if original is not None:
+        reservation = {}
+        if type(original) is dict:
+            for name, value in original.items():
+                if (name in ('entry_count', 'per_entry_tokens', 'raw', 'applied', 'limit')
+                        and (value is None or type(value) is int)):
+                    reservation[name] = value
+                elif name == 'scope' and value in ('unobserved', 'context', 'output_only'):
+                    reservation[name] = value
+                else:
+                    reservation_omitted = True
+        else:
+            reservation_omitted = True
+    sampling = {}
+    for name in ('temperature', 'top_p', 'presence_penalty'):
+        value = getattr(params, name)
+        if type(value) is int or type(value) is float and math.isfinite(value):
+            sampling[name] = value
+    return {
+        'version': 1, 'request_id': request_id, 'prepared_at_unix_seconds': time.time(),
+        'run_id': os.environ.get('ALEXANDRIA_RUN_ID') or None, 'model': model_name,
+        'scope': 'shared_completion_arguments_before_provider_adaptation',
+        'sampling': sampling, 'sampling_fields_omitted': len(sampling) != 3,
+        'response_format': response_format, 'extra_body': options,
+        'provider_options_omitted': omitted, 'budget': budget,
+        'budget_fields_omitted': budget_omitted, 'reasoning_reservation': reservation,
+        'reasoning_reservation_fields_omitted': reservation_omitted,
+    }
 
 
 def get_returned_values_note(quality):
@@ -189,6 +266,10 @@ def get_generation_fingerprint(source_text, chunks, model_name, base_url, params
     # before that key existed was a JSON run, so including it unconditionally
     # would discard resumable work that is still valid (Rule 9). Structured
     # output is included above because it changes the request contract.
+    if getattr(params, "max_input_tokens", None) is not None:
+        settings["max_input_tokens"] = params.max_input_tokens
+    from llm_request_budget import get_task_output_fingerprint
+    settings.update(get_task_output_fingerprint(params))
     if getattr(params, "literal_source_preserving", False):
         settings["literal_source_preserving"] = "literal_words_v1"
     output_format = getattr(params, "output_format", "json") or "json"
@@ -227,6 +308,11 @@ def load_generation_checkpoint(output_path, fingerprint):
         if (not isinstance(item, dict) or not isinstance(item.get("entries"), list)
                 or item.get("source_sha256") != fingerprint["chunk_sha256"][index]):
             return []
+        if get_chunk_schema_findings(item["entries"]):
+            # Resume consumes a gapless prefix. Keep validated earlier work,
+            # then regenerate this chunk and everything after it, even if an
+            # older writer stamped the malformed entries as quality.passed.
+            return accepted[:index]
         quality = item.get("quality")
         if not isinstance(quality, dict):
             return []
@@ -702,8 +788,17 @@ class LLMGenParams:
     quoted_must_be_spoken: bool = True
     unquoted_must_be_narrator: bool = True
     request_admission: object = field(default=None, repr=False, compare=False)
+    # Appended to preserve positional constructors from older releases.
+    max_input_tokens: int = None
+    # Preserve task policy independently of a serving profile override.
+    task_max_tokens: int = None
+    task_hard_max_tokens: int = None
+    # A request-specific safety ceiling survives serving-profile switches.
+    request_output_ceiling: int = None
     # Explicit literal annotation policy; default speech transformations unchanged.
     literal_source_preserving: bool = False
+    # Initial window allowance; truncation retries retain the task hard ceiling.
+    request_initial_max_tokens: int = None
     # Experimental review transport; full-text boundary editing remains default.
     review_labels_only: bool = False
     # Pure resolver(params, profile_bound=False), refreshed after profile changes.
@@ -718,6 +813,9 @@ class LLMGenParams:
     # callers intentionally see the same endpoint-specific negotiation result.
     ordered_schema_rejected_by: set = field(default_factory=set, repr=False,
                                             compare=False)
+    # Pass 3 delivery-direction mode (#1258, pass_quality.DELIVERY_DIRECTIONS).
+    # "off" sends the shipped instruct prompt and output unchanged.
+    delivery_direction: str = "off"
 
 
 
@@ -823,6 +921,12 @@ def is_ordered_schema_rejection(error):
         return True
     if "items" not in text:
         return False
+    unquoted = text.replace("'", "").replace('"', "")
+    if any(phrase in unquoted for phrase in (
+            "items is not of type object",
+            "items must be of type object",
+            "items must be an object")):
+        return True
     return (any(word in text for word in ("array", "list", "dict_type"))
             and any(word in text for word in ("object", "boolean", "dict_type"))
             and any(word in text for word in (
@@ -1049,9 +1153,31 @@ def ensure_run_request_params(client, params):
         "provider_extra_body", "structured_output", "api_retry_limit",
         "retry_initial_delay_seconds", "retry_multiplier", "retry_max_delay_seconds",
         "retry_jitter", "on_api_exhaustion")}
-    changes["context_length"] = profile["context_length"]
+    from llm_request_budget import get_request_limits
+    limits = get_request_limits(config, profile["context_length"])
+    changes["context_length"] = limits["context_length"]
+    changes["max_input_tokens"] = limits["max_input_tokens"]
+    # A blank secondary limit keeps the run's own task ceiling (review 32768,
+    # three-pass 16384+); the dataclass default would lower it on failover.
+    changes["hard_max_tokens"] = limits["max_output_tokens"] or params.task_hard_max_tokens or params.hard_max_tokens
+    if params.request_output_ceiling is not None:
+        changes["hard_max_tokens"] = min(changes["hard_max_tokens"], params.request_output_ceiling)
+    changes["max_tokens"] = min(
+        params.request_initial_max_tokens or params.task_max_tokens or params.max_tokens,
+        changes["hard_max_tokens"])
     resolved = replace(params, **changes)
     return resolver(resolved, profile_bound=True) if resolver else resolved
+
+
+def get_transform_metadata(transformed, key="accepted_metadata"):
+    """Build detached bounded JSON for transform diagnostics or accepted provenance."""
+    metadata = (transformed or {}).get(key)
+    if metadata is None:
+        return
+    raw = json.dumps(metadata, allow_nan=False, ensure_ascii=True, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > 65536:
+        raise ValueError("Response transform metadata exceeds 64KiB")
+    return json.loads(raw)
 
 
 def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
@@ -1134,6 +1260,7 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
         attempt_requested_max = requested_max
         attempt_record = None
         effective_max = None
+        request_id = None
         try:
             base_messages = [
                 {"role": "system", "content": sys_prompt},
@@ -1149,7 +1276,8 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
             ]
             effective_max = get_effective_max_tokens(
                 requested_max, params.context_length, messages,
-                params.hard_max_tokens, scale_to_context=False)
+                params.hard_max_tokens, scale_to_context=False,
+                max_input_tokens=params.max_input_tokens)
             # Only when the sampler is deterministic. Above 0 a repeated prompt
             # is a legitimate second sample and must still be sent. The key is
             # the prompt AND the completion budget: a truncated response raises
@@ -1165,10 +1293,41 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                           f"rejected at temperature 0; further retries cannot "
                           f"differ", flush=True)
                     break
+            # Close the prepared request block before provider work, so a
+            # timeout or terminated worker does not erase what was asked.
+            # Do not hold the log lock across inference or retry/fallback.
+            request_id = uuid.uuid4().hex[:12]
+            request_log_error = None
+            log_path = None
             response_format = get_response_format(params, client)
             portable_response_format = get_response_format(params, client, portable=True)
             if portable_response_format == response_format:
                 portable_response_format = None
+            extra_body = build_extra_body(params)
+            try:
+                log_path = get_response_log_path(log_name)
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with file_lock(log_path):
+                    request_log_path = get_request_log_path(log_path)
+                    if not os.environ.get("ALEXANDRIA_RUN_ID"):
+                        _rotate_log_if_large(request_log_path, max_bytes=REQUEST_LOG_MAX_BYTES)
+                    metadata = get_llm_request_log_metadata(
+                        request_id, model_name, params, attempt_requested_max,
+                        effective_max, response_format, extra_body)
+                    metadata_json = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+                    with open(request_log_path, "a", encoding="utf-8") as rf:
+                        rf.write(f"\n{'='*80}\n")
+                        rf.write(f"{label} | attempt {attempt_number} | request={request_id} | "
+                                 f"model={model_name} | temperature={params.temperature} | "
+                                 f"max_tokens={effective_max} | scope=prepared_logical_attempt\n")
+                        rf.write('REQUEST_METADATA_JSON: ' + metadata_json + '\n')
+                        for message in messages:
+                            rf.write(f"{'─'*80}\n[{message['role']}]\n{message['content']}\n")
+                        rf.write(f"{'='*80}\n")
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                request_log_error = f"{type(exc).__name__}: {exc}"
+                print(f"WARNING: request logging failed for {label}: {request_log_error}. "
+                      "Continuing with the provider request.", flush=True)
             response = create_completion(
                 client, response_format,
                 schema_rejected_by=schema_rejected_by,
@@ -1181,7 +1340,7 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 top_p=params.top_p,
                 presence_penalty=params.presence_penalty,
                 max_tokens=effective_max,
-                extra_body=build_extra_body(params)
+                extra_body=extra_body
             )
             # Some OpenAI-compatible providers return a successful HTTP
             # response with no choices (or a JSON null response) during a
@@ -1215,6 +1374,7 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
             # to any budget sized on the visible response.
             usage_details = getattr(usage, "completion_tokens_details", None)
             reasoning_tokens = getattr(usage_details, "reasoning_tokens", None)
+            reasoning_tokens_source = 'provider' if reasoning_tokens is not None else 'unreported'
             # llama.cpp returns the trace in message.reasoning_content but
             # reports no reasoning_tokens in usage, so the allowance never
             # grew and a short chunk's ceiling (512) was spent entirely on
@@ -1225,36 +1385,37 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 trace = getattr(choice.message, "reasoning_content", None) or ""
                 if trace:
                     reasoning_tokens = max(1, len(trace) // 4)
+                    reasoning_tokens_source = 'estimated_from_reasoning_content'
 
             # A local log failure must not consume the provider retry/failover budget.
+            response_id = None
             response_log_error = None
-            request_id = uuid.uuid4().hex[:12]
             try:
-                log_path = get_response_log_path(log_name)
+                raw_response_id = getattr(response, 'id', None)
+                response_id = raw_response_id if type(raw_response_id) is str else None
+                if log_path is None:
+                    log_path = get_response_log_path(log_name)
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with file_lock(log_path):
                     if not os.environ.get("ALEXANDRIA_RUN_ID"):
                         _rotate_log_if_large(log_path)
-                    request_log_path = get_request_log_path(log_path)
-                    if not os.environ.get("ALEXANDRIA_RUN_ID"):
-                        _rotate_log_if_large(request_log_path, max_bytes=REQUEST_LOG_MAX_BYTES)
-                    with open(request_log_path, "a", encoding="utf-8") as rf:
-                        rf.write(f"\n{'='*80}\n")
-                        rf.write(f"{label} | attempt {attempt_number} | request={request_id} | "
-                                 f"model={model_name} | temperature={params.temperature} | "
-                                 f"max_tokens={effective_max}\n")
-                        for message in messages:
-                            rf.write(f"{'─'*80}\n[{message['role']}]\n{message['content']}\n")
-                        rf.write(f"{'='*80}\n")
+                    metadata_json = json.dumps({
+                        'version': 1, 'request_id': request_id,
+                        'response_id': response_id,
+                        'response_id_omitted': raw_response_id is not None and response_id is None,
+                        'reasoning_tokens': reasoning_tokens,
+                        'reasoning_tokens_source': reasoning_tokens_source,
+                    }, ensure_ascii=False, allow_nan=False)
                     with open(log_path, "a", encoding="utf-8") as lf:
                         lf.write(f"\n{'='*80}\n")
                         lf.write(f"{label} | attempt {attempt_number} | finish_reason={finish_reason} | request={request_id}\n")
                         if usage:
                             lf.write(f"tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}\n")
+                        lf.write('RESPONSE_METADATA_JSON: ' + metadata_json + '\n')
                         lf.write(f"{'─'*80}\n")
                         lf.write(text)
                         lf.write(f"\n{'='*80}\n")
-            except (OSError, UnicodeError, ValueError) as exc:
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
                 response_log_error = f"{type(exc).__name__}: {exc}"
                 print(f"WARNING: response logging failed for {label}: {response_log_error}. "
                       "Keeping the provider response for validation.", flush=True)
@@ -1266,6 +1427,8 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
             if attempt_observer:
                 attempt_record = {
                     "attempt": attempt_number,
+                    "request_id": request_id,
+                    "response_id": response_id,
                     "elapsed_seconds": round(time.time() - t0, 3),
                     "finish_reason": finish_reason,
                     "requested_max_tokens": requested_max,
@@ -1273,6 +1436,7 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                     "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
                     "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
                     "reasoning_tokens": reasoning_tokens,
+                    "reasoning_tokens_source": reasoning_tokens_source,
                     "error": None,
                     "response_fingerprint": response_fingerprint,
                     "response_repeat_count": repeat_count,
@@ -1282,6 +1446,8 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 if response_log_error is not None:
                     attempt_record["response_log_error"] = response_log_error
                     attempt_record["raw_response"] = text
+                if request_log_error is not None:
+                    attempt_record["request_log_error"] = request_log_error
                 attempt_observer(attempt_record)
 
             if finish_reason == "length":
@@ -1301,7 +1467,8 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                         requested_max, "token_truncated", params.hard_max_tokens)
                     next_effective = get_effective_max_tokens(
                         next_max, params.context_length, base_messages,
-                        params.hard_max_tokens, scale_to_context=False)
+                        params.hard_max_tokens, scale_to_context=False,
+                        max_input_tokens=params.max_input_tokens)
                     if next_effective > effective_max:
                         print(f"  Token budget: requested={requested_max}, effective={effective_max}, "
                               f"next_requested={next_max}, next_effective={next_effective}")
@@ -1332,6 +1499,7 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 if can_retry else None)
             if attempt_observer:
                 attempt_observer({"attempt": attempt_number,
+                                  "request_id": request_id,
                                   "elapsed_seconds": round(time.time() - t0, 3),
                                   "finish_reason": None, "requested_max_tokens": requested_max,
                                   "effective_max_tokens": None, "prompt_tokens": None,
@@ -1434,10 +1602,14 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 "raw_fallback_used": raw_fallback_used, "salvage_used": False}
         else:
             entries = codec.parse(json_text)
+        transformed = None
 
         if entries or (codec.name == "json_object" and isinstance(entries, dict)):
             if transform_entries:
                 transformed = transform_entries(entries)
+                raw_report = get_transform_metadata(transformed, "raw_native_report")
+                if attempt_record is not None and raw_report is not None:
+                    attempt_record["raw_native_report"] = raw_report
                 if transformed.get("unresolved"):
                     if attempt_record is not None:
                         attempt_record["outcome"] = "response_rejected"
@@ -1456,7 +1628,11 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                     print(f"  Speaker identity review: {transformed['review']}")
             if validate_entries:
                 quality = validate_entries(entries)
+                if attempt_record is not None and "raw_native_report" in (transformed or {}):
+                    attempt_record["full_provider_report"] = get_transform_metadata({"report": quality}, "report")
                 if not quality["passed"]:
+                    if attempt_record is not None and (transformed or {}).get("accepted_metadata"):
+                        attempt_record["quality_findings"] = quality.get("findings", [])
                     if near_miss_sink is not None and is_trigram_only_near_miss(quality):
                         best = (near_miss_sink[0][1]["metrics"]["ordered_trigram_recall"]
                                 if near_miss_sink else -1.0)
@@ -1510,6 +1686,9 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                     print("Retrying truncated response with a larger token budget...")
                     continue
                 return []
+            accepted_metadata = get_transform_metadata(transformed)
+            if attempt_record is not None and accepted_metadata is not None:
+                attempt_record["accepted_entry_transform"] = accepted_metadata
             if attempt > 0:
                 print(f"  Succeeded on retry {attempt_number}")
             if attempt_record is not None:
@@ -1535,18 +1714,31 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
         if salvaged_entries:
             if attempt_record is not None and "parse_provenance" in attempt_record:
                 attempt_record["parse_provenance"]["salvage_used"] = True
+            transformed = None
             if transform_entries:
                 transformed = transform_entries(salvaged_entries)
+                raw_report = get_transform_metadata(transformed, "raw_native_report")
+                if attempt_record is not None and raw_report is not None:
+                    attempt_record["raw_native_report"] = raw_report
                 if transformed.get("unresolved"):
                     print("Regex-salvaged response has unresolved deterministic repairs")
                     return []
                 salvaged_entries = transformed["entries"]
             if validate_entries:
                 quality = validate_entries(salvaged_entries)
+                if attempt_record is not None and "raw_native_report" in (transformed or {}):
+                    attempt_record["full_provider_report"] = get_transform_metadata({"report": quality}, "report")
                 if not quality["passed"]:
+                    if attempt_record is not None and (transformed or {}).get("accepted_metadata"):
+                        attempt_record["quality_findings"] = quality.get("findings", [])
+                        attempt_record["failure_codes"] = [finding.get("code") for finding in quality.get("findings", [])]
+                        attempt_record["outcome"] = "quality_rejected"
                     codes = ", ".join(finding["code"] for finding in quality["findings"])
                     print(f"Regex-salvaged response failed quality validation: {codes}")
                     return []
+            accepted_metadata = get_transform_metadata(transformed)
+            if attempt_record is not None and accepted_metadata is not None:
+                attempt_record["accepted_entry_transform"] = accepted_metadata
             print(f"Regex-salvaged {len(salvaged_entries)} entries from malformed response")
             if attempt_record is not None:
                 attempt_record["outcome"] = "accepted"
@@ -2206,9 +2398,11 @@ def main():
     total_chunks = len(chunks)
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
+    from llm_request_budget import get_request_limits
+    limits = get_request_limits(llm_config, lm_status.get("context_length"))
     request_preflight = build_book_request_preflight(
         chunks, system_prompt, user_prompt_template, max_tokens,
-        lm_status.get("context_length"), lm_status.get("parallel"))
+        limits["context_length"], lm_status.get("parallel"))
     print(f"Request preflight: worst={request_preflight['worst_predicted_tokens']} tokens, "
           f"p95={request_preflight['p95_predicted_tokens']}, "
           f"per-slot={request_preflight['per_slot_context']}, "
@@ -2234,6 +2428,9 @@ def main():
 
     gen_params = LLMGenParams(
         literal_source_preserving=args.literal_source_preserving,
+        task_max_tokens=max_tokens, task_hard_max_tokens=LLMGenParams.hard_max_tokens,
+        max_input_tokens=limits["max_input_tokens"],
+        hard_max_tokens=limits["max_output_tokens"] or LLMGenParams.hard_max_tokens,
         system_prompt=system_prompt,
         user_prompt_template=user_prompt_template,
         max_tokens=max_tokens,
@@ -2243,9 +2440,9 @@ def main():
         min_p=min_p,
         presence_penalty=presence_penalty,
         banned_tokens=banned_tokens,
-        context_length=lm_status.get("context_length"),
+        context_length=limits["context_length"],
         output_format=args.output_format,
-        provider_extra_body=llm_config.get("provider_extra_body"),
+        provider_extra_body=(get_provider_extra_body(llm_config) or llm_config.get("provider_extra_body")),
         structured_output=llm_config.get("structured_output", "auto"),
         api_retry_limit=llm_config.get("api_retry_limit"),
         retry_initial_delay_seconds=llm_config.get("retry_initial_delay_seconds", 1),
@@ -2377,6 +2574,9 @@ def main():
             if dialogue["speaker_changes"]:
                 print(f"Printed speaker labels: corrected "
                       f"{len(dialogue['speaker_changes'])} entries from the source")
+            if dialogue["narration_changes"]:
+                print(f"Source narration: {len(dialogue['narration_changes'])} entries "
+                      "had a character speaker and were set to NARRATOR")
         else:
             print("Dialogue map: no convention detected; entries left unmarked")
     except Exception as exc:                              # noqa: BLE001

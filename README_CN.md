@@ -79,13 +79,13 @@
 
 </details>
 
-## 系统要求
+> **文档：**上游的 [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki) 对声音类型、LoRA 训练、批量生成的说明仍然适用；本分支不同之处以本 README 和 `RECIPES.md` 为准。
 
 - 实用的本地 TTS 生成建议使用 GPU。CPU 模式可用，但较慢。显存需求取决于模型、批量大小及是否与 LLM 共用 GPU，没有适用于所有设备的安全批量值。
 - 每个 TTS 模型变体需要数 GB 磁盘空间；还需为 Python/PyTorch 环境、可选 LLM 权重、原书及输出音频留空间。下载与工作数据可能持续增长。
 - 自动标注需要可访问的 OpenAI 兼容 LLM 接口；手动模式无需 API 服务。本地 TTS 本身无需外部 TTS 服务。
 
-### GPU 兼容性
+### 方式 A：Pinokio（推荐）
 
 下表说明安装器采用的路径，不保证每张显卡或每个驱动版本都可用：
 
@@ -216,6 +216,23 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 
 ## 常见问题
 
+### Pinokio 到不了 “Open Web UI”
+
+`start.js` 等待 Alexandria 打印服务地址。导入失败、端口占用、Python 回溯和 FastAPI 启动失败都会让启动器明确停下，而不是停在 **Starting**。
+
+1. 打开正在运行或失败的 Start 条目旁的 **Terminal**，读第一个回溯或启动错误。导航栏的构建标签显示实际运行的版本；悬停可看 Python 与包版本。
+2. 打开 Pinokio 的 **Logs** 页，选最近的 Alexandria 会话。其 **Get Help** 报告会打包相关启动器日志和系统信息（经 Pinokio 常规的密钥/路径脱敏）便于分享。
+3. 直接看文件：当前启动器日志是 `logs/api/start.js/latest`，带时间戳的运行在旁边，`logs/sessions/` 把相关的 install/start/helper 运行归组。应用任务日志（脚本生成、审阅、音频）仍在 `logs/api/*-latest.log`。
+4. 修好第一个启动错误后，停止并重新启动已有的 `start.js` 条目。不要为绕过端口占用再启动一份。`env_doctor.py` 会报告 `app/env` 缺失或 torch 被后续安装换成 CPU 版——这是最常见的两个原因。
+
+启动器使用 Pinokio 分配的空闲端口并把 Alexandria 绑定到 `127.0.0.1`；不需要也不建议写死端口。
+
+### 脚本生成时“闲置”很久
+看 Generate 下方的活动行：它写着步骤、单元、第几次尝试、在等什么（模型、限流退避、重试）。如果几分钟没有变化，是 LLM 服务器不回应了——在 Setup 里测试。“重试耗尽时 → 暂停”的运行会等待 Resume。
+
+### Pause 是灰的
+Windows 上应用无法挂起工作进程；那里 Pause 直接禁用，而不是每次点击都失败。Cancel 和 Resume failed run 可用。
+
 ### 脚本生成失败
 
 确认 LLM 服务已启动、地址可访问、模型 ID 与服务一致。检查完整日志，并用短文本测试模型是否能返回指定结构。模型输出推理过程时，使用服务支持的非思考设置；不要把禁止 `<think>` 当作通用修复。
@@ -315,7 +332,7 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 
 </details>
 
-## 更多文档
+见英文页 [Project structure](README.md#project-structure)。
 
 - [Side Story 使用指南（英文）](https://github.com/on22s/Side-Story/wiki)：安装、脚本、声音、编辑器、导出及高级工具。
 - [English README](README.md)：英文说明及项目结构。

@@ -10,6 +10,39 @@
     <link href="/static/vendor/bootstrap-5.3.0/bootstrap.min.css" rel="stylesheet">
     <link href="/static/vendor/font-awesome-6.0.0/css/all.min.css" rel="stylesheet">
     <style>
+        /* Shared workflow layout: preserve the original controls and actions. */
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .card-header { flex-wrap: wrap; gap: .75rem; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(.card-header > .d-flex, .card-body > .d-flex) { flex-wrap: wrap; max-width: 100%; gap: .75rem; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(.input-group, .form-select, .form-control) { max-width: 100%; min-width: 0; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(button, summary) { min-height: 2.25rem; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(button, summary, input, select, textarea, a):focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .btn-link { color: var(--text-primary); text-decoration: underline; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .accordion-button { background: var(--bg-card-header); color: var(--text-primary); }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .log-window { max-width: 100%; overflow: auto; }
+        .workflow-disclosure { border: 1px solid var(--border-input); border-radius: var(--radius-md); padding: 1rem; background: var(--bg-card-header); }
+        .workflow-disclosure > summary { cursor: pointer; font-weight: 600; color: var(--text-primary); }
+        .workflow-disclosure :is(label.form-label, .form-text, p) { color: var(--text-primary); }
+        #series-cast-card { padding: 0; }
+        #series-cast-card > summary::after { content: 'Show / hide'; font-size: .8rem; font-weight: 400; margin-left: auto; }
+        .navbar .nav-link:not(.active) { color: #c4dcff; }
+        html #theme-toggle, html[data-theme] body #theme-toggle { color: #edf4ff; border-color: #a5b4c8; }
+        @media (max-width: 575px) {
+            :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .card-header > .d-flex { flex-basis: 100%; }
+            :is(#voices-tab, #training-tab, #voicelab-tab) .input-group { flex-wrap: wrap; }
+            :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(.card-header, .card-body) { overflow-wrap: anywhere; }
+        }
+        #home-tab .text-muted { color: var(--text-primary) !important; }
+        #home-tab :is(button, summary):focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+        .workspace-stages { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
+        .workspace-stage, .workspace-task { padding: 1rem; border: 1px solid var(--border-input); border-radius: var(--radius-md); background: var(--bg-card-header); min-width: 0; overflow-wrap: anywhere; }
+        .workspace-stage h6 { color: var(--text-heading); }
+        .workspace-stage p { margin-bottom: .5rem; }
+        .workspace-columns { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 1.5rem; }
+        .workspace-task-list { display: grid; gap: 1rem; }
+        .workspace-task pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; overflow: auto; margin-top: .75rem; font-size: .8rem; }
+        .workspace-library-row { padding: .8rem 0; border-bottom: 1px solid var(--border-input); overflow-wrap: anywhere; }
+        @media (max-width: 991px) { .workspace-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); } .workspace-columns { grid-template-columns: minmax(0, 1fr); } }
+        @media (max-width: 575px) { .workspace-stages { grid-template-columns: minmax(0, 1fr); } }
         /* ── Theme tokens ──────────────────────────────────────────────── */
         :root {
             --bg-page:        #f8f9fa;
@@ -31,6 +64,8 @@
             --log-bg:         #1e1e1e;
             --log-color:      #00ff00;
             --accent:         #0d6efd;
+            --accent-fill:    #0d6efd;
+            --accent-fill-strong: #0b5ed7;
             --accent-strong:  #0a58ca;
             --accent-soft:    rgba(13,110,253,0.12);
             --success:        #198754;
@@ -53,10 +88,10 @@
             --bg-navbar:      #111419;
             --bg-modal:       #252a35;
             --text-primary:   #dde3ed;
-            --text-muted:     #8896a8;
+            --text-muted:     #95a3b7;
             --text-heading:   #e8edf5;
             --border-color:   rgba(255,255,255,0.08);
-            --border-input:   #3d4558;
+            --border-input:   #6d7d95;
             --shadow:         rgba(0,0,0,0.35);
             --step-bg:        #363d50;
             --step-color:     #8896a8;
@@ -65,6 +100,8 @@
             --log-bg:         #111419;
             --log-color:      #4ade80;
             --accent:         #6ea8fe;
+            --accent-fill:    #245ca6;
+            --accent-fill-strong: #1b4c8d;
             --accent-strong:  #9ec5fe;
             --accent-soft:    rgba(110,168,254,0.14);
             --focus-ring:     rgba(110,168,254,0.34);
@@ -78,11 +115,11 @@
             --bg-input:       #0f0f0f;
             --bg-navbar:      #000000;
             --bg-modal:       #111111;
-            --text-primary:   #999999;
-            --text-muted:     #606060;
-            --text-heading:   #bbbbbb;
+            --text-primary:   #f0f4fb;
+            --text-muted:     #a3afc2;
+            --text-heading:   #ffffff;
             --border-color:   rgba(255,255,255,0.09);
-            --border-input:   #2a2a2a;
+            --border-input:   #6d7d95;
             --shadow:         rgba(0,0,0,0.7);
             --step-bg:        #1e1e1e;
             --step-color:     #5a5a5a;
@@ -91,6 +128,8 @@
             --log-bg:         #000000;
             --log-color:      #4a8a4a;
             --accent:         #8ab4f8;
+            --accent-fill:    #245ca6;
+            --accent-fill-strong: #1b4c8d;
             --accent-strong:  #aecbfa;
             --accent-soft:    rgba(138,180,248,0.14);
             --focus-ring:     rgba(138,180,248,0.38);
@@ -386,9 +425,29 @@
             margin-right: 10px;
             font-weight: bold;
         }
-        .step-active { background-color: var(--accent); color: white; }
+        .step-active { background-color: var(--accent-fill); color: white; }
         .voice-card { border-left: 4px solid var(--accent); }
 
+        #editor-tab .editor-toolbar { position: sticky; top: 0; z-index: 5; background: var(--bg-card-header); }
+        .editor-whole-book { position: relative; }
+        .editor-whole-book[open] { max-width: 28rem; }
+        .word-timing-active { background: var(--bg-input); color: var(--text-primary) !important; outline: 2px solid var(--accent); font-weight: 700; }
+        .word-timing-span { white-space: normal; color: var(--text-primary); text-decoration: underline; }
+        .editor-review-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(17rem, 23rem); gap: 1rem; align-items: start; }
+        .editor-review-main { min-width: 0; }
+        .editor-review-main table { min-width: 64rem; table-layout: fixed; }
+        .editor-review-main .chunk-row td:first-child { white-space: normal !important; }
+        .editor-review-main .chunk-actions { flex-wrap: wrap; }
+        .editor-review-main .chunk-audio { max-width: 100%; }
+        .editor-review-panel { padding: 1rem; border: 1px solid var(--border-input); border-radius: var(--radius-md); background: var(--bg-card-header); overflow-wrap: anywhere; }
+        .editor-line-inspector { scroll-margin-top: 8rem; position: sticky; top: 7rem; max-height: calc(100vh - 8rem); overflow-y: auto; }
+        .editor-line-text { white-space: pre-wrap; }
+        .editor-quality-row { padding: .6rem 0; border-bottom: 1px solid var(--border-input); }
+        #editor-tab .editor-review-panel .text-muted { color: var(--text-primary) !important; }
+        #editor-tab .editor-review-panel :is(button, select, summary):focus-visible, #editor-tab .editor-toolbar :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+        #editor-tab tr.editor-selected-line { outline: 2px solid var(--accent); outline-offset: -2px; }
+        @media (max-width: 1199px) { .editor-review-layout { grid-template-columns: minmax(0, 1fr); } .editor-line-inspector { position: static; max-height: none; grid-row: 1; } }
+        @media (prefers-reduced-motion: reduce) { #editor-tab { scroll-behavior: auto; } }
         /* Editor row expand/collapse */
         .chunk-action-btn {
             border: none;
@@ -408,7 +467,7 @@
         /* Advanced tabs - blue */
         .nav-link.nav-advanced { color: rgba(130, 177, 255, 0.7); }
         .nav-link.nav-advanced:hover { color: #82b1ff; }
-        .nav-link.nav-advanced.active { color: #fff; background-color: var(--accent); border-radius: 4px; }
+        .nav-link.nav-advanced.active { color: #fff; background-color: var(--accent-fill); border-radius: 4px; }
         .navbar .nav-link { border-radius: var(--radius-sm); margin: 2px 1px; transition: background-color var(--motion-fast), color var(--motion-fast); }
         .navbar .nav-link:focus-visible { outline-color: var(--focus-ring); }
         .navbar .nav-link:not(.active):hover { background-color: var(--accent-soft); }
@@ -839,12 +898,94 @@
             border-color: var(--accent);
         }
         html[data-theme="leek"] .btn-close { filter: invert(1) grayscale(100%) brightness(200%); }
+        /* One form, task-based panels; navigation never alters saved settings. */
+        .settings-workspace { display: grid; grid-template-columns: 17rem minmax(0, 1fr); gap: 1.5rem; align-items: start; }
+        .settings-sidebar { position: sticky; top: 1rem; max-height: calc(100vh - 2rem); overflow-y: auto; padding: 1rem; border: 1px solid var(--border-input); border-radius: var(--radius-md); background: var(--bg-card-header); min-width: 0; }
+        .settings-sidebar-title { color: var(--text-heading); font-weight: 700; font-size: 1.05rem; }
+        .settings-categories { display: grid; gap: .15rem; margin: 1rem -.4rem; }
+        .settings-category { display: flex; align-items: center; gap: .8rem; text-align: left; padding: .65rem; width: 100%; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); }
+        .settings-category > i { width: 1rem; color: var(--accent); }
+        .settings-category strong, .settings-category small { display: block; }
+        .settings-category > .help-nav-glyph { margin-left: auto; }
+        .settings-category small { font-size: .75rem; color: var(--text-muted); margin-top: .15rem; }
+        .settings-category:hover { background: var(--bg-card); border-color: var(--border-input); }
+        .settings-category[aria-current="true"] { background: var(--accent-fill); color: #fff; }
+        .settings-category[aria-current="true"] :is(i, small) { color: #fff; }
+        .settings-finder { border-top: 1px solid var(--border-input); padding-top: 1rem; }
+        .settings-mobile { display: none; }
+        #config-form { min-width: 0; }
+        .settings-section { padding: 1rem 0; scroll-margin-top: 5rem; }
+        .settings-section[hidden] { display: none; }
+        .settings-section > h5 { scroll-margin-top: 5rem; font-size: 1.5rem; margin-bottom: .5rem; }
+        .settings-intro { color: var(--text-muted); margin-bottom: 1.5rem; max-width: 65ch; }
+        .settings-section .row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin-left: 0; margin-right: 0; }
+        .settings-section .row > [class*="col"] { width: auto; min-width: 0; padding-left: 0; padding-right: 0; margin-top: 0; }
+        .settings-search-results { display: grid; gap: .5rem; margin-top: .75rem; }
+        .settings-search-results[hidden] { display: none; }
+        .settings-search-hit { display: flex; align-items: center; gap: .5rem; min-width: 0; }
+        .settings-search-hit > button { flex: 1; min-width: 0; text-align: left; white-space: normal; font-size: .8rem; }
+        .settings-advanced { padding: 1rem; border: 1px solid var(--border-input); border-radius: var(--radius-sm); background: var(--bg-card-header); }
+        .settings-advanced > summary { color: var(--text-heading); font-weight: 600; }
+        .settings-advanced[open] > summary { margin-bottom: 1rem; }
+        .settings-section .form-text { line-height: 1.5; }
+        @media (max-width: 991px) {
+            .settings-workspace { grid-template-columns: minmax(0, 1fr); gap: .5rem; }
+            .settings-sidebar { position: static; max-height: none; overflow-y: visible; }
+            .settings-categories { display: none; }
+            .settings-mobile { display: block; }
+        }
+        @media (max-width: 575px) {
+            .settings-section .row { grid-template-columns: minmax(0, 1fr); }
+        }
+        html:is([data-theme="night"], [data-theme="super-night"]) .btn-primary {
+            --bs-btn-color: #ffffff;
+            --bs-btn-bg: var(--accent-fill);
+            --bs-btn-border-color: var(--accent-fill);
+            --bs-btn-hover-color: #ffffff;
+            --bs-btn-hover-bg: var(--accent-fill-strong);
+            --bs-btn-hover-border-color: var(--accent-fill-strong);
+            --bs-btn-active-color: #ffffff;
+            --bs-btn-active-bg: var(--accent-fill-strong);
+            --bs-btn-active-border-color: var(--accent-fill-strong);
+            --bs-btn-disabled-color: #ffffff;
+            --bs-btn-disabled-bg: var(--accent-fill);
+            --bs-btn-disabled-border-color: var(--accent-fill);
+        }
+        html:is([data-theme="night"], [data-theme="super-night"]) :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible,
+        html:is([data-theme="night"], [data-theme="super-night"]) .navbar .nav-link:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+
+        .task-guide-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr)); gap:.75rem; }
+        .task-guide-card { display:flex; flex-direction:column; gap:.4rem; text-align:left; padding:1rem; border:1px solid var(--border-input); border-radius:var(--radius-md); background:var(--bg-card); color:var(--text-primary); }
+        .task-guide-card:hover, .task-guide-card:focus-visible { outline:2px solid var(--bs-info); outline-offset:2px; }
+        .task-guide-card span { font-size:.9rem; }
+        #task-guide-detail { scroll-margin-top:5rem; }
+        #task-guide-return { position:fixed; bottom:1rem; right:1rem; z-index:1030; max-width:calc(100vw - 2rem); }
         /* Field help (app-help.js): a small ⓘ after a control's label. */
         .help-tip { border: 0; background: none; padding: 0 0 0 .3rem; font-size: .85em; line-height: 1;
                     color: var(--bs-secondary-color); cursor: help; vertical-align: baseline; }
         .help-tip:hover, .help-tip:focus-visible { color: var(--bs-info); }
+        .help-tip { display: inline-block; flex: 0 0 auto; align-self: center; user-select: none; }
+        .help-tip:focus-visible { outline: 2px solid var(--bs-info); outline-offset: 2px; border-radius: .2rem; }
+        .help-action-group { display: inline-flex; align-items: center; gap: .25rem; }
+        .help-list-action { display: flex; }
+        .help-list-action > .report-list-item { flex: 1; min-width: 0; border-width: 0 0 1px; border-radius: 0; }
+        .help-nav-glyph { margin-left: .25rem; font-size: .75em; }
+        .input-group > .help-tip { padding: .25rem; }
+        .accordion-header { display: flex; align-items: center; }
+        .accordion-header > .accordion-button { flex: 1; width: auto; min-width: 0; }
+        .accordion-header > .help-tip { margin-right: 1rem; font-size: .85rem; }
         .tooltip { --bs-tooltip-color: #fff; --bs-tooltip-bg: #000; }
         .tooltip-inner { max-width: 340px; text-align: left; }
+        .help-tooltip { pointer-events: auto; }
+        .help-tooltip:not(.show) { pointer-events: none; }
+        .settings-preview { background: var(--bg-card-header); overflow-wrap: anywhere; }
+        #llm-active-mode-badge { white-space: normal; text-align: left; line-height: 1.4; }
+        .settings-preview-row { border-bottom: 1px solid var(--border-input); padding: .75rem 0; }
+        .settings-preview-values { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 1rem; margin-top: .4rem; }
+        .settings-preview-defaults { max-height: 22rem; overflow-y: auto; }
+        .settings-preview :is(button,summary):focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+        @media (max-width:575px) { .settings-preview-values { grid-template-columns: minmax(0,1fr); gap: .4rem; } }
     </style>
     <script>
         /* Anti-flash: apply saved theme before first paint */
@@ -872,6 +1013,7 @@
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto">
                     <li class="nav-section-label" aria-hidden="true">Workflow</li>
+                    <li class="nav-item"><a class="nav-link" href="#home" data-tab="home">Workspace</a></li>
                     <li class="nav-item"><a href="#setup" class="nav-link nav-pipeline active" aria-current="page" data-tab="setup">1. Setup</a></li>
                     <li class="nav-item"><a href="#script" class="nav-link nav-pipeline" data-tab="script">2. Script</a></li>
                     <li class="nav-item"><a href="#voices" class="nav-link nav-pipeline" data-tab="voices">3. Voices</a></li>
@@ -923,6 +1065,56 @@
             </div>
         </div>
 
+        <!-- Book workspace: viewing and Continue never start a task. -->
+        <div id="home-tab" class="tab-content" style="display:none;">
+            <section class="card mb-3" aria-labelledby="task-guides-heading">
+                <div class="card-body">
+                    <h4 id="task-guides-heading">What would you like to finish?</h4>
+                    <p class="text-muted">Short guides with listening checkpoints. Opening one never starts a job.</p>
+                    <div id="task-guide-cards" class="task-guide-cards"></div>
+                    <section id="task-guide-detail" class="border rounded p-3 mt-3" aria-labelledby="task-guide-title" hidden>
+                        <div class="d-flex justify-content-between gap-2"><h5 id="task-guide-title"></h5><button type="button" class="btn btn-outline-secondary btn-sm" onclick="closeTaskGuide()" title="Close this guide without changing your book">Close guide</button></div>
+                        <img id="task-guide-image" class="img-fluid mb-3" width="640" height="140" alt="">
+                        <h6 id="task-guide-step-title" tabindex="-1"></h6>
+                        <p id="task-guide-instruction"></p>
+                        <p><strong>Look for:</strong> <span id="task-guide-expected"></span></p>
+                        <p class="small"><strong>Time and resources:</strong> <span id="task-guide-cost"></span></p>
+                        <div class="d-flex flex-wrap gap-2"><button id="task-guide-prev" type="button" class="btn btn-outline-secondary" onclick="onTaskGuideStep(-1)" title="Read the previous checklist step">Previous</button><button type="button" class="btn btn-primary" onclick="openTaskGuideTarget()" title="Navigate to existing controls without starting work">Open this screen</button><button id="task-guide-next" type="button" class="btn btn-outline-secondary" onclick="onTaskGuideStep(1)" title="Read the next checklist step; does not mark app work complete">Next step</button></div>
+                        <p id="task-guide-feedback" class="small mt-2 mb-0" role="status" aria-live="polite"></p>
+                    </section>
+                </div>
+            </section>
+
+            <div class="card">
+                <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                    <h4 class="m-0">Book workspace</h4>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="refreshWorkspaceView()">Refresh workspace</button>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">Your selected book, its saved progress and the work currently running.</p>
+                    <div id="workspace-feedback" role="status" aria-live="polite" class="small mb-3">Book status has not been checked yet.</div>
+                    <div class="d-flex flex-wrap align-items-start justify-content-between gap-3 mb-4">
+                        <div><h5 id="workspace-book-name">Selected book</h5><p id="workspace-next-reason" class="mb-0 text-muted"></p></div>
+                        <button type="button" class="btn btn-primary" id="workspace-continue" onclick="continueBookWorkspace()" disabled>Continue</button>
+                    </div>
+                    <div id="workspace-stages" class="workspace-stages mb-4"></div>
+                    <div class="workspace-columns">
+                        <section aria-labelledby="workspace-monitor-title">
+                            <h5 id="workspace-monitor-title" tabindex="-1">Running work</h5>
+                            <div id="workspace-monitor-feedback" role="status" aria-live="polite" class="small mb-2">Task status has not been checked yet.</div>
+                            <div id="workspace-monitor" class="workspace-task-list"></div>
+                        </section>
+                        <section aria-labelledby="workspace-library-title">
+                            <h5 id="workspace-library-title">Saved books</h5>
+                            <p class="small text-muted">Loading a saved book uses the existing confirmation before replacing the active book. Audio and output status above refers to the selected book.</p>
+                            <div id="workspace-library-feedback" role="status" aria-live="polite" class="small mb-2"></div>
+                            <div id="workspace-library"></div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Setup Tab -->
         <div id="setup-tab" class="tab-content">
             <div class="card">
@@ -942,12 +1134,60 @@
                         <span id="config-warning-msg"></span>
                         <button type="button" id="config-load-retry" class="btn btn-sm btn-outline-secondary ms-2" onclick="loadConfig()" style="display:none;">Retry loading configuration</button>
                     </div>
+<div class="settings-workspace">
+                    <aside class="settings-sidebar" id="setup-settings-overview">
+                        <div class="settings-sidebar-title">Setup workspace</div>
+                        <p class="small text-muted">Choose an area to work on.</p>
+                        <div class="settings-mobile"><label class="form-label" for="setup-settings-category">Settings category</label>
+                        <select class="form-select mb-3" id="setup-settings-category" onchange="openSetupSettingsSection(this.value, false)"><option value="settings-llm">Connection</option><option value="settings-limits">Limits &amp; retries</option><option value="settings-tts">Speech engine</option><option value="settings-audio">Audio &amp; timing</option><option value="settings-generation">Generation</option><option value="settings-strategy">Script strategy</option><option value="settings-prompts">Prompt studio</option></select></div>
+                        <nav class="settings-categories" aria-label="Setup categories"><button type="button" class="settings-category" data-settings-target="settings-llm" aria-controls="settings-llm" aria-current="true" onclick="openSetupSettingsSection('settings-llm')"><i class="fas fa-plug" aria-hidden="true"></i><span><strong>Connection</strong><small>Server, model &amp; credentials</small></span></button>
+<button type="button" class="settings-category" data-settings-target="settings-limits" aria-controls="settings-limits" aria-current="false" onclick="openSetupSettingsSection('settings-limits')"><i class="fas fa-shield-alt" aria-hidden="true"></i><span><strong>Limits &amp; retries</strong><small>Context, timeouts &amp; recovery</small></span></button>
+<button type="button" class="settings-category" data-settings-target="settings-tts" aria-controls="settings-tts" aria-current="false" onclick="openSetupSettingsSection('settings-tts')"><i class="fas fa-microphone" aria-hidden="true"></i><span><strong>Speech engine</strong><small>Local model or external server</small></span></button>
+<button type="button" class="settings-category" data-settings-target="settings-audio" aria-controls="settings-audio" aria-current="false" onclick="openSetupSettingsSection('settings-audio')"><i class="fas fa-sliders-h" aria-hidden="true"></i><span><strong>Audio &amp; timing</strong><small>Batches, takes &amp; pauses</small></span></button>
+<button type="button" class="settings-category" data-settings-target="settings-generation" aria-controls="settings-generation" aria-current="false" onclick="openSetupSettingsSection('settings-generation')"><i class="fas fa-magic" aria-hidden="true"></i><span><strong>Generation</strong><small>Token budgets &amp; sampling</small></span></button>
+<button type="button" class="settings-category" data-settings-target="settings-strategy" aria-controls="settings-strategy" aria-current="false" onclick="openSetupSettingsSection('settings-strategy')"><i class="fas fa-book-open" aria-hidden="true"></i><span><strong>Script strategy</strong><small>Segmentation &amp; speakers</small></span></button>
+<button type="button" class="settings-category" data-settings-target="settings-prompts" aria-controls="settings-prompts" aria-current="false" onclick="openSetupSettingsSection('settings-prompts')"><i class="fas fa-code" aria-hidden="true"></i><span><strong>Prompt studio</strong><small>Advanced instructions &amp; presets</small></span></button>
+</nav>
+                        <div class="settings-finder">                        <label class="form-label" for="setup-settings-search">Find a setting</label>
+                        <div class="d-flex align-items-center gap-2">
+                            <input type="search" class="form-control" id="setup-settings-search" maxlength="120" placeholder="Try context, memory, language or retries" aria-describedby="setup-settings-search-hint" aria-controls="setup-settings-results" oninput="renderSetupSettingsSearch()" onkeydown="onSetupSettingsSearchKeydown(event)">
+                            <button type="button" class="btn btn-outline-secondary" id="setup-settings-clear" onclick="clearSetupSettingsSearch()" hidden>Clear</button>
+                        </div>
+                        <div class="form-text" id="setup-settings-search-hint">Search labels and help for your current services.</div>
+                        <div id="setup-settings-search-status" class="small mt-2" role="status" aria-live="polite"></div>
+                        <div id="setup-settings-results" class="settings-search-results" hidden></div>
+</div>
+                        <p class="small text-muted mt-3 mb-0">Looking for character voices or line edits? Use Voices or Editor in the main navigation.</p>
+                    </aside>
                     <form id="config-form">
                         <div class="config-save-bar d-flex flex-wrap align-items-center gap-2 mb-3 p-2 border rounded">
                             <button id="config-save-button-top" data-config-save-action type="submit" class="btn btn-primary"><i class="fas fa-save me-2"></i>Save Configuration</button>
+                            <button type="button" id="config-preview-button" data-config-save-action class="btn btn-outline-secondary" onclick="previewSetupChanges()">Preview changes</button>
+                            <span class="small text-muted">Save applies edits across every category.</span>
                             <span id="config-save-status" class="small" role="status" aria-live="polite"></span>
                         </div>
-                        <h5 class="mb-3">LLM Settings (Script Generation)</h5>
+<section id="setup-preview-panel" class="settings-preview border rounded p-3 mb-3" aria-labelledby="setup-preview-title" hidden>
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 id="setup-preview-title" tabindex="-1" class="m-0">Settings change preview</h5>
+        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="closeSetupPreview()">Close preview</button>
+    </div>
+    <p id="setup-preview-status" role="status" aria-live="polite" class="mt-2"></p>
+    <div id="setup-preview-results" hidden>
+        <p id="setup-preview-active"></p>
+        <p id="setup-preview-notice" class="small"></p>
+        <p id="setup-preview-timing" class="small"></p>
+        <p id="setup-preview-unmanaged" class="small"></p>
+        <div id="setup-preview-changes"></div>
+        <details id="setup-preview-default-details" class="mt-3">
+            <summary id="setup-preview-default-summary">Default values</summary>
+            <div id="setup-preview-defaults" class="settings-preview-defaults mt-2"></div>
+        </details>
+    </div>
+</section>
+<section id="settings-llm" class="settings-section" data-settings-section="Connection" aria-labelledby="settings-llm-heading">
+<h5 id="settings-llm-heading" tabindex="-1">Connection</h5>
+<p class="settings-intro">Connect the language model that reads your book and identifies speakers. Each location keeps its own profile.</p>
+
                         <div class="mb-3">
                             <label class="form-label" for="llm-mode">LLM Location <span id="llm-active-mode-badge" class="badge bg-secondary ms-1">Active: Local</span></label>
                             <select class="form-select" id="llm-mode" onchange="onLlmModeChange()">
@@ -980,51 +1220,6 @@
                             </div>
                             <datalist id="llm-model-options"></datalist>
                             <small id="llm-model-hint" class="text-muted"></small>
-                        </div>
-                        <div class="row g-2 mb-3">
-                            <div class="col-md-4">
-                                <label class="form-label" for="llm-request-timeout">Request timeout (seconds)</label>
-                                <input type="number" class="form-control" id="llm-request-timeout" min="0.1" max="3600" step="0.1" placeholder="App default">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label" for="llm-connect-timeout">Connect timeout (seconds)</label>
-                                <input type="number" class="form-control" id="llm-connect-timeout" min="0.1" max="300" step="0.1" placeholder="Request timeout">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label" for="llm-request-interval">Minimum interval (seconds)</label>
-                                <input type="number" class="form-control" id="llm-request-interval" min="0" max="3600" step="0.1" value="0">
-                            </div>
-                        </div>
-                        <div class="row g-2 mb-3">
-                            <div class="col-md-3">
-                                <label class="form-label" for="llm-api-retry-limit">API retries</label>
-                                <input type="number" class="form-control" id="llm-api-retry-limit" min="0" max="10" step="1" placeholder="Stage default">
-                            </div>
-                            <div class="col-md-3">
-                                <label class="form-label" for="llm-on-api-exhaustion">When retries run out</label>
-                                <select class="form-select" id="llm-on-api-exhaustion">
-                                    <option value="fail">Fail the chunk</option>
-                                    <option value="pause">Pause and wait for me</option>
-                                </select>
-                                <div class="form-text">Pause freezes the run in place on a rate limit or outage; Resume retries the same request.</div>
-                            </div>
-                            <div class="col-md-3">
-                                <label class="form-label" for="llm-retry-initial-delay">Initial backoff (s)</label>
-                                <input type="number" class="form-control" id="llm-retry-initial-delay" min="0" max="60" step="0.1" value="1">
-                            </div>
-                            <div class="col-md-3">
-                                <label class="form-label" for="llm-retry-multiplier">Backoff multiplier</label>
-                                <input type="number" class="form-control" id="llm-retry-multiplier" min="1" max="10" step="0.1" value="2">
-                            </div>
-                            <div class="col-md-3">
-                                <label class="form-label" for="llm-retry-max-delay">Maximum backoff (s)</label>
-                                <input type="number" class="form-control" id="llm-retry-max-delay" min="0" max="300" step="0.1" value="30">
-                            </div>
-                            <div class="col-md-3">
-                                <label class="form-label" for="llm-retry-jitter">Backoff jitter (0–1)</label>
-                                <input type="number" class="form-control" id="llm-retry-jitter" min="0" max="1" step="0.05" value="0.2">
-                                <div class="form-text">Randomises each retry delay by ± this fraction so parallel workers don't retry in lockstep.</div>
-                            </div>
                         </div>
                         <details class="mb-3">
                             <summary>Provider request options: transport, GPU sharing, reasoning, headers</summary>
@@ -1074,7 +1269,76 @@
                             <span id="llm-test-result" class="ms-2 small"></span>
                         </div>
 
-                        <h5 class="mb-3 mt-4">TTS Settings (Voice Generation)</h5>
+
+</section>
+<section id="settings-limits" class="settings-section" data-settings-section="Limits &amp; retries" aria-labelledby="settings-limits-heading" hidden>
+<h5 id="settings-limits-heading" tabindex="-1">Limits &amp; retries</h5>
+<p class="settings-intro">Control request size and recovery for the LLM location selected in Connection. Profile ceilings still work together with detected context and task safety limits.</p>
+                        <div class="settings-budget">
+                        </div>
+                        <details class="settings-advanced mb-3">
+                            <summary id="settings-llm-advanced-toggle">Timeouts and retry backoff</summary>
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-4">
+                                <label class="form-label" for="llm-request-timeout">Request timeout (seconds)</label>
+                                <input type="number" class="form-control" id="llm-request-timeout" min="0.1" max="3600" step="0.1" placeholder="App default">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="llm-connect-timeout">Connect timeout (seconds)</label>
+                                <input type="number" class="form-control" id="llm-connect-timeout" min="0.1" max="300" step="0.1" placeholder="Request timeout">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="llm-request-interval">Minimum interval (seconds)</label>
+                                <input type="number" class="form-control" id="llm-request-interval" min="0" max="3600" step="0.1" value="0">
+                            </div>
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-3">
+                                <label class="form-label" for="llm-api-retry-limit">API retries</label>
+                                <input type="number" class="form-control" id="llm-api-retry-limit" min="0" max="10" step="1" placeholder="Stage default">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="llm-on-api-exhaustion">When retries run out</label>
+                                <select class="form-select" id="llm-on-api-exhaustion">
+                                    <option value="fail">Fail the chunk</option>
+                                    <option value="pause">Pause and wait for me</option>
+                                </select>
+                                <div class="form-text">Pause freezes the run in place on a rate limit or outage; Resume retries the same request.</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="llm-retry-initial-delay">Initial backoff (s)</label>
+                                <input type="number" class="form-control" id="llm-retry-initial-delay" min="0" max="60" step="0.1" value="1">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="llm-retry-multiplier">Backoff multiplier</label>
+                                <input type="number" class="form-control" id="llm-retry-multiplier" min="1" max="10" step="0.1" value="2">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="llm-retry-max-delay">Maximum backoff (s)</label>
+                                <input type="number" class="form-control" id="llm-retry-max-delay" min="0" max="300" step="0.1" value="30">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="llm-retry-jitter">Backoff jitter (0–1)</label>
+                                <input type="number" class="form-control" id="llm-retry-jitter" min="0" max="1" step="0.05" value="0.2">
+                                <div class="form-text">Randomises each retry delay by ± this fraction so parallel workers don't retry in lockstep.</div>
+                            </div>
+                        </div>
+                        </details>
+
+</section>
+<section id="settings-tts" class="settings-section" data-settings-section="Speech engine" aria-labelledby="settings-tts-heading" hidden>
+<h5 id="settings-tts-heading" tabindex="-1">Speech engine</h5>
+<details class="mb-3 border rounded p-3">
+    <summary>TTS timing, loaded models and support report</summary>
+    <p class="small text-muted mt-2">Recent operations in this app process, across books. Timings show observed work; unavailable stages are not zero. Nested and worker stage times can overlap. The report excludes text, names, paths, URLs and raw errors.</p>
+    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="refreshTtsDiagnostics()">Refresh report</button>
+    <button type="button" class="btn btn-outline-secondary btn-sm" id="tts-diagnostics-download" onclick="downloadTtsDiagnostics()" disabled>Download support report</button>
+    <p id="tts-diagnostics-status" class="small mt-2" role="status">No timings requested.</p>
+    <div id="tts-diagnostics-records" class="small text-break"></div>
+</details>
+<p class="settings-intro">Choose where voices are generated and the language used for synthesis. Assign individual character voices in Voices.</p>
+<p id="tts-capability-summary" class="small border rounded p-2" role="status">Backend capabilities have not loaded. Existing settings are preserved.</p>
+
                         <div class="row mb-3">
                             <div class="col-md-3">
                                 <label class="form-label" for="tts-mode">TTS Mode</label>
@@ -1122,7 +1386,7 @@
                                     <option value="Russian">Russian</option>
                                     <option value="Spanish">Spanish</option>
                                 </select>
-                                <div class="form-text">Language for audio synthesis only. To generate scripts in another language, edit the prompts under Prompt Settings (Advanced).</div>
+                                <div class="form-text">Language for audio synthesis only. To generate scripts in another language, edit the prompts in Prompt studio.</div>
                             </div>
                             <div class="col-md-2">
                                 <label class="form-label" for="parallel-workers">Parallel Workers</label>
@@ -1135,6 +1399,12 @@
                                 <div class="form-text">Seed for reproducibility</div>
                             </div>
                         </div>
+
+</section>
+<section id="settings-audio" class="settings-section" data-settings-section="Audio &amp; timing" aria-labelledby="settings-audio-heading" hidden>
+<h5 id="settings-audio-heading" tabindex="-1">Audio &amp; timing</h5>
+<p class="settings-intro">Tune rendering, reproducible takes and the pauses used when audio is merged. Voice-design text limits apply to the next persona generation.</p>
+<details class="settings-advanced mb-3"><summary>Advanced local rendering and batching</summary>
                         <div class="row mb-3" id="tts-local-options" style="display:none;">
                             <div class="col-md-2">
                                 <div class="form-check form-switch mt-4">
@@ -1178,37 +1448,104 @@
                                 <div class="form-text">Hard cap on sequences per sub-batch (0 = auto from VRAM estimate)</div>
                             </div>
                         </div>
+</details>
+<details class="settings-advanced mb-3" id="synthesis-window-settings">
+    <summary>Internal render windows (experimental)</summary>
+    <p class="form-text mt-2">Split a long line into smaller synthesis calls and assemble one take. Limits apply to new renders. Saved lines and export pauses retain their structure. Choose explicit limits after checking the backend and listening to the result.</p>
+    <div class="form-check mb-2">
+        <input class="form-check-input" type="checkbox" id="synthesis-windows-enabled" title="Use explicit limits to synthesize smaller windows inside a line. Save Configuration to apply these choices to future renders." disabled>
+        <label class="form-check-label" for="synthesis-windows-enabled">Enable internal render windows</label>
+    </div>
+    <p class="form-text" id="synthesis-window-status" role="status">Load configuration to see supported voice categories.</p>
+    <fieldset id="synthesis-window-options" disabled>
+        <legend class="fs-6">Limits by service and voice category</legend>
+        <p class="form-text">Leave character limits blank to keep that category's existing rendering. A word limit is optional. Ensembles use the smallest enabled limit among the ensemble and its members.</p>
+        <div class="table-responsive"><table class="table table-sm">
+            <thead><tr><th scope="col">Service / voice</th><th scope="col">Maximum characters</th><th scope="col">Maximum words (optional)</th></tr></thead>
+            <tbody id="synthesis-window-budgets"></tbody>
+        </table></div>
+        <h6>Joins within one take</h6>
+        <p class="form-text">Blank gap targets preserve natural silence. Trimming removes only detected quiet edges up to the chosen cap. The first and last edges of a line are kept. Defaults leave fades, trimming and crossfades off.</p>
+        <div class="row g-2">
+            <div class="col-md-4"><label class="form-label" for="synthesis-sentence-gap">Sentence gap target (ms)</label><input class="form-control" type="number" id="synthesis-sentence-gap" title="Optional target silence at sentence joins within one take. Blank preserves natural silence; trimming is limited by the edge trim setting." min="0" max="5000" step="1" placeholder="Preserve natural silence"></div>
+            <div class="col-md-4"><label class="form-label" for="synthesis-clause-gap">Clause gap target (ms)</label><input class="form-control" type="number" id="synthesis-clause-gap" title="Optional target silence at clause joins within one take. Blank preserves natural silence; trimming is limited by the edge trim setting." min="0" max="5000" step="1" placeholder="Preserve natural silence"></div>
+            <div class="col-md-4"><label class="form-label" for="synthesis-paragraph-gap">Paragraph gap target (ms)</label><input class="form-control" type="number" id="synthesis-paragraph-gap" title="Optional target silence at paragraph joins within one take. Blank preserves natural silence; trimming is limited by the edge trim setting." min="0" max="5000" step="1" placeholder="Preserve natural silence"></div>
+            <div class="col-md-3"><label class="form-label" for="synthesis-edge-trim">Maximum quiet edge trim (ms)</label><input class="form-control" type="number" id="synthesis-edge-trim" title="Maximum detected quiet audio removed from each internal boundary edge. Zero preserves the original edges, and the outer line edges are always kept." min="0" max="2000" step="1" value="0"></div>
+            <div class="col-md-3"><label class="form-label" for="synthesis-fade">Boundary fade (ms)</label><input class="form-control" type="number" id="synthesis-fade" title="Short fade at internal sentence, clause and paragraph boundaries. Zero disables fading. Listen to check consonants and endings after changing this value." min="0" max="50" step="1" value="0"></div>
+            <div class="col-md-3"><label class="form-label" for="synthesis-crossfade">Continuation crossfade (ms)</label><input class="form-control" type="number" id="synthesis-crossfade" title="Overlap adjacent continuation windows by up to this duration, bounded by available audio. Zero disables crossfading. Listen to check the resulting join." min="0" max="50" step="1" value="0"></div>
+            <div class="col-md-3"><label class="form-label" for="synthesis-quiet-threshold">Quiet threshold (dBFS, optional)</label><input class="form-control" type="number" id="synthesis-quiet-threshold" title="Optional silence detection threshold from -120 to 0 dBFS. Blank uses the existing threshold. Quiet speech can require a lower value." min="-120" max="0" step="any" placeholder="Use existing threshold"></div>
+        </div>
+    </fieldset>
+    <h6 class="mt-3">Resume interrupted renders (experimental)</h6>
+    <p class="form-text">Keep verified internal windows for retrying an unchanged line. Currently available for local stock voices with a fixed seed on Linux, using the native codec without compilation. Other renders continue normally. Existing takes stay selected until the complete replacement is saved.</p>
+    <div class="form-check mb-2">
+        <input class="form-check-input" type="checkbox" id="synthesis-recovery-enabled" disabled>
+        <label class="form-check-label" for="synthesis-recovery-enabled">Keep verified windows for recovery</label>
+    </div>
+    <label class="form-label" for="synthesis-recovery-budget">Maximum retained recovery audio (MiB)</label>
+    <input class="form-control" type="number" id="synthesis-recovery-budget" min="16" max="4096" step="1" value="256" disabled>
+    <p class="form-text">Off by default. Save Configuration to apply. The limit covers this workspace's recovery audio. Completed replacements release their windows; older interrupted renders may be removed when capacity is reached. Disabling keeps retained windows.</p>
+    <button class="btn btn-sm btn-outline-secondary" type="button" onclick="clearSynthesisRecoveryWindows()">Clear retained recovery windows</button>
+    <p class="form-text">Open Editor first to load the current book. Clearing requires idle tasks and keeps all saved takes. Damaged or unknown cache files are preserved for inspection.</p>
+</details>
+<details class="settings-advanced mb-3" id="speech-verification-settings">
+    <summary>Generated speech checks (experimental)</summary>
+    <div class="form-check mt-2 mb-2">
+        <input class="form-check-input" type="checkbox" id="speech-verification-enabled" disabled>
+        <label class="form-check-label" for="speech-verification-enabled">Check new takes for missing or extra speech</label>
+    </div>
+    <p class="form-text">Off by default. Save Configuration to check subsequent renders against the exact text sent for synthesis. A confirmed material defect rejects the new attempt and keeps the prior take. Review differences and unavailable checks in the Editor.</p>
+    <p class="form-text">Initial coverage: English mono audio with the installed Linux CPU whisper.cpp bundle. Uses cached Small.en and, for suspicious results, a distinct Large-v3 model. Checks can add substantial time and RAM. Short lines also receive a bounded acoustic check. Unsupported inputs or missing resources report unavailable. No models are downloaded automatically; listening review is still needed.</p>
+</details>
                         <div class="row mb-3">
                             <div class="col-md-2">
                                 <label class="form-label" for="pause-between-speakers">Speaker Change Pause (ms)</label>
-                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" step="50">
+                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" max="760000" step="50">
                                 <div class="form-text">Silence between different speakers on merge</div>
                             </div>
                             <div class="col-md-2">
                                 <label class="form-label" for="pause-same-speaker">Same Speaker Pause (ms)</label>
-                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50">
+                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" max="760000" step="50">
                                 <div class="form-text">Silence when same speaker continues on merge</div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="form-check mt-4">
+                                    <input class="form-check-input" type="checkbox" id="reproducible-takes">
+                                    <label class="form-check-label" for="reproducible-takes">Reproducible takes</label>
+                                </div>
+                                <div class="form-text">Regenerating an unchanged line gives the same take; batch renders are not covered</div>
+                            </div>
+                            <div class="col-md-4">
+                                <fieldset>
+                                    <legend class="form-label fs-6 mb-2">Voice Design text length (characters)</legend>
+                                    <div class="input-group">
+                                        <label class="input-group-text" for="design-text-min-chars">Min</label>
+                                        <input type="number" class="form-control" id="design-text-min-chars" value="12" min="1" max="500" step="1">
+                                        <label class="input-group-text" for="design-text-max-chars">Max</label>
+                                        <input type="number" class="form-control" id="design-text-max-chars" value="500" min="1" max="500" step="1">
+                                    </div>
+                                    <div class="form-text">Persona generation designs each voice from one of the character's lines in this range, or the nearest shorter line when none fits. Applies the next time a persona is generated.</div>
+                                </fieldset>
                             </div>
                         </div>
 
-                        <h5 class="mb-3 mt-4">
-                            <a class="text-decoration-none" data-bs-toggle="collapse" href="#promptSettings" role="button" aria-expanded="false">
-                                <i class="fas fa-chevron-right me-2" id="prompt-chevron"></i>Prompt Settings (Advanced)
-                            </a>
-                        </h5>
-                        <div class="small mb-2">
-                            <span id="prompt-defaults-status" role="status" aria-live="polite"></span>
-                            <button type="button" class="btn btn-sm btn-outline-secondary ms-2" id="prompt-defaults-retry" onclick="loadMissingPromptDefaults()" hidden>Retry loading prompts</button>
-                        </div>
-                        <div class="collapse" id="promptSettings">
+
+</section>
+<section id="settings-generation" class="settings-section" data-settings-section="Generation" aria-labelledby="settings-generation-heading" hidden>
+<h5 id="settings-generation-heading" tabindex="-1">Generation</h5>
+<p class="settings-intro">Set shared LLM response allowances and sampling. Profile limits and task safeguards continue to apply.</p>
                             <h6 class="mb-3">Generation Settings</h6>
                             <div class="row mb-3">
                                 <div class="col-md-6">
                                     <label class="form-label" for="max-tokens">Baseline Response Tokens</label>
                                     <input type="number" class="form-control" id="max-tokens" value="4096" min="256">
+                                    <label class="form-label mt-2" for="max-input-tokens">Global input ceiling (tokens)</label>
+                                    <input type="number" class="form-control" id="max-input-tokens" min="1" step="1" placeholder="Use existing context checks">
+                                    <small class="text-muted">Optional input ceiling for LLM requests. Existing configurations keep this blank.</small>
                                     <div class="form-text">Conservative baseline. Verified LM Studio context may raise the effective allowance, up to each task's hard safety ceiling.</div>
                                 </div>
                             </div>
+<details class="settings-advanced mb-3"><summary>Sampling and token restrictions</summary>
                             <h6 class="mb-3">LLM Sampling Parameters</h6>
                             <div class="row mb-3">
                                 <div class="col">
@@ -1242,13 +1579,30 @@
                                 <input type="text" class="form-control" id="banned-tokens" placeholder="Optional: comma-separated tokens">
                                 <div class="form-text">Comma-separated tokens the LLM is forbidden from generating. Do not ban <code>&lt;think&gt;</code> to disable reasoning; use <strong>Reasoning effort</strong> set to <strong>low</strong> in Provider request options instead.</div>
                             </div>
+</details>
                             <div class="mb-3 form-check form-switch">
                                 <input class="form-check-input" type="checkbox" id="merge-narrators">
                                 <label class="form-check-label" for="merge-narrators">Merge consecutive narrator lines</label>
                                 <div class="form-text">During script review, combine adjacent NARRATOR entries that share the same instruct into a single longer entry. Disable for better per-line voice direction control.</div>
                             </div>
-                            <details class="mb-3" open>
-                                <summary class="text-muted small">Script generation: how much of the book the AI reads at once</summary>
+
+                            <div class="mb-3">
+                                <div class="d-flex align-items-center justify-content-between">
+                                    <div class="form-check form-switch mb-0">
+                                        <input class="form-check-input" type="checkbox" id="lmstudio-optimize-toggle" onchange="toggleLmStudioOptimize()">
+                                        <label class="form-check-label" for="lmstudio-optimize-toggle">Optimize LM Studio settings</label>
+                                    </div>
+                                    <span id="lmstudio-status-badge" class="badge bg-secondary">Checking...</span>
+                                </div>
+                                <div class="form-text">Local: reloads with context 8192 / parallel 1 (lower VRAM during batch review). Remote: reloads the remote model with context 98304 / parallel 2 over SSH (needs the SSH host alias above). Off restores LM Studio's defaults.</div>
+                            </div>
+
+</section>
+<section id="settings-strategy" class="settings-section" data-settings-section="Script strategy" aria-labelledby="settings-strategy-heading" hidden>
+<h5 id="settings-strategy-heading" tabindex="-1">Script strategy</h5>
+<p class="settings-intro">Choose segmentation, speaker context and per-pass behavior for script generation. Keep the defaults unless a book needs a different approach.</p>
+                            <div class="settings-strategy">
+                                <p class="form-text">Choose how much of the book the AI reads at once.</p>
                                 <div class="form-text mb-2">Turning a book into a script happens in three steps, for one book or a batch alike: <strong>1</strong> split the text into narration and spoken lines, <strong>2</strong> decide who says each line, <strong>3</strong> write a delivery note for each line. The settings below control how much text the AI sees in all three steps. The defaults are what this project's published accuracy numbers were measured with; change them to trade speed for context.</div>
                                 <div class="row g-2 mt-1">
                                     <div class="col-md-4">
@@ -1305,6 +1659,16 @@
                                         <div class="form-text">Only affects chunks the quote marks don't settle. <strong>Compact labels</strong> sends numbered sentences and asks the model for a label per sentence instead of rewriting the text; if a reply is unusable or fails the fidelity check, that chunk falls back to <strong>Full text</strong> automatically. In testing (#744) it used fewer output tokens and failed fewer chunks on messy formats, but scored a little lower on clean single-quote books. Changing this restarts an unfinished book instead of resuming it.</div>
                                     </div>
                                     <div class="col-md-4">
+                                        <label class="form-label small mb-1" for="tp-delivery-direction">Step 3: delivery notes</label>
+                                        <select class="form-select form-select-sm" id="tp-delivery-direction">
+                                            <option value="off" selected>Current notes (default)</option>
+                                            <option value="gaps">Current notes + timed pauses (experimental)</option>
+                                            <option value="directed">Directed replies + timed pauses (experimental)</option>
+                                            <option value="action_only">Intent only + timed pauses (experimental)</option>
+                                        </select>
+                                        <div class="form-text">The experimental modes ask the model to direct how each line answers the one before it and to mark pauses (a beat, a cut-off, trailing off) that become silence between lines. They are being evaluated in a blind listening test and are off by default. They need the default Step 3 prompt preset. Changing this restarts an unfinished book instead of resuming it.</div>
+                                    </div>
+                                    <div class="col-md-4">
                                         <label class="form-label small mb-1">Fidelity gate controls</label>
                                         <div class="form-check form-switch">
                                             <input class="form-check-input" type="checkbox" id="tp-quoted-must-be-spoken" checked>
@@ -1353,19 +1717,17 @@
                                         <input type="number" class="form-control form-control-sm" id="context-rescue-retries" min="0" max="10" step="1" value="2">
                                     </div>
                                 </div>
-                            </details>
-                            <div class="mb-3">
-                                <div class="d-flex align-items-center justify-content-between">
-                                    <div class="form-check form-switch mb-0">
-                                        <input class="form-check-input" type="checkbox" id="lmstudio-optimize-toggle" onchange="toggleLmStudioOptimize()">
-                                        <label class="form-check-label" for="lmstudio-optimize-toggle">Optimize LM Studio settings</label>
-                                    </div>
-                                    <span id="lmstudio-status-badge" class="badge bg-secondary">Checking...</span>
-                                </div>
-                                <div class="form-text">Local: reloads with context 8192 / parallel 1 (lower VRAM during batch review). Remote: reloads the remote model with context 98304 / parallel 2 over SSH (needs the SSH host alias above). Off restores LM Studio's defaults.</div>
                             </div>
-                            <hr>
-                            <h6 class="mb-3">Prompt Customization</h6>
+</section>
+                        <section id="settings-prompts" class="settings-section" data-settings-section="Prompt studio" aria-labelledby="settings-prompts-heading" hidden>
+                        <h5 id="settings-prompts-heading" tabindex="-1">Prompt studio</h5>
+                        <p class="settings-intro">Advanced: change what the model is asked. Open a prompt family to edit its original fields. Preserve the required template placeholders.</p>
+                        <div class="small mb-2">
+                            <span id="prompt-defaults-status" role="status" aria-live="polite"></span>
+                            <button type="button" class="btn btn-sm btn-outline-secondary ms-2" id="prompt-defaults-retry" onclick="loadMissingPromptDefaults()" hidden>Retry loading prompts</button>
+                        </div>
+                        <div id="promptSettings">
+                            <details class="settings-advanced mb-3"><summary>Attribution and segmentation prompts</summary>
                             <div class="card card-body bg-light mb-3">
                                 <div class="row g-2 align-items-end">
                                     <div class="col-md-6">
@@ -1423,8 +1785,8 @@
                                 <div class="small text-muted">User message (sample window)</div>
                                 <pre class="border rounded p-2 bg-light" id="prompt-preview-user" style="white-space: pre-wrap; font-size: 0.8em; max-height: 30em; overflow: auto;"></pre>
                             </div>
-                            <hr>
-                            <h6 class="mb-3">Review Prompt Customization</h6>
+                            </details>
+                            <details class="settings-advanced mb-3"><summary>Delivery notes and review prompts</summary>
                             <div class="mb-3">
                                 <div class="row g-2 align-items-end mb-2">
                                     <div class="col-md-6">
@@ -1452,8 +1814,8 @@
                                 <textarea class="form-control font-monospace" id="review-user-prompt" rows="4" style="font-size: 0.85em;"></textarea>
                                 <div class="form-text">Template for each review batch. Use <code>{context}</code> for batch context and <code>{batch}</code> for the script entries.</div>
                             </div>
-                            <hr>
-                            <h6 class="mb-3">Persona Prompt Customization</h6>
+                            </details>
+                            <details class="settings-advanced mb-3"><summary>Persona and voice design prompts</summary>
                             <div class="mb-3">
                                 <label class="form-label" for="persona-system-prompt">Persona System Prompt</label>
                                 <textarea class="form-control font-monospace" id="persona-system-prompt" rows="4" style="font-size: 0.85em;"></textarea>
@@ -1477,11 +1839,13 @@
                                 <textarea class="form-control font-monospace" id="persona-advanced-prompt" rows="8" style="font-size: 0.85em;"></textarea>
                                 <div class="form-text">Template for advanced mode final compilation. Use <code>{character_ref}</code> for the accumulated character reference data.</div>
                             </div>
+                            </details>
                             <button type="button" class="btn btn-outline-secondary btn-sm mb-3" data-config-save-action onclick="resetPrompts()">
                                 <i class="fas fa-undo me-1"></i>Reset to Defaults
                             </button>
                         </div>
 
+                        </section>
                         <button id="config-save-button" data-config-save-action type="submit" class="btn btn-primary"><i class="fas fa-save me-2"></i>Save Configuration</button>
                         <div class="small mt-2">
                             <span id="config-refresh-status" role="status" aria-live="polite"></span>
@@ -1492,12 +1856,35 @@
                             <span id="notification-status" class="form-text ms-2" role="status" aria-live="polite">Optional: receive desktop updates when tasks finish.</span>
                         </div>
                     </form>
+                    </div>
                 </div>
             </div>
         </div>
 
         <!-- Script Tab -->
         <div id="script-tab" class="tab-content" style="display:none;">
+            <details class="card mb-3" id="source-scope-panel" ontoggle="onSourceScopePanelToggle()">
+                <summary class="card-header">Keep a later part of this book</summary>
+                <div class="card-body">
+                    <p class="small">Remove a prefix from the current saved script while keeping unaffected voices, audio and take history. Preview the exact changes first. The original source stays on disk.</p>
+                    <label for="source-scope-search" class="form-label">Find the first entry to keep</label>
+                    <div class="input-group mb-2">
+                        <input id="source-scope-search" class="form-control" maxlength="200" placeholder="Chapter heading or exact words">
+                        <button class="btn btn-outline-secondary" id="source-scope-find" type="button" onclick="refreshSourceScope()">Find / refresh</button>
+                        <button class="btn btn-outline-secondary" id="source-scope-next" type="button" onclick="loadNextSourceScopeEntries()" disabled>Next entries</button>
+                    </div>
+                    <select id="source-scope-entry" class="form-select mb-2" aria-label="First saved entry to keep" onchange="invalidateSourceScopePreview()"><option value="">Find an entry first</option></select>
+                    <div class="d-flex gap-2 flex-wrap mb-2">
+                        <button class="btn btn-outline-primary" id="source-scope-preview" type="button" onclick="previewSourceScope()" disabled>Preview scope</button>
+                        <button class="btn btn-primary" id="source-scope-apply" type="button" onclick="applySourceScope()" disabled>Apply reviewed scope</button>
+                        <button class="btn btn-outline-primary" id="source-scope-undo" type="button" onclick="undoSourceScope()" disabled>Undo scope change</button>
+                        <button class="btn btn-outline-danger" id="source-scope-discard" type="button" onclick="discardSourceScopeUndo()" disabled>Discard undo; keep current scope</button>
+                    </div>
+                    <p id="source-scope-feedback" class="small" role="status" aria-live="polite"></p>
+                    <p id="source-scope-undo-status" class="small"></p>
+                    <div id="source-scope-review"></div>
+                </div>
+            </details>
             <div class="card">
                 <div class="card-header d-flex justify-content-between align-items-center">
                     <h4 class="m-0"><span class="step-indicator step-active">2</span>Generate Script</h4>
@@ -1529,6 +1916,46 @@
                             </div>
                             <div class="form-text" id="cast-list-status">One request over the whole book lists everyone who speaks, including people the book never names (<em>THE DETECTIVE</em>, <em>THE OLD WOMAN</em>). Generation then gives them their own lines instead of UNKNOWN.</div>
                             <div id="cast-list-panel" class="mt-2" style="display:none;"></div>
+                            <details id="character-roster-panel" class="border rounded p-3 mt-3">
+                                <summary>Review character identities and source quotes</summary>
+                                <p class="small mt-2">Review recurring names, aliases and ambiguous characters before updating the cast for future script generation. Accepted text, voices and audio stay as they are.</p>
+                                <button type="button" id="roster-load" class="btn btn-sm btn-outline-secondary">Load or reload character review</button>
+                                <button type="button" id="roster-export" class="btn btn-sm btn-outline-secondary" disabled>Export approved roster</button>
+                                <button type="button" id="roster-recover" class="btn btn-sm btn-outline-secondary" hidden>Restore previous unsaved draft</button>
+                                <p id="roster-book" class="small mt-2"></p>
+                                <div id="roster-status" class="small mb-2" role="status" aria-live="polite">Load this book when you are ready.</div>
+                                <fieldset id="roster-fields" disabled>
+                                    <div class="d-flex gap-2 flex-wrap my-2">
+                                        <button type="button" id="roster-seed" class="btn btn-sm btn-outline-secondary">Use current cast as a draft</button>
+                                        <button type="button" id="roster-add" class="btn btn-sm btn-outline-secondary">Add character</button>
+                                        <label class="small">Import an exported roster <input type="file" id="roster-import" accept=".json,application/json" class="form-control form-control-sm"></label>
+                                    </div>
+                                    <div id="roster-import-review" class="my-2"></div>
+                                    <div class="border rounded p-2 mb-2">
+                                        <label class="small" for="roster-survivor">When merging selected characters, keep</label>
+                                        <select id="roster-survivor" class="form-select form-select-sm mb-2"></select>
+                                        <button type="button" id="roster-merge" class="btn btn-sm btn-outline-secondary">Merge selected</button>
+                                        <label class="small ms-2" for="roster-split-name">New character name for a split</label>
+                                        <input id="roster-split-name" class="form-control form-control-sm my-1" maxlength="2048">
+                                        <label class="small"><input type="checkbox" id="roster-split-new"> Give both split characters new identities</label>
+                                        <button type="button" id="roster-split" class="btn btn-sm btn-outline-secondary">Split selected character</button>
+                                        <button type="button" id="roster-retire" class="btn btn-sm btn-outline-danger">Retire selected</button>
+                                    </div>
+                                    <div id="roster-rows"></div>
+                                    <button type="button" id="roster-previous" class="btn btn-sm btn-outline-secondary">Previous characters</button>
+                                    <span id="roster-page" class="small mx-2"></span>
+                                    <button type="button" id="roster-next" class="btn btn-sm btn-outline-secondary">Next characters</button>
+                                    <button type="button" id="roster-preview" class="btn btn-sm btn-outline-info ms-2">Review draft changes</button>
+                                </fieldset>
+                                <div id="roster-review" class="my-3"></div>
+                                <label class="small"><input type="checkbox" id="roster-consent" disabled> I reviewed the character identities and quote locations.</label>
+                                <button type="button" id="roster-approve" class="btn btn-sm btn-primary" disabled>Approve reviewed roster</button>
+                                <div class="border-top mt-3 pt-2">
+                                    <p id="roster-undo-status" class="small"></p>
+                                    <button type="button" id="roster-undo" class="btn btn-sm btn-outline-secondary" disabled>Undo last approval</button>
+                                    <button type="button" id="roster-discard" class="btn btn-sm btn-outline-danger" disabled>Discard saved undo</button>
+                                </div>
+                            </details>
                         </div>
                     </div>
 
@@ -1953,11 +2380,11 @@
             </div>
 
             <!-- Series Cast: reuse character voices across books -->
-            <div class="card mb-3" id="series-cast-card">
-                <div class="card-header d-flex justify-content-between align-items-center">
+            <details class="card mb-3 workflow-disclosure" id="series-cast-card">
+                <summary class="card-header d-flex justify-content-between align-items-center">
                     <h5 class="m-0"><i class="fas fa-users me-2"></i>Series Cast</h5>
                     <span id="cast-status" class="text-muted small" role="status" aria-live="polite" aria-atomic="true"></span>
-                </div>
+                </summary>
                 <div class="card-body">
                     <p class="small text-muted mb-2">Save character voices to a named cast and reuse them across books in a series, so recurring characters sound the same. The <strong>narrator is shared across the whole series</strong> unless a cast saves its own.</p>
                     <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
@@ -1972,7 +2399,7 @@
                     </div>
                     <div id="cast-panel"></div>
                 </div>
-            </div>
+            </details>
 
              <div class="card">
                 <div class="card-header">Voice Parsing Logs</div>
@@ -2076,6 +2503,7 @@
                             <div class="col-md-6">
                                 <label class="form-label" for="prep-audio-file">Select Audio File (WAV/MP3)</label>
                                 <input type="file" class="form-control" id="prep-audio-file" accept=".wav,.mp3">
+                                <div id="prep-channel-picker" class="mt-2"></div>
                             </div>
                         </div>
 
@@ -2365,7 +2793,7 @@
                             <div class="form-check"><input class="form-check-input vl-stage" type="checkbox" id="vl-stage-name" value="name" checked><label class="form-check-label small" for="vl-stage-name"><strong>Name</strong> — descriptive slug + rename adapters</label></div>
                         </div>
                         <div class="col-md-7">
-                            <div class="fw-bold small mb-1">Parameters</div>
+                            <details id="voicelab-tuning" class="workflow-disclosure mb-2"><summary>Training &amp; evaluation tuning</summary><p class="small mt-2">These values apply to the selected stages even when collapsed.</p>
                             <div class="row g-2">
                                 <div class="col-6 col-lg-3">
                                     <label class="form-label small mb-0" for="vl-device">Device</label>
@@ -2391,6 +2819,7 @@
                                     <input type="number" class="form-control form-control-sm" id="vl-candidate-checkpoints" value="2" min="0" max="2">
                                 </div>
                             </div>
+                            </details>
                             <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="vl-name-apply" checked><label class="form-check-label small" for="vl-name-apply">Name stage: actually rename (uncheck for a dry-run preview)</label></div>
                             <div class="form-check"><input class="form-check-input" type="checkbox" id="vl-name-overwrite"><label class="form-check-label small" for="vl-name-overwrite">Re-name adapters that already have a descriptive name</label></div>
                         </div>
@@ -2482,28 +2911,6 @@
                             <input type="number" class="form-control" id="lora-epochs" value="5" min="1">
                         </div>
                         <div class="col-md-2">
-                            <label class="form-label" for="lora-lr">Learning Rate</label>
-                            <input type="text" class="form-control" id="lora-lr" value="1e-6">
-                        </div>
-                        <div class="col-md-2">
-                            <label class="form-label" for="lora-batch-size">Batch Size</label>
-                            <input type="number" class="form-control" id="lora-batch-size" value="1" min="1">
-                        </div>
-                    </div>
-                    <div class="row g-3 mb-3">
-                        <div class="col-md-2">
-                            <label class="form-label" for="lora-rank">LoRA Rank</label>
-                            <input type="number" class="form-control" id="lora-rank" value="32" min="1">
-                        </div>
-                        <div class="col-md-2">
-                            <label class="form-label" for="lora-alpha">LoRA Alpha</label>
-                            <input type="number" class="form-control" id="lora-alpha" value="128" min="1">
-                        </div>
-                        <div class="col-md-2">
-                            <label class="form-label" for="lora-grad-accum">Grad Accum Steps</label>
-                            <input type="number" class="form-control" id="lora-grad-accum" value="8" min="1">
-                        </div>
-                        <div class="col-md-2">
                             <label class="form-label" for="lora-language">Language</label>
                             <select class="form-select" id="lora-language">
                                 <option value="english" selected>English</option>
@@ -2518,7 +2925,34 @@
                                 <option value="russian">Russian</option>
                             </select>
                         </div>
-                        <div class="col-md-6 d-flex align-items-end">
+                    </div>
+                    <details id="training-tuning" class="workflow-disclosure mb-3">
+                        <summary>Training tuning</summary>
+                        <p class="small mt-2">These values still apply when this section is collapsed. Check them before starting a run.</p>
+                        <div class="row g-3">
+                        <div class="col-md-2">
+                            <label class="form-label" for="lora-lr">Learning Rate</label>
+                            <input type="text" class="form-control" id="lora-lr" value="1e-6">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label" for="lora-batch-size">Batch Size</label>
+                            <input type="number" class="form-control" id="lora-batch-size" value="1" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label" for="lora-rank">LoRA Rank</label>
+                            <input type="number" class="form-control" id="lora-rank" value="32" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label" for="lora-alpha">LoRA Alpha</label>
+                            <input type="number" class="form-control" id="lora-alpha" value="128" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label" for="lora-grad-accum">Grad Accum Steps</label>
+                            <input type="number" class="form-control" id="lora-grad-accum" value="8" min="1">
+                        </div>
+                        </div>
+                    </details>
+                    <div class="workflow-actions d-flex align-items-center gap-2 flex-wrap mb-3">
                             <button class="btn btn-success btn-lg" id="btn-lora-train" onclick="startLoraTraining()">
                                 <i class="fas fa-dumbbell me-1"></i>Start Training
                             </button>
@@ -2526,7 +2960,6 @@
                                 <i class="fas fa-stop me-1"></i>Cancel
                             </button>
                             <span id="lora-train-status" class="ms-3 text-muted"></span>
-                        </div>
                     </div>
 
                     <!-- Settings Info Panel -->
@@ -2714,38 +3147,63 @@
         <!-- Editor Tab -->
         <div id="editor-tab" class="tab-content" style="display:none;">
             <div class="card">
-                <div class="card-header d-flex flex-column flex-lg-row justify-content-between align-items-start gap-3">
-                    <h4 class="m-0"><span class="step-indicator step-active">4</span>Audio Editor</h4>
-                    <div class="d-flex flex-wrap gap-2" role="group" aria-label="Audio Editor actions">
-                        <div class="text-center" style="flex:0 1 10rem;">
-                            <button class="btn btn-primary btn-sm w-100" id="btn-play-seq" onclick="playSequence()"><i class="fas fa-play me-1"></i>Play Sequence</button>
-                            <div class="text-muted mt-1" style="font-size:0.7rem;">Preview generated audio</div>
-                        </div>
-                        <div class="text-center" style="flex:0 1 10rem;">
-                            <button class="btn btn-success btn-sm w-100" id="btn-batch-fast" onclick="startRender(false)"><i class="fas fa-bolt me-1"></i>Render Pending</button>
-                            <div class="text-muted mt-1" style="font-size:0.7rem;">Generate audio for all unrendered chunks</div>
-                        </div>
-                        <div class="text-center" style="flex:0 1 10rem;">
-                            <button class="btn btn-outline-success btn-sm w-100" id="btn-regen-all" onclick="startRender(true)"><i class="fas fa-redo me-1"></i>Regenerate All</button>
-                            <div class="text-muted mt-1" style="font-size:0.7rem;">Re-render everything from scratch</div>
-                        </div>
-                        <button class="btn btn-danger btn-sm" id="btn-cancel-render" onclick="cancelRender()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
-                        <div class="text-center" style="flex:0 1 10rem;">
-                            <button class="btn btn-outline-secondary btn-sm w-100" id="btn-drift-check" onclick="runDriftCheck()" title="Score every rendered chunk against its speaker's reference voice and flag the ones that drifted"><i class="fas fa-fingerprint me-1"></i>Check Voices</button>
-                            <div class="form-check form-check-inline mt-1 mb-0 small"><input class="form-check-input" type="checkbox" id="chk-drift-only" onchange="applyDriftFilter()"><label class="form-check-label" for="chk-drift-only">flagged only</label></div>
-                        </div>
-                        <div class="text-center" style="flex:0 1 10rem;">
-                            <button class="btn btn-warning btn-sm w-100" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button>
-                            <div class="text-muted mt-1" style="font-size:0.7rem;">Combine all chunks into final audiobook</div>
+                <div class="card-header editor-toolbar">
+                    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                        <h4 class="m-0"><span class="step-indicator step-active">4</span>Audio Editor</h4>
+                        <div class="d-flex flex-wrap gap-2" role="group" aria-label="Audio Editor actions">
+                            <button class="btn btn-primary btn-sm" id="btn-play-seq" onclick="playSequence()"><i class="fas fa-play me-1"></i>Play Sequence</button>
+                            <button class="btn btn-success btn-sm" id="btn-batch-fast" onclick="startRender(false)"><i class="fas fa-bolt me-1"></i>Render Pending</button>
+                            <button class="btn btn-danger btn-sm" id="btn-cancel-render" onclick="cancelRender()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
+                            <details class="editor-whole-book">
+                                <summary>Whole-book actions</summary>
+                                <div class="d-flex flex-wrap gap-2 mt-2">
+                                    <button class="btn btn-outline-success btn-sm" id="btn-regen-all" onclick="startRender(true)"><i class="fas fa-redo me-1"></i>Regenerate All</button>
+                                    <button class="btn btn-warning btn-sm" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button>
+                                </div>
+                                <p class="small mt-2 mb-0">Regenerate All replaces generated audio. Merge All combines the book after its existing checks.</p>
+                            </details>
                         </div>
                     </div>
                 </div>
                 <div class="card-body">
+                     <details class="mb-3" ontoggle="if (this.open) SoundAssets.refresh()">
+                         <summary>Sound asset library</summary>
+                         <p class="small mt-2">Import effects and ambience to keep for your books. Listen before choosing cues. Adding an asset does not change the book audio.</p>
+                         <label for="sound-assets-file" class="form-label">Audio file</label>
+                         <input id="sound-assets-file" type="file" accept=".wav,.flac,.mp3,.ogg" class="form-control form-control-sm mb-2">
+                         <div class="d-flex flex-wrap gap-2">
+                             <button id="sound-assets-import" type="button" class="btn btn-sm btn-primary" data-help-key="soundAssetsImport" onclick="SoundAssets.importFile()">Import audio</button>
+                             <button id="sound-assets-cancel" type="button" class="btn btn-sm btn-outline-danger" data-help-key="soundAssetsCancel" onclick="SoundAssets.cancel()" hidden>Cancel import</button>
+                             <button type="button" class="btn btn-sm btn-outline-secondary" data-help-key="soundAssetsRefresh" onclick="SoundAssets.refresh()">Refresh library</button>
+                         </div>
+                         <p id="sound-assets-status" class="small mt-2" role="status" aria-live="polite"></p>
+                         <div id="sound-assets-list"></div>
+                     </details>
+                     <details class="mb-3" ontoggle="if (this.open) { SoundCues.refresh(); }">
+                         <summary title="Place effects and ambience at stable dialogue anchors, preserve revisions, and review changed takes.">Sound cues</summary>
+                         <p class="small mt-2">Choose dialogue and imported sounds, then save explicit cue revisions. Mix audition and delivery approval are required before using cues in a finished audiobook.</p>
+                         <button id="sound-cues-refresh" type="button" class="btn btn-sm btn-outline-secondary" title="Reload current dialogue and cue history; this clears unsaved form edits." onclick="SoundCues.refresh()">Refresh cues</button>
+                         <p id="sound-cues-status" class="small mt-2" role="status" aria-live="polite"></p>
+                         <div id="sound-cues-content"></div>
+                     </details>
+                     <details class="mb-3" ontoggle="if (this.open) { SoundRenditions.refresh(); }">
+                         <summary title="Inspect immutable master/stem provenance, keep records and review cleanup protection; recording is separate from mix approval.">Recorded renditions and stems</summary>
+                         <p class="small mt-2">Preserve imported master/stem provenance and earlier source revisions. Choose Record a rendition in Sound cues, or inspect and keep existing records here. Full mixed-audio review and approval remain separate.</p>
+                         <button id="sound-renditions-refresh" type="button" class="btn btn-sm btn-outline-secondary" onclick="SoundRenditions.refresh()" title="Reload this book’s recorded renditions and clear unsaved edits.">Refresh rendition history</button>
+                         <p id="sound-renditions-status" class="small mt-2" role="status" aria-live="polite"></p>
+                         <div id="sound-renditions-content"></div>
+                     </details>
+                     <details class="mb-3" ontoggle="if (this.open) { SoundMixes.refresh(); }">
+                         <summary>Mixed audio review</summary>
+                         <button id="sound-mixes-refresh" type="button" class="btn btn-sm btn-outline-secondary" onclick="SoundMixes.refresh()" title="Reload saved mixes and available delivery formats; clears unsaved review choices.">Refresh saved mixes</button>
+                         <p id="sound-mixes-status" class="small mt-2" role="status" aria-live="polite"></p>
+                         <div id="sound-mixes-content"></div>
+                     </details>
                      <!-- Full Progress Bar -->
                      <div class="progress mb-3" style="height: 25px;">
                          <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
                      </div>
-                     <div class="d-flex align-items-center gap-2 mb-2">
+                     <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
                          <button class="btn btn-outline-secondary btn-sm" id="btn-text-diff" onclick="openTextDiff()" title="Where the script's words differ from the source"><i class="fas fa-code-compare me-1"></i>Text integrity</button>
                          <span id="editor-integrity-badge" class="badge bg-secondary">Source check pending</span>
                          <span id="text-diff-summary" class="small text-muted"></span>
@@ -2753,24 +3211,153 @@
                      </div>
                      <div id="text-diff-panel" class="card mb-3" style="display:none;"></div>
                      <div id="delivery-review-panel" class="alert alert-warning mb-3" style="display:none;"></div>
+                     <details class="editor-review-panel mb-3" id="pronunciation-panel" ontoggle="if (this.open) { loadDateOrder(); }">
+                         <summary title="Edit shared spellings or one exact occurrence, and audition without replacing book audio.">Pronunciation</summary>
+                         <p class="small mt-2">Respell names for speech without changing the script. Shared rules apply to future renders of all books; saving shared rules keeps existing audio.</p>
+                         <div id="date-order-row" class="mb-3" hidden>
+                             <label class="form-label small mb-1" for="date-order-choice">Dates written like 1/2/1900 in this book</label>
+                             <select title="Choose how this book's ambiguous slash dates are read aloud. Auto uses the book's own dates, then its spelling." id="date-order-choice" class="form-select form-select-sm" onchange="saveDateOrder()">
+                                 <option value="auto">Auto</option>
+                                 <option value="mdy">US: month/day/year (1/2/1900 is January 2nd)</option>
+                                 <option value="dmy">UK: day/month/year (1/2/1900 is 1st February)</option>
+                             </select>
+                             <p id="date-order-status" class="small mt-1 mb-0" role="status" aria-live="polite"></p>
+                         </div>
+                         <div class="d-flex flex-wrap gap-2 mb-2"><button title="Load, edit, preview or explicitly save shared rules; audition buttons generate temporary audio." type="button" class="btn btn-outline-secondary btn-sm" onclick="loadPronunciationPanel()">Load shared rules</button><button title="Load, edit, preview or explicitly save shared rules; audition buttons generate temporary audio." type="button" class="btn btn-outline-secondary btn-sm" id="pronunciation-add" onclick="addPronunciationRow()" disabled>Add spelling</button><button title="Load, edit, preview or explicitly save shared rules; audition buttons generate temporary audio." type="button" class="btn btn-outline-primary btn-sm" id="pronunciation-preview" onclick="previewPronunciationPanel()" disabled>Preview counts and line voices</button><button title="Load, edit, preview or explicitly save shared rules; audition buttons generate temporary audio." type="button" class="btn btn-primary btn-sm" id="pronunciation-save" onclick="savePronunciationPanel()" disabled>Save shared rules…</button></div>
+                         <div class="table-responsive"><table class="table table-sm"><thead><tr><th scope="col">Original spelling</th><th scope="col">Spoken replacement</th><th scope="col">Active matches</th><th scope="col">Action</th></tr></thead><tbody id="pronunciation-rows"></tbody></table></div>
+                         <p class="small">Matching is case-sensitive and uses the same word boundaries and longest-name priority as generation. Blank replacements are inactive.</p>
+                         <label class="form-label" for="pronunciation-line">Audition or edit an occurrence in this line</label><select title="Choose a line for its assigned audition voice and exact occurrence rules." id="pronunciation-line" class="form-select mb-2" onchange="onPronunciationLineEdit()"></select>
+                         <div class="row g-2">
+                             <div class="col-md-6"><label class="form-label" for="pronunciation-audition-original">Short original spelling</label><input title="Enter an exact spelling to audition or find in the chosen line." id="pronunciation-audition-original" type="text" maxlength="128" class="form-control" oninput="onPronunciationAuditionEdit(); onOccurrenceQueryEdit()"><button title="Load, edit, preview or explicitly save shared rules; audition buttons generate temporary audio." type="button" class="btn btn-outline-primary btn-sm mt-2" onclick="auditionPronunciation('original')">Generate original audition</button></div>
+                             <div class="col-md-6"><label class="form-label" for="pronunciation-audition-spoken">Short spoken replacement</label><input title="Enter a short literal spelling to audition with the selected assigned line voice." id="pronunciation-audition-spoken" type="text" maxlength="256" class="form-control" oninput="onPronunciationAuditionEdit()"><button title="Load, edit, preview or explicitly save shared rules; audition buttons generate temporary audio." type="button" class="btn btn-outline-primary btn-sm mt-2" onclick="auditionPronunciation('spoken')">Generate replacement audition</button></div>
+                         </div>
+                         <audio title="Play the most recently generated disposable pronunciation audition." id="pronunciation-player" class="w-100 mt-2" controls preload="none" hidden></audio>
+                         <p id="pronunciation-status" class="small mt-2 mb-0" role="status" aria-live="polite">Load shared rules to edit them. Auditions use the TTS engine and may take time.</p>
+                         <hr>
+                         <h6>One occurrence in the chosen line</h6>
+                         <p class="small">Choose an exact match in the text prepared for speech, after cue and symbol cleanup. Preview uses saved shared rules. Only approved rules affect future renders; changed spoken words make that line pending while retaining its audio file. Rules belong to these Editor lines; loading or rebuilding a script creates new lines.</p>
+                         <div class="d-flex flex-wrap gap-2 mb-2">
+                             <button id="pronunciation-occurrence-load" type="button" class="btn btn-outline-secondary btn-sm" title="Read the chosen line’s occurrence rules without generating audio." onclick="loadOccurrencePronunciation()">Load line rules</button>
+                             <button id="pronunciation-occurrence-find" type="button" class="btn btn-outline-secondary btn-sm" title="Find exact matches for the original spelling above in this line’s spoken text." onclick="findPronunciationOccurrences()" disabled>Find original spelling</button>
+                             <button id="pronunciation-occurrence-preview" type="button" class="btn btn-outline-primary btn-sm" title="Preview approved line rules and why each applies or is bypassed; no audio is generated." onclick="previewOccurrencePronunciation()" disabled>Preview line</button>
+                             <button id="pronunciation-occurrence-save" type="button" class="btn btn-primary btn-sm" title="Save these line rules. Wait for active work to finish or cancel it first." onclick="saveOccurrencePronunciation()" disabled>Save line rules</button>
+                         </div>
+                         <div id="pronunciation-occurrence-candidates" class="mb-2"></div>
+                         <div id="pronunciation-occurrence-rules" class="mb-2"></div>
+                         <pre id="pronunciation-occurrence-text" class="small mb-2" style="white-space:pre-wrap;overflow-wrap:anywhere;" hidden></pre>
+                         <p id="pronunciation-occurrence-status" class="small mb-0" role="status" aria-live="polite">Preview shared counts to choose a line, then load its rules. Auditions above remain disposable.</p>
+                     </details>
+
                      <div id="chunk-load-status" class="small mb-2" role="status" aria-live="polite"></div>
 
+                     <details class="editor-review-panel mb-3" id="editor-repair-panel">
+                         <summary title="Choose a chapter and speakers, preview exact lines, then explicitly replace their audio.">Repair audio by chapter and speaker</summary>
+                         <p class="small mt-2">Preview the exact lines before replacing their audio. Dialogue and speaker labels stay unchanged.</p>
+                         <button title="Load options, preview lines or explicitly regenerate only the reviewed audio selection." type="button" class="btn btn-outline-secondary btn-sm" onclick="loadEditorRepairOptions()">Load current chapters and speakers</button>
+                         <div class="row g-2 mt-1">
+                             <div class="col-md-6"><label class="form-label" for="editor-repair-chapter">Chapter</label><select title="Choose the chapter or speakers included in the next repair preview." id="editor-repair-chapter" class="form-select" onchange="resetEditorRepairPreview()"><option value="">Entire book</option></select></div>
+                             <div class="col-md-6"><label class="form-label" for="editor-repair-speakers">Speakers (select one or more)</label><select title="Choose the chapter or speakers included in the next repair preview." id="editor-repair-speakers" class="form-select" multiple size="5" onchange="resetEditorRepairPreview()"></select></div>
+                         </div>
+                         <p id="editor-repair-note" class="small mt-2"></p>
+                         <div class="d-flex flex-wrap gap-2 my-2"><button title="Load options, preview lines or explicitly regenerate only the reviewed audio selection." type="button" class="btn btn-outline-primary btn-sm" onclick="previewEditorRepair()">Preview selected lines</button><button title="Load options, preview lines or explicitly regenerate only the reviewed audio selection." type="button" class="btn btn-outline-danger btn-sm" id="editor-repair-start" onclick="generateEditorRepair()" disabled>Regenerate selection…</button></div>
+                         <p id="editor-repair-status" class="small" role="status" aria-live="polite">Load the current book to choose a selection.</p>
+                         <ol id="editor-repair-lines" class="small ps-4" style="max-height: 20rem; overflow: auto; overflow-wrap: anywhere;"></ol>
+                     </details>
+
+                     <div class="editor-review-layout">
+                       <div class="editor-review-main">
+                         <section class="editor-review-panel mb-3" aria-labelledby="editor-quality-title">
+                             <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                                 <h5 id="editor-quality-title" class="m-0">Quality inbox</h5>
+                                 <button type="button" class="btn btn-outline-secondary btn-sm" onclick="loadChunks(false)">Refresh review</button>
+                             </div>
+                             <p class="small mt-2 mb-2">Saved flags to inspect, not a quality certificate. Opening a finding does not run a check or change the line.</p>
+                             <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                                 <label for="editor-quality-filter">Show</label>
+                                 <select id="editor-quality-filter" class="form-select form-select-sm" style="width:auto;" onchange="renderEditorQualityInbox(true)">
+                                     <option value="all">All findings</option><option value="unknown">Unknown speakers</option><option value="failed">Failed renders</option><option value="missing">Missing audio files</option><option value="drift">Voice drift</option>
+                                     <option value="speech_rejected">Rejected speech attempts</option><option value="speech_review">Speech review needed</option><option value="speech_unavailable">Speech check unavailable</option><option value="speech_difference">Speech content differences</option>
+                                 </select>
+                                 <button class="btn btn-outline-secondary btn-sm" id="btn-drift-check" onclick="runDriftCheck()" title="Run the existing voice check against saved reference voices">Check Voices</button>
+                                 <div class="form-check mb-0"><input class="form-check-input" type="checkbox" id="chk-drift-only" onchange="applyDriftFilter()"><label class="form-check-label" for="chk-drift-only">Show only drift in table</label></div>
+                             </div>
+                             <p id="editor-quality-status" role="status" aria-live="polite" class="small mb-2">Review facts have not been loaded.</p>
+                             <div id="editor-quality-list"></div>
+                             <button type="button" id="editor-quality-more" class="btn btn-outline-secondary btn-sm mt-2" onclick="showMoreEditorFindings()" hidden>Show 50 more</button>
+                         </section>
                      <div class="table-responsive">
                          <table class="table table-bordered table-hover">
                              <thead>
                                  <tr>
-                                     <th width="3%"></th>
-                                     <th width="9%">Speaker</th>
-                                     <th width="40%">Text</th>
-                                     <th width="14%">Delivery</th>
-                                     <th width="7%">Status</th>
-                                     <th width="27%">Audio / Actions</th>
+                                     <th width="8%"></th>
+                                     <th width="12%">Speaker</th>
+                                     <th width="35%">Text</th>
+                                     <th width="17%">Delivery</th>
+                                     <th width="8%">Status</th>
+                                     <th width="20%">Audio / Actions</th>
                                  </tr>
                              </thead>
                              <tbody id="chunks-table-body">
                                  <!-- Rows will be injected here -->
                              </tbody>
                          </table>
+                     </div>
+                       </div>
+                       <aside class="editor-review-panel editor-line-inspector" aria-label="Selected line inspector">
+                           <details class="mb-3">
+                               <summary>Automatic take history</summary>
+                               <p class="small mt-2">Optionally save prior performances before regenerating them. This project setting starts with selected takes and future edits. Earlier detached audio is not reconstructed. Saving stops when history is full; remove an unneeded snapshot or turn this setting off to continue. Snapshots remain available for audition.</p>
+                               <div class="d-flex flex-wrap gap-2 mb-2">
+                                   <button type="button" class="btn btn-outline-secondary btn-sm" id="editor-auto-take-refresh" title="Read the saved automatic-history setting for this project." onclick="loadAutomaticTakePolicy()">Refresh setting</button>
+                                   <button type="button" class="btn btn-outline-primary btn-sm" id="editor-auto-take-on" title="Keep selected prior performances before future regeneration." onclick="changeAutomaticTakePolicy(true)" disabled>Turn on</button>
+                                   <button type="button" class="btn btn-outline-secondary btn-sm" id="editor-auto-take-off" title="Stop new automatic snapshots while retaining existing copies." onclick="changeAutomaticTakePolicy(false)" disabled>Turn off</button>
+                               </div>
+                               <p class="small" id="editor-auto-take-status" role="status" aria-live="polite">Off by default. Refresh to read this project's setting.</p>
+                           </details>
+                           <details id="editor-line-details" open>
+                               <summary><strong>Selected line</strong></summary>
+                               <p id="editor-line-empty" class="small mt-2 mb-0">Choose Inspect on a line, focus one of its fields, or open a finding.</p>
+                               <div id="editor-line-content" hidden>
+                                   <h5 id="editor-line-title" class="mt-3" tabindex="-1"></h5>
+                                   <p id="editor-line-state" class="small" role="status" aria-live="polite"></p>
+                                   <div class="editor-line-actions d-flex flex-wrap gap-2 mb-3">
+                                       <button type="button" class="btn btn-outline-primary btn-sm" id="editor-line-play" onclick="playEditorReviewLine()">Play line</button>
+                                       <button type="button" class="btn btn-outline-success btn-sm" id="editor-line-generate" onclick="generateEditorReviewLine()">Generate line…</button>
+                                   </div>
+                                   <details class="mb-3"><summary title="Save and audition immutable copies, or explicitly check an eligible snapshot for restoration.">Saved take snapshots</summary>
+                                       <p class="small mt-2">Save a good performance explicitly or enable automatic history above. Audition keeps the current selection. Check &amp; restore selects a saved performance only when its original inputs, voice, settings and pronunciation still match; it retains the displaced take. Verification may load the native voice model. Other snapshots remain available for audition.</p>
+                                       <div class="d-flex flex-wrap gap-2 mb-2">
+                                           <button type="button" id="editor-take-save" class="btn btn-outline-primary btn-sm" onclick="saveEditorTakeSnapshot()" title="Save an immutable copy of the selected saved performance, including its recorded metadata.">Save this take</button>
+                                           <button type="button" class="btn btn-outline-secondary btn-sm" onclick="loadEditorTakeSnapshots(false)" title="List the saved snapshots for this stable line in the current book generation.">This line's snapshots</button>
+                                           <button type="button" class="btn btn-outline-secondary btn-sm" onclick="loadEditorTakeSnapshots(true)" title="Browse snapshots across project books and line identities, including deleted and interrupted copies.">All project snapshots</button>
+                                       </div>
+                                       <button type="button" id="editor-take-cancel" class="btn btn-outline-danger btn-sm mb-2" onclick="cancelEditorTakeRestore()" title="Request cancellation of the active audio task and wait for its cleanup before starting another operation." hidden>Cancel audio task</button>
+                                       <p id="editor-take-status" class="small" role="status" aria-live="polite">No snapshots loaded. Up to 16 per line, 4,096 records and 1 GiB per project. Deleted and incomplete copies count until permanently removed.</p>
+                                       <div id="editor-take-list"></div>
+                                       <button type="button" id="editor-take-first" class="btn btn-outline-secondary btn-sm" onclick="loadEditorTakeSnapshots(takeHistoryAll, 0)" title="Return to the first page of this snapshot list without changing selected audio." hidden>First page</button>
+                                       <button type="button" id="editor-take-more" class="btn btn-outline-secondary btn-sm" title="Show the next fifty snapshots in the current archive view." hidden>Next 50</button>
+                                   </details>
+                                   <details class="mb-3"><summary>Word-timed listening (English audio)</summary>
+                                       <p class="small mt-2">Estimated ASR timing mapped to the current spoken-text preparation, including pronunciation rules. Older takes may differ. Untimed words stay plain. Timing does not certify accuracy. Use the existing line controls to edit or regenerate.</p>
+                                       <div class="d-flex flex-wrap gap-2 mb-2"><button type="button" id="editor-word-timing" class="btn btn-outline-primary btn-sm" onclick="createEditorWordTiming()" title="Time only this saved English line with an already installed CPU ASR model.">Time this line</button><button type="button" id="editor-word-cancel" class="btn btn-outline-secondary btn-sm" onclick="cancelEditorWordTiming()" disabled title="Request cancellation and retain the existing audio.">Cancel timing</button></div>
+                                       <p id="editor-word-status" role="status" class="small">No timing requested. No model loads until you choose Time this line.</p>
+                                       <div id="editor-word-spans" class="small editor-line-text"></div>
+                                   </details>
+                                   <dl class="mb-0">
+                                       <dt>Speaker <button type="button" class="btn btn-link btn-sm" onclick="focusEditorReviewField('speaker')">Edit speaker</button></dt><dd id="editor-line-speaker"></dd>
+                                       <dt>Text <button type="button" class="btn btn-link btn-sm" onclick="focusEditorReviewField('text')">Edit text</button></dt><dd id="editor-line-text" class="editor-line-text"></dd>
+                                       <dt>Delivery <button type="button" class="btn btn-link btn-sm" onclick="focusEditorReviewField('instruct')">Edit delivery</button></dt><dd id="editor-line-instruct" class="editor-line-text"></dd>
+                                       <dt>Pause after <button type="button" class="btn btn-link btn-sm" onclick="focusEditorReviewField('pause_after')">Edit pause</button></dt><dd id="editor-line-pause"></dd>
+                                       <dt>Render error</dt><dd id="editor-line-error" class="small editor-line-text"></dd>
+                                       <dt>Audio and voice check</dt><dd id="editor-line-quality" class="small"></dd><dd id="editor-line-drift-detail" class="small"></dd>
+                                       <dt>Speech content check</dt><dd id="editor-line-speech" class="small"></dd><dd id="editor-line-speech-attempt" class="small"></dd>
+                                       <dd><div class="d-flex flex-wrap gap-2"><button type="button" id="editor-line-speech-recheck" class="btn btn-outline-primary btn-sm" onclick="recheckEditorSpeech()" title="Recheck this saved take using its recorded synthesis input and cached CPU models. Existing audio is retained.">Recheck speech</button><button type="button" id="editor-line-speech-cancel" class="btn btn-outline-secondary btn-sm" onclick="cancelEditorSpeechVerification()" title="Request cancellation of the active speech recheck and keep saved audio." disabled>Cancel recheck</button></div><p id="editor-line-speech-status" class="small mt-2" role="status">Rechecking requires a take with recorded synthesis input. To check older takes, enable speech checks and regenerate the line.</p></dd>
+                                       <dd><details><summary>Speech input and saved evidence</summary><p id="editor-line-speech-expected" class="small editor-line-text"></p><pre id="editor-line-speech-evidence" class="small editor-line-text"></pre></details></dd>
+                                       <dt>Source entries</dt><dd id="editor-line-source" class="small"></dd>
+                                   </dl>
+                               </div>
+                           </details>
+                       </aside>
                      </div>
                 </div>
             </div>
@@ -2801,14 +3388,58 @@
                             <i class="fas fa-file-archive me-2"></i>Download All (zip)
                         </a>
                         <div class="w-100 mt-3">
+                            <details id="export-quality-options" class="workflow-disclosure mt-3 text-start">
+                                <summary>Export integrity checks</summary>
+                                <p class="small mt-2">Finished MP3, M4B and chapter audio is checked before publication. Long silence is advisory by default; authored pauses are excluded. These settings apply to the next export. Audacity checks archive structure and track frames.</p>
+                                <div class="row g-2"><div class="col-sm-6"><label class="form-label" for="export-quality-noise">Silence threshold (dBFS)</label><input id="export-quality-noise" type="number" class="form-control" value="-50" min="-90" max="-20" step="1" oninput="resetExportQualityView()"></div><div class="col-sm-6"><label class="form-label" for="export-quality-gap">Maximum unexpected gap (seconds)</label><input id="export-quality-gap" type="number" class="form-control" value="5" min="0.1" max="3600" step="0.1" oninput="resetExportQualityView()"></div></div>
+                                <label class="form-check mt-2"><input id="export-quality-reject" type="checkbox" class="form-check-input" onchange="resetExportQualityView()"><span class="form-check-label">Reject exports with unexpected long silence</span></label>
+                                <button type="button" class="btn btn-outline-secondary btn-sm mt-2" onclick="loadExportQualityReports()">Show checks for this book</button>
+                                <p id="export-quality-status" role="status" aria-live="polite" class="small mt-2">Completed checks and rejected attempts are retained separately for this app session.</p>
+                                <div id="export-quality-reports" class="small"></div>
+                            </details>
+                            <details id="export-mastering-options" class="workflow-disclosure mt-3 text-start">
+                                <summary title="Optional processing applied to assembled exports, with measured output results">Optional export mastering</summary>
+                                <p class="small mt-2">Applies to the next merged MP3, MP3/WAV chapters or M4B. Source clips and Audacity tracks stay unchanged. Analysis and encoding use CPU and extra disk/time. These targets do not certify distribution compliance.</p>
+                                <label class="form-check"><input type="checkbox" id="export-mastering-enabled" class="form-check-input" onchange="resetExportMasteringView()"><span class="form-check-label">Enable mastering for the next export</span></label>
+                                <div class="row g-2 mt-1"><div class="col-sm-6"><label class="form-label" for="export-mastering-loudness">Integrated loudness (LUFS)</label><input id="export-mastering-loudness" type="number" class="form-control" value="-18" min="-24" max="-14" step="0.5" oninput="resetExportMasteringView()"></div><div class="col-sm-6"><label class="form-label" for="export-mastering-peak">True-peak ceiling (dBTP)</label><input id="export-mastering-peak" type="number" class="form-control" value="-2" min="-9" max="-1" step="0.5" oninput="resetExportMasteringView()"></div></div>
+                                <button type="button" class="btn btn-outline-secondary btn-sm mt-2" onclick="loadExportMasteringReports()" title="Verify output file identity and show measured results for this book">Show verified export measurements</button>
+                                <p id="export-mastering-status" role="status" aria-live="polite" class="small mt-2">Off by default. Export explicitly, then check the measured results.</p>
+                                <div id="export-mastering-reports" class="small"></div>
+                            </details>
                             <a class="text-decoration-none" data-bs-toggle="collapse" href="#m4b-options" role="button" aria-expanded="false">
                                 <i class="fas fa-book-reader me-1"></i>M4B Export Options <i class="fas fa-chevron-down fa-xs ms-1"></i>
                             </a>
                             <div class="collapse mt-2" id="m4b-options">
                                 <div class="border rounded p-3" style="background: var(--bg-card-header);">
+                                    <details class="mb-3" id="m4b-publication-panel">
+                                        <summary>Source metadata and cover suggestions</summary>
+                                        <p class="small text-muted mt-2">Review captured EPUB information before applying it. Entered or intentionally cleared fields are kept. Uploaded covers have priority.</p>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm mb-2" id="m4b-publication-review" onclick="previewM4bPublication()">Review source suggestions</button>
+                                        <label class="form-label small" for="m4b-publication-origin">Captured origin</label>
+                                        <select class="form-select form-select-sm mb-2" id="m4b-publication-origin" disabled></select>
+                                        <div id="m4b-publication-info" class="overflow-auto text-break" style="max-height:12rem"></div>
+                                        <img id="m4b-publication-image" alt="Captured source cover preview" class="img-thumbnail mb-2" style="max-height:160px" hidden>
+                                        <div class="row g-2 mb-2">
+                                            <div class="col-md-6"><label class="form-label small" for="m4b-publication-title-choice">Suggested title</label><select class="form-select form-select-sm" id="m4b-publication-title-choice" disabled></select></div>
+                                            <div class="col-md-6"><label class="form-label small" for="m4b-publication-author-choice">Suggested author</label><select class="form-select form-select-sm" id="m4b-publication-author-choice" disabled></select></div>
+                                        </div>
+                                        <label class="form-check small"><input class="form-check-input" type="checkbox" id="m4b-publication-cover-choice" disabled>Use this source cover for export</label>
+                                        <label class="form-check small"><input class="form-check-input" type="checkbox" id="m4b-publication-reviewed" disabled>I reviewed the source origin and any stale or ambiguous details</label>
+                                        <div class="small text-warning" id="m4b-publication-review-required" hidden>Explicit review is required for these choices.</div>
+                                        <div class="d-flex flex-wrap gap-2 mt-2">
+                                            <button type="button" class="btn btn-outline-primary btn-sm" id="m4b-publication-apply" onclick="applyM4bPublication()" disabled>Apply choices</button>
+                                            <button type="button" class="btn btn-outline-secondary btn-sm" id="m4b-publication-clear" onclick="clearM4bAppliedSuggestions()" disabled>Clear applied suggestions</button>
+                                            <button type="button" class="btn btn-outline-secondary btn-sm" id="m4b-publication-clear-cover" onclick="clearM4bSourceCover()" disabled>Clear source-cover choice</button>
+                                        </div>
+                                        <div class="small mt-2" id="m4b-publication-cover-status">No source cover selected.</div>
+                                        <div class="small mt-2" id="m4b-publication-feedback" role="status" aria-live="polite"></div>
+                                    </details>
                                     <div class="row g-2">
                                         <div class="col-md-6">
-                                            <label class="form-label small mb-1" for="m4b-title">Title</label>
+                                            <div class="d-flex justify-content-between align-items-center">
+                                                <label class="form-label small mb-1" for="m4b-title">Title</label>
+                                                <button type="button" class="btn btn-link btn-sm py-0" id="m4b-title-clear" onclick="clearM4bTitle()">Leave empty</button>
+                                            </div>
                                             <input type="text" class="form-control form-control-sm" id="m4b-title" placeholder="Book title">
                                         </div>
                                         <div class="col-md-6">
@@ -3036,6 +3667,7 @@
                 <div class="modal-body fs-6">
                     <div class="small text-muted mb-2" id="clone-import-filename"></div>
                     <fieldset id="clone-import-fields" aria-label="Reference clip details">
+                    <div id="clone-channel-picker" class="mb-2"></div>
                     <label class="form-label mb-1" for="clone-import-ref-text">Exact transcript of the clip <span class="text-danger">*</span></label>
                     <textarea class="form-control form-control-sm mb-2" id="clone-import-ref-text" rows="2" placeholder="Word for word, including punctuation."></textarea>
                     <label class="form-label mb-1" for="clone-import-source-title">Source title</label>
@@ -3121,13 +3753,38 @@
     <script src="/static/vendor/bootstrap-5.3.0/bootstrap.bundle.min.js" integrity="sha384-ONWp+8Lk6Ptrwq4R/Ntd1LG+8lzGbwWO2UUjJ/yiGNLXZqzu/v1pP7ZQj47+ae8S" crossorigin="anonymous"></script>
     <script src="/static/vendor/marked-12.0.2/marked.umd.min.js" integrity="sha384-dtN1dfjaRWzuK+5SU9280jRAmCKbalJTmz/Zu9zpdLNKf4I06Zkfd6mni3BT4vYC" crossorigin="anonymous"></script>
     <script src="/static/vendor/dompurify-3.4.16/purify.min.js" integrity="sha384-a/Pq38xPj+MNDC/q6/2UZz/s1EDeRyzrih4ysqlpUMh7hELW35bKynyicZxfyRcJ" crossorigin="anonymous"></script>
+    <button id="task-guide-return" type="button" class="btn btn-secondary shadow" onclick="returnToTaskGuide()" title="Return to the same guide step without changing your selected book" hidden>Return to guide</button>
     <script src="/static/js/app-core.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-scripts.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-project-scope.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-speaker-review.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-character-roster.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-editor-repair.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-editor-review.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-word-timing.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-take-history.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-pronunciation.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-training.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-tts-capabilities.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-synthesis-windows.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-speech-verification.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-guides.js?v=__APP_BUILD__"></script>
+<script src="/static/js/app-audio-channels.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-workbench.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-voicelab.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-workspace.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-sound-assets.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-sound-cues.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-sound-renditions.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-publication-validation.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-sound-mix-cover.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-sound-mixes.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-mastering.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-export-quality.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-publication.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-reports.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-help.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-settings.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-tts-diagnostics.js?v=__APP_BUILD__"></script>
 </body>
 </html>
