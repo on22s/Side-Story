@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from tests.export_staging_assertions import delivery_names
 from unittest.mock import patch
 
 from pydub.generators import Sine
@@ -56,7 +57,7 @@ class ExportQualityEncoderBoundaryTests(unittest.TestCase):
                         self.assertIsNone(result)
                     else:
                         self.assertEqual(reports[0]['sha256'], result['sha256'])
-                    self.assertEqual([path.name], [item.name for item in Path(tmp).iterdir()])
+                    self.assertEqual([path.name], sorted(delivery_names(self, Path(tmp))))
 
     def test_spooled_pcm_encoding_uses_same_output_clock_and_receipt(self):
         for mastering in (None, {}):
@@ -167,7 +168,7 @@ class ExportQualityEncoderBoundaryTests(unittest.TestCase):
                             quality_plan=self.plan(source, 'wav'), quality_callback=receive)
                 self.assertEqual(1, len(stages))
                 self.assertEqual(b'previous verified delivery', path.read_bytes())
-                self.assertEqual([path.name], [item.name for item in Path(tmp).iterdir()])
+                self.assertEqual([path.name], sorted(delivery_names(self, Path(tmp))))
 
     def test_ordinary_chunk_exports_do_not_add_a_finished_export_scan(self):
         with tempfile.TemporaryDirectory() as tmp:

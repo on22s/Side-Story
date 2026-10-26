@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from tests.export_staging_assertions import delivery_names
 from unittest.mock import patch
 
 import numpy as np
@@ -89,7 +90,7 @@ class MasteringMeasurementRangeTests(unittest.TestCase):
                     report = export_audio_segment(source, path, fmt, lambda: False, mastering={})
                     self.assert_positive_media(path, report, seconds, channels)
                     self.assertEqual(before, source.raw_data)
-                    self.assertEqual([path.name], [item.name for item in Path(tmp).iterdir()])
+                    self.assertEqual([path.name], sorted(delivery_names(self, Path(tmp))))
 
     def test_real_positive_m4b_preserves_source_chapters_and_previous_file_on_late_cancel(self):
         for seconds in (2, 5):
@@ -144,4 +145,4 @@ class MasteringMeasurementRangeTests(unittest.TestCase):
                         export_audio_segment(source, path, 'mp3', lambda: cancelled, mastering={})
                 report_call.assert_called_once()
                 self.assertEqual(b'previous synthetic output', path.read_bytes())
-                self.assertEqual([path.name], [item.name for item in Path(tmp).iterdir()])
+                self.assertEqual([path.name], sorted(delivery_names(self, Path(tmp))))

@@ -2703,9 +2703,11 @@ class ProjectManager:
                 ensure_audio_export_active(cancel_check)
                 backup_dir = os.path.join(staging_dir, "old")
                 os.mkdir(backup_dir)
-                names = sorted(name for name in os.listdir(staging_dir)
-                               if name not in ("old", "manifest.json",
-                                               MARKER, OWNER_LOCK + ".lock"))
+                # Publish only admitted outputs. Nested encoder registries and
+                # other staging metadata are not chapter deliverables.
+                names = sorted(os.path.basename(path) for path in outputs
+                               if os.path.dirname(path) == staging_dir
+                               and path != manifest_path)
                 touched = []
 
                 def publish(name):

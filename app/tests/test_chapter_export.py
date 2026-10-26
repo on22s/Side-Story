@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import numpy as np
 from tests.export_quality_assertions import stable_chapter_evidence
+from tests.export_staging_assertions import delivery_names
 import soundfile as sf
 from fastapi import HTTPException
 
@@ -179,19 +180,19 @@ class ExportChaptersTests(unittest.TestCase):
                 with patch.object(pm, 'load_chunks', return_value=chunks):
                     if existing:
                         self.assertTrue(pm.export_chapters(fmt='wav')[0])
-                    before = {path.name: path.read_bytes() for path in out.iterdir()} if existing else {}
+                    before = {name: (out / name).read_bytes() for name in delivery_names(self, out)} if existing else {}
                     _tone(str(Path(tmp, 'voicelines', 'c0.wav')), 0.9, hz=700)
                     replace = os.replace
-                    def cancel_after_first_publication(src, dst):
+                    def cancel_after_first_publication(src, dst, **kwargs):
                         nonlocal cancelled
-                        result = replace(src, dst)
+                        result = replace(src, dst, **kwargs)
                         if Path(dst).parent == out and Path(dst).suffix == '.wav':
                             cancelled = True
                         return result
                     with patch('project.os.replace', side_effect=cancel_after_first_publication):
                         result = pm.export_chapters(fmt='wav', cancel_check=lambda: cancelled)
                     self.assertEqual((False, 'Export cancelled'), result)
-                    self.assertEqual(set(before), {path.name for path in out.iterdir()})
+                    self.assertEqual(set(before), delivery_names(self, out))
                     for name, contents in before.items():
                         self.assertTrue(contents == (out / name).read_bytes(), name)
 
@@ -205,16 +206,17 @@ class ExportChaptersTests(unittest.TestCase):
                 old_manifest = (out / 'manifest.json').read_bytes()
                 _tone(str(Path(tmp, 'voicelines', 'c0.wav')), 0.9, hz=700)
                 replace = os.replace
-                def refuse_publish_and_restore(src, dst):
+                def refuse_publish_and_restore(src, dst, **kwargs):
                     target = Path(dst)
                     if target.parent == out and (target.name == '02 - Chapter 2.wav'
                             or Path(src).parent.name == 'old'):
                         raise OSError('synthetic publish/restore failure')
-                    return replace(src, dst)
+                    return replace(src, dst, **kwargs)
                 with patch('project.os.replace', side_effect=refuse_publish_and_restore):
                     with self.assertRaisesRegex(RuntimeError, 'recovery files kept at') as error:
                         pm.export_chapters(fmt='wav')
-                staging = list(out.glob('.chapter-export-*'))
+                staging = (list(out.glob('.chapter-export-*'))
+                           + list(out.glob('.aa2-export-retirement/*/stage')))
                 self.assertEqual(1, len(staging))
                 self.assertIn(str(staging[0]), str(error.exception))
                 self.assertTrue(old == (staging[0] / 'old' / '01 - Chapter 1.wav').read_bytes())
@@ -237,21 +239,21 @@ class ExportChaptersTests(unittest.TestCase):
                         if boundary == 'encode' and Path(path).name == names[1]:
                             raise OSError('synthetic encode failure')
                         return _export_audio_segment(segment, path, fmt, **kwargs)
-                    def fail_publish(src, dst):
+                    def fail_publish(src, dst, **kwargs):
                         target = Path(dst)
                         if target.parent == out and ((boundary == 'publish' and target.name == names[1])
                                 or (boundary == 'manifest' and target.name == 'manifest.json')):
                             # Only reject publication, allowing restoration of old files.
                             if Path(src).parent.name != 'old':
                                 raise OSError('synthetic publication failure')
-                        return replace(src, dst)
+                        return replace(src, dst, **kwargs)
                     with patch('project._export_audio_segment', side_effect=fail_encode), \
                             patch('project.os.replace', side_effect=fail_publish):
                         with self.assertRaises(OSError):
                             pm.export_chapters(fmt='wav')
                     for name, contents in before.items():
                         self.assertTrue(contents == (out / name).read_bytes(), name)
-                    self.assertEqual([], list(out.glob('.chapter-export-*')))
+                    self.assertEqual(set(before), delivery_names(self, out))
                     self.assertTrue(pm.export_chapters(fmt='wav')[0])
                     self.assertNotEqual(before[names[0]], (out / names[0]).read_bytes())
                     self.assertEqual(2, len(json.loads((out / 'manifest.json').read_text())['chapters']))
@@ -339,7 +341,7 @@ class ExportChaptersTests(unittest.TestCase):
                 self.assertTrue(ok, msg); self.assertIn("2 chapter file(s) written", msg)
                 out = os.path.join(tmp, CHAPTER_EXPORT_DIR)
                 self.assertEqual(sorted(["Test Book 01 Chapter 1.wav", "Test Book 02 Chapter 2.wav", "manifest.json"]),
-                                 sorted(os.listdir(out)))
+                                 sorted(delivery_names(self, out)))
                 info = sf.info(os.path.join(out, "Test Book 02 Chapter 2.wav"))
                 self.assertGreater(info.frames / info.samplerate, 1.0)   # 0.7 s + 0.8 s of audio + a pause
                 with open(os.path.join(out, "manifest.json")) as handle:
@@ -372,7 +374,7 @@ class ExportChaptersTests(unittest.TestCase):
             with patch.object(pm, "load_chunks", return_value=chunks):
                 ok, msg = pm.export_chapters(fmt="wav", chapters=[1])
                 self.assertTrue(ok); self.assertIn("1 chapter file(s) written", msg)
-                self.assertEqual(["02 - Chapter 2.wav", "manifest.json"], sorted(os.listdir(os.path.join(tmp, CHAPTER_EXPORT_DIR))))
+                self.assertEqual(["02 - Chapter 2.wav", "manifest.json"], sorted(delivery_names(self, Path(tmp, CHAPTER_EXPORT_DIR))))
                 ok, msg = pm.export_chapters(fmt="wav", cancel_check=lambda: True)
                 self.assertEqual((False, "Export cancelled"), (ok, msg))
 

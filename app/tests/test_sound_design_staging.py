@@ -13,6 +13,16 @@ class SoundRenderStagingTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
 
+    def test_registry_contention_remains_a_retryable_timeout(self):
+        from export_staging_retirement import DIRECTORY, PosixRetirement
+        directory = self.root / staging.DIRECTORY
+        directory.mkdir()
+        (directory / DIRECTORY).mkdir(mode=0o700)
+        with patch.object(PosixRetirement, '__enter__',
+                          side_effect=TimeoutError('registry is busy')):
+            with self.assertRaisesRegex(TimeoutError, 'registry is busy'):
+                staging.get_sound_render_usage(directory, self.root)
+
     def test_retained_candidates_reduce_next_allowance_and_are_not_deleted(self):
         with staging.ensure_sound_render_stage(self.root, max_bytes=20) as (first, available):
             self.assertEqual(20, available)

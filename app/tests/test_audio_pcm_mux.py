@@ -1,5 +1,6 @@
 """Bounded parent admission, native mastering and publication failure controls."""
 from pathlib import Path
+from tests.export_staging_assertions import delivery_names
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -54,7 +55,7 @@ class BoundedPCMExportTests(unittest.TestCase):
                         self.assertIn(report['mode'],('linear','dynamic'))
                         self.assertEqual({'loudness':-18,'true_peak':-2},report['settings'])
                     self.assertEqual(audio.raw_data,raw.read_bytes())
-                    self.assertEqual({'input.pcm','output.'+fmt},{p.name for p in root.iterdir()})
+                    self.assertEqual({'input.pcm','output.'+fmt},delivery_names(self, root))
 
     def test_late_pcm_edit_and_runtime_change_refuse_before_output_replace(self):
         from audio_encoder_identity import get_ffmpeg_runtime_identity, FFmpegRuntimeIdentity
@@ -77,7 +78,7 @@ class BoundedPCMExportTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'changed'):
                         export_bounded_pcm(raw,output,geometry,None,quality_plan=plan,max_output_bytes=1024**2)
                 self.assertEqual(b'prior complete delivery',output.read_bytes())
-                self.assertEqual({'input.pcm','output.mp3'},{p.name for p in root.iterdir()})
+                self.assertEqual({'input.pcm','output.mp3'},delivery_names(self, root))
 
     def test_mastered_resampling_and_silent_native_sample_drop_use_full_parent_gate(self):
         import subprocess
@@ -109,4 +110,4 @@ class BoundedPCMExportTests(unittest.TestCase):
                 with self.assertRaises(ExportQualityError) as failure:encode()
             self.assertEqual('failed',failure.exception.report['status'])
             self.assertEqual(prior,output.read_bytes())
-            self.assertEqual({'input.pcm','output.mp3'},{p.name for p in root.iterdir()})
+            self.assertEqual({'input.pcm','output.mp3'},delivery_names(self, root))

@@ -24,6 +24,7 @@ class NativeWindowsCiTests(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/tests.yml').read_text().split('  windows-owner:', 1)[1]
         self.assertIn('runs-on: windows-latest', workflow)
         self.assertIn('run: python tests/native_windows_owner_checks.py', workflow)
+        self.assertIn('run: python -m unittest tests.test_export_staging -v', workflow)
         self.assertIn('PYTHONPATH: .', workflow)
         self.assertFalse((SCRIPT.parent / 'test_windows_owner_native.py').exists())
 

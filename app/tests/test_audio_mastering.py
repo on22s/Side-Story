@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from tests.export_staging_assertions import delivery_names
 from unittest.mock import patch
 
 from pydub import AudioSegment
@@ -29,7 +30,7 @@ class AudioMasteringTests(unittest.TestCase):
                 self.assertLess(report['after']['true_peak_dbtp'],-1)
                 with output.open('rb') as stream:decoded=AudioSegment.from_file(stream,format=fmt)
                 self.assertEqual(24000,decoded.frame_rate);self.assertEqual(channels,decoded.channels)
-                self.assertEqual(['out.'+fmt],sorted(p.name for p in Path(tmp).iterdir()))
+                self.assertEqual(['out.'+fmt],sorted(delivery_names(self, Path(tmp))))
                 # Separate FFmpeg meter confirms the report describes the encoded file.
                 measured=subprocess.run(['ffmpeg','-hide_banner','-nostats','-i',str(output),'-af','ebur128=peak=true','-f','null','-'],capture_output=True,text=True,check=True).stderr
                 import re
@@ -46,7 +47,7 @@ class AudioMasteringTests(unittest.TestCase):
             with self.assertRaises(ExportCancelled):
                 export_audio_segment(Sine(440).to_audio_segment(duration=4000),output,'wav',lambda:True,mastering={})
             self.assertEqual(b'previous verified output',output.read_bytes())
-            self.assertEqual(['out.wav'],[p.name for p in Path(tmp).iterdir()])
+            self.assertEqual(['out.wav'],sorted(delivery_names(self, Path(tmp))))
 
     def test_rejects_bad_measurements_and_unbounded_targets(self):
         for value in [float('nan'),float('inf'),-100,0]:
@@ -62,13 +63,13 @@ class AudioMasteringTests(unittest.TestCase):
             pm=ProjectManager(tmp);pm.save_chunks([{'id':0,'uid':'a','speaker':'Hero','text':'Hello.','status':'done','audio_path':'tone.wav'}])
             reports=[]
             ok,msg=pm.export_chapters(fmt='wav',mastering={},mastering_callback=reports.append);self.assertTrue(ok,msg);self.assertEqual(1,len(reports))
-            directory=root/CHAPTER_EXPORT_DIR;before={p.name:p.read_bytes() for p in directory.iterdir()}
+            directory=root/CHAPTER_EXPORT_DIR;before={name:(directory/name).read_bytes() for name in delivery_names(self,directory)}
             self.assertEqual([],pm.preview_chapter_filenames(fmt='wav',changed_only=True,mastering={}))
             self.assertEqual(1,len(pm.preview_chapter_filenames(fmt='wav',changed_only=True)))
             self.assertEqual(1,len(pm.preview_chapter_filenames(fmt='wav',changed_only=True,mastering={'loudness':-20})))
             with patch.object(mastering,'export_mastered_pcm',side_effect=RuntimeError('synthetic mastering failure')):
                 with self.assertRaises(RuntimeError):pm.export_chapters(fmt='wav',mastering={'loudness':-20})
-            self.assertEqual(before,{p.name:p.read_bytes() for p in directory.iterdir()})
+            self.assertEqual(before,{name:(directory/name).read_bytes() for name in delivery_names(self,directory)})
 
     def test_m4b_preserves_chapters_and_metadata_with_final_encoded_measurements(self):
         with tempfile.TemporaryDirectory() as tmp:

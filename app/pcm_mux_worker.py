@@ -7,7 +7,6 @@ independent full-output admission; worker success alone is not publication.
 """
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import threading
@@ -21,20 +20,18 @@ from pcm_mux_profile import require_pcm_mux_runtime
 from pcm_mux_worker_request import get_pcm_mux_worker_request, MAX_REQUEST_BYTES
 from pcm_worker_contract import MAX_PCM_BYTES, get_pcm_worker_error_context
 from project_scope_files import capture_scope_file
+from export_staging import get_encoder_staging_source_root
 
 
 def run_pcm_mux_worker(directory):
     directory = Path(directory).absolute()
-    if (directory.resolve() != directory or not directory.is_dir()
-            or re.fullmatch(r'\.pcm-encode-[A-Za-z0-9_-]+', directory.name) is None):
-        raise ValueError('PCM worker requires its private canonical directory')
+    source_root = get_encoder_staging_source_root(directory)
     request_facts, raw = capture_scope_file(directory, 'request.json',
         limit=MAX_REQUEST_BYTES, include_bytes=True)
     if not request_facts['exists']:
         raise ValueError('PCM worker request is missing')
     request = get_pcm_mux_worker_request(raw)
     executable = require_ffmpeg_binary_identity(request.encoder.binary)
-    source_root = directory.parent
     raw_facts, _ = capture_scope_file(source_root, request.raw_name, limit=MAX_PCM_BYTES)
     if (not raw_facts['exists'] or raw_facts['file_version'] != request.raw.version
             or raw_facts['sha256'] != request.raw.sha256):

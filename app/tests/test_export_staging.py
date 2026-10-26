@@ -8,6 +8,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+
+import export_staging
 
 from export_staging import (ExportStaging, create_export_staging, reclaim_export_staging,
                             MARKER, OWNER_LOCK, PREFIXES)
@@ -33,6 +36,1280 @@ else:
 
 
 class ExportStagingTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_other_reaper_completes_discovered_slot_without_phantom_error(self):
+        from export_staging_retirement import PosixRetirement, reclaim_retired_slots
+        with tempfile.TemporaryDirectory() as root:
+            stage = create_export_staging(root, 'mp3')
+            (stage.path / 'payload').write_bytes(b'abandoned owned output')
+            stage._lock.__exit__(None, None, None)
+            stage._closed = True
+            close = PosixRetirement.__exit__
+            peer = []
+            def finish_discovery(registry, *error):
+                close(registry, *error)
+                if not peer:
+                    peer.append(None)
+                    peer[0] = reclaim_retired_slots(root, max_remove=1)
+            with patch.object(PosixRetirement, '__exit__', new=finish_discovery):
+                result = reclaim_retired_slots(root, max_remove=1)
+            self.assertEqual([str(stage.path)], peer[0]['removed'])
+            self.assertEqual({'removed':[], 'preserved':[], 'errors':[]}, result)
+            self.assertFalse(stage.path.exists())
+
+    def test_ordinary_render_named_destination_remains_usable(self):
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root) / 'render-my-audiobook'
+            parent.mkdir()
+            sentinel = parent / 'book.txt'
+            sentinel.write_bytes(b'original authored text')
+            with create_export_staging(parent, 'mp3') as stage:
+                (stage.path / 'encoded-part').write_bytes(b'owned bytes')
+            self.assertFalse(stage.path.exists())
+            self.assertEqual(b'original authored text', sentinel.read_bytes())
+            if os.name != 'nt':
+                # An actual owner fingerprint still refuses an unmarked stage,
+                # even when its nonhidden prefix resembles an ordinary name.
+                orphan = Path(root) / 'render-unmarked-owner'
+                orphan.mkdir()
+                (orphan / (OWNER_LOCK + '.lock')).touch()
+                with self.assertRaisesRegex(OSError, 'marker is missing'):
+                    create_export_staging(orphan, 'encode')
+                self.assertEqual({OWNER_LOCK + '.lock'}, {p.name for p in orphan.iterdir()})
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX registry admission')
+    def test_private_parent_recovery_guard_refuses_nested_allocation(self):
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            try:
+                (outer.path / export_staging.RECOVERY).write_bytes(b'preserve recovery')
+                (outer.path / 'keep.bin').write_bytes(b'preserve payload')
+                before = {str(p.relative_to(outer.path)):p.read_bytes()
+                          for p in outer.path.rglob('*') if p.is_file()}
+                with self.assertRaisesRegex(OSError, 'Parent staging authority changed'):
+                    create_export_staging(outer.path, 'encode')
+                self.assertEqual(before, {str(p.relative_to(outer.path)):p.read_bytes()
+                                         for p in outer.path.rglob('*') if p.is_file()})
+                self.assertFalse((outer.path / '.aa2-export-retirement').exists())
+            finally:
+                (outer.path / export_staging.RECOVERY).unlink()
+                outer.finish(remove=False)
+
+    def test_windows_recursion_preserves_nested_registry_before_metadata_access(self):
+        from windows_export_staging_directory import WindowsStageDirectory
+        from export_staging_retirement import DIRECTORY
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root)
+            registry = parent / DIRECTORY
+            stage = registry / ('1' * 32) / 'stage'
+            stage.mkdir(parents=True)
+            (registry / 'owner.lock').write_bytes(b'owned registry lock')
+            (stage.parent / 'creation.json').write_bytes(b'creation receipt')
+            (stage / MARKER).write_bytes(b'owned stage marker')
+            (stage / 'keep.bin').write_bytes(b'live nested bytes')
+            before = {str(p.relative_to(parent)):p.read_bytes()
+                      for p in parent.rglob('*') if p.is_file()}
+            authority = WindowsStageDirectory.__new__(WindowsStageDirectory)
+            authority.check = lambda: None
+            authority.api = None
+            with patch('windows_export_staging_directory._Handle',
+                       side_effect=AssertionError('registry must not be opened')), \
+                    self.assertRaisesRegex(OSError, 'Nested export registry'):
+                authority._remove_children(parent, frozenset(), 0)
+            self.assertEqual(before, {str(p.relative_to(parent)):p.read_bytes()
+                                     for p in parent.rglob('*') if p.is_file()})
+
+    def test_windows_recursion_preserves_nested_stage_before_payload_access(self):
+        from windows_export_staging_directory import WindowsStageDirectory
+        with tempfile.TemporaryDirectory() as root:
+            nested = Path(root) / 'nested'
+            nested.mkdir()
+            payload = nested / 'keep.bin'
+            payload.write_bytes(b'live nested payload')
+            authority = WindowsStageDirectory.__new__(WindowsStageDirectory)
+            for marker in (MARKER, OWNER_LOCK + '.lock'):
+                with self.subTest(marker=marker):
+                    metadata = nested / marker
+                    metadata.write_bytes(b'torn metadata is still a preservation signal')
+                    with patch('windows_export_staging_directory._Handle',
+                               side_effect=AssertionError('nested payload must not be opened')), \
+                            self.assertRaisesRegex(OSError, 'Nested staging owner'):
+                        authority._remove_children(nested, frozenset(), 1)
+                    self.assertEqual(b'live nested payload', payload.read_bytes())
+                    metadata.unlink()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX registry admission')
+    def test_preservation_guard_survives_registry_admission_failure(self):
+        from export_staging_retirement import PosixRetirement
+        with tempfile.TemporaryDirectory() as root:
+            stage = create_export_staging(root, 'sound_delivery')
+            payload = stage.path / 'keep.bin'
+            payload.write_bytes(b'retained after failed admission')
+            with patch.object(PosixRetirement, '__enter__',
+                              side_effect=PermissionError('synthetic registry admission failure')):
+                with self.assertRaisesRegex(PermissionError, 'registry admission failure'):
+                    stage.finish(preserve_on_error=True)
+            self.assertTrue((stage.path / export_staging.RECOVERY).exists())
+            result = reclaim_export_staging([root])
+            self.assertIn(str(stage.path), result['preserved'])
+            self.assertEqual(b'retained after failed admission', payload.read_bytes())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX legacy recovery fixture')
+    def test_failed_public_cleanup_reports_preserved_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            stage = export_staging._create_public_export_staging(root, 'encode')
+            payload = stage.path / 'keep.bin'
+            payload.write_bytes(b'retained after failed cleanup')
+            stage._lock.__exit__(None, None, None)
+            with patch.object(export_staging, '_cleanup_admitted',
+                              side_effect=PermissionError('synthetic cleanup failure')):
+                result = reclaim_export_staging([root])
+            self.assertIn(str(stage.path), result['preserved'])
+            self.assertTrue(result['errors'])
+            self.assertEqual([], result['removed'])
+            self.assertEqual(b'retained after failed cleanup', payload.read_bytes())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_delayed_nested_allocator_refuses_replaced_parent_after_cleanup(self):
+        import select
+        child = r'''
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from export_staging import create_export_staging
+from export_staging_retirement import PosixRetirement
+original = PosixRetirement.__enter__
+def delayed(self):
+    if self.parent == Path(sys.argv[2]):
+        print('waiting-for-owner-registry', flush=True)
+        if sys.stdin.readline().strip() != 'continue':
+            raise RuntimeError('Missing explicit test release')
+    return original(self)
+PosixRetirement.__enter__ = delayed
+try:
+    create_export_staging(Path(sys.argv[3]), 'encode')
+except OSError as error:
+    print(json.dumps({'status':'refused','error':type(error).__name__}), flush=True)
+else:
+    raise RuntimeError('Delayed allocator admitted replaced outer stage')
+'''
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            process = subprocess.Popen([sys.executable, '-c', child, str(APP), root, str(outer.path)],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(select.select([process.stdout], [], [], 15)[0])
+                self.assertEqual('waiting-for-owner-registry', process.stdout.readline().strip())
+                outer.finish()
+                outer.path.mkdir(parents=True)
+                (outer.path / 'keep.bin').write_bytes(b'foreign replacement')
+                stdout, stderr = process.communicate('continue\n', timeout=25)
+                self.assertEqual(0, process.returncode, stderr)
+                self.assertEqual('refused', json.loads(stdout)['status'])
+                self.assertEqual(b'foreign replacement', (outer.path / 'keep.bin').read_bytes())
+                self.assertEqual({'keep.bin'}, {entry.name for entry in outer.path.iterdir()})
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+                outer.finish(remove=False)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_unlocked_nested_registry_with_payload_is_preserved(self):
+        from export_staging_retirement import DIRECTORY, LOCK
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            with create_export_staging(outer.path, 'encode'):
+                pass
+            (outer.path / DIRECTORY / LOCK).unlink()
+            retained = outer.path / DIRECTORY / 'keep.bin'
+            retained.write_bytes(b'unproven registry payload')
+            with self.assertRaisesRegex(OSError, 'retained contents'):
+                outer.finish()
+            self.assertEqual(b'unproven registry payload', retained.read_bytes())
+            reclaim_export_staging([root])
+            self.assertEqual(b'unproven registry payload', retained.read_bytes())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_outer_cleanup_preserves_live_public_nested_stage(self):
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            inner = export_staging._create_public_export_staging(outer.path, 'encode')
+            payload = inner.path / 'live-payload'
+            payload.write_bytes(b'live legacy payload')
+            try:
+                with self.assertRaisesRegex(OSError, 'Nested staging owner'):
+                    outer.finish()
+                self.assertEqual(b'live legacy payload', payload.read_bytes())
+                inner.finish()
+                result = reclaim_export_staging([root])
+                self.assertEqual([], result['errors'])
+                self.assertFalse(outer.path.exists())
+            finally:
+                inner.finish(remove=False)
+                outer.finish(remove=False)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_staging_named_parent_without_marker_refuses_nested_allocation(self):
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root) / '.pcm-encode-missing-marker'
+            parent.mkdir()
+            with self.assertRaisesRegex(OSError, 'Parent staging marker is missing'):
+                create_export_staging(parent, 'encode')
+            self.assertEqual([], list(parent.iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_full_registry_keeps_a_bounded_nested_retirement_reserve(self):
+        import export_staging_retirement as retirement
+        from tests.export_staging_assertions import delivery_names
+        with tempfile.TemporaryDirectory() as root, patch.object(retirement, 'MAX_SLOTS', 2):
+            first = create_export_staging(root, 'chapter')
+            second = create_export_staging(root, 'chapter')
+            try:
+                for outer in (first, second):
+                    with create_export_staging(outer.path, 'encode'):
+                        pass
+                with self.assertRaisesRegex(OSError, 'capacity exhausted'):
+                    create_export_staging(root, 'chapter')
+                first.finish()
+                second.finish()
+                self.assertEqual(set(), delivery_names(self, root))
+            finally:
+                first.finish(remove=False)
+                second.finish(remove=False)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_nested_quarantine_publication_crashes_are_recoverable(self):
+        from tests.export_staging_assertions import delivery_names
+        child = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from export_staging import create_export_staging
+from export_staging_nested_quarantine import PENDING_RECEIPT, PAYLOAD
+from export_staging_retirement import DIRECTORY
+outer = create_export_staging(sys.argv[2], 'chapter')
+with create_export_staging(outer.path, 'encode'):
+    pass
+original = os.open
+def interrupted(name, *args, **kwargs):
+    descriptor = original(name, *args, **kwargs)
+    if name == PENDING_RECEIPT and sys.argv[3] != 'moved':
+        if sys.argv[3] == 'partial':
+            os.write(descriptor, b'{')
+            os.fsync(descriptor)
+        os._exit(76)
+    return descriptor
+os.open = interrupted
+os.supports_dir_fd = os.supports_dir_fd | {interrupted}
+rename = os.rename
+def moved(source, target, *args, **kwargs):
+    result = rename(source, target, *args, **kwargs)
+    if sys.argv[3] == 'moved' and source == DIRECTORY and target == PAYLOAD:
+        os._exit(76)
+    return result
+os.rename = moved
+os.supports_dir_fd = os.supports_dir_fd | {moved}
+outer.finish()
+raise RuntimeError('Expected pending-receipt hard exit')
+'''
+        for phase in ('opened', 'partial', 'moved'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as root:
+                result = subprocess.run([sys.executable, '-c', child, str(APP), root, phase],
+                                        capture_output=True, text=True, timeout=25)
+                self.assertEqual(76, result.returncode, result.stderr)
+                recovered = reclaim_export_staging([root])
+                self.assertEqual([], recovered['errors'])
+                self.assertEqual([], recovered['preserved'])
+                self.assertEqual(set(), delivery_names(self, root))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_nested_registry_finalization_interruption_remains_recoverable(self):
+        from export_staging_nested_quarantine import PAYLOAD
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            with create_export_staging(outer.path, 'encode'):
+                pass
+            remove = os.rmdir
+            def interrupt_registry_remove(name, *args, **kwargs):
+                if name == PAYLOAD:
+                    raise OSError('synthetic interruption after nested owner retirement')
+                return remove(name, *args, **kwargs)
+            with patch('export_staging_nested.os.rmdir', side_effect=interrupt_registry_remove) as hooked, \
+                    patch.object(os, 'supports_dir_fd', os.supports_dir_fd | {hooked}):
+                with self.assertRaisesRegex(OSError, 'synthetic interruption'):
+                    outer.finish()
+            result = reclaim_export_staging([root])
+            self.assertEqual([], result['errors'])
+            self.assertFalse(outer.path.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_nested_registry_replacement_before_quarantine_preserves_foreign_root(self):
+        from export_staging_retirement import DIRECTORY
+        from export_staging_directory import identity
+        for unlocked in (False, True):
+            with self.subTest(unlocked=unlocked), tempfile.TemporaryDirectory() as root:
+                outer = create_export_staging(root, 'chapter')
+                with create_export_staging(outer.path, 'encode'):
+                    pass
+                if unlocked:
+                    (outer.path / DIRECTORY / 'owner.lock').unlink()
+                rename = os.rename
+                original = Path(root) / 'original-nested-root'
+                foreign = []
+                def substitute(source, target, *args, **kwargs):
+                    if source == DIRECTORY:
+                        rename(str(outer.path / DIRECTORY), str(original))
+                        (outer.path / DIRECTORY).mkdir(mode=0o700)
+                        foreign.append(identity((outer.path / DIRECTORY).stat()))
+                    return rename(source, target, *args, **kwargs)
+                with patch('export_staging_nested_quarantine.os.rename', side_effect=substitute) as hooked, \
+                        patch.object(os, 'supports_dir_fd', os.supports_dir_fd | {hooked}):
+                    with self.assertRaisesRegex(OSError, 'mismatch preserved'):
+                        outer.finish()
+                self.assertEqual(1, len(foreign))
+                self.assertTrue(original.is_dir())
+                def foreign_locations():
+                    return [path for path in Path(root).rglob('*')
+                            if path.is_dir() and identity(path.stat()) == foreign[0]]
+                self.assertEqual(1, len(foreign_locations()))
+                result = reclaim_export_staging([root])
+                self.assertTrue(result['preserved'] or result['errors'])
+                self.assertEqual(1, len(foreign_locations()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_outer_cleanup_retires_completed_nested_registry(self):
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            try:
+                with create_export_staging(outer.path, 'encode') as inner:
+                    (inner.path / 'completed-payload').write_bytes(b'completed')
+                outer.finish()
+                self.assertFalse(outer.path.exists())
+                from tests.export_staging_assertions import delivery_names
+                self.assertEqual(set(), delivery_names(self, root))
+            finally:
+                outer.finish(remove=False)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX nested registry ownership')
+    def test_outer_cleanup_preserves_live_nested_encoder_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            outer = create_export_staging(root, 'chapter')
+            inner = create_export_staging(outer.path, 'encode')
+            payload = inner.path / 'live-payload'
+            payload.write_bytes(b'encoder still owns these bytes')
+            try:
+                with self.assertRaises(OSError):
+                    outer.finish()
+                self.assertEqual(b'encoder still owns these bytes', payload.read_bytes())
+            finally:
+                # Release both real locks even when the regression deletes the
+                # inner directory. Do not replace the original assertion error.
+                try:
+                    inner.finish(remove=False)
+                except FileNotFoundError:
+                    pass
+                outer.finish(remove=False)
+
+    def test_windows_handle_rename_uses_bound_directory_without_overwrite(self):
+        import ctypes
+        from types import SimpleNamespace
+        from windows_export_staging_directory import _Handle, _FileRenameInformation
+        from export_staging_directory import StageDirectoryChanged
+        calls = []
+        def rename(handle, kind, buffer, size):
+            record = _FileRenameInformation.from_buffer(buffer)
+            raw = ctypes.string_at(ctypes.addressof(buffer) +
+                                   _FileRenameInformation.name.offset, record.name_bytes)
+            calls.append((handle, kind, record.replace, record.root,
+                          raw.decode('utf-16-le'), size))
+            return 1
+        source = _Handle.__new__(_Handle)
+        source.handle = 123
+        source.api = SimpleNamespace(SetFileInformationByHandle=rename)
+        destination = _Handle.__new__(_Handle)
+        destination.handle = 456
+        destination.information = lambda: SimpleNamespace(attributes=0x10)
+        source.rename_child(destination, 'stage-\U0001f3b5')
+        self.assertEqual((123, 3, 0, 456, 'stage-\U0001f3b5'), calls[0][:5])
+        self.assertGreaterEqual(calls[0][5], _FileRenameInformation.name.offset + 16)
+        for name in ('', '.', '..', '../stage', 'a/b', 'a\\b', 'a:b', 'a\x00b', 'x' * 256):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                source.rename_child(destination, name)
+        destination.information = lambda: SimpleNamespace(attributes=0x410)
+        with self.assertRaises(StageDirectoryChanged):
+            source.rename_child(destination, 'stage')
+        destination.handle = None
+        with self.assertRaises(ValueError):
+            source.rename_child(destination, 'stage')
+        self.assertEqual(1, len(calls))
+        if os.name == 'nt':
+            from windows_export_staging_directory import _api, _identity
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                original = root / 'source'; original.mkdir()
+                (original / 'payload').write_bytes(b'owned')
+                occupied = root / 'occupied'; occupied.mkdir()
+                (occupied / 'keep').write_bytes(b'foreign')
+                api = _api()
+                parent_handle = _Handle(api, root)
+                try:
+                    stage_handle = _Handle(api, original, delete=True)
+                    try:
+                        from utils import file_lock
+                        contender = """
+import sys
+from utils import file_lock
+try:
+    with open(sys.argv[1], 'r+b') as stream:
+        with file_lock(sys.argv[1], timeout=0, lock_handle=stream):
+            print('acquired')
+except TimeoutError:
+    print('blocked')
+"""
+                        def check_contender(path, expected):
+                            result = subprocess.run([sys.executable, '-c', contender, str(path)],
+                                                    cwd=APP, capture_output=True, text=True, timeout=10)
+                            self.assertEqual(0, result.returncode, result.stderr)
+                            self.assertEqual(expected, result.stdout.strip())
+                        with (original / 'owner.lock').open('w+b') as owner:
+                            owner_identity = os.fstat(owner.fileno())
+                            with file_lock(original / 'owner', timeout=0, lock_handle=owner):
+                                check_contender(original / 'owner.lock', 'blocked')
+                                # Windows cannot rename a directory with an
+                                # open descendant. This is not a qualified
+                                # durable owner-relocation protocol.
+                                with self.assertRaises(OSError):
+                                    stage_handle.rename_child(parent_handle, 'moved')
+                                self.assertEqual(b'owned', (original / 'payload').read_bytes())
+                        before = _identity(stage_handle.information())
+                        with self.assertRaises(OSError):
+                            stage_handle.rename_child(parent_handle, 'occupied')
+                        self.assertEqual(b'foreign', (occupied / 'keep').read_bytes())
+                        stage_handle.rename_child(parent_handle, 'moved')
+                        self.assertEqual(before, _identity(stage_handle.information()))
+                        self.assertFalse(original.exists())
+                        self.assertEqual(b'owned', (root / 'moved' / 'payload').read_bytes())
+                        moved_owner = (root / 'moved' / 'owner.lock').stat()
+                        self.assertEqual((owner_identity.st_dev, owner_identity.st_ino),
+                                         (moved_owner.st_dev, moved_owner.st_ino))
+                        check_contender(root / 'moved' / 'owner.lock', 'acquired')
+                    finally:
+                        stage_handle.close()
+                finally:
+                    parent_handle.close()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX registry lock contention')
+    def test_busy_registry_preserves_recovery_and_worker_waits_for_release(self):
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+        from export_staging import get_encoder_staging_source_root
+        from export_staging_retirement import DIRECTORY
+        child = '''
+import sys
+from export_staging_retirement import PosixRetirement
+with PosixRetirement(parent=sys.argv[1], create=False):
+ print('locked', flush=True)
+ sys.stdin.readline()
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp).resolve()
+            with create_export_staging(parent, 'encode') as stage:
+                process = subprocess.Popen([sys.executable, '-c', child, str(parent)],
+                    cwd=APP, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertEqual('locked', process.stdout.readline().strip())
+                    result = reclaim_export_staging([parent])
+                    self.assertEqual([], result['errors'])
+                    self.assertEqual([], result['removed'])
+                    self.assertIn(str(parent / DIRECTORY), result['preserved'])
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(get_encoder_staging_source_root, stage.path)
+                        with self.assertRaises(FutureTimeout):
+                            future.result(timeout=0.1)
+                        process.communicate('\n', timeout=5)
+                        self.assertEqual(0, process.returncode)
+                        self.assertEqual(parent, future.result(timeout=5))
+                finally:
+                    if process.poll() is None:
+                        process.communicate('\n', timeout=5)
+                    process.stdout.close()
+                    process.stderr.close()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private encoding layout')
+    def test_encoder_alias_parent_and_unbound_legacy_slot(self):
+        from export_staging import get_encoder_staging_source_root
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            target = root / 'actual'; target.mkdir()
+            alias = root / 'alias'; alias.symlink_to(target, target_is_directory=True)
+            with create_export_staging(alias, 'encode') as stage:
+                self.assertEqual(stage.path.resolve(), stage.path)
+                self.assertEqual(target, get_encoder_staging_source_root(stage.path))
+            fake = root / '.aa2-export-retirement' / ('a' * 32) / '.pcm-encode-unbound'
+            fake.mkdir(parents=True)
+            with self.assertRaises(ValueError):
+                get_encoder_staging_source_root(fake)
+            self.assertEqual([], list(fake.iterdir()))
+            legacy = root / '.pcm-encode-legacy'; legacy.mkdir()
+            self.assertEqual(root, get_encoder_staging_source_root(legacy))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private encoding layout')
+    def test_encoder_source_root_requires_bound_creation(self):
+        from export_staging import get_encoder_staging_source_root
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            with create_export_staging(parent, 'encode') as stage:
+                before = {p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}
+                self.assertEqual(parent, get_encoder_staging_source_root(stage.path))
+                self.assertEqual(before, {p: p.read_bytes() for p in parent.rglob('*') if p.is_file()})
+                owner = stage.path.parent / 'owner.json'
+                saved = owner.read_bytes()
+                try:
+                    value = json.loads(saved)
+                    value['owner_identity'][1] += 1
+                    owner.write_text(json.dumps(value))
+                    with self.assertRaises(OSError):
+                        get_encoder_staging_source_root(stage.path)
+                finally:
+                    owner.write_bytes(saved)
+            with create_export_staging(parent, 'wave') as stage:
+                with self.assertRaises(ValueError):
+                    get_encoder_staging_source_root(stage.path)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / '.aa2-export-retirement' / ('a' * 32) / 'stage'
+            fake.mkdir(parents=True)
+            with self.assertRaises(OSError):
+                get_encoder_staging_source_root(fake)
+            self.assertFalse((fake.parents[1] / 'owner.lock').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX durability ordering')
+    def test_creation_owner_entry_durable_before_receipt(self):
+        from export_staging_retirement import PosixRetirement
+        from export_staging_directory import stage_directory, stage_owner_lock
+        for mode in ('initialize', 'recover_partial'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                synced = []
+                real_sync = os.fsync
+                real_write = PosixRetirement._write_receipt
+                checked = []
+                def sync(fd):
+                    real_sync(fd)
+                    info = os.fstat(fd)
+                    synced.append((info.st_dev, info.st_ino))
+                def write(transaction, name, value):
+                    if name == 'owner.json':
+                        self.assertIn(tuple(value['stage_identity']), synced)
+                        checked.append(name)
+                    return real_write(transaction, name, value)
+                with PosixRetirement(parent=Path(tmp)) as transaction:
+                    if mode == 'recover_partial':
+                        path, expected = transaction.allocate_creation('mp3', 'a' * 32)
+                        with stage_directory(path, expected) as authority:
+                            with stage_owner_lock(authority, create=True):
+                                pass
+                    with patch('os.fsync', side_effect=sync), patch.object(
+                            PosixRetirement, '_write_receipt', new=write):
+                        if mode == 'initialize':
+                            path, expected, marker, owner, stream = transaction.initialize_creation('mp3')
+                            owner.__exit__(None, None, None)
+                        transaction.recover_creation_slot(transaction.slot)
+                    self.assertEqual(['owner.json'], checked)
+                    self.assertFalse(path.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX cross-directory retirement')
+    def test_legacy_move_syncs_destination_before_source(self):
+        from export_staging_retirement import PosixRetirement
+        original = PosixRetirement.move
+        synced = []
+        def move(transaction, stream):
+            real_rename, real_sync = os.rename, os.fsync
+            moved = []
+            def rename(source, destination, **kwargs):
+                result = real_rename(source, destination, **kwargs)
+                if destination == 'stage':
+                    moved.append(True)
+                return result
+            def sync(fd):
+                real_sync(fd)
+                if moved and fd in (transaction.slot_fd, transaction.authority.parent_fd):
+                    synced.append('destination' if fd == transaction.slot_fd else 'source')
+            with patch('os.rename', side_effect=rename), patch('os.fsync', side_effect=sync):
+                result = original(transaction, stream)
+            self.assertEqual([True], moved)
+            self.assertEqual(['destination', 'source'], synced[:2])
+            return result
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = export_staging._create_public_export_staging(tmp, 'mp3')
+            try:
+                with patch.object(PosixRetirement, 'move', new=move):
+                    stage.finish()
+            finally:
+                stage._lock.__exit__(None, None, None)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX durable receipt retirement')
+    def test_receipt_removal_syncs_dependencies_before_next_unlink(self):
+        from export_staging_retirement import PosixRetirement
+        original = PosixRetirement.discard_empty_slot
+        for factory, expected in ((create_export_staging,
+                                   ['owner.json', 'creation.json', 'allocation.json']),
+                                  (export_staging._create_public_export_staging,
+                                   ['verified.json', 'reserved.json'])):
+            with self.subTest(factory=factory.__name__), tempfile.TemporaryDirectory() as tmp:
+                removed = []
+                def discard(transaction, name):
+                    pending = []
+                    real_unlink, real_sync, real_rmdir = os.unlink, os.fsync, os.rmdir
+                    def rmdir(path, *args, **kwargs):
+                        if path == name and kwargs.get('dir_fd') == transaction.fd:
+                            self.assertEqual([], pending,
+                                             'Receipt deletion must be durable before slot removal')
+                        return real_rmdir(path, *args, **kwargs)
+                    def unlink(path, *args, **kwargs):
+                        if kwargs.get('dir_fd') == transaction.slot_fd:
+                            self.assertEqual([], pending,
+                                             'Previous receipt deletion is not durable')
+                            real_unlink(path, *args, **kwargs)
+                            removed.append(path)
+                            pending.append(path)
+                        else:
+                            real_unlink(path, *args, **kwargs)
+                    def sync(fd):
+                        real_sync(fd)
+                        if fd == transaction.slot_fd:
+                            pending.clear()
+                    with patch('os.unlink', side_effect=unlink), patch('os.fsync', side_effect=sync), \
+                            patch('os.rmdir', side_effect=rmdir):
+                        original(transaction, name)
+                    self.assertEqual([], pending)
+                stage = factory(tmp, 'mp3')
+                try:
+                    with patch.object(PosixRetirement, 'discard_empty_slot', new=discard):
+                        stage.finish()
+                    self.assertEqual(expected, removed)
+                finally:
+                    stage._lock.__exit__(None, None, None)
+
+    def test_replacement_during_cleanup_preserves_foreign_directory(self):
+        for mode in ('normal', 'recovery'):
+            for boundary in ('_remove_contents', 'remove_empty_directory'):
+                with self.subTest(mode=mode, boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    parent = root / 'exports'; parent.mkdir()
+                    foreign = root / 'foreign'; foreign.mkdir()
+                    expected = {MARKER: b'foreign marker', OWNER_LOCK + '.lock': b'foreign lock',
+                                'keep.wav': b'foreign audio fixture'}
+                    for name, content in expected.items():
+                        (foreign / name).write_bytes(content)
+                    staging = create_export_staging(parent, 'mp3')
+                    (staging.path / 'payload.bin').write_bytes(b'owned payload')
+                    if mode == 'recovery':
+                        staging._lock.__exit__(None, None, None)
+                    from export_staging_directory import stage_directory
+                    target = (export_staging if boundary == '_remove_contents' else
+                              type(stage_directory(staging.path, staging._directory_identity)))
+                    original = getattr(target, boundary)
+                    calls = []
+                    def retarget(subject, *args, **kwargs):
+                        path = Path(subject) if boundary == '_remove_contents' else subject.path
+                        calls.append(True)
+                        if os.name == 'nt':
+                            ancestor_before = parent.stat()
+                            with self.assertRaises(OSError) as ancestor_denied:
+                                parent.rename(root / 'admitted-export-parent')
+                            self.assertEqual(32, ancestor_denied.exception.winerror)
+                            ancestor_after = parent.stat()
+                            self.assertEqual((ancestor_before.st_dev, ancestor_before.st_ino),
+                                             (ancestor_after.st_dev, ancestor_after.st_ino))
+                            self.assertFalse((root / 'admitted-export-parent').exists())
+                            before = path.stat()
+                            with self.assertRaises(OSError) as denied:
+                                path.rename(root / 'admitted-stage')
+                            self.assertEqual(32, denied.exception.winerror)
+                            after = path.stat()
+                            self.assertEqual((before.st_dev, before.st_ino),
+                                             (after.st_dev, after.st_ino))
+                            self.assertFalse((root / 'admitted-stage').exists())
+                            # Preserve the interrupted-cleanup outcome while
+                            # checking Windows denied the retarget operation.
+                            raise denied.exception
+                        path.rename(root / 'admitted-stage')
+                        path.symlink_to(foreign, target_is_directory=True)
+                        return original(subject, *args, **kwargs)
+                    with patch.object(target, boundary, new=retarget):
+                        if mode == 'normal':
+                            try:
+                                staging.finish()
+                            except OSError:
+                                pass
+                        else:
+                            result = reclaim_export_staging([parent])
+                            self.assertEqual([], result['removed'])
+                    self.assertEqual([True], calls)
+                    self.assertEqual(expected, {name: (foreign / name).read_bytes()
+                                     if (foreign / name).exists() else None for name in expected})
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX retained-owner protocol')
+    def test_retained_owner_recovers_each_abrupt_finalization_exit(self):
+        from export_staging_retirement import DIRECTORY, LOCK
+        child = r'''
+import os, sys, json
+from pathlib import Path
+from export_staging import create_export_staging, _create_public_export_staging, MARKER, OWNER_LOCK
+from export_staging_retirement import RETAINED_OWNER
+from export_staging_directory import PosixStageDirectory
+factory = _create_public_export_staging if sys.argv[3] == 'legacy' else create_export_staging
+stage = factory(sys.argv[1], 'mp3')
+(stage.path / 'payload').write_bytes(b'owned')
+boundary = sys.argv[2]
+if sys.argv[3] == 'legacy':
+    marker = json.loads((stage.path / MARKER).read_text())
+    marker.pop('owner_identity')
+    (stage.path / MARKER).write_text(json.dumps(marker))
+    (stage.path / (OWNER_LOCK + '.lock')).chmod(0o644)
+rename, unlink = os.rename, os.unlink
+remove = PosixStageDirectory.remove_empty_directory
+def interrupted_rename(src, dst, *args, **kwargs):
+    if dst == RETAINED_OWNER and boundary == 'before_owner_move':
+        os._exit(77)
+    value = rename(src, dst, *args, **kwargs)
+    if dst == RETAINED_OWNER and boundary == 'after_owner_move':
+        os._exit(77)
+    return value
+def interrupted_unlink(name, *args, **kwargs):
+    value = unlink(name, *args, **kwargs)
+    if ((name == MARKER and boundary == 'after_marker_unlink') or
+            (name == RETAINED_OWNER and boundary == 'after_owner_unlink')):
+        os._exit(77)
+    return value
+def interrupted_remove(self):
+    if boundary == 'before_stage_rmdir':
+        os._exit(77)
+    value = remove(self)
+    if boundary == 'after_stage_rmdir':
+        os._exit(77)
+    return value
+os.supports_dir_fd = set(os.supports_dir_fd) | {interrupted_rename, interrupted_unlink}
+os.rename, os.unlink = interrupted_rename, interrupted_unlink
+PosixStageDirectory.remove_empty_directory = interrupted_remove
+stage.finish()
+raise RuntimeError('Crash boundary was not reached')
+'''
+        boundaries = ('before_owner_move', 'after_owner_move', 'after_marker_unlink',
+                      'before_stage_rmdir', 'after_stage_rmdir', 'after_owner_unlink')
+        for marker_kind, boundary in ((kind, point) for kind in ('current', 'legacy')
+                                      for point in boundaries):
+            with self.subTest(marker=marker_kind, boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                completed = subprocess.run([sys.executable, '-c', child, tmp, boundary, marker_kind],
+                                           cwd=APP, capture_output=True, text=True, timeout=10)
+                self.assertEqual(77, completed.returncode, completed.stderr)
+                # A fresh reaper must reopen and lock the original inode. No
+                # inherited Python object or graceful finally block survives.
+                result = reclaim_export_staging([tmp])
+                self.assertEqual([], result['errors'])
+                self.assertEqual(1, len(result['removed']))
+                self.assertEqual([LOCK], sorted(p.name for p in (Path(tmp) / DIRECTORY).iterdir()))
+                self.assertEqual([DIRECTORY], sorted(p.name for p in Path(tmp).iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX retained-owner protocol')
+    def test_retained_owner_recovery_preserves_ambiguous_states(self):
+        from export_staging_directory import PosixStageDirectory
+        from export_staging_retirement import DIRECTORY, LOCK, RETAINED_OWNER
+        from utils import file_lock
+        from contextlib import ExitStack
+        for case in ('missing', 'replaced', 'both', 'symlink', 'hardlink',
+                     'payload', 'unknown_slot', 'live_owner', 'receipt_conflict',
+                     'legacy_unbound', 'invalid_owner_identity', 'foreign_receipt_parent',
+                     'foreign_receipt_prefix'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+                stage = export_staging._create_public_export_staging(tmp, 'mp3')
+                with patch.object(PosixStageDirectory, 'remove_empty_directory',
+                                  side_effect=OSError('injected final removal failure')):
+                    with self.assertRaisesRegex(OSError, 'injected'):
+                        stage.finish()
+                slots = [p for p in (Path(tmp) / DIRECTORY).iterdir() if p.name != LOCK]
+                self.assertEqual(1, len(slots))
+                slot = slots[0]
+                retained = slot / RETAINED_OWNER
+                saved = slot / 'stage'
+                self.assertEqual(stage.marker['owner_identity'],
+                                 [retained.stat().st_dev, retained.stat().st_ino])
+                if case == 'missing':
+                    retained.unlink()
+                elif case in ('replaced', 'symlink'):
+                    original = Path(tmp) / 'original-owner'
+                    retained.rename(original)
+                    if case == 'replaced':
+                        retained.write_bytes(b'foreign')
+                        retained.chmod(0o600)
+                    else:
+                        retained.symlink_to(original)
+                elif case == 'both':
+                    (saved / (OWNER_LOCK + '.lock')).write_bytes(b'foreign owner')
+                elif case == 'hardlink':
+                    os.link(retained, Path(tmp) / 'other-owner-link')
+                elif case == 'payload':
+                    (saved / 'foreign.wav').write_bytes(b'foreign audio')
+                elif case == 'unknown_slot':
+                    (slot / 'foreign.wav').write_bytes(b'foreign audio')
+                elif case in ('receipt_conflict', 'legacy_unbound', 'invalid_owner_identity',
+                              'foreign_receipt_parent', 'foreign_receipt_prefix'):
+                    for name in ('reserved.json', 'verified.json'):
+                        receipt = json.loads((slot / name).read_text())
+                        if case == 'receipt_conflict':
+                            receipt['owner_identity'][1] += 1
+                        elif case == 'invalid_owner_identity':
+                            receipt['owner_identity'] = [True, 1]
+                        elif case == 'foreign_receipt_prefix':
+                            receipt['original_name'] = 'foreign-directory'
+                        elif case == 'foreign_receipt_parent':
+                            marker = json.loads(receipt['marker'])
+                            marker['parent'] = str(Path(tmp) / 'foreign')
+                            receipt['marker'] = json.dumps(marker)
+                        else:
+                            receipt.pop('owner_identity')
+                            marker = json.loads(receipt['marker'])
+                            marker.pop('owner_identity')
+                            receipt['marker'] = json.dumps(marker)
+                        (slot / name).write_text(json.dumps(receipt))
+                elif case == 'live_owner':
+                    stream = stack.enter_context(retained.open('r+b'))
+                    stack.enter_context(file_lock(retained, timeout=0, lock_handle=stream))
+                def snapshot():
+                    result = {}
+                    for item in slot.rglob('*'):
+                        key = str(item.relative_to(slot))
+                        if item.is_symlink():
+                            result[key] = ('symlink', os.readlink(item))
+                        elif item.is_dir():
+                            result[key] = ('directory',)
+                        else:
+                            result[key] = ('file', item.read_bytes(), item.stat().st_ino)
+                    return result
+                before = snapshot()
+                result = reclaim_export_staging([tmp])
+                self.assertEqual([], result['removed'])
+                self.assertTrue(result['preserved'] or result['errors'])
+                self.assertEqual(before, snapshot())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX retained-owner protocol')
+    def test_retained_original_lock_excludes_another_process_until_disposal(self):
+        from export_staging_retirement import PosixRetirement, RETAINED_OWNER, DIRECTORY
+        child = r'''
+import sys
+from pathlib import Path
+from utils import file_lock
+with Path(sys.argv[1]).open('r+b') as stream:
+    try:
+        with file_lock(sys.argv[1], timeout=0, lock_handle=stream):
+            pass
+    except TimeoutError:
+        raise SystemExit(79)
+raise SystemExit('Original lock was not held')
+'''
+        original = PosixRetirement.check_retained_owner
+        checked = []
+        def observed(transaction, receipt, stream, **kwargs):
+            original(transaction, receipt, stream, **kwargs)
+            path = transaction.parent / DIRECTORY / transaction.slot / RETAINED_OWNER
+            result = subprocess.run([sys.executable, '-c', child, str(path)],
+                                    cwd=APP, capture_output=True, text=True, timeout=10)
+            self.assertEqual(79, result.returncode, result.stderr)
+            checked.append(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = create_export_staging(tmp, 'mp3')
+            with patch.object(PosixRetirement, 'check_retained_owner', new=observed):
+                stage.finish()
+            self.assertGreaterEqual(len(checked), 3)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX retirement protocol')
+    def test_unknown_slot_preserves_payload_before_owner_retention(self):
+        from export_staging_directory import stage_directory
+        from export_staging_retirement import PosixRetirement, DIRECTORY
+        injected = ('unknown', 'allocation.json', 'creation.json', 'owner.json',
+                    'allocation.json.pending', 'creation.json.pending', 'owner.json.pending')
+        for verified, member in ((ready, name) for ready in (False, True) for name in injected):
+            with self.subTest(verified=verified, member=member), tempfile.TemporaryDirectory() as tmp:
+                stage = export_staging._create_public_export_staging(tmp, 'mp3')
+                (stage.path / 'payload.wav').write_bytes(b'preserve audio')
+                try:
+                    with stage_directory(stage.path, stage._directory_identity) as authority:
+                        with PosixRetirement(authority) as transaction:
+                            transaction.move(stage._owner_stream)
+                            slot = Path(tmp) / DIRECTORY / transaction.slot
+                            (slot / member).write_bytes(b'preserve unknown')
+                            if not verified:
+                                (slot / 'verified.json').unlink()
+                finally:
+                    stage._lock.__exit__(None, None, None)
+                    stage._closed = True
+                result = reclaim_export_staging([tmp])
+                self.assertEqual([], result['removed'])
+                self.assertTrue(result['errors'] or result['preserved'])
+                self.assertEqual(b'preserve audio', (slot / 'stage' / 'payload.wav').read_bytes())
+                self.assertEqual(b'preserve unknown', (slot / member).read_bytes())
+
+    def test_zero_or_invalid_recovery_budget_never_removes_abandoned_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = create_export_staging(tmp, 'mp3')
+            payload = stage.path / 'payload.wav'
+            payload.write_bytes(b'preserve audio')
+            stage._lock.__exit__(None, None, None)
+            stage._closed = True
+            for parameter in ('max_remove', 'max_scan'):
+                with self.subTest(parameter=parameter):
+                    self.assertEqual({'removed': [], 'preserved': [], 'errors': []},
+                                     reclaim_export_staging([tmp], **{parameter: 0}))
+                    for invalid in (-1, True, 1.5, '1'):
+                        with self.assertRaises(ValueError):
+                            reclaim_export_staging([tmp], **{parameter: invalid})
+                    self.assertEqual(b'preserve audio', payload.read_bytes())
+            self.assertEqual([str(stage.path)], reclaim_export_staging([tmp])['removed'])
+
+    def test_owner_creation_refuses_existing_inode(self):
+        from export_staging_directory import stage_directory, identity
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'stage'
+            directory.mkdir()
+            owner = directory / (OWNER_LOCK + '.lock')
+            owner.write_bytes(b'preexisting owner')
+            before = identity(owner.stat())
+            with stage_directory(directory, identity(directory.stat())) as authority:
+                with self.assertRaises(FileExistsError):
+                    authority.open_owner_stream(create=True)
+            self.assertEqual(before, identity(owner.stat()))
+            self.assertEqual(b'preexisting owner', owner.read_bytes())
+
+    def test_bad_parent_does_not_abort_recovery_of_other_parents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad = root / 'regular-file'
+            bad.write_bytes(b'preserve')
+            good = root / 'exports'
+            stage = create_export_staging(good, 'mp3')
+            stage._lock.__exit__(None, None, None)
+            stage._closed = True
+            result = reclaim_export_staging([bad, good])
+            self.assertTrue(result['errors'])
+            self.assertEqual([str(stage.path)], result['removed'])
+            self.assertFalse(stage.path.exists())
+            self.assertEqual(b'preserve', bad.read_bytes())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private allocation prototype')
+    def test_private_creation_recovers_initialization_crashes(self):
+        from export_staging_retirement import DIRECTORY, LOCK
+        child = r'''
+import os,sys
+from export_staging_retirement import PosixRetirement
+import export_staging
+point = sys.argv[2]
+write = PosixRetirement._write_receipt
+replace = os.replace
+marker_write = export_staging._write_marker
+def interrupted_marker(*args, **kwargs):
+    if point == 'before_marker':os._exit(77)
+    result = marker_write(*args, **kwargs)
+    if point == 'after_marker':os._exit(77)
+    return result
+def interrupted_write(self, name, value):
+    if point == 'before_' + name:
+        os._exit(77)
+    result = write(self, name, value)
+    if point == 'after_' + name:
+        os._exit(77)
+    return result
+def interrupted_replace(src, dst, *args, **kwargs):
+    if point == 'pending_' + dst:
+        os._exit(77)
+    return replace(src, dst, *args, **kwargs)
+PosixRetirement._write_receipt = interrupted_write
+os.replace = interrupted_replace
+export_staging._write_marker = interrupted_marker
+with PosixRetirement(parent=sys.argv[1]) as transaction:
+    transaction.initialize_creation('mp3')
+raise RuntimeError('Crash point not reached')
+'''
+        for point in ('before_allocation.json', 'pending_allocation.json',
+                      'after_allocation.json', 'before_creation.json',
+                      'pending_creation.json', 'after_creation.json',
+                      'before_owner.json', 'pending_owner.json', 'after_owner.json',
+                      'before_marker', 'after_marker'):
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run([sys.executable, '-c', child, tmp, point],
+                                        cwd=APP, capture_output=True, text=True, timeout=10)
+                self.assertEqual(77, result.returncode, result.stderr)
+                self.assertEqual([DIRECTORY], sorted(p.name for p in Path(tmp).iterdir()))
+                recovered = reclaim_export_staging([tmp])
+                self.assertEqual([], recovered['errors'])
+                self.assertEqual(1, len(recovered['removed']))
+                self.assertEqual([LOCK], sorted(p.name for p in (Path(tmp) / DIRECTORY).iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private allocation prototype')
+    def test_private_creation_preserves_mismatched_or_populated_stage(self):
+        from export_staging_retirement import PosixRetirement, DIRECTORY
+        for case in ('payload', 'slot_identity', 'stage_identity', 'missing_allocation',
+                     'unknown_metadata', 'duplicate_fields'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                with PosixRetirement(parent=tmp) as transaction:
+                    stage, expected = transaction.allocate_creation('mp3', 'a' * 32)
+                    slot = stage.parent
+                if case == 'payload':
+                    (stage / 'foreign.wav').write_bytes(b'preserve')
+                elif case == 'slot_identity':
+                    for name in ('allocation.json', 'creation.json'):
+                        receipt = json.loads((slot / name).read_text())
+                        receipt['slot_identity'][1] += 1
+                        (slot / name).write_text(json.dumps(receipt))
+                elif case == 'stage_identity':
+                    stage.rename(Path(tmp) / 'original-stage')
+                    stage.mkdir(mode=0o700)
+                elif case == 'missing_allocation':
+                    (slot / 'allocation.json').unlink()
+                elif case == 'unknown_metadata':
+                    (slot / 'unknown').write_bytes(b'preserve')
+                elif case == 'duplicate_fields':
+                    path = slot / 'allocation.json'
+                    raw = path.read_text()
+                    path.write_text('{"schema":1,' + raw[1:])
+                before = {str(p.relative_to(slot)): p.read_bytes()
+                          for p in slot.rglob('*') if p.is_file()}
+                recovered = reclaim_export_staging([tmp])
+                self.assertEqual([], recovered['removed'])
+                self.assertTrue(recovered['errors'] or recovered['preserved'])
+                self.assertTrue(stage.is_dir())
+                self.assertEqual(before, {str(p.relative_to(slot)): p.read_bytes()
+                                         for p in slot.rglob('*') if p.is_file()})
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_partial_initialization_reclaims_only_dead_metadata(self):
+        from export_staging_directory import stage_directory, stage_owner_lock
+        from export_staging_retirement import PosixRetirement, DIRECTORY, LOCK
+        for marker_bytes in (None, b'', b'{', b'\xff'):
+            with self.subTest(marker=marker_bytes), tempfile.TemporaryDirectory() as tmp:
+                with PosixRetirement(parent=tmp) as transaction:
+                    path, expected = transaction.allocate_creation('mp3', 'a' * 32)
+                    with stage_directory(path, expected) as authority:
+                        owner = stage_owner_lock(authority, create=True)
+                        owner.__enter__()
+                        try:
+                            if marker_bytes is not None:
+                                descriptor = os.open(path / MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                                with os.fdopen(descriptor, 'wb') as stream:
+                                    stream.write(marker_bytes)
+                        finally:
+                            owner.__exit__(None, None, None)
+                result = reclaim_export_staging([tmp])
+                self.assertEqual([], result['errors'])
+                self.assertEqual(1, len(result['removed']))
+                self.assertEqual([LOCK], sorted(p.name for p in (Path(tmp) / DIRECTORY).iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_partial_initialization_preserves_live_or_replaced_owner(self):
+        from export_staging_directory import stage_directory, stage_owner_lock, identity
+        from export_staging_retirement import PosixRetirement
+        for case in ('live', 'replaced', 'missing', 'foreign_valid_marker', 'unknown_payload', 'unbound_replaced'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                with PosixRetirement(parent=tmp) as transaction:
+                    path, expected = transaction.allocate_creation('mp3', 'a' * 32)
+                    with stage_directory(path, expected) as authority:
+                        owner = stage_owner_lock(authority, create=True)
+                        stream = owner.__enter__()
+                        owned = {**transaction.read_receipt('creation.json'),
+                                 'owner_identity': list(identity(os.fstat(stream.fileno())))}
+                        if case != 'unbound_replaced':
+                            transaction._write_receipt('owner.json', owned)
+                        if case == 'foreign_valid_marker':
+                            marker = {'schema': 1, 'kind': 'mp3', 'prefix': PREFIXES['mp3'],
+                                      'parent': str(Path(tmp).resolve()), 'token': 'b' * 32,
+                                      'owner_identity': owned['owner_identity']}
+                            authority.write_marker_bytes(json.dumps(marker).encode())
+                        else:
+                            authority.write_marker_bytes(b'{')
+                        if case == 'unknown_payload':
+                            (path / 'foreign.wav').write_bytes(b'preserve')
+                try:
+                    if case != 'live':
+                        owner.__exit__(None, None, None)
+                    if case in ('replaced', 'missing', 'unbound_replaced'):
+                        lock = path / (OWNER_LOCK + '.lock')
+                        lock.rename(Path(tmp) / 'original-owner')
+                        if case in ('replaced', 'unbound_replaced'):
+                            lock.write_bytes(b'foreign owner')
+                            lock.chmod(0o600)
+                    before = {p.name: p.read_bytes() for p in path.iterdir()}
+                    result = reclaim_export_staging([tmp])
+                    self.assertEqual([], result['removed'])
+                    self.assertTrue(result['errors'] or result['preserved'])
+                    self.assertEqual(before, {p.name: p.read_bytes() for p in path.iterdir()})
+                finally:
+                    if case == 'live':
+                        owner.__exit__(None, None, None)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_partial_initialization_cleanup_survives_abrupt_exit(self):
+        from export_staging_retirement import DIRECTORY, LOCK
+        child = r'''
+import os,sys
+from export_staging import MARKER,reclaim_export_staging
+from export_staging_retirement import PosixRetirement,RETAINED_OWNER
+from export_staging_directory import stage_directory,stage_owner_lock,PosixStageDirectory
+with PosixRetirement(parent=sys.argv[1]) as transaction:
+    path,expected = transaction.allocate_creation('mp3','a'*32)
+    with stage_directory(path,expected) as authority:
+        with stage_owner_lock(authority,create=True):
+            authority.write_marker_bytes(b'{')
+point=sys.argv[2]
+write=PosixRetirement._write_receipt
+unlink,rename=os.unlink,os.rename
+remove=PosixStageDirectory.remove_empty_directory
+def interrupted_write(self,name,value):
+    result=write(self,name,value)
+    if point=='owner_record' and name=='owner.json':os._exit(77)
+    return result
+def interrupted_unlink(name,*args,**kwargs):
+    result=unlink(name,*args,**kwargs)
+    if ((point=='marker_unlink' and name==MARKER) or
+        (point=='retained_unlink' and name==RETAINED_OWNER) or
+        (point=='creation_receipt_unlink' and name=='creation.json')):os._exit(77)
+    return result
+def interrupted_rename(src,dst,*args,**kwargs):
+    result=rename(src,dst,*args,**kwargs)
+    if point=='owner_move' and dst==RETAINED_OWNER:os._exit(77)
+    return result
+def interrupted_remove(self):
+    result=remove(self)
+    if point=='stage_remove':os._exit(77)
+    return result
+PosixRetirement._write_receipt=interrupted_write
+PosixStageDirectory.remove_empty_directory=interrupted_remove
+os.supports_dir_fd=set(os.supports_dir_fd)|{interrupted_unlink,interrupted_rename}
+os.unlink,os.rename=interrupted_unlink,interrupted_rename
+reclaim_export_staging([sys.argv[1]])
+raise RuntimeError('Cleanup crash boundary not reached')
+'''
+        for point in ('owner_record', 'marker_unlink', 'owner_move', 'stage_remove',
+                      'retained_unlink', 'creation_receipt_unlink'):
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run([sys.executable, '-c', child, tmp, point],
+                                        cwd=APP, capture_output=True, text=True, timeout=10)
+                self.assertEqual(77, result.returncode, result.stderr)
+                recovered = reclaim_export_staging([tmp])
+                self.assertEqual([], recovered['errors'])
+                self.assertEqual(1, len(recovered['removed']))
+                self.assertEqual([LOCK], sorted(p.name for p in (Path(tmp) / DIRECTORY).iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_private_initialized_stage_live_normal_and_abandoned_cleanup(self):
+        from export_staging_directory import stage_directory
+        from export_staging_retirement import PosixRetirement, DIRECTORY, LOCK
+        for mode in ('normal', 'abandoned', 'rollback', 'guard'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                with PosixRetirement(parent=tmp) as transaction:
+                    path, expected, marker, owner, stream = transaction.initialize_creation('chapter')
+                    slot = transaction.slot
+                try:
+                    (path / 'payload.wav').write_bytes(b'owned audio')
+                    live = reclaim_export_staging([tmp])
+                    self.assertEqual([], live['removed'])
+                    self.assertTrue(live['preserved'])
+                    self.assertEqual(b'owned audio', (path / 'payload.wav').read_bytes())
+                    if mode == 'rollback':
+                        (path / 'old').mkdir()
+                        (path / 'old' / 'backup.wav').write_bytes(b'keep backup')
+                    elif mode == 'guard':
+                        (path / export_staging.RECOVERY).write_bytes(b'keep')
+                    if mode == 'normal':
+                        with PosixRetirement(parent=tmp) as transaction:
+                            transaction.open_slot(slot)
+                            with stage_directory(path, expected) as authority:
+                                transaction.cleanup_initialized_creation(authority, stream)
+                            transaction.discard_empty_slot(slot)
+                finally:
+                    owner.__exit__(None, None, None)
+                if mode == 'abandoned':
+                    recovered = reclaim_export_staging([tmp])
+                    self.assertEqual([], recovered['errors'])
+                    self.assertEqual(1, len(recovered['removed']))
+                elif mode in ('rollback', 'guard'):
+                    recovered = reclaim_export_staging([tmp])
+                    self.assertEqual([], recovered['removed'])
+                    self.assertEqual(b'owned audio', (path / 'payload.wav').read_bytes())
+                    continue
+                self.assertFalse(path.exists())
+                self.assertEqual([LOCK], sorted(p.name for p in (Path(tmp) / DIRECTORY).iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_private_creation_failure_cleans_known_metadata_and_keeps_primary_error(self):
+        from export_staging_retirement import PosixRetirement, DIRECTORY, LOCK
+        for mode in ('absent_marker', 'partial_marker', 'cleanup_failure'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                original = OSError('marker publication failed')
+                cleanup = OSError('cleanup unavailable')
+                def fail(path, marker, *, authority):
+                    if mode == 'partial_marker':
+                        authority.write_marker_bytes(b'{')
+                    raise original
+                with PosixRetirement(parent=tmp) as transaction:
+                    with patch.object(export_staging, '_write_marker', new=fail):
+                        if mode == 'cleanup_failure':
+                            with patch.object(transaction, 'recover_creation_slot', side_effect=cleanup):
+                                with self.assertRaises(OSError) as caught:
+                                    transaction.initialize_creation('mp3')
+                            self.assertIs(cleanup, caught.exception.__cause__)
+                        else:
+                            with self.assertRaises(OSError) as caught:
+                                transaction.initialize_creation('mp3')
+                        self.assertIs(original, caught.exception)
+                if mode == 'cleanup_failure':
+                    recovered = reclaim_export_staging([tmp])
+                    self.assertEqual([], recovered['errors'])
+                    self.assertEqual(1, len(recovered['removed']))
+                self.assertEqual([LOCK], sorted(p.name for p in (Path(tmp) / DIRECTORY).iterdir()))
+                self.assertEqual([DIRECTORY], sorted(p.name for p in Path(tmp).iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_partial_recovery_rechecks_marker_under_owner_lock(self):
+        from contextlib import contextmanager
+        import export_staging_retirement as retirement
+        from export_staging_directory import stage_directory, stage_owner_lock, identity
+        with tempfile.TemporaryDirectory() as tmp:
+            with retirement.PosixRetirement(parent=tmp) as transaction:
+                path, expected = transaction.allocate_creation('mp3', 'a' * 32)
+                with stage_directory(path, expected) as authority:
+                    with stage_owner_lock(authority, create=True) as stream:
+                        owned = {**transaction.read_receipt('creation.json'),
+                                 'owner_identity': list(identity(os.fstat(stream.fileno())))}
+                        raw = transaction.creation_cleanup_receipt(owned)['marker'].encode()
+            original = retirement.stage_owner_lock
+            @contextmanager
+            def insert_marker(authority, **kwargs):
+                with original(authority, **kwargs) as stream:
+                    authority.write_marker_bytes(raw)
+                    yield stream
+            with patch.object(retirement, 'stage_owner_lock', new=insert_marker):
+                result = reclaim_export_staging([tmp])
+            self.assertEqual([], result['removed'])
+            self.assertTrue(result['errors'])
+            self.assertEqual(raw, (path / MARKER).read_bytes())
+            self.assertTrue((path / (OWNER_LOCK + '.lock')).exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private initialization prototype')
+    def test_registry_exclusion_and_missing_capability_preserve_slot(self):
+        from export_staging_retirement import PosixRetirement
+        with tempfile.TemporaryDirectory() as tmp:
+            with PosixRetirement(parent=tmp) as first:
+                path, _ = first.allocate_creation('mp3', 'a' * 32)
+                with self.assertRaises(TimeoutError):
+                    with PosixRetirement(parent=tmp):
+                        self.fail('A second descriptor acquired the live registry lock')
+            with patch.object(os, 'supports_dir_fd', set(os.supports_dir_fd) - {os.stat}):
+                result = reclaim_export_staging([tmp])
+            self.assertEqual([], result['removed'])
+            self.assertTrue(any('Descriptor-relative retirement is unavailable' in error
+                                for error in result['errors']))
+            self.assertTrue(path.is_dir())
+            self.assertEqual(1, len(reclaim_export_staging([tmp])['removed']))
+
     def run_child(self, parent, kind='mp3', mode='hold'):
         process = subprocess.Popen(
             [sys.executable, '-c', CHILD, str(APP), str(parent), kind, mode],
@@ -51,6 +1328,14 @@ class ExportStagingTests(unittest.TestCase):
                 path = staging.path
                 (path / 'payload.bin').write_bytes(b'x')
                 self.assertTrue(path.is_dir())
+                marker_at_release = []
+                release = staging._lock.__exit__
+                def observed_release(*args):
+                    marker_at_release.append((path / MARKER).exists())
+                    return release(*args)
+                with patch.object(staging._lock, '__exit__', side_effect=observed_release):
+                    staging.finish()
+                self.assertEqual([False], marker_at_release)
             self.assertFalse(path.exists())
 
     def test_hard_exit_leaves_a_verifiably_abandoned_directory(self):
@@ -190,6 +1475,63 @@ print(json.dumps(reclaim_export_staging((sys.argv[2],))))
             self.assertIn(str(path), result['preserved'])
             self.assertTrue((path / 'old' / 'backup.wav').is_file())
 
+    def test_recovery_does_not_recreate_a_missing_live_owner_lock(self):
+        for replaced in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                stage = create_export_staging(tmp, 'mp3')
+                payload = stage.path / 'payload.bin'
+                payload.write_bytes(b'live owner payload')
+                try:
+                    try:
+                        (stage.path / (OWNER_LOCK + '.lock')).unlink()
+                    except PermissionError:
+                        self.skipTest('Platform prevents unlinking the open owner file')
+                    if replaced:
+                        (stage.path / (OWNER_LOCK + '.lock')).write_bytes(b'')
+                    result = reclaim_export_staging((tmp,))
+                    self.assertEqual([], result['removed'])
+                    self.assertTrue(result['errors'] or result['preserved'])
+                    self.assertEqual(b'live owner payload', payload.read_bytes())
+                    self.assertEqual(replaced, (stage.path / (OWNER_LOCK + '.lock')).exists())
+                finally:
+                    stage._lock.__exit__(None, None, None)
+                    stage._closed = True
+
+
+    def test_creation_failure_keeps_original_error_when_cleanup_also_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = OSError('marker publication failed')
+            cleanup = OSError('staging directory changed during cleanup')
+            from export_staging_retirement import PosixRetirement
+            target = export_staging if os.name == 'nt' else PosixRetirement
+            method = '_remove_tree' if os.name == 'nt' else 'recover_creation_slot'
+            with patch.object(export_staging, '_write_marker', side_effect=original), \
+                    patch.object(target, method, side_effect=cleanup):
+                with self.assertRaises(OSError) as caught:
+                    create_export_staging(tmp, 'mp3')
+            self.assertIs(original, caught.exception)
+            self.assertIs(cleanup, caught.exception.__cause__)
+
+    def test_rollback_alias_is_preserved_without_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            foreign = root / 'foreign'
+            foreign.mkdir()
+            stage = create_export_staging(root, 'chapter')
+            try:
+                (stage.path / 'old').symlink_to(foreign, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                stage.finish()
+                self.skipTest('Directory symlink creation unavailable')
+            stage._lock.__exit__(None, None, None)
+            stage._closed = True
+            result = reclaim_export_staging((root,))
+            self.assertEqual([], result['removed'])
+            self.assertIn(str(stage.path), result['preserved'])
+            self.assertTrue((stage.path / 'old').is_symlink())
+            self.assertTrue((stage.path / MARKER).is_file())
+            self.assertTrue(foreign.is_dir())
+
     def test_unknown_sibling_missing_marker_and_foreign_parent_are_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -234,6 +1576,13 @@ print(json.dumps(reclaim_export_staging((sys.argv[2],))))
             result = reclaim_export_staging((tmp,))
             self.assertEqual([], result['removed'])
             self.assertTrue((path / 'recovery.bin').is_file())
+            guarded = create_export_staging(tmp, 'chapter')
+            (guarded.path / 'recovery.bin').write_bytes(b'keep guarded')
+            (guarded.path / export_staging.RECOVERY).write_bytes(b'1')
+            with self.assertRaises(OSError):
+                guarded.finish(remove=True)
+            self.assertEqual(b'keep guarded', (guarded.path / 'recovery.bin').read_bytes())
+            self.assertTrue((guarded.path / MARKER).exists())
 
 
 if __name__ == '__main__':

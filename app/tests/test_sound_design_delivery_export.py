@@ -54,6 +54,7 @@ class SoundDeliveryExportTests(unittest.TestCase):
 
     def test_repeated_success_does_not_exhaust_retained_stage_slots(self):
         from sound_design_staging import MAX_STAGES
+        from tests.export_staging_assertions import delivery_names
         def check(candidate, revision):
             approval = self.approve(candidate, revision, full_mix_reviewed=True)
             for _ in range(MAX_STAGES + 1):
@@ -63,6 +64,7 @@ class SoundDeliveryExportTests(unittest.TestCase):
                 self.assertEqual('published', result['status'])
                 self.assertEqual([],result['warnings'])
                 self.assertEqual([candidate],list(candidate.parent.glob('render-*')))
+                self.assertEqual({candidate.name, 'quota.lock'}, delivery_names(self, candidate.parent))
         self.run_owned(check)
 
     def test_postpublication_stat_failure_reports_published_without_stale_quality(self):
@@ -94,8 +96,8 @@ class SoundDeliveryExportTests(unittest.TestCase):
             approval = self.approve(candidate, revision, full_mix_reviewed=True)
             replace = os.replace
             retained = []
-            def add_recovery_note(source,destination):
-                replace(source,destination)
+            def add_recovery_note(source,destination,**kwargs):
+                replace(source,destination,**kwargs)
                 if str(destination).endswith('mixed_audiobook.mp3'):
                     path = Path(source).parent/'recovery-note'
                     path.write_bytes(b'preserve for inspection')
@@ -107,6 +109,74 @@ class SoundDeliveryExportTests(unittest.TestCase):
             self.assertEqual('published',result['status'])
             self.assertEqual(1,len(result['warnings']))
             self.assertEqual(b'preserve for inspection',retained[0].read_bytes())
+            from sound_design_staging import ensure_sound_render_quota
+            with ensure_sound_render_quota(self.root) as (_, _, count):
+                self.assertEqual(2, count)
+        self.run_owned(check)
+
+    def test_failed_postpublication_retirement_is_guarded_before_owner_release(self):
+        import os
+        from export_staging import RECOVERY, reclaim_export_staging
+        from export_staging_retirement import PosixRetirement
+        cleanup = PosixRetirement.cleanup_initialized_creation
+        replace = os.replace
+        def check(candidate, revision):
+            approval = self.approve(candidate, revision, full_mix_reviewed=True)
+            published = False
+            retained = []
+            def record_publication(source, destination, **kwargs):
+                nonlocal published
+                replace(source, destination, **kwargs)
+                if str(destination).endswith('mixed_audiobook.mp3'):
+                    published = True
+            def fail_delivery(transaction, authority, stream, **kwargs):
+                if published and not retained and authority.path.parents[2] == candidate.parent:
+                    retained.append(authority.path)
+                    (authority.path / 'retained-note').write_bytes(b'keep')
+                    raise PermissionError('synthetic retirement failure')
+                return cleanup(transaction, authority, stream, **kwargs)
+            with patch('sound_design_delivery.os.replace', side_effect=record_publication), \
+                    patch.object(PosixRetirement, 'cleanup_initialized_creation', new=fail_delivery):
+                result = save_sound_delivery_mp3(ProjectManager(str(self.root)), candidate.name,
+                    revision, approval['approval_revision'],
+                    {'format':'mp3', 'mastering':None, 'export_quality':None})
+            self.assertTrue(published)
+            self.assertEqual('published', result['status'])
+            self.assertEqual(1, len(result['warnings']))
+            self.assertTrue((self.root / result['file']).is_file())
+            self.assertEqual(1, len(retained))
+            self.assertTrue((retained[0] / RECOVERY).exists())
+            reclaim_export_staging([candidate.parent])
+            self.assertEqual(b'keep', (retained[0] / 'retained-note').read_bytes())
+        self.run_owned(check)
+
+    def test_postpublication_nested_registry_failure_preserves_payload(self):
+        import os
+        from pathlib import Path
+        from export_staging import RECOVERY, reclaim_export_staging
+        from export_staging_retirement import DIRECTORY
+        replace = os.replace
+        def check(candidate, revision):
+            approval = self.approve(candidate, revision, full_mix_reviewed=True)
+            retained = []
+            def add_unknown_registry_entry(source, destination, **kwargs):
+                replace(source, destination, **kwargs)
+                if str(destination).endswith('mixed_audiobook.mp3'):
+                    path = Path(source).parent / DIRECTORY / 'unknown-entry'
+                    self.assertTrue(path.parent.is_dir())
+                    path.write_bytes(b'preserve unknown registry data')
+                    retained.append(path)
+            with patch('sound_design_delivery.os.replace', side_effect=add_unknown_registry_entry):
+                result = save_sound_delivery_mp3(ProjectManager(str(self.root)), candidate.name,
+                    revision, approval['approval_revision'],
+                    {'format':'mp3', 'mastering':None, 'export_quality':None})
+            self.assertEqual('published', result['status'])
+            self.assertEqual(1, len(result['warnings']))
+            self.assertTrue((self.root / result['file']).is_file())
+            self.assertEqual(1, len(retained))
+            self.assertTrue((retained[0].parents[1] / RECOVERY).exists())
+            reclaim_export_staging([candidate.parent])
+            self.assertEqual(b'preserve unknown registry data', retained[0].read_bytes())
         self.run_owned(check)
 
     def test_approved_wav_delivers_exact_candidate_pcm(self):
@@ -121,6 +191,9 @@ class SoundDeliveryExportTests(unittest.TestCase):
                 revision,approval['approval_revision'],options)
             self.assertEqual('mixed_audiobook.wav',result['file'])
             self.assertEqual('verified',result['quality']['status'])
+            self.assertEqual([], result['warnings'])
+            from tests.export_staging_assertions import delivery_names
+            self.assertEqual({candidate.name, 'quota.lock'}, delivery_names(self, candidate.parent))
             with (self.root/result['file']).open('rb') as stream:
                 self.assertEqual((candidate/'mixed.pcm').read_bytes(), AudioSegment.from_wav(stream).raw_data)
         self.run_owned(check)
@@ -137,6 +210,9 @@ class SoundDeliveryExportTests(unittest.TestCase):
             result = save_sound_delivery(manager,candidate.name,revision,approval['approval_revision'],options)
             self.assertEqual('mixed_audiobook.m4b',result['file'])
             self.assertEqual('verified',result['quality']['status'])
+            self.assertEqual([], result['warnings'])
+            from tests.export_staging_assertions import delivery_names
+            self.assertEqual({candidate.name, 'quota.lock'}, delivery_names(self, candidate.parent))
             self.assertEqual(2,result['quality']['chapters_checked'])
             self.assertEqual(6,result['quality']['tags_checked'])
             import json,subprocess
