@@ -4,6 +4,8 @@ All lines here are synthetic. "off" must stay the shipped instruct contract;
 the other modes are opt-in and change only what Pass 3 asks for and returns.
 """
 import json
+import os
+import tempfile
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -65,6 +67,21 @@ class PromptSelectionTests(unittest.TestCase):
         for field in ('"gap"', '"action"', '"answers"'):
             self.assertNotIn(field, system + user)
 
+    def test_directed_prompt_asks_for_reply_fields_and_neighbour_context(self):
+        contexts = [
+            {},
+            {"previous_context": {"speaker": "ANNA", "text": "Outside-window sentinel."}},
+            {"previous_context": {"speaker": "BEN", "text": "Another sentinel."}},
+        ]
+        system, user = tp.build_instruct_request(PRIOR, make_params("directed"), contexts)
+        for field in ('"answers"', '"action"', '"delivery"', '"gap"'):
+            self.assertIn(field, system)
+        self.assertIn("earlier entry", system)
+        self.assertIn("Never the entry's own", system)
+        self.assertIn("previous_context", user)
+        self.assertIn("Outside-window sentinel.", user)
+        self.assertIn("Another sentinel.", user)
+
 
 class ResolverTests(unittest.TestCase):
     def test_cli_beats_config_and_default_is_off(self):
@@ -120,6 +137,17 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(["invalid_answers"], self.codes(self.rows({(1, "answers"): 1})))
         self.assertEqual(["invalid_answers"], self.codes(self.rows({(1, "answers"): 3})))
         self.assertEqual(["invalid_answers"], self.codes(self.rows({(1, "answers"): True})))
+        self.assertEqual(["invalid_answers"], self.codes(self.rows({(0, "answers"): 1})))
+        self.assertEqual(["invalid_answers"], self.codes(self.rows({(1, "answers"): 2})))
+        self.assertEqual([], self.codes(self.rows({(2, "answers"): 0})))
+
+    def test_answers_accepts_transport_index_forms_and_requires_the_key(self):
+        self.assertEqual([], self.codes(self.rows({(1, "answers"): "0"})))
+        self.assertEqual([], self.codes(self.rows({(1, "answers"): 0.0})))
+        self.assertEqual(["invalid_answers"], self.codes(self.rows({(1, "answers"): "²"})))
+        missing = self.rows()
+        missing[1].pop("answers")
+        self.assertEqual(["invalid_answers"], self.codes(missing))
 
     def test_action_only_does_not_need_delivery(self):
         self.assertEqual([], self.codes(self.rows({(2, "delivery"): ""}), "action_only"))
@@ -156,6 +184,16 @@ class InstructBatchTests(unittest.TestCase):
         self.assertEqual({"answers": 0, "action": "dodging", "delivery": "low, hurried.",
                           "gap": "beat"}, out[1]["direction"])
         self.assertEqual([e["text"] for e in PRIOR], [e["text"] for e in out])
+        self.assertEqual([e["speaker"] for e in PRIOR], [e["speaker"] for e in out])
+        self.assertEqual([None, 0, 1], [e["direction"]["answers"] for e in out])
+
+    def test_directed_rows_normalize_and_preserve_reply_indexes(self):
+        rows = [dict(row) for row in DIRECTED_ROWS]
+        rows[1]["answers"] = "0"
+        out = tp.instruct_batch(tpg._client_returning([rows]), "m", PRIOR,
+                                make_params("directed"))
+        self.assertEqual(0, out[1]["direction"]["answers"])
+        self.assertIsInstance(out[1]["direction"]["answers"], int)
 
     def test_action_only_drops_the_delivery_note(self):
         out = tp.instruct_batch(tpg._client_returning([DIRECTED_ROWS]), "m", PRIOR,
@@ -237,10 +275,11 @@ class RunThreePassTests(unittest.TestCase):
                  {"type": "SPOKEN", "text": "Then go."}]
     NAMED = [{"n": 0, "speaker": "ANNA"}, {"n": 1, "speaker": "BEN"}, {"n": 2, "speaker": "ANNA"}]
 
-    def run_book(self, direction, instruct_rows):
+    def run_book(self, direction, instruct_rows, output_path=None):
         client = tpg._client_returning([self.SEGMENTED, self.NAMED, instruct_rows])
         return tp.run_three_pass(client, "m", self.SOURCE, make_params(direction), chunk_size=6000,
-                                 cast=tpg._load_orchestration_fixture_cast(("ANNA", "BEN")))
+                                 cast=tpg._load_orchestration_fixture_cast(("ANNA", "BEN")),
+                                 output_path=output_path)
 
     def test_directed_book_carries_gap_pauses_to_tts(self):
         entries = self.run_book("directed", DIRECTED_ROWS)
@@ -273,6 +312,18 @@ class RunThreePassTests(unittest.TestCase):
                 # sub-millisecond PCM rounding, not a changed pause choice.
                 self.assertAlmostEqual(100 + expected, timeline[1][2], delta=0.5)
                 self.assertAlmostEqual(200 + expected + 60, timeline[2][2], delta=0.5)
+
+    def test_directed_book_checkpoint_preserves_reply_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            out = os.path.join(root, "annotated_script.json")
+            entries = self.run_book("directed", DIRECTED_ROWS, output_path=out)
+            from generation_checkpoint_deltas import load_generation_delta_checkpoint
+            saved = load_generation_delta_checkpoint(tp.three_pass_checkpoint_path(out))["annotated"]
+        self.assertEqual([None, 0, 1], [e["direction"]["answers"] for e in saved])
+        self.assertEqual([e["text"] for e in self.SEGMENTED], [e["text"] for e in saved])
+        self.assertEqual(["ANNA", "BEN", "ANNA"], [e["speaker"] for e in saved])
+        self.assertEqual([900, 60, None], [e.get("pause_after") for e in saved])
+        self.assertEqual(entries, saved)
 
     def test_off_book_has_no_gap_pauses(self):
         rows = [{"n": i, "instruct": "Quiet."} for i in range(3)]
