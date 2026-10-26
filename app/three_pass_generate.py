@@ -601,17 +601,22 @@ def get_directed_entry(prior, item, delivery_direction):
 
 
 def apply_gap_pauses(entries):
-    """Return copies with each line's gap placed on the previous entry's pause_after,
-    which is the silence after that entry. A longer pause already there (a scene
-    break) is kept, so cut_off never shortens one."""
+    """Return copies with gap suggestions filling only missing pause_after fields.
+    Existing choices, including zero and None (the speaker-based default), remain
+    authoritative. A materialized suggestion also stays unchanged on later runs.
+    """
     result = [dict(entry) if isinstance(entry, dict) else entry for entry in entries]
     for previous, current in zip(result, result[1:]):
         if not isinstance(previous, dict) or not isinstance(current, dict):
             continue
         pause = GAP_PAUSE_MS.get((current.get("direction") or {}).get("gap"))
         if pause is not None:
-            existing = previous.get("pause_after")
-            previous["pause_after"] = pause if existing is None else max(int(existing), pause)
+            if "pause_after" not in previous:
+                previous["pause_after"] = pause
+            elif previous["pause_after"] is not None:
+                # Keep the existing malformed-value refusal without replacing
+                # a valid explicit value with the model's suggestion.
+                int(previous["pause_after"])
     return result
 
 
