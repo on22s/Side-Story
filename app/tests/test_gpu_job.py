@@ -174,21 +174,6 @@ class GpuJobTest(unittest.TestCase):
                 self.fail(message)
             time.sleep(0.01)
 
-    def pending_names(self, env):
-        pending = env["GPU_PENDING_DIR"]
-        if not os.path.isdir(pending):
-            return []
-        names = []
-        for marker in os.listdir(pending):
-            try:
-                with open(os.path.join(pending, marker), encoding="utf-8") as handle:
-                    name = handle.readline().split("\t", 1)[0]
-            except OSError:
-                continue
-            if name:
-                names.append(name)
-        return names
-
     def lock_wait_pid(self, process):
         if not os.path.isdir("/proc"):
             self.skipTest("procfs is required to observe the lock waiter")
@@ -317,13 +302,14 @@ class GpuJobTest(unittest.TestCase):
             except FileNotFoundError:
                 return []
 
-        first = subprocess.Popen(["bash", GPU_JOB, "j0", "bash", "-c", script],
-                                 env=env, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-        second = subprocess.Popen(["bash", GPU_JOB, "j1", "bash", "-c", script],
-                                  env=env, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
+        first = second = None
         try:
+            first = subprocess.Popen(["bash", GPU_JOB, "j0", "bash", "-c", script],
+                                     env=env, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            second = subprocess.Popen(["bash", GPU_JOB, "j1", "bash", "-c", script],
+                                      env=env, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
             self.wait_for(
                 lambda: len(witness_lines()) > 1 or (
                     len(witness_lines()) == 1
@@ -338,11 +324,13 @@ class GpuJobTest(unittest.TestCase):
             first.wait(timeout=60)
             second.wait(timeout=60)
         finally:
-            Path(release).touch()
-            for process in (first, second):
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
+            try:
+                Path(release).touch()
+            finally:
+                for process in (first, second):
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
         self.assertEqual(first.returncode, 0)
         self.assertEqual(second.returncode, 0)
         self.assertIn("OK       j0", self.log())
@@ -365,7 +353,7 @@ class GpuJobTest(unittest.TestCase):
         try:
             self.wait_for_log("START    slow", processes=(slow,))
             self.wait_for(lambda: os.path.exists(slow_started),
-                          "slow job did not start its command")
+                          "slow job did not start its command", processes=(slow,))
             waiter = subprocess.Popen(["bash", GPU_JOB, "waiter", "touch", waiter_ran],
                                       env=env, stdout=subprocess.DEVNULL,
                                       stderr=subprocess.DEVNULL)
@@ -377,11 +365,13 @@ class GpuJobTest(unittest.TestCase):
             slow.wait(timeout=60)
             waiter.wait(timeout=60)
         finally:
-            Path(release).touch()
-            for process in (slow, waiter):
-                if process is not None and process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
+            try:
+                Path(release).touch()
+            finally:
+                for process in (slow, waiter):
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
         self.assertEqual(slow.returncode, 0)
         self.assertEqual(waiter.returncode, 0)
         self.assertTrue(os.path.exists(slow_started))
@@ -404,7 +394,7 @@ class GpuJobTest(unittest.TestCase):
         try:
             self.wait_for_log("START    holder", processes=(holder,))
             self.wait_for(lambda: os.path.exists(holder_started),
-                          "holder did not start its command")
+                          "holder did not start its command", processes=(holder,))
             waiter = subprocess.Popen(["bash", GPU_JOB, "waiter", "touch", marker],
                                       env=env, stdout=subprocess.DEVNULL)
             self.wait_for_lock(waiter)
@@ -414,11 +404,13 @@ class GpuJobTest(unittest.TestCase):
             Path(release).touch()
             holder.wait(timeout=60)
         finally:
-            Path(release).touch()
-            for process in (holder, waiter):
-                if process is not None and process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
+            try:
+                Path(release).touch()
+            finally:
+                for process in (holder, waiter):
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
         self.assertEqual(holder.returncode, 0)
         self.assertTrue(os.path.exists(holder_started))
         self.assertEqual(-9, waiter.returncode)
