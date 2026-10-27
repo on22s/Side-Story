@@ -612,7 +612,12 @@ class MalformedChapterManifestTests(unittest.TestCase):
             expected_evidence = stable_chapter_evidence(expected_manifest)
             expected_audio = {row["file"]: sf.read(output / row["file"], dtype="int16")
                               for row in expected_manifest["chapters"]}
-            for malformed in self.MALFORMED + timing_cases:
+            # Preserve a valid plan and matching audio while corrupting one row:
+            # stale outputs alone must not explain rejecting the manifest.
+            valid_plan_bad_row = json.loads(json.dumps(expected_manifest))
+            valid_plan_bad_row["chapters"][0]["index"] = False
+            from project import _export_audio_segment
+            for malformed in self.MALFORMED + timing_cases + (valid_plan_bad_row,):
                 for changed in (False, True):
                     with self.subTest(manifest=malformed, changed=changed):
                         shutil.rmtree(output)
@@ -621,12 +626,15 @@ class MalformedChapterManifestTests(unittest.TestCase):
                             cache.unlink(missing_ok=True)
                         else:
                             cache.write_bytes(baseline_cache)
-                        for name in expected_audio:
-                            (output / name).write_bytes(b"stale previous chapter")
+                        if not changed:
+                            for name in expected_audio:
+                                (output / name).write_bytes(b"stale previous chapter")
                         (output / "manifest.json").write_text(json.dumps(malformed))
                         with patch.object(pm, "load_chunks", return_value=chunks), \
                              patch.object(pm, "_load_pause_defaults", return_value=(10, 5)):
-                            ok, msg = pm.export_chapters(fmt="wav", changed_only=changed)
+                            with patch('project._export_audio_segment', wraps=_export_audio_segment) as render:
+                                ok, msg = pm.export_chapters(fmt="wav", changed_only=changed)
+                            self.assertEqual(2, render.call_count)
                             self.assertTrue(ok, msg)
                             self.assertIn("2 chapter file(s) written", msg)
                             self.assertEqual(expected_evidence,
