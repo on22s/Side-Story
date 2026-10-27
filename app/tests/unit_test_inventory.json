@@ -3092,7 +3092,8 @@
   "test_derived_metadata": [
     "tests.test_derived_metadata.DerivedMetadataTests.test_metadata_queries_do_not_execute_generators_and_match_existing_interfaces",
     "tests.test_derived_metadata.DerivedMetadataTests.test_pointer_only_resolver_queries_metadata_once_and_regenerates_once",
-    "tests.test_derived_metadata.DerivedMetadataTests.test_ready_regenerates_once_then_checks_and_runs_verifier"
+    "tests.test_derived_metadata.DerivedMetadataTests.test_ready_regenerates_once_then_checks_and_runs_verifier",
+    "tests.test_derived_metadata.DerivedMetadataTests.test_ready_targets_its_own_checkout_when_invoked_from_another_repo"
   ],
   "test_derived_prose_staging": [
     "tests.test_derived_prose_staging.DerivedProseStagingTests.test_followup_commits_only_generated_blobs_with_unstaged_prose",

@@ -20,6 +20,10 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
+# The shared generator resolves its checkout from the current directory.
+# Keep it, the hook installer and the verifier on this script's checkout even
+# when ready.sh is invoked by absolute path from another Git repository.
+cd "$REPO" || exit 1
 # HOOKS FIRST. The derived-file hooks and the merge driver they need are LOCAL
 # git config, so a fresh checkout or a new worktree does not have them and the
 # conflicts come straight back. Installing here is idempotent and means the
@@ -34,9 +38,9 @@ echo "== regenerating what CI checks =="
 "$REPO/tools/regen_derived.sh" || exit 1
 python="$("$REPO/tools/regen_derived.sh" --python)"
 
-# The verifier owns the settle checks and runs them before units. ready.sh
-# has just regenerated every derived file, so rerunning the four evidence
-# generators as checks here would be duplicate work; CI still runs them.
+# The verifier owns the evidence gates. ready.sh has just regenerated every
+# derived file, so it marks those gates skipped instead of checking again;
+# CI and an explicit --check-evidence still run them.
 
 # A BRAND-NEW ARTIFACT WILL GO STALE THE MOMENT YOU COMMIT IT, ONCE.
 # collect_results records the commit each artifact was generated at, and that
