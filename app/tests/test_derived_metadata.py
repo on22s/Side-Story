@@ -64,8 +64,30 @@ class DerivedMetadataTests(unittest.TestCase):
                 [Path(args[0]).name for args in calls])
             self.assertFalse(any('--check' in args for args in calls),
                              'ready must delegate checks instead of repeating them')
-            self.assertEqual(['verify_release.py','--check-evidence','--shard','2/3'],
+            self.assertEqual(['verify_release.py','--skip-evidence-recheck','--shard','2/3'],
                              calls[-1])
+
+    def test_ready_targets_its_own_checkout_when_invoked_from_another_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            caller=Path(tmp)/'caller';target=Path(tmp)/'target'
+            for root in (caller,target):
+                root.mkdir()
+                self.fixture(root)
+                if root == caller:
+                    (root/'RESULTS_INDEX.md').write_text('resolved\n')
+                subprocess.run(['git','-C',str(root),'add','-A'],check=True)
+                subprocess.run(['git','-C',str(root),'commit','-qm','base'],check=True)
+            result=subprocess.run(['bash',str(target/'ready.sh')],cwd=caller,
+                                  capture_output=True,text=True,timeout=10)
+            self.assertEqual(2,result.returncode,result.stdout+result.stderr)
+            self.assertFalse((caller/'calls').exists(),'generator ran in caller checkout')
+            calls=[json.loads(line) for line in (target/'calls').read_text().splitlines()]
+            self.assertEqual(['audit_experiment_artifacts.py','audit_legacy_attribution.py',
+                              'collect_results.py','goal_evidence_audit.py',
+                              'update_test_inventory.py'],
+                             [Path(args[0]).name for args in calls])
+            self.assertEqual('resolved\n',(target/'RESULTS_INDEX.md').read_text())
+            self.assertIn('NOT READY: regeneration changed',result.stdout)
 
     def test_pointer_only_resolver_queries_metadata_once_and_regenerates_once(self):
         with tempfile.TemporaryDirectory() as tmp:

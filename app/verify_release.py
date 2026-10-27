@@ -314,8 +314,13 @@ def main(argv=None):
     )
     parser.add_argument(
         "--check-evidence", action="store_true",
-        help="check all derived evidence indexes before units, including on later shards; "
-             "used by ready.sh (evidence failures exit 2)",
+        help="check all derived evidence indexes before units, including on later shards",
+    )
+    parser.add_argument(
+        "--skip-evidence-recheck", action="store_true",
+        help="mark the derived-evidence gates skipped because the caller just regenerated "
+             "every derived file; ignored when --check-evidence is explicit; other "
+             "unsharded gates still run",
     )
     args = parser.parse_args(argv)
     try:
@@ -345,18 +350,27 @@ def main(argv=None):
                 ),
             )
         # One owner for the checks formerly repeated by ready.sh and CI.
-        # ready.sh also requires them when invoking a non-primary shard.
-        if runs_other_gates or args.check_evidence:
-            for gate, script in (("evidence_index", "tools/audit/audit_experiment_artifacts.py"),
-                                 ("legacy_audit", "tools/audit/audit_legacy_attribution.py"),
-                                 ("results_index", "tools/audit/collect_results.py"),
-                                 ("goal_evidence", "app/experiments/goal_evidence_audit.py")):
+        # ready.sh marks them skipped after regeneration; an explicit
+        # --check-evidence still forces them on every shard.
+        evidence_gates = (("evidence_index", "tools/audit/audit_experiment_artifacts.py"),
+                          ("legacy_audit", "tools/audit/audit_legacy_attribution.py"),
+                          ("results_index", "tools/audit/collect_results.py"),
+                          ("goal_evidence", "app/experiments/goal_evidence_audit.py"))
+        if args.check_evidence or (runs_other_gates and not args.skip_evidence_recheck):
+            for gate, script in evidence_gates:
                 run_report_gate(
                     report, gate, lambda script=script: run_report_command(
                         "Evidence index (%s)" % script,
                         [sys.executable, script, "--check"], repo_dir,
                     ),
                 )
+        elif runs_other_gates and args.skip_evidence_recheck:
+            report["gates"].extend({
+                "name": gate,
+                "status": "skipped",
+                "reason": "ready.sh regenerated derived evidence before the verifier",
+                "duration_seconds": 0.0,
+            } for gate, _script in evidence_gates)
         unit_command = [sys.executable, "-m", "ci_env", "discover", "-s", ".", "-p", "test_*.py", "-v"]
         if args.shard is not None:
             unit_command += ["--shard", args.shard]

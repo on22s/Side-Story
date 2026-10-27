@@ -270,12 +270,27 @@ class VerifierShardTests(unittest.TestCase):
                 self.assertEqual(1234, report["gates"][0]["result"]["tests_ran"])
                 self.assertEqual([f"test.{i}" for i in range(1234)], report["gates"][0]["result"]["test_ids"])
 
-        # ready.sh keeps all evidence checks even when selecting a later shard.
+        # --check-evidence keeps all evidence checks on later shards.
         for shard in ("2/3", "3/3"):
             with self.subTest(ready_shard=shard):
                 code, names, _, _ = self.run_main("--check-evidence", "--shard", shard)
                 self.assertEqual((0, ["evidence_index", "legacy_audit", "results_index",
                                       "goal_evidence", "unit_tests"]), (code, names))
+
+        # ready.sh regenerated these files already; skip the duplicate recheck.
+        code, names, _, report = self.run_main("--skip-evidence-recheck")
+        self.assertEqual((0, ["compile_python", "test_inventory", "unit_tests",
+                              "api_contract", "api_tests"]), (code, names))
+        self.assertEqual(["skipped", "skipped", "skipped", "skipped"],
+                         [gate["status"] for gate in report["gates"]
+                          if gate["name"] in {"evidence_index", "legacy_audit",
+                                              "results_index", "goal_evidence"}])
+        code, names, _, _ = self.run_main("--skip-evidence-recheck", "--check-evidence")
+        self.assertEqual((0, ["compile_python", "test_inventory", "evidence_index",
+                              "legacy_audit", "results_index", "goal_evidence",
+                              "unit_tests", "api_contract", "api_tests"]), (code, names))
+        code, names, _, _ = self.run_main("--skip-evidence-recheck", "--shard", "2/3")
+        self.assertEqual((0, ["unit_tests"]), (code, names))
 
     def test_bad_shard_is_refused_before_any_gate_runs(self):
         with patch.object(verify_release, "run_report_gate") as gate, patch.object(sys, "stderr", io.StringIO()):
