@@ -12,6 +12,7 @@ Run from the repository root:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
@@ -38,6 +39,7 @@ if str(APP) not in sys.path:
 import export_staging
 from export_staging import create_export_staging, reclaim_export_staging, MARKER
 from export_staging_directory import StageDirectoryChanged
+from windows_export_staging_directory import _api
 from export_staging_retirement import DIRECTORY, PosixRetirement
 
 IS_WINDOWS = os.name == 'nt'
@@ -509,13 +511,59 @@ def check_windows_live_owner(platform):
 
 
 def check_windows_parent_replacement(platform):
+    api = _api()
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    def delete_open_result(path):
+        """Probe DELETE access while sharing read, write and delete."""
+        # The probe uses the same path as the rename target or held stage,
+        # and sharing all modes avoids creating a conflict of its own.
+        handle = api.CreateFileW(str(path), 0x10000, 0x1 | 0x2 | 0x4,
+                                 None, 3, 0x02000000 | 0x00200000, None)
+        error = ctypes.get_last_error()
+        if handle == invalid_handle:
+            return error
+        if not api.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return None
+
+    def after_release(path):
+        error = None
+        for _ in range(20):
+            error = delete_open_result(path)
+            if error is None:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f'DELETE access did not recover after child exit: '
+                             f'WinError {error}, path {path}')
+
     with tempfile.TemporaryDirectory() as base:
         root = Path(base) / 'book'
         root.mkdir()
         moved = Path(base) / 'book-moved'
+
+        def require_intact(stage, point):
+            if not root.is_dir() or moved.exists() or not stage.is_dir():
+                raise AssertionError(f'parent or stage changed {point}')
+            try:
+                payload = (stage / 'payload.bin').read_bytes()
+            except OSError as error:
+                raise AssertionError(f'stage payload missing {point}') from error
+            if payload != b'owned payload':
+                raise AssertionError(f'stage payload changed {point}')
+
         # Establish that ordinary permissions allow this exact rename.
         root.rename(moved)
         moved.rename(root)
+        if not root.is_dir() or moved.exists():
+            raise AssertionError('rename target missing before child hold')
+        before_error = delete_open_result(root)
+        if before_error is not None:
+            if before_error in (5, 32):
+                raise UnsupportedCheck(f'DELETE access to rename target before owner hold: '
+                                       f'WinError {before_error}')
+            raise AssertionError(f'unexpected DELETE-open error before child hold: '
+                                 f'WinError {before_error}')
         process, stage = child_hold(HOLD_HANDLE_CHILD, root)
         try:
             assert process.poll() is None, 'child exited before rename probe'
@@ -524,17 +572,35 @@ def check_windows_parent_replacement(platform):
                 root.rename(moved)
             except OSError as error:
                 winerror = getattr(error, 'winerror', None)
-                if winerror == 5:
-                    raise UnsupportedCheck('access denied does not establish a sharing violation') from error
-                assert winerror == 32, f'unexpected rename error: {error}'
+                require_intact(stage, 'during refused rename')
+                if winerror in (2, 3, 183):
+                    raise AssertionError(f'parent rename failed with invalid path state: '
+                                         f'WinError {winerror}') from error
+                if winerror not in (5, 32):
+                    raise UnsupportedCheck(f'unexpected parent rename error: {error}') from error
             else:
                 raise AssertionError('parent rename was not refused while ancestor/stage handles were live')
+            root_sharing_error = delete_open_result(root)
+            stage_sharing_error = delete_open_result(stage)
+            for name, code in (('parent', root_sharing_error), ('stage', stage_sharing_error)):
+                if code is None:
+                    raise AssertionError(f'{name} DELETE open unexpectedly succeeded during hold')
+                if code != 32:
+                    raise UnsupportedCheck(f'{name} DELETE open did not show a sharing violation: WinError {code}')
         finally:
             _terminate(process)
-        # A stable access denial would not demonstrate protection by the handle.
+        require_intact(stage, 'after child exit')
+        after_release(root)
+        after_release(stage)
         root.rename(moved)
         moved.rename(root)
+        require_intact(stage, 'after released rename control')
         return {'rename_refused': winerror, 'rename_without_handle': True,
+                'parent_delete_sharing_violation': root_sharing_error,
+                'stage_delete_sharing_violation': stage_sharing_error,
+                'delete_open_without_handle': True,
+                'delete_open_after_release': True,
+                'child_ready_after_stage_directory_entry': True,
                 'rename_after_release': True}
 
 

@@ -31,31 +31,52 @@ class WindowsQualificationVerdictTests(unittest.TestCase):
             process.live = True
             stage = Path(root) / 'stage'
             stage.mkdir()
-            (stage / 'payload.bin').write_bytes(b'owned')
+            (stage / 'payload.bin').write_bytes(b'owned payload')
             return process, stage
 
         def terminate(_process):
             process.live = False
 
         original = Path.rename
-        for error_code, expected in ((32, None), (5, qualification.UnsupportedCheck), (3, AssertionError)):
-            with self.subTest(error_code=error_code):
+        for rename_code, probe_code, expected in (
+                (32, 32, None),
+                (5, 32, None),
+                (5, 5, qualification.UnsupportedCheck),
+                (3, 32, AssertionError),
+                (183, 32, AssertionError),
+                (5, None, AssertionError)):
+            with self.subTest(rename_code=rename_code, probe_code=probe_code):
                 rename_attempts = []
+                last_error = {'code': 0}
+                invalid = qualification.ctypes.c_void_p(-1).value
+
+                def create_file(path, *_args):
+                    code = probe_code if process.live else None
+                    last_error['code'] = code or 0
+                    return invalid if code is not None else 123
+
+                api = SimpleNamespace(CreateFileW=create_file,
+                                      CloseHandle=lambda _handle: True)
 
                 def rename(path, target):
                     rename_attempts.append(process.live)
                     if process.live:
                         error = PermissionError('synthetic held-window failure')
-                        error.winerror = error_code
+                        error.winerror = rename_code
                         raise error
                     return original(path, target)
 
                 with patch.object(qualification, 'child_hold', side_effect=hold), \
                         patch.object(qualification, '_terminate', side_effect=terminate), \
+                        patch.object(qualification, '_api', return_value=api), \
+                        patch.object(qualification.ctypes, 'get_last_error', create=True,
+                                     side_effect=lambda: last_error['code']), \
                         patch.object(Path, 'rename', rename):
                     if expected is None:
                         result = qualification.check_windows_parent_replacement('windows')
-                        self.assertEqual(result['rename_refused'], 32)
+                        self.assertEqual(result['rename_refused'], rename_code)
+                        self.assertEqual(result['parent_delete_sharing_violation'], 32)
+                        self.assertEqual(result['stage_delete_sharing_violation'], 32)
                         self.assertTrue(result['rename_after_release'])
                         self.assertEqual(rename_attempts, [False, False, True, False, False])
                     else:
