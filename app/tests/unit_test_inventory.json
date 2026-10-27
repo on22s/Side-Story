@@ -6275,6 +6275,7 @@
   "test_luar_character_selector": [],
   "test_m4b_cancellation": [
     "tests.test_m4b_cancellation.M4bCancellationTests.test_cancel_after_encoder_exit_refuses_publication_and_failure_retains_stderr",
+    "tests.test_m4b_cancellation.M4bCancellationTests.test_default_deadline_scales_with_audio_duration",
     "tests.test_m4b_cancellation.M4bCancellationTests.test_native_http_cancel_keeps_claim_until_worker_finishes",
     "tests.test_m4b_cancellation.M4bCancellationTests.test_prelaunch_cancellation_preserves_prior_output_without_starting_encoder",
     "tests.test_m4b_cancellation.M4bCancellationTests.test_progress_precedes_completion_and_failure_reports_stderr_tail",
@@ -6314,6 +6315,7 @@
   ],
   "test_m4b_export_quality": [
     "tests.test_m4b_export_quality.M4BExportQualityTests.test_callback_exceptions_after_commit_do_not_erase_success",
+    "tests.test_m4b_export_quality.M4BExportQualityTests.test_merge_forwards_scaled_timeout_to_encoder_and_mastering",
     "tests.test_m4b_export_quality.M4BExportQualityTests.test_native_legacy_and_mastered_aac_match_exact_source_clock_chapters_tags_and_one_decode",
     "tests.test_m4b_export_quality.M4BExportQualityTests.test_source_cover_mutation_and_late_cancel_preserve_prior_delivery",
     "tests.test_m4b_export_quality.M4BExportQualityTests.test_successful_encoder_with_short_audio_missing_moved_or_renamed_chapter_and_wrong_tags_is_refused"
