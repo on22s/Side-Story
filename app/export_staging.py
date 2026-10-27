@@ -38,6 +38,9 @@ MAX_SCAN_ENTRIES = 4096
 # An old advisory cursor, if present, is foreign evidence: never read or modify it.
 SCAN_CURSOR = '.export-staging-scan.json'
 MAX_OPEN_SCANS = 64
+_SCANDIR_SUPPORTS_FD = os.scandir in os.supports_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
 _scan_lock = threading.RLock()
 _scan_iterators = {}
 MAX_RECLAIM = 64
@@ -452,12 +455,14 @@ def _pin_recovery_parent(parent, *, with_fd=False):
 
 
 @contextmanager
-def _scan_entries(parent, budget, *, expected_parent_identity=None):
+def _scan_entries(parent, budget, *, expected_parent_identity=None, pinned_parent_fd=None):
     """Consume a bounded part of a serialized, identity-bound directory pass.
 
     A live iterator avoids re-enumerating skipped names or collecting the whole
     parent. No pathname is used to publish resume state. Unknown files remain
-    untouched, including cursor files left by earlier versions.
+    untouched, including cursor files left by earlier versions. POSIX scanning
+    uses the admitted parent descriptor, which the caller also uses for child
+    stats. Unsupported descriptor or no-follow operations fail closed.
     """
     parent = Path(os.path.abspath(parent))
     with _scan_lock:
@@ -475,13 +480,29 @@ def _scan_entries(parent, budget, *, expected_parent_identity=None):
         parent_identity = identity(os.stat(parent))
         if expected_parent_identity is not None and parent_identity != expected_parent_identity:
             raise OSError('export parent changed before discovery')
+        if os.name != 'nt':
+            if (not _SCANDIR_SUPPORTS_FD or pinned_parent_fd is None
+                    or not _STAT_SUPPORTS_DIR_FD or not _STAT_SUPPORTS_NOFOLLOW):
+                raise OSError('Safe export directory scanning is unavailable')
+            # Also reject a mismatched descriptor from any future internal caller.
+            if identity(os.fstat(pinned_parent_fd)) != parent_identity:
+                raise OSError('export parent changed before opening discovery')
         saved = _scan_iterators.get(parent)
+        # Maintenance and admission observe the path separately. A parent that
+        # swaps away and back between them must not reuse the old iterator.
+        if saved is not None and saved[0] != parent_identity:
+            saved[1].close()
+            del _scan_iterators[parent]
+            saved = None
         if saved is None:
             if len(_scan_iterators) >= MAX_OPEN_SCANS:
                 oldest_parent = next(iter(_scan_iterators))
                 _, oldest = _scan_iterators.pop(oldest_parent)
                 oldest.close()
-            entries = os.scandir(parent)
+            if os.name != 'nt':
+                entries = os.scandir(pinned_parent_fd)
+            else:
+                entries = os.scandir(parent)
             try:
                 if identity(os.stat(parent)) != parent_identity:
                     raise OSError('export parent changed while opening discovery')
@@ -529,6 +550,8 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
       parent. Production recovery normally visits three roots. Parent replacement,
       disappearance and iteration errors
       discard that pass safely. An EOF probe may take one additional call.
+      POSIX discovery and child stats are bound to the admitted parent descriptor;
+      missing descriptor or no-follow support produces an error without removal.
       Identity maintenance stats at most 64 retained parents per input parent and does
       not enumerate their children. No resume file is read, written or deleted.
     - Admission attempts: at most the examined candidates, so ``max_scan``
@@ -573,7 +596,7 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
 
         with ExitStack() as parent_guard:
             try:
-                expected_parent_identity = parent_guard.enter_context(_pin_recovery_parent(scan_parent))
+                expected_parent_identity, pinned_parent_fd = parent_guard.enter_context(_pin_recovery_parent(scan_parent, with_fd=True))
             except FileNotFoundError:
                 continue
             except OSError as error:
@@ -597,14 +620,17 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
                     return result
             try:
                 with _scan_entries(scan_parent, max_scan,
-                                   expected_parent_identity=expected_parent_identity) as window:
+                                   expected_parent_identity=expected_parent_identity,
+                                   pinned_parent_fd=pinned_parent_fd) as window:
                     parent_identity = _scan_iterators[scan_parent][0]
                     for name in window:
                         entry_path = os.path.join(scan_parent, name)
                         try:
                             # Windows DirEntry.stat reports zero device/inode fields.
                             # Admission requires the actual current filesystem identity.
-                            info = os.stat(entry_path, follow_symlinks=False)
+                            info = (os.stat(name, dir_fd=pinned_parent_fd, follow_symlinks=False)
+                                    if pinned_parent_fd is not None else
+                                    os.stat(entry_path, follow_symlinks=False))
                         except FileNotFoundError:
                             # Removed since it was listed: nothing left to reclaim.
                             continue
