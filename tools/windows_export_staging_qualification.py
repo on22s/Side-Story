@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Standalone Windows staging/cleanup qualification harness.
 
-Runs POSIX reference checks on Linux and current Windows staging checks on a
-native Windows host. Private Windows retirement checks are reported as
-unsupported until that protocol is implemented; unsupported checks are never
+Runs POSIX reference checks on Linux and current Windows staging/private
+retirement checks on a native Windows host. Unsupported checks are never
 counted as passes.
 
 Run from the repository root:
@@ -195,6 +194,87 @@ with patch.object(PosixRetirement, '_write_receipt', new=write):
     stage.finish()
 '''
 
+
+
+
+PARTIAL_WINDOWS_CHILD = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from unittest.mock import patch
+from pathlib import Path
+import export_staging
+from export_staging import create_export_staging
+from windows_export_staging_retirement import WindowsRetirement
+mode = sys.argv[3]
+original = WindowsRetirement._write_receipt
+def write(self, name, value):
+    if name == ('creation.json' if mode == 'allocation' else 'owner.json'):
+        print(self.registry / self.slot, flush=True)
+        os._exit(76)
+    return original(self, name, value)
+if mode in ('allocation', 'owner'):
+    with patch.object(WindowsRetirement, '_write_receipt', new=write):
+        create_export_staging(sys.argv[2], 'mp3')
+elif mode == 'marker':
+    original_marker = export_staging._write_marker
+    def write_marker(path, marker, *, authority=None):
+        original_marker(path, marker, authority=authority)
+        print(Path(path).parent.parent, flush=True)
+        os._exit(76)
+    with patch.object(export_staging, '_write_marker', new=write_marker):
+        create_export_staging(sys.argv[2], 'mp3')
+else:
+    raise ValueError('Unknown partial creation crash point')
+'''
+
+DISCARD_WINDOWS_CHILD = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from unittest.mock import patch
+from export_staging import create_export_staging
+stage = create_export_staging(sys.argv[2], 'mp3')
+slot = stage.path.parent
+original_unlink = Path.unlink
+def after_owner_receipt(self, *args, **kwargs):
+    result = original_unlink(self, *args, **kwargs)
+    if self == slot / 'owner.json':
+        print(slot, flush=True)
+        os._exit(76)
+    return result
+with patch.object(Path, 'unlink', new=after_owner_receipt):
+    stage.finish()
+'''
+
+RETIRE_WINDOWS_CHILD = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from unittest.mock import patch
+from export_staging import MARKER, create_export_staging
+from windows_export_staging_directory import WindowsStageDirectory
+stage = create_export_staging(sys.argv[2], 'mp3')
+(stage.path / 'payload.bin').write_bytes(b'windows retirement payload')
+mode = sys.argv[3]
+def exit_after_marker(self, name):
+    original_unlink(self, name)
+    if name == MARKER:
+        print(stage.path.parent, flush=True)
+        os._exit(76)
+if mode == 'payload':
+    original_remove = WindowsStageDirectory.remove_contents
+    def exit_after_payload(self, retained_names):
+        original_remove(self, retained_names)
+        print(stage.path.parent, flush=True)
+        os._exit(76)
+    with patch.object(WindowsStageDirectory, 'remove_contents', new=exit_after_payload):
+        stage.finish()
+elif mode == 'marker':
+    original_unlink = WindowsStageDirectory.unlink
+    with patch.object(WindowsStageDirectory, 'unlink', new=exit_after_marker):
+        stage.finish()
+else:
+    raise ValueError('Unknown finalization crash point')
+'''
 
 def _terminate(process):
     if process.poll() is None:
@@ -536,10 +616,27 @@ def check_windows_readonly_deletion(platform):
         return {'stage': str(stage), 'result': reclaimed}
 
 
-def check_windows_partial_creation_missing(platform):
-    raise UnsupportedCheck(
-        'current Windows creation writes no durable allocation/creation receipt; '
-        'hard termination before marker/owner publication is not implemented or qualified')
+def check_windows_partial_creation(platform):
+    observed = []
+    for mode in ('allocation', 'owner', 'marker'):
+        with tempfile.TemporaryDirectory() as base:
+            root = Path(base) / 'book'
+            root.mkdir()
+            result = child(PARTIAL_WINDOWS_CHILD, root, mode)
+            assert result.returncode == 76, result.stderr[-2000:]
+            slot = Path(result.stdout.strip().splitlines()[-1])
+            stage = slot / 'stage'
+            assert slot.is_dir(), 'partial Windows creation slot is missing'
+            assert (slot / 'allocation.json').exists()
+            assert (slot / 'creation.json').exists() == (mode != 'allocation')
+            assert (slot / 'owner.json').exists() == (mode == 'marker')
+            assert (stage / '.export-staging.owner.lock').exists() == (mode != 'allocation')
+            assert (stage / MARKER).exists() == (mode == 'marker')
+            reclaimed = reclaim_export_staging([root])
+            assert reclaimed['removed'], reclaimed
+            assert not slot.exists(), 'partial Windows creation slot survived recovery'
+            observed.append({'mode': mode, 'slot': str(slot), 'result': reclaimed})
+    return {'crash_points': observed}
 
 
 def check_windows_failed_deletion(platform):
@@ -550,6 +647,7 @@ def check_windows_failed_deletion(platform):
         result = child(CREATE_CHILD, root)
         assert result.returncode == 76, result.stderr[-2000:]
         stage = Path(result.stdout.strip())
+        assert stage.parent.parent.name == '.aa2-export-retirement', 'private stage was not used'
         with patch.object(WindowsStageDirectory, 'remove_contents',
                           side_effect=PermissionError('synthetic Windows deletion failure')) as failure:
             reclaimed = reclaim_export_staging([root])
@@ -579,12 +677,61 @@ def check_native_abi(platform):
     return {'module': win.__name__}
 
 
-def check_private_retirement(platform):
-    if importlib.util.find_spec('windows_export_staging_retirement') is None:
-        raise UnsupportedCheck(
-            'private Windows retirement module is not implemented in this handoff')
-    raise UnsupportedCheck(
-        'private Windows retirement module exists but this harness has no bound adapter; update the harness')
+def check_windows_private_state_machine(platform):
+    partial = check_windows_partial_creation(platform)
+    with tempfile.TemporaryDirectory() as base:
+        root = Path(base) / 'book'
+        root.mkdir()
+        result = child(DISCARD_WINDOWS_CHILD, root)
+        assert result.returncode == 76, result.stderr[-2000:]
+        slot = Path(result.stdout.strip().splitlines()[-1])
+        assert slot.parent.name == '.aa2-export-retirement', 'private slot was not used'
+        assert not (slot / 'stage').exists(), 'discard crash occurred before stage removal'
+        assert not (slot / 'owner.json').exists(), 'discard crash occurred before owner receipt removal'
+        assert (slot / 'creation.json').exists() and (slot / 'allocation.json').exists()
+        reclaimed = reclaim_export_staging([root])
+        assert reclaimed['removed'], reclaimed
+        assert not slot.exists(), 'interrupted discard slot survived recovery'
+        return {'partial': partial, 'discard': {'slot': str(slot), 'result': reclaimed}}
+
+def check_windows_private_live_owner(platform):
+    detail = check_windows_live_owner(platform)
+    assert '.aa2-export-retirement' in str(detail['stage']), 'private stage was not used'
+    return detail
+
+def check_windows_private_malformed_receipt(platform):
+    with tempfile.TemporaryDirectory() as base:
+        root = Path(base) / 'book'
+        root.mkdir()
+        result = child(CREATE_CHILD, root)
+        assert result.returncode == 76, result.stderr[-2000:]
+        stage = Path(result.stdout.strip())
+        slot = stage.parent
+        assert slot.parent.name == '.aa2-export-retirement', 'private stage was not used'
+        (slot / 'creation.json').write_text('{malformed', encoding='utf-8')
+        reclaimed = reclaim_export_staging([root])
+        assert not reclaimed['removed'], reclaimed
+        assert slot.is_dir() and (stage / 'payload.bin').exists(), 'malformed receipt deleted payload'
+        assert (slot / 'creation.json').exists(), 'malformed receipt was deleted'
+        assert any(str(slot) in item for item in reclaimed['preserved'] + reclaimed['errors']), reclaimed
+        return {'slot': str(slot), 'result': reclaimed}
+
+def check_windows_private_failed_deletion(platform):
+    from windows_export_staging_directory import WindowsStageDirectory
+    with tempfile.TemporaryDirectory() as base:
+        root = Path(base) / 'book'
+        root.mkdir()
+        result = child(CREATE_CHILD, root)
+        assert result.returncode == 76, result.stderr[-2000:]
+        stage = Path(result.stdout.strip())
+        assert stage.parent.parent.name == '.aa2-export-retirement', 'private stage was not used'
+        with patch.object(WindowsStageDirectory, 'remove_contents',
+                          side_effect=PermissionError('synthetic Windows deletion failure')) as failure:
+            reclaimed = reclaim_export_staging([root])
+        assert failure.called, 'failed Windows deletion probe did not reach payload deletion'
+        assert not reclaimed['removed'], reclaimed
+        assert stage.exists() and (stage / 'payload.bin').exists(), 'failed Windows deletion removed payload'
+        return {'stage': str(stage), 'result': reclaimed}
 
 
 def check_power_loss(platform):
@@ -592,10 +739,29 @@ def check_power_loss(platform):
         'directory-entry power-loss durability is a documented limitation and remains unqualified')
 
 
-def check_windows_finalization_missing(platform):
-    raise UnsupportedCheck(
-        'current Windows cleanup has no durable retirement/finalization state; '
-        'hard termination during cleanup is not implemented or qualified')
+def check_windows_finalization(platform, restart=False):
+    with tempfile.TemporaryDirectory() as base:
+        root = Path(base) / 'book'
+        root.mkdir()
+        mode = 'marker' if restart else 'payload'
+        result = child(RETIRE_WINDOWS_CHILD, root, mode)
+        assert result.returncode == 76, result.stderr[-2000:]
+        slot = Path(result.stdout.strip().splitlines()[-1])
+        assert slot.is_dir(), 'Windows retirement slot is missing'
+        stage = slot / 'stage'
+        assert not (stage / 'payload.bin').exists(), 'finalization did not remove the payload before exit'
+        assert (stage / MARKER).exists() == (mode == 'payload'), 'finalization stopped at the wrong marker boundary'
+        assert (stage / '.export-staging.owner.lock').exists(), 'finalization did not retain its owner'
+        if restart:
+            recovered = child(RECOVER_CHILD, root)
+            assert recovered.returncode == 0, recovered.stderr[-2000:]
+            payload = json.loads(recovered.stdout.strip().splitlines()[-1])
+        else:
+            payload = reclaim_export_staging([root])
+        assert payload['removed'], payload
+        assert not slot.exists(), 'Windows retirement slot survived recovery'
+        assert not list(root.rglob('payload.bin')), 'Windows retirement payload survived'
+        return {'slot': str(slot), 'result': payload}
 
 
 def _git_state():
@@ -636,7 +802,7 @@ def main(argv=None):
               lambda: check_finalization_recovery('posix', False, unverified=True))
 
     run_check('windows_partial_creation_recovery', 'windows',
-              lambda: check_windows_partial_creation_missing('windows'), required=True)
+              lambda: check_windows_partial_creation('windows'), required=True)
     run_check('windows_hard_termination_recovery', 'windows',
               lambda: check_windows_current('windows'), required=True)
     run_check('windows_restart_recovery', 'windows',
@@ -657,17 +823,17 @@ def main(argv=None):
               lambda: check_native_abi('windows'), required=True)
 
     run_check('windows_hard_termination_finalization', 'windows',
-              lambda: check_windows_finalization_missing('windows'), required=True)
+              lambda: check_windows_finalization('windows', False), required=True)
     run_check('windows_restart_finalization', 'windows',
-              lambda: check_windows_finalization_missing('windows'), required=True)
+              lambda: check_windows_finalization('windows', True), required=True)
     run_check('windows_private_retirement_state_machine', 'windows',
-              lambda: check_private_retirement('windows'), required=True)
+              lambda: check_windows_private_state_machine('windows'), required=True)
     run_check('windows_private_retirement_live_owner', 'windows',
-              lambda: check_private_retirement('windows'), required=True)
+              lambda: check_windows_private_live_owner('windows'), required=True)
     run_check('windows_private_retirement_malformed_receipt', 'windows',
-              lambda: check_private_retirement('windows'), required=True)
+              lambda: check_windows_private_malformed_receipt('windows'), required=True)
     run_check('windows_private_retirement_failed_deletion', 'windows',
-              lambda: check_private_retirement('windows'), required=True)
+              lambda: check_windows_private_failed_deletion('windows'), required=True)
     run_check('windows_power_loss_directory_durability', 'both',
               lambda: check_power_loss('both'), required=True)
 
@@ -696,7 +862,7 @@ def main(argv=None):
         'limitations': [
             'Unsupported checks are never passes.',
             'No native Windows runner was available for this run unless platform=windows.',
-            'Private Windows retirement and power-loss directory durability remain unimplemented/unqualified.',
+            'Private Windows retirement is implemented but native qualification and power-loss directory durability remain outstanding.',
             'Synthetic temp files only; no application, model, GPU or user project data.',
         ],
     }
