@@ -17,6 +17,7 @@ reach every entry.
 from __future__ import annotations
 
 import atexit
+from collections import OrderedDict
 from contextlib import contextmanager, ExitStack
 import json
 import os
@@ -37,12 +38,19 @@ MAX_MARKER_BYTES = 4096
 MAX_SCAN_ENTRIES = 4096
 # An old advisory cursor, if present, is foreign evidence: never read or modify it.
 SCAN_CURSOR = '.export-staging-scan.json'
-MAX_OPEN_SCANS = 64
+MAX_OPEN_SCANS = 128
+MAX_PARENT_ROWS = 128
+MAX_PARENT_PATH_CHARS = 4096
+MAX_SEQUENCE_TURNS = 64
+MAX_TOTAL_LEGACY_SCAN = 3 * MAX_SCAN_ENTRIES
+MAX_RECLAIM_PER_CALL = 128
 _SCANDIR_SUPPORTS_FD = os.scandir in os.supports_fd
 _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
 _STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
 _scan_lock = threading.RLock()
 _scan_iterators = {}
+_sequence_lock = threading.Lock()
+_sequence_turns = OrderedDict()
 MAX_RECLAIM = 64
 RECOVERY = '.export-staging-recovery'
 PREFIXES = {
@@ -422,20 +430,59 @@ def _close_scan_iterators():
         for _, entries in _scan_iterators.values():
             entries.close()
         _scan_iterators.clear()
+    with _sequence_lock:
+        _sequence_turns.clear()
+
+
+def _prune_stale_scan_iterators():
+    """Release replaced or missing cached parents once per recovery call."""
+    with _scan_lock:
+        for parent, (saved_identity, entries) in list(_scan_iterators.items()):
+            try:
+                current = identity(os.stat(parent))
+            except OSError:
+                current = None
+            if current != saved_identity:
+                entries.close()
+                del _scan_iterators[parent]
+        capacity = _scan_capacity_from_fd_limit()
+        while len(_scan_iterators) > capacity:
+            oldest_parent = next(iter(_scan_iterators))
+            _, entries = _scan_iterators.pop(oldest_parent)
+            entries.close()
 
 
 atexit.register(_close_scan_iterators)
 
 
 def _reset_scan_iterators_after_fork():
-    global _scan_lock
+    global _scan_lock, _sequence_lock
     # A fork may inherit the lock held by another thread. Replace it first.
     _scan_lock = threading.RLock()
+    _sequence_lock = threading.Lock()
     _close_scan_iterators()
 
 
 if hasattr(os, 'register_at_fork'):
     os.register_at_fork(after_in_child=_reset_scan_iterators_after_fork)
+
+
+def _fd_headroom():
+    """Leave room for owner locks, parent pins, and unrelated process files."""
+    if os.name == 'nt':
+        return MAX_PARENT_ROWS
+    try:
+        import resource
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, OSError, ValueError):
+        return MAX_PARENT_ROWS
+    if soft == resource.RLIM_INFINITY:
+        return MAX_PARENT_ROWS
+    return max(1, soft - 32)
+
+
+def _scan_capacity_from_fd_limit():
+    return min(MAX_OPEN_SCANS, _fd_headroom())
 
 
 @contextmanager
@@ -466,18 +513,24 @@ def _scan_entries(parent, budget, *, expected_parent_identity=None, pinned_paren
     """
     parent = Path(os.path.abspath(parent))
     with _scan_lock:
-        # Bound retained descriptors. Missing/replaced roots release their
-        # handles. This maintenance examines at most MAX_OPEN_SCANS parents,
-        # never their directory entries.
-        for saved_parent, (saved_identity, entries) in list(_scan_iterators.items()):
+        # Revalidate the requested parent's retained iterator. Unrequested
+        # parents cannot authorize work and their bounded handles leave by LRU.
+        saved = _scan_iterators.get(parent)
+        if saved is not None:
             try:
-                current = identity(os.stat(saved_parent))
+                current = identity(os.stat(parent))
             except OSError:
                 current = None
-            if current != saved_identity:
-                entries.close()
-                del _scan_iterators[saved_parent]
-        parent_identity = identity(os.stat(parent))
+            if current != saved[0]:
+                saved[1].close()
+                del _scan_iterators[parent]
+        try:
+            parent_identity = identity(os.stat(parent))
+        except OSError:
+            stale = _scan_iterators.pop(parent, None)
+            if stale is not None:
+                stale[1].close()
+            raise
         if expected_parent_identity is not None and parent_identity != expected_parent_identity:
             raise OSError('export parent changed before discovery')
         if os.name != 'nt':
@@ -495,7 +548,8 @@ def _scan_entries(parent, budget, *, expected_parent_identity=None, pinned_paren
             del _scan_iterators[parent]
             saved = None
         if saved is None:
-            if len(_scan_iterators) >= MAX_OPEN_SCANS:
+            capacity = _scan_capacity_from_fd_limit()
+            while len(_scan_iterators) >= capacity:
                 oldest_parent = next(iter(_scan_iterators))
                 _, oldest = _scan_iterators.pop(oldest_parent)
                 oldest.close()
@@ -534,28 +588,41 @@ def _scan_entries(parent, budget, *, expected_parent_identity=None, pinned_paren
 
 
 def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
-                           max_scan=MAX_SCAN_ENTRIES):
+                           max_scan=MAX_SCAN_ENTRIES,
+                           max_total_scan=MAX_TOTAL_LEGACY_SCAN):
     """Remove verifiably abandoned marked staging directories.
 
     Returns ``{'removed': [...], 'preserved': [...], 'errors': [...]}``. The
     scan is one level deep, over known direct children only. Its bounds:
 
+    - Input: an exact list or tuple of at most 128 exact text/Path rows, each
+      at most 4096 encoded bytes. Larger or one-shot inputs are rejected before
+      cleanup; callers must explicitly batch them. Budgets above 128 removals,
+      4096 entries per parent, or 12288 total legacy entries are rejected.
+      Zero budgets inspect no parent input. A bounded per-sequence rotation
+      advances the first parent after input rows are deferred or a removal cap.
     - Discovery: at most ``max_scan`` directory entries are enumerated and
-      examined per parent per call, whatever their type. A serialized in-memory
+      examined per parent and ``max_total_scan`` across parents per call,
+      whatever their type. A serialized in-memory
       iterator continues each retained pass; a stable parent of N entries is
-      covered in ceil(N / max_scan) calls while its iterator remains retained. Restarting the process restarts the bounded pass.
-      At most 64 parent iterators are retained with least-recently-used eviction.
-      Continuation is guaranteed while a parent is revisited before 64 other
-      distinct parents; eviction restarts its bounded pass, never refuses a new
+      covered in ceil(N / assigned_quota) visits while its iterator remains
+      retained. Restarting the process restarts the bounded pass.
+      At most 128 parent iterators are retained, subject to the process file
+      descriptor limit, with least-recently-used eviction. Continuation is
+      guaranteed while a parent is revisited before the current descriptor
+      capacity's worth of other distinct parents; eviction restarts its bounded
+      pass and never refuses a new
       parent. Production recovery normally visits three roots. Parent replacement,
       disappearance and iteration errors
       discard that pass safely. An EOF probe may take one additional call.
       POSIX discovery and child stats are bound to the admitted parent descriptor;
       missing descriptor or no-follow support produces an error without removal.
-      Identity maintenance stats at most 64 retained parents per input parent and does
-      not enumerate their children. No resume file is read, written or deleted.
+      Identity maintenance stats at most 128 cached parents once per call and
+      does not enumerate their children. No resume file is read, written or
+      deleted.
     - Admission attempts: at most the examined candidates, so ``max_scan``
-      per parent.
+      per parent. Canonicalization and cached-parent identity maintenance are
+      separately bounded by 128 input rows and 128 retained iterators.
     - POSIX retirement slots: bounded separately by the private namespace
       (128 slots plus one reserve, refused beyond that), not by
       ``max_scan``. Each slot's recovery does its own receipt validation
@@ -564,14 +631,68 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
     - Removals: at most ``max_remove`` successful removals per call, across
       all parents. Attempts are bounded by the rows above, not by this.
     """
-    if any(type(limit) is not int or limit < 0 for limit in (max_remove, max_scan)):
+    if any(type(limit) is not int or limit < 0
+           for limit in (max_remove, max_scan, max_total_scan)):
         raise ValueError('Export recovery budgets must be nonnegative integers')
+    if (max_remove > MAX_RECLAIM_PER_CALL or max_scan > MAX_SCAN_ENTRIES
+            or max_total_scan > MAX_TOTAL_LEGACY_SCAN):
+        raise ValueError('Export recovery budget exceeds the configured limit')
     result = {'removed': [], 'preserved': [], 'errors': []}
-    if max_remove == 0 or max_scan == 0:
+    if max_remove == 0 or max_scan == 0 or max_total_scan == 0:
         return result
+    if type(parents) not in (list, tuple):
+        raise ValueError('Export recovery parents must be a bounded list or tuple')
+    if len(parents) > MAX_PARENT_ROWS:
+        raise ValueError('Export recovery parent input exceeds the row limit')
+    # Copy a bounded prefix. A caller may mutate a list concurrently, but no
+    # later append can silently enter this call or make its work unbounded.
+    rows = tuple(parents[:MAX_PARENT_ROWS + 1])
+    if len(rows) > MAX_PARENT_ROWS or len(parents) > MAX_PARENT_ROWS:
+        raise ValueError('Export recovery parent input changed or exceeds the row limit')
+    if not rows:
+        return result
+    sequence = []
+    for row_index, parent in enumerate(rows):
+        if type(parent) not in (str, type(Path())):
+            raise ValueError(f'Export recovery parent row {row_index} must be text or Path')
+        spelling = os.fspath(parent)
+        try:
+            encoded = os.fsencode(spelling)
+        except UnicodeError as error:
+            raise ValueError(f'Export recovery parent row {row_index} has invalid encoding') from error
+        if type(spelling) is not str or len(encoded) > MAX_PARENT_PATH_CHARS:
+            raise ValueError(f'Export recovery parent row {row_index} is too long or invalid')
+        sequence.append(spelling)
+    first_spelling = {}
+    for spelling in sequence:
+        try:
+            canonical = os.path.normcase(os.path.realpath(Path(spelling)))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        first_spelling.setdefault(canonical, spelling)
+    _prune_stale_scan_iterators()
+    if os.name != 'nt' and len(first_spelling) > _fd_headroom():
+        result['errors'].append('Export recovery skipped: insufficient descriptor capacity')
+        return result
+    sequence_key = tuple(sequence)
+    with _sequence_lock:
+        first = _sequence_turns.pop(sequence_key, 0) % len(rows)
+        reserved_next = (first + 1) % len(rows)
+        _sequence_turns[sequence_key] = reserved_next
+        if len(_sequence_turns) > MAX_SEQUENCE_TURNS:
+            _sequence_turns.popitem(last=False)
+    order = rows[first:] + rows[:first]
+    # Reserve equal, conservative quotas up front. Early EOF may leave unused
+    # capacity, but the sum of successful legacy examinations stays bounded.
+    quota = min(max_scan, max_total_scan // len(order))
+    input_incomplete = quota == 0
+    if quota == 0:
+        order = order[:max_total_scan]
+        quota = 1
+        result['errors'].append('parent scan budget reached; input rows deferred')
     removed = 0
     seen_parents = set()
-    for parent in parents:
+    for parent in order:
         try:
             parent = Path(parent)
             scan_parent = Path(os.path.realpath(parent))
@@ -584,14 +705,22 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
         if parent_key in seen_parents:
             continue
         seen_parents.add(parent_key)
+        preferred = first_spelling.get(parent_key)
+        if preferred is not None:
+            try:
+                if os.path.normcase(os.path.realpath(preferred)) != parent_key:
+                    preferred = None
+            except (OSError, RuntimeError, ValueError):
+                preferred = None
+        display_parent = Path(preferred) if preferred is not None else parent
         def display_path(value):
             # Filesystem operations use the admitted canonical parent; only
             # result rows use the first caller spelling for this parent.
             prefix = os.path.join(str(scan_parent), '')
             if value.startswith(prefix):
-                return os.path.join(str(parent), '') + value[len(prefix):]
+                return os.path.join(str(display_parent), '') + value[len(prefix):]
             if value == str(scan_parent) or value.startswith(str(scan_parent) + ':'):
-                return str(parent) + value[len(str(scan_parent)):]
+                return str(display_parent) + value[len(str(scan_parent)):]
             return value
 
         with ExitStack() as parent_guard:
@@ -600,7 +729,7 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
             except FileNotFoundError:
                 continue
             except OSError as error:
-                result['errors'].append(f'{parent}: {error}')
+                result['errors'].append(f'{display_parent}: {error}')
                 continue
             if os.name != 'nt' and removed < max_remove:
                 from export_staging_retirement import reclaim_retired_slots
@@ -610,16 +739,17 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
                 except FileNotFoundError:
                     continue
                 except (OSError, RuntimeError) as error:
-                    result['errors'].append(f'{parent}: {error}')
+                    result['errors'].append(f'{display_parent}: {error}')
                     continue
-                for key in result:
-                    result[key].extend(display_path(value) for value in retired[key])
+                for result_key in result:
+                    result[result_key].extend(display_path(value)
+                                              for value in retired[result_key])
                 removed += len(retired['removed'])
                 if removed >= max_remove:
                     result['errors'].append('reclaim limit reached')
                     return result
             try:
-                with _scan_entries(scan_parent, max_scan,
+                with _scan_entries(scan_parent, quota,
                                    expected_parent_identity=expected_parent_identity,
                                    pinned_parent_fd=pinned_parent_fd) as window:
                     parent_identity = _scan_iterators[scan_parent][0]
@@ -708,9 +838,15 @@ def reclaim_export_staging(parents, *, max_remove=MAX_RECLAIM,
                             result['errors'].append('reclaim limit reached')
                             return result
                     if scan_parent in _scan_iterators:
-                        result['errors'].append(f'{parent}: scan limit reached')
+                        result['errors'].append(f'{display_parent}: scan limit reached')
             except FileNotFoundError:
                 continue
             except OSError as error:
-                result['errors'].append(f'{parent}: {error}')
+                result['errors'].append(f'{display_parent}: {error}')
+    if not input_incomplete:
+        # A full visit needs no ordering rotation. Leave a concurrent caller's
+        # reservation intact; only undo the turn still owned by this call.
+        with _sequence_lock:
+            if _sequence_turns.get(sequence_key) == reserved_next:
+                _sequence_turns[sequence_key] = first
     return result
