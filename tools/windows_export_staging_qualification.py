@@ -12,6 +12,7 @@ Run from the repository root:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
@@ -38,6 +39,7 @@ if str(APP) not in sys.path:
 import export_staging
 from export_staging import create_export_staging, reclaim_export_staging, MARKER
 from export_staging_directory import StageDirectoryChanged
+from windows_export_staging_directory import _api
 from export_staging_retirement import DIRECTORY, PosixRetirement
 
 IS_WINDOWS = os.name == 'nt'
@@ -88,22 +90,53 @@ def child(command, *args, timeout=30):
                           timeout=timeout, env=_child_env())
 
 
-def child_hold(command, *args, timeout=30):
-    process = subprocess.Popen([sys.executable, '-c', command, str(APP), *map(str, args)],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               encoding='utf-8', errors='replace', env=_child_env())
+def _child_line(process, timeout):
+    """Read one child readiness line without an unbounded pipe wait."""
     line_holder = []
     def read_line():
         line_holder.append(process.stdout.readline())
     thread = threading.Thread(target=read_line, daemon=True)
     thread.start()
     thread.join(timeout)
-    line = line_holder[0].strip() if line_holder else ''
+    return line_holder[0].strip() if line_holder else ''
+
+
+def child_hold(command, *args, timeout=30, interactive=False):
+    process = subprocess.Popen([sys.executable, '-c', command, str(APP), *map(str, args)],
+                               stdin=subprocess.PIPE if interactive else None,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               encoding='utf-8', errors='replace', env=_child_env(),
+                               cwd=str(REPO) if interactive else None)
+    line = _child_line(process, timeout)
     if not line:
         stderr = process.stderr.read() if process.poll() is not None else ''
         _terminate(process)
         raise AssertionError(f'child did not report a stage within {timeout}s: {stderr[-1000:]}')
     return process, Path(line)
+
+
+def _release_child_handles(process):
+    if process.stdin is None or process.poll() is not None:
+        raise AssertionError('child unavailable before handle-release signal')
+    process.stdin.write('release\n')
+    process.stdin.flush()
+    line = _child_line(process, 10)
+    if line != 'released' or process.poll() is not None:
+        raise AssertionError(f'child did not remain alive after releasing handles: {line!r}')
+
+
+def _finish_interactive_child(process):
+    if process.stdin is None or process.poll() is not None:
+        raise AssertionError('child unavailable before exit signal')
+    process.stdin.write('exit\n')
+    process.stdin.flush()
+    try:
+        code = process.wait(timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError('child did not exit after handles were released') from error
+    if code != 0:
+        raise AssertionError(f'child failed after handle release: '
+                             f'{process.stderr.read()[-1000:]}')
 
 
 CREATE_CHILD = r'''
@@ -134,7 +167,7 @@ time.sleep(60)
 '''
 
 HOLD_HANDLE_CHILD = r'''
-import sys, time
+import sys
 sys.path.insert(0, sys.argv[1])
 from export_staging import create_export_staging
 from export_staging_directory import stage_directory
@@ -142,7 +175,16 @@ stage = create_export_staging(sys.argv[2], 'mp3')
 (stage.path / 'payload.bin').write_bytes(b'owned payload')
 with stage_directory(stage.path, stage._directory_identity):
     print(stage.path, flush=True)
-    time.sleep(60)
+    if sys.stdin.readline().strip() != 'release':
+        raise RuntimeError('Missing release signal')
+# ExportStaging also retains its owner-lock stream after the directory context
+# closes. Release it without finish(), which would change marker/guard files.
+stage._lock.__exit__(None, None, None)
+if not stage._owner_stream.closed:
+    raise RuntimeError('Owner-lock stream remained open after release')
+print('released', flush=True)
+if sys.stdin.readline().strip() != 'exit':
+    raise RuntimeError('Missing exit signal')
 '''
 
 PARTIAL_CREATE_CHILD = r'''
@@ -509,14 +551,61 @@ def check_windows_live_owner(platform):
 
 
 def check_windows_parent_replacement(platform):
+    api = _api()
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    def delete_open_result(path):
+        """Probe DELETE access while sharing read, write and delete."""
+        # The probe uses the same path as the rename target or held stage,
+        # and sharing all modes avoids creating a conflict of its own.
+        handle = api.CreateFileW(str(path), 0x10000, 0x1 | 0x2 | 0x4,
+                                 None, 3, 0x02000000 | 0x00200000, None)
+        error = ctypes.get_last_error()
+        if handle == invalid_handle:
+            return error
+        if not api.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return None
+
+    def after_handle_release(path):
+        error = None
+        for _ in range(20):
+            error = delete_open_result(path)
+            if error is None:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f'DELETE access did not recover after handle release: '
+                             f'WinError {error}, path {path}')
+
     with tempfile.TemporaryDirectory() as base:
         root = Path(base) / 'book'
         root.mkdir()
         moved = Path(base) / 'book-moved'
+
+        def require_intact(stage, point):
+            if not root.is_dir() or moved.exists() or not stage.is_dir():
+                raise AssertionError(f'parent or stage changed {point}')
+            try:
+                payload = (stage / 'payload.bin').read_bytes()
+            except OSError as error:
+                raise AssertionError(f'stage payload missing {point}') from error
+            if payload != b'owned payload':
+                raise AssertionError(f'stage payload changed {point}')
+
         # Establish that ordinary permissions allow this exact rename.
         root.rename(moved)
         moved.rename(root)
-        process, stage = child_hold(HOLD_HANDLE_CHILD, root)
+        if not root.is_dir() or moved.exists():
+            raise AssertionError('rename target missing before child hold')
+        before_error = delete_open_result(root)
+        if before_error is not None:
+            if before_error in (5, 32):
+                raise UnsupportedCheck(f'DELETE access to rename target before owner hold: '
+                                       f'WinError {before_error}')
+            raise AssertionError(f'unexpected DELETE-open error before child hold: '
+                                 f'WinError {before_error}')
+        process, stage = child_hold(HOLD_HANDLE_CHILD, root, interactive=True)
+        child_pid = process.pid
         try:
             assert process.poll() is None, 'child exited before rename probe'
             assert stage.is_dir() and (stage / 'payload.bin').exists()
@@ -524,18 +613,53 @@ def check_windows_parent_replacement(platform):
                 root.rename(moved)
             except OSError as error:
                 winerror = getattr(error, 'winerror', None)
-                if winerror == 5:
-                    raise UnsupportedCheck('access denied does not establish a sharing violation') from error
-                assert winerror == 32, f'unexpected rename error: {error}'
+                require_intact(stage, 'during refused rename')
+                if winerror in (2, 3, 183):
+                    raise AssertionError(f'parent rename failed with invalid path state: '
+                                         f'WinError {winerror}') from error
+                if winerror not in (5, 32):
+                    raise UnsupportedCheck(f'unexpected parent rename error: {error}') from error
             else:
                 raise AssertionError('parent rename was not refused while ancestor/stage handles were live')
+            root_sharing_error = delete_open_result(root)
+            stage_sharing_error = delete_open_result(stage)
+            if stage_sharing_error is None:
+                raise AssertionError('stage DELETE open unexpectedly succeeded during hold')
+            if stage_sharing_error in (2, 3, 183):
+                raise AssertionError(f'stage DELETE probe lost its admitted path: '
+                                     f'WinError {stage_sharing_error}')
+            if stage_sharing_error != 32:
+                raise UnsupportedCheck(f'stage DELETE open did not show a sharing violation: '
+                                       f'WinError {stage_sharing_error}')
+            if root_sharing_error in (2, 3, 183):
+                raise AssertionError(f'parent DELETE probe lost its admitted path: '
+                                     f'WinError {root_sharing_error}')
+            if root_sharing_error not in (None, 32):
+                raise UnsupportedCheck(f'parent DELETE probe had an unexpected live error: '
+                                       f'WinError {root_sharing_error}')
+            _release_child_handles(process)
+            require_intact(stage, 'after handle release while child alive')
+            after_handle_release(root)
+            after_handle_release(stage)
+            root.rename(moved)
+            moved.rename(root)
+            if process.poll() is not None:
+                raise AssertionError('child exited before released rename control')
+            require_intact(stage, 'after released rename control while child alive')
+            _finish_interactive_child(process)
         finally:
             _terminate(process)
-        # A stable access denial would not demonstrate protection by the handle.
-        root.rename(moved)
-        moved.rename(root)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
         return {'rename_refused': winerror, 'rename_without_handle': True,
-                'rename_after_release': True}
+                'child_pid': child_pid,
+                'parent_delete_probe_during_hold': root_sharing_error,
+                'stage_delete_sharing_violation': stage_sharing_error,
+                'delete_open_without_handle': True,
+                'delete_open_after_handle_release': True,
+                'child_ready_after_stage_directory_entry': True,
+                'rename_after_handle_release_while_child_alive': True}
 
 
 def check_windows_reparse(platform):
