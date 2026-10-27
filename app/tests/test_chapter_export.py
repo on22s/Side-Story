@@ -1,6 +1,7 @@
 """Chapter-by-chapter export: filenames from a template, chapters from the same
 grouping the M4B uses, changed-only re-export, and the download routes."""
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ from fastapi import HTTPException
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from chapter_timing_cache import CACHE_FILENAME
 from project import (CHAPTER_EXPORT_DIR, ProjectManager, build_chapter_filename,
                      build_chapter_filenames)
 from routers import editor as editor_module
@@ -223,16 +225,28 @@ class ExportChaptersTests(unittest.TestCase):
                 self.assertTrue(old_manifest == (out / 'manifest.json').read_bytes())
 
     def test_failed_selected_export_keeps_previous_audio_and_manifest(self):
-        for boundary in ('encode', 'publish', 'manifest'):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
-                pm, chunks = _project(tmp)
-                out = Path(tmp, CHAPTER_EXPORT_DIR)
-                with patch.object(pm, 'load_chunks', return_value=chunks):
-                    self.assertTrue(pm.export_chapters(fmt='wav')[0])
-                    before = {path.name: path.read_bytes() for path in out.iterdir()
-                              if path.is_file() and path.suffix in ('.wav', '.json')}
-                    names = [row['file'] for row in json.loads(before['manifest.json'])['chapters']]
-                    _tone(str(Path(tmp, 'voicelines', 'c0.wav')), 0.9, hz=700)
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as snapshot:
+            pm, chunks = _project(tmp)
+            out = Path(tmp, CHAPTER_EXPORT_DIR)
+            source = Path(tmp, 'voicelines', 'c0.wav')
+            with patch.object(pm, 'load_chunks', return_value=chunks):
+                self.assertTrue(pm.export_chapters(fmt='wav')[0])
+            shutil.copytree(out, snapshot, dirs_exist_ok=True)
+            cache = Path(tmp, CACHE_FILENAME)
+            baseline_cache = cache.read_bytes() if cache.exists() else None
+            before = {path.name: path.read_bytes() for path in out.iterdir()
+                      if path.is_file() and path.suffix in ('.wav', '.json')}
+            names = [row['file'] for row in json.loads(before['manifest.json'])['chapters']]
+            for boundary in ('encode', 'publish', 'manifest'):
+                with self.subTest(boundary=boundary):
+                    shutil.rmtree(out)
+                    shutil.copytree(snapshot, out)
+                    if baseline_cache is None:
+                        cache.unlink(missing_ok=True)
+                    else:
+                        cache.write_bytes(baseline_cache)
+                    _tone(str(source), 0.9, hz=700)
                     from project import _export_audio_segment
                     replace = os.replace
                     def fail_encode(segment, path, fmt, **kwargs):
@@ -247,16 +261,28 @@ class ExportChaptersTests(unittest.TestCase):
                             if Path(src).parent.name != 'old':
                                 raise OSError('synthetic publication failure')
                         return replace(src, dst, **kwargs)
-                    with patch('project._export_audio_segment', side_effect=fail_encode), \
+                    with patch.object(pm, 'load_chunks', return_value=chunks), \
+                            patch('project._export_audio_segment', side_effect=fail_encode), \
                             patch('project.os.replace', side_effect=fail_publish):
                         with self.assertRaises(OSError):
                             pm.export_chapters(fmt='wav')
                     for name, contents in before.items():
                         self.assertTrue(contents == (out / name).read_bytes(), name)
                     self.assertEqual(set(before), delivery_names(self, out))
-                    self.assertTrue(pm.export_chapters(fmt='wav')[0])
+                    with patch.object(pm, 'load_chunks', return_value=chunks):
+                        ok, message = pm.export_chapters(fmt='wav')
+                    self.assertTrue(ok, message)
                     self.assertNotEqual(before[names[0]], (out / names[0]).read_bytes())
-                    self.assertEqual(2, len(json.loads((out / 'manifest.json').read_text())['chapters']))
+                    manifest = json.loads((out / 'manifest.json').read_text())
+                    self.assertEqual(2, len(manifest['chapters']))
+                    for row in manifest['chapters']:
+                        path = out / row['file']
+                        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),
+                                         row['output_sha256'])
+                        info = sf.info(str(path))
+                        self.assertEqual(path.stat().st_size, row['output_bytes'])
+                        self.assertAlmostEqual(info.frames / info.samplerate * 1000,
+                                               row['duration_ms'], places=3)
 
     def test_same_size_subsecond_audio_replacement_rebuilds_changed_chapter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -571,33 +597,65 @@ class MalformedChapterManifestTests(unittest.TestCase):
                                        "start_ms": None, "end_ms": 100}]},
                         {"chapters": [{"index": 0, "file": "01 - Chapter 1.wav",
                                        "start_ms": 0, "end_ms": "not a time"}]})
-        for malformed in self.MALFORMED + timing_cases:
-            for changed in (False, True):
-                with self.subTest(manifest=malformed, changed=changed), tempfile.TemporaryDirectory() as tmp:
-                    pm, chunks = _project(tmp)
-                    with patch.object(pm, "load_chunks", return_value=chunks), \
-                         patch.object(pm, "_load_pause_defaults", return_value=(10, 5)):
-                        ok, msg = pm.export_chapters(fmt="wav")
-                        self.assertTrue(ok, msg)
-                        output = Path(tmp, CHAPTER_EXPORT_DIR)
-                        expected_manifest = json.loads((output / "manifest.json").read_text())
-                        expected_audio = {row["file"]: sf.read(output / row["file"], dtype="int16")
-                                          for row in expected_manifest["chapters"]}
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as snapshot:
+            pm, chunks = _project(tmp)
+            with patch.object(pm, "load_chunks", return_value=chunks), \
+                 patch.object(pm, "_load_pause_defaults", return_value=(10, 5)):
+                ok, msg = pm.export_chapters(fmt="wav")
+                self.assertTrue(ok, msg)
+            output = Path(tmp, CHAPTER_EXPORT_DIR)
+            shutil.copytree(output, snapshot, dirs_exist_ok=True)
+            cache = Path(tmp, CACHE_FILENAME)
+            baseline_cache = cache.read_bytes() if cache.exists() else None
+            expected_manifest = json.loads((output / "manifest.json").read_text())
+            expected_evidence = stable_chapter_evidence(expected_manifest)
+            expected_audio = {row["file"]: sf.read(output / row["file"], dtype="int16")
+                              for row in expected_manifest["chapters"]}
+            # Preserve a valid plan and matching audio while corrupting one row:
+            # stale outputs alone must not explain rejecting the manifest.
+            valid_plan_bad_row = json.loads(json.dumps(expected_manifest))
+            valid_plan_bad_row["chapters"][0]["index"] = False
+            from project import _export_audio_segment
+            for malformed in self.MALFORMED + timing_cases + (valid_plan_bad_row,):
+                for changed in (False, True):
+                    with self.subTest(manifest=malformed, changed=changed):
+                        shutil.rmtree(output)
+                        shutil.copytree(snapshot, output)
+                        if baseline_cache is None:
+                            cache.unlink(missing_ok=True)
+                        else:
+                            cache.write_bytes(baseline_cache)
+                        if not changed:
+                            for name in expected_audio:
+                                (output / name).write_bytes(b"stale previous chapter")
                         (output / "manifest.json").write_text(json.dumps(malformed))
-                        ok, msg = pm.export_chapters(fmt="wav", changed_only=changed)
-                        self.assertTrue(ok, msg)
-                        self.assertIn("2 chapter file(s) written", msg)
-                        self.assertEqual(stable_chapter_evidence(expected_manifest),
-                                         stable_chapter_evidence(json.loads((output / "manifest.json").read_text())))
-                        for name, (samples, rate) in expected_audio.items():
-                            actual, actual_rate = sf.read(output / name, dtype="int16")
-                            self.assertEqual(rate, actual_rate)
-                            np.testing.assert_array_equal(samples, actual)
-                        before = {name: (output / name).read_bytes() for name in expected_audio}
-                        ok, msg = pm.export_chapters(fmt="wav", changed_only=True)
-                        self.assertTrue(ok, msg)
-                        self.assertIn("0 chapter file(s) written, 2 unchanged and kept", msg)
-                        self.assertEqual(before, {name: (output / name).read_bytes() for name in expected_audio})
+                        with patch.object(pm, "load_chunks", return_value=chunks), \
+                             patch.object(pm, "_load_pause_defaults", return_value=(10, 5)):
+                            with patch('project._export_audio_segment', wraps=_export_audio_segment) as render:
+                                ok, msg = pm.export_chapters(fmt="wav", changed_only=changed)
+                            self.assertEqual(2, render.call_count)
+                            self.assertTrue(ok, msg)
+                            self.assertIn("2 chapter file(s) written", msg)
+                            self.assertEqual(expected_evidence,
+                                             stable_chapter_evidence(json.loads((output / "manifest.json").read_text())))
+                            for name, (samples, rate) in expected_audio.items():
+                                actual, actual_rate = sf.read(output / name, dtype="int16")
+                                self.assertEqual(rate, actual_rate)
+                                np.testing.assert_array_equal(samples, actual)
+                            before = {name: (output / name).read_bytes() for name in expected_audio}
+                            with patch.object(
+                                    pm, "_load_chunks_with_audio",
+                                    side_effect=AssertionError(
+                                        "changed-only export decoded unchanged chapters")), \
+                                 patch.object(
+                                    pm, "get_chunk_audio_segment",
+                                    side_effect=AssertionError(
+                                        "changed-only export decoded unchanged chunks")):
+                                ok, msg = pm.export_chapters(fmt="wav", changed_only=True)
+                            self.assertTrue(ok, msg)
+                            self.assertIn("0 chapter file(s) written, 2 unchanged and kept", msg)
+                            self.assertEqual(before, {name: (output / name).read_bytes() for name in expected_audio})
 
     def test_http_listing_and_zip_reject_corrupt_whole_set_without_rewriting_manifest(self):
         import io
