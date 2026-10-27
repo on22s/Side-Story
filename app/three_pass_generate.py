@@ -47,7 +47,7 @@ from pass_quality import (is_attested_name, strip_roster_alias_echo,
                           validate_segment_quality, validate_attribution,
                           get_attribution_tag_evidence,
                           get_attribution_shift_feedback_report,
-                          validate_instruct, index_head_check,
+                          validate_instruct, index_head_check, coerce_index,
                           DELIVERY_DIRECTIONS,
                           analyze_outer_quote_regions, split_outer_quote_regions,
                           QUOTE_MARKS)
@@ -596,7 +596,8 @@ def get_directed_entry(prior, item, delivery_direction):
     return {**entry,
             "instruct": compose_directed_instruct(item["action"], item.get("delivery") or "",
                                                   delivery_direction),
-            "direction": {"answers": item.get("answers"), "action": item["action"],
+            "direction": {"answers": coerce_index(item.get("answers")),
+                          "action": item["action"],
                           "delivery": item.get("delivery"), "gap": item["gap"]}}
 
 
