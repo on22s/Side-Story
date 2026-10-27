@@ -34,8 +34,9 @@ echo "== regenerating what CI checks =="
 "$REPO/tools/regen_derived.sh" || exit 1
 python="$("$REPO/tools/regen_derived.sh" --python)"
 
-# The verifier owns the settle checks and runs them before units. Its
-# --check-evidence flag preserves these checks even for ready.sh --shard 2/3.
+# The verifier owns the settle checks and runs them before units. ready.sh
+# has just regenerated every derived file, so rerunning the four evidence
+# generators as checks here would be duplicate work; CI still runs them.
 
 # A BRAND-NEW ARTIFACT WILL GO STALE THE MOMENT YOU COMMIT IT, ONCE.
 # collect_results records the commit each artifact was generated at, and that
@@ -92,4 +93,4 @@ echo "   nothing unstaged"
 
 echo
 echo "== release verifier =="
-( cd "$REPO/app" && "$python" verify_release.py --check-evidence "$@" )
+( cd "$REPO/app" && "$python" verify_release.py --skip-evidence-recheck "$@" )

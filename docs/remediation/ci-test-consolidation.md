@@ -19,10 +19,12 @@ complete source review. Provider claims are hypotheses, not deletion authority.
 * `ready.sh` still regenerates indexes and refuses unstaged derived files before
   expensive tests. The shared verifier now owns the evidence checks instead of
   repeating them in the shell script and a separate CI step.
-* `--check-evidence` enforces all four evidence checks before unit tests,
-  including `ready.sh --shard 2/3` and `3/3`. Flagged evidence failures retain
-  exit 2; plain verifier failures retain exit 1. Inventory and compilation
-  remain primary-shard gates. Goal evidence is now checked by primary CI too.
+* `ready.sh` marks the four derived-evidence checks skipped after it has just
+  regenerated every derived file; this removes the duplicate local recheck.
+  `--check-evidence` still explicitly enforces all four checks before unit
+  tests, including on later shards. Flagged evidence failures retain exit 2;
+  plain verifier failures retain exit 1. Inventory and compilation remain
+  primary-shard gates. Goal evidence is now checked by primary CI too.
 * The two native audio workflows become one three-OS workflow. It preserves the
   exact 34-path trigger union, all nine original test modules, the finished M4B
   cover probe, pixel-budget checks, native tool version logging, and dependency

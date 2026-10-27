@@ -64,7 +64,7 @@ class DerivedMetadataTests(unittest.TestCase):
                 [Path(args[0]).name for args in calls])
             self.assertFalse(any('--check' in args for args in calls),
                              'ready must delegate checks instead of repeating them')
-            self.assertEqual(['verify_release.py','--check-evidence','--shard','2/3'],
+            self.assertEqual(['verify_release.py','--skip-evidence-recheck','--shard','2/3'],
                              calls[-1])
 
     def test_pointer_only_resolver_queries_metadata_once_and_regenerates_once(self):
