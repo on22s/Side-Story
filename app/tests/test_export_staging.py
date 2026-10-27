@@ -37,6 +37,263 @@ else:
 
 
 class ExportStagingTests(unittest.TestCase):
+    def test_bound_retirement_rejects_registry_creation_before_side_effects(self):
+        from export_staging_retirement import PosixRetirement, DIRECTORY
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, 'cannot create a registry'):
+                PosixRetirement(parent=tmp, create=True, expected_registry_identity=(1, 1))
+            self.assertFalse((Path(tmp) / DIRECTORY).exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_private_registry_preserves_parent_replaced_before_open(self):
+        import export_staging_retirement as retirement
+        with tempfile.TemporaryDirectory() as temporary:
+            target, foreign, saved = (Path(temporary).resolve() / name for name in ('target', 'foreign', 'saved'))
+            target.mkdir()
+
+            def abandon(parent):
+                stage = create_export_staging(parent, 'mp3')
+                (stage.path / 'payload').write_bytes(b'owned')
+                stage._lock.__exit__(None, None, None)
+                stage._closed = True
+                return stage.path.relative_to(parent)
+
+            # Both registries occupied this pathname at different times, so
+            # their marker parent strings alone cannot distinguish them.
+            protected = abandon(target)
+            target.rename(foreign)
+            target.mkdir()
+            original = abandon(target)
+            real_reclaim = retirement.reclaim_retired_slots
+            moved = []
+
+            def swap_before_open(parent, **kwargs):
+                if not moved:
+                    target.rename(saved)
+                    foreign.rename(target)
+                    moved.append(True)
+                return real_reclaim(parent, **kwargs)
+
+            try:
+                export_staging._close_scan_iterators()
+                with patch.object(retirement, 'reclaim_retired_slots', side_effect=swap_before_open):
+                    result = reclaim_export_staging([str(target)], max_remove=1, max_scan=1)
+                self.assertTrue(moved)
+                self.assertEqual((saved / original / 'payload').read_bytes(), b'owned')
+                self.assertEqual((target / protected / 'payload').read_bytes(), b'owned')
+                self.assertTrue(result['errors'], result)
+            finally:
+                export_staging._close_scan_iterators()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_private_registry_preserves_parent_replaced_between_slot_opens(self):
+        import export_staging_retirement as retirement
+        with tempfile.TemporaryDirectory() as temporary:
+            target, foreign, saved = (Path(temporary).resolve() / name for name in ('target', 'foreign', 'saved'))
+            target.mkdir()
+
+            def abandon(parent):
+                with patch.object(retirement.secrets, 'token_hex', side_effect=lambda length: 'a' * (2 * length)):
+                    stage = create_export_staging(parent, 'mp3')
+                (stage.path / 'payload').write_bytes(b'owned')
+                stage._lock.__exit__(None, None, None)
+                stage._closed = True
+                return stage.path.relative_to(parent)
+
+            # Matching slot and marker names do not make these the same parent.
+            protected = abandon(target)
+            target.rename(foreign)
+            target.mkdir()
+            original = abandon(target)
+            self.assertEqual(protected, original)
+            real_enter = retirement.PosixRetirement.__enter__
+            entered = []
+
+            def swap_on_second_open(transaction):
+                entered.append(True)
+                if len(entered) == 2:
+                    target.rename(saved)
+                    foreign.rename(target)
+                return real_enter(transaction)
+
+            try:
+                export_staging._close_scan_iterators()
+                with patch.object(retirement.PosixRetirement, '__enter__', new=swap_on_second_open):
+                    result = reclaim_export_staging([str(target)], max_remove=1, max_scan=1)
+                self.assertGreaterEqual(len(entered), 2)
+                self.assertEqual((saved / original / 'payload').read_bytes(), b'owned')
+                self.assertEqual((target / protected / 'payload').read_bytes(), b'owned')
+                self.assertTrue(result['errors'], result)
+            finally:
+                export_staging._close_scan_iterators()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_private_registry_reports_parent_swap_before_discovery(self):
+        import export_staging_retirement as retirement
+        with tempfile.TemporaryDirectory() as temporary:
+            target, foreign, saved = (Path(temporary).resolve() / name for name in ('target', 'foreign', 'saved'))
+            target.mkdir()
+            foreign.mkdir()
+            (foreign / 'keep').write_bytes(b'foreign')
+            stage = create_export_staging(target, 'mp3')
+            payload = stage.path / 'payload'
+            payload.write_bytes(b'original')
+            stage._lock.__exit__(None, None, None)
+            stage._closed = True
+            bound = retirement._reclaim_retired_slots_bound
+            swapped = []
+
+            def swap_before_discovery(*args, **kwargs):
+                target.rename(saved)
+                foreign.rename(target)
+                try:
+                    return bound(*args, **kwargs)
+                finally:
+                    target.rename(foreign)
+                    saved.rename(target)
+                    swapped.append(True)
+
+            with patch.object(retirement, '_reclaim_retired_slots_bound', side_effect=swap_before_discovery):
+                result = retirement.reclaim_retired_slots(target, max_remove=1)
+            self.assertTrue(swapped)
+            self.assertTrue(result['errors'], result)
+            self.assertEqual([], result['removed'])
+            self.assertEqual(b'original', payload.read_bytes())
+            self.assertEqual(b'foreign', (foreign / 'keep').read_bytes())
+            self.assertFalse((foreign / retirement.DIRECTORY).exists())
+            stable = retirement.reclaim_retired_slots(target, max_remove=1)
+            self.assertEqual(1, len(stable['removed']), stable)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_private_registry_recovery_does_not_recreate_a_moved_registry(self):
+        import export_staging_retirement as retirement
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary).resolve()
+            stage = create_export_staging(target, 'mp3')
+            relative_payload = (stage.path / 'payload').relative_to(target / retirement.DIRECTORY)
+            (stage.path / 'payload').write_bytes(b'original')
+            stage._lock.__exit__(None, None, None)
+            stage._closed = True
+            registry = target / retirement.DIRECTORY
+            saved = target / 'saved-registry'
+            real_enter = retirement.PosixRetirement.__enter__
+            opened = []
+
+            def move_before_reopen(transaction):
+                opened.append(True)
+                if len(opened) == 2:
+                    registry.rename(saved)
+                return real_enter(transaction)
+
+            with patch.object(retirement.PosixRetirement, '__enter__', new=move_before_reopen):
+                result = retirement.reclaim_retired_slots(target, max_remove=1)
+            self.assertGreaterEqual(len(opened), 2)
+            self.assertTrue(result['errors'], result)
+            self.assertEqual([], result['removed'])
+            self.assertFalse(registry.exists())
+            self.assertEqual(b'original', (saved / relative_payload).read_bytes())
+            saved.rename(registry)
+            stable = retirement.reclaim_retired_slots(target, max_remove=1)
+            self.assertEqual(1, len(stable['removed']), stable)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_private_recovery_preserves_replaced_registry(self):
+        import export_staging_retirement as retirement
+        for swap_on in (1, 2):
+            with self.subTest(swap_on=swap_on), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                registry = root / retirement.DIRECTORY
+                first, second = root / 'first', root / 'second'
+
+                def abandon(payload):
+                    with patch.object(retirement.secrets, 'token_hex', side_effect=lambda n: 'a' * (2 * n)):
+                        stage = create_export_staging(root, 'mp3')
+                    (stage.path / 'payload').write_bytes(payload)
+                    stage._lock.__exit__(None, None, None)
+                    stage._closed = True
+                    return (stage.path / 'payload').relative_to(registry)
+
+                original = abandon(b'original')
+                registry.rename(first)
+                protected = abandon(b'foreign')
+                registry.rename(second)
+                first.rename(registry)
+                self.assertEqual(original, protected)
+                real_enter = retirement.PosixRetirement.__enter__
+                opened = []
+
+                def swap_before_open(transaction):
+                    opened.append(True)
+                    if len(opened) == swap_on:
+                        registry.rename(first)
+                        second.rename(registry)
+                    return real_enter(transaction)
+
+                with patch.object(retirement.PosixRetirement, '__enter__', new=swap_before_open):
+                    result = retirement.reclaim_retired_slots(root, max_remove=1)
+                self.assertGreaterEqual(len(opened), swap_on)
+                self.assertTrue(result['errors'], result)
+                self.assertEqual([], result['removed'])
+                self.assertEqual(b'original', (first / original).read_bytes())
+                self.assertEqual(b'foreign', (registry / protected).read_bytes())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
+    def test_private_recovery_handles_empty_uninitialized_registry_conservatively(self):
+        from contextlib import contextmanager
+        import export_staging_retirement as retirement
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            registry = root / retirement.DIRECTORY
+            registry.mkdir(mode=0o700)
+            empty = retirement.reclaim_retired_slots(root, max_remove=1)
+            self.assertEqual({'removed': [], 'preserved': [], 'errors': []}, empty)
+            self.assertEqual([], list(registry.iterdir()))
+            (registry / 'unknown').write_bytes(b'preserve')
+            damaged = retirement.reclaim_retired_slots(root, max_remove=1)
+            self.assertTrue(damaged['errors'], damaged)
+            self.assertEqual(b'preserve', (registry / 'unknown').read_bytes())
+            self.assertFalse((registry / retirement.LOCK).exists())
+            (registry / 'unknown').unlink()
+
+            # A normal creation can initialize the interrupted empty registry.
+            stage = create_export_staging(root, 'mp3')
+            stage.finish()
+            self.assertTrue((registry / retirement.LOCK).exists())
+            real_lock = retirement.file_lock
+
+            @contextmanager
+            def remove_acquired_lock(*args, **kwargs):
+                with real_lock(*args, **kwargs):
+                    (registry / retirement.LOCK).unlink()
+                    yield
+
+            # Losing a lock after acquisition is not the benign first-open case.
+            with patch.object(retirement, 'file_lock', new=remove_acquired_lock):
+                lost = retirement.reclaim_retired_slots(root, max_remove=1)
+            self.assertTrue(lost['errors'], lost)
+            self.assertFalse((registry / retirement.LOCK).exists())
+
+            # A swap during the empty scan must be reported, even though the
+            # descriptor still points to the original empty registry.
+            saved = root / 'saved-registry'
+            class SwapScandir:
+                def __getattr__(self, name):
+                    if name == 'supports_fd':
+                        return set(os.supports_fd) | {self.scandir}
+                    return getattr(os, name)
+
+                def scandir(self, descriptor):
+                    registry.rename(saved)
+                    registry.mkdir(mode=0o700)
+                    (registry / 'foreign').write_bytes(b'foreign')
+                    return os.scandir(descriptor)
+
+            with patch.object(retirement, 'os', SwapScandir()):
+                changed = retirement.reclaim_retired_slots(root, max_remove=1)
+            self.assertTrue(changed['errors'], changed)
+            self.assertEqual(b'foreign', (registry / 'foreign').read_bytes())
+            self.assertEqual([], list(saved.iterdir()))
+
     @unittest.skipIf(os.name == 'nt', 'POSIX private retirement registry')
     def test_other_reaper_completes_discovered_slot_without_phantom_error(self):
         from export_staging_retirement import PosixRetirement, reclaim_retired_slots
