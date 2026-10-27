@@ -25,6 +25,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GPU_JOB = os.path.join(REPO, "gpu_job.sh")
@@ -161,6 +162,61 @@ class GpuJobTest(unittest.TestCase):
         os.chmod(p, 0o755)
         return d
 
+    def wait_for(self, condition, message="fixture did not reach readiness", timeout=90,
+                 processes=()):
+        deadline = time.monotonic() + timeout
+        while not condition():
+            exited = [process for process in processes
+                      if process is not None and process.poll() is not None]
+            if exited:
+                self.fail(f"{message}: job exited with {exited[0].returncode}")
+            if time.monotonic() >= deadline:
+                self.fail(message)
+            time.sleep(0.01)
+
+    def pending_names(self, env):
+        pending = env["GPU_PENDING_DIR"]
+        if not os.path.isdir(pending):
+            return []
+        names = []
+        for marker in os.listdir(pending):
+            try:
+                with open(os.path.join(pending, marker), encoding="utf-8") as handle:
+                    name = handle.readline().split("\t", 1)[0]
+            except OSError:
+                continue
+            if name:
+                names.append(name)
+        return names
+
+    def lock_wait_pid(self, process):
+        if not os.path.isdir("/proc"):
+            self.skipTest("procfs is required to observe the lock waiter")
+        try:
+            children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+        except OSError:
+            return None
+        for child in children:
+            try:
+                argv = Path(f"/proc/{child}/cmdline").read_bytes().split(b"\0")
+                if not argv or os.path.basename(argv[0].decode()) != "flock":
+                    continue
+                opened = os.path.realpath(os.readlink(f"/proc/{child}/fd/9"))
+            except OSError:
+                continue
+            if opened == os.path.realpath(self.lock):
+                return int(child)
+        return None
+
+    def wait_for_lock(self, *processes):
+        self.wait_for(
+            lambda: all(self.lock_wait_pid(process) for process in processes),
+            "jobs did not reach the GPU lock", processes=processes)
+
+    def wait_for_log(self, marker, timeout=90, processes=()):
+        self.wait_for(lambda: marker in self.log(), f"missing queue log: {marker}",
+                      timeout=timeout, processes=processes)
+
     # ---------------------------------------------------------------- basics
 
     def test_a_successful_job_runs_and_logs_ok(self):
@@ -240,55 +296,132 @@ class GpuJobTest(unittest.TestCase):
     def test_two_jobs_do_not_overlap(self):
         """The whole point. Overlap cost 42 minutes of A6000 training once.
 
-        Each job appends to a witness file on entry and exit; interleaved
-        markers would mean both held the GPU at once.
+        Both jobs are launched together against an idle lock. Each appends to a
+        witness file on entry and exit; the loser must wait on its own flock
+        child until the winner is released.
         """
         witness = os.path.join(self.tmp.name, "witness")
+        release = os.path.join(self.tmp.name, "release")
         script = textwrap.dedent(f"""
-            echo in >> {witness}
-            sleep 1
-            echo out >> {witness}
+            echo in >> {shlex.quote(witness)}
+            while [ ! -e {shlex.quote(release)} ]; do sleep .01; done
+            echo out >> {shlex.quote(witness)}
         """)
         env = isolated_env(self.tmp.name, GPU_LOCK=self.lock,
                            GPU_QLOG=self.qlog, ALLOW_DIRTY_TREE="1")
-        procs = [subprocess.Popen(["bash", GPU_JOB, f"j{i}", "bash", "-c",
-                                   script], env=env,
-                                  stdout=subprocess.DEVNULL,
+
+        def witness_lines():
+            try:
+                with open(witness, encoding="utf-8") as fh:
+                    return [line.strip() for line in fh if line.strip()]
+            except FileNotFoundError:
+                return []
+
+        first = subprocess.Popen(["bash", GPU_JOB, "j0", "bash", "-c", script],
+                                 env=env, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        second = subprocess.Popen(["bash", GPU_JOB, "j1", "bash", "-c", script],
+                                  env=env, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL)
-                 for i in range(2)]
-        for p in procs:
-            p.wait(timeout=60)
-        with open(witness, encoding="utf-8") as fh:
-            seq = [l.strip() for l in fh if l.strip()]
-        self.assertEqual(seq, ["in", "out", "in", "out"],
-                         f"jobs overlapped: {seq}")
+        try:
+            self.wait_for(
+                lambda: len(witness_lines()) > 1 or (
+                    len(witness_lines()) == 1
+                    and any(self.lock_wait_pid(process) for process in (first, second))),
+                "neither job acquired the lock with the other waiting",
+                processes=(first, second))
+            self.assertEqual(["in"], witness_lines(),
+                             "two jobs entered their commands while the lock was held")
+            self.assertTrue(any(self.lock_wait_pid(process) for process in (first, second)),
+                            "the losing job did not reach the lock")
+            Path(release).touch()
+            first.wait(timeout=60)
+            second.wait(timeout=60)
+        finally:
+            Path(release).touch()
+            for process in (first, second):
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0)
+        self.assertIn("OK       j0", self.log())
+        self.assertIn("OK       j1", self.log())
+        self.assertEqual(witness_lines(), ["in", "out", "in", "out"],
+                         f"jobs overlapped: {witness_lines()}")
 
     def test_the_second_job_waits_rather_than_failing(self):
         """Blocking is correct; a queued job must not be dropped."""
         env = isolated_env(self.tmp.name, GPU_LOCK=self.lock,
                            GPU_QLOG=self.qlog, ALLOW_DIRTY_TREE="1")
-        slow = subprocess.Popen(["bash", GPU_JOB, "slow", "sleep", "2"],
+        slow_started = os.path.join(self.tmp.name, "slow_started")
+        release = os.path.join(self.tmp.name, "slow_release")
+        slow_script = (f"touch {shlex.quote(slow_started)}; "
+                       f"while [ ! -e {shlex.quote(release)} ]; do sleep .01; done")
+        waiter_ran = os.path.join(self.tmp.name, "waiter_ran")
+        slow = subprocess.Popen(["bash", GPU_JOB, "slow", "bash", "-c", slow_script],
                                 env=env, stdout=subprocess.DEVNULL)
-        time.sleep(0.4)
-        r = self.run_job("waiter", "true", timeout=60)
-        slow.wait(timeout=60)
-        self.assertEqual(r.returncode, 0)
+        waiter = None
+        try:
+            self.wait_for_log("START    slow", processes=(slow,))
+            self.wait_for(lambda: os.path.exists(slow_started),
+                          "slow job did not start its command")
+            waiter = subprocess.Popen(["bash", GPU_JOB, "waiter", "touch", waiter_ran],
+                                      env=env, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+            self.wait_for_lock(waiter)
+            self.assertIsNone(waiter.poll(), "waiter exited instead of waiting")
+            self.assertFalse(os.path.exists(waiter_ran),
+                             "waiter ran while the slow job held the lock")
+            Path(release).touch()
+            slow.wait(timeout=60)
+            waiter.wait(timeout=60)
+        finally:
+            Path(release).touch()
+            for process in (slow, waiter):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+        self.assertEqual(slow.returncode, 0)
+        self.assertEqual(waiter.returncode, 0)
+        self.assertTrue(os.path.exists(slow_started))
+        self.assertTrue(os.path.exists(waiter_ran))
+        self.assertIn("OK       slow", self.log())
         self.assertIn("OK       waiter", self.log())
 
     def test_interrupting_a_waiter_releases_nothing_and_logs_no_start(self):
         """A job killed while queued must not appear to have run."""
         env = isolated_env(self.tmp.name, GPU_LOCK=self.lock,
                            GPU_QLOG=self.qlog, ALLOW_DIRTY_TREE="1")
-        holder = subprocess.Popen(["bash", GPU_JOB, "holder", "sleep", "3"],
-                                  env=env, stdout=subprocess.DEVNULL)
-        time.sleep(0.4)
+        holder_started = os.path.join(self.tmp.name, "holder_started")
+        release = os.path.join(self.tmp.name, "holder_release")
+        holder_script = (f"touch {shlex.quote(holder_started)}; "
+                         f"while [ ! -e {shlex.quote(release)} ]; do sleep .01; done")
         marker = os.path.join(self.tmp.name, "waiter_ran")
-        waiter = subprocess.Popen(["bash", GPU_JOB, "waiter", "touch", marker],
+        holder = subprocess.Popen(["bash", GPU_JOB, "holder", "bash", "-c", holder_script],
                                   env=env, stdout=subprocess.DEVNULL)
-        time.sleep(0.4)
-        waiter.kill()
-        waiter.wait(timeout=30)
-        holder.wait(timeout=60)
+        waiter = None
+        try:
+            self.wait_for_log("START    holder", processes=(holder,))
+            self.wait_for(lambda: os.path.exists(holder_started),
+                          "holder did not start its command")
+            waiter = subprocess.Popen(["bash", GPU_JOB, "waiter", "touch", marker],
+                                      env=env, stdout=subprocess.DEVNULL)
+            self.wait_for_lock(waiter)
+            self.assertIsNone(waiter.poll(), "waiter exited instead of waiting")
+            waiter.kill()
+            waiter.wait(timeout=30)
+            Path(release).touch()
+            holder.wait(timeout=60)
+        finally:
+            Path(release).touch()
+            for process in (holder, waiter):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+        self.assertEqual(holder.returncode, 0)
+        self.assertTrue(os.path.exists(holder_started))
+        self.assertEqual(-9, waiter.returncode)
         self.assertFalse(os.path.exists(marker))
         self.assertNotIn("START    waiter", self.log())
         self.assertIn("OK       holder", self.log())
@@ -968,7 +1101,6 @@ class PauseAndProcessGroupTest(unittest.TestCase):
     def test_a_paused_queue_holds_the_job_before_the_lock(self):
         """Observe repeated pause iterations and a free authoritative lease."""
         import signal
-        from pathlib import Path
         with open(self.flag, "w") as handle:
             handle.write("paused")
         root = Path(self.tmp.name)
@@ -1522,7 +1654,8 @@ class PauseNowTest(unittest.TestCase):
                                 capture_output=True, text=True, timeout=90)
         self.assertEqual(0, result.returncode, result.stderr)
         proc.wait(timeout=30)   # the wrapper is gone, not merely signalled
-        # Wait out the wrapper's own log write, then the job must never log OK.
+        # A late owner-written terminal line is exactly what this guard keeps
+        # observable; it is not fixture startup time.
         time.sleep(1)
         terminal = [l.split()[1] for l in self._log().splitlines()
                     if len(l.split()) > 1 and l.split()[1] in
