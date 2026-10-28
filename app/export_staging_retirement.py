@@ -30,15 +30,32 @@ RETIREMENT_RESERVE = '0' * 32
 RETAINED_OWNER = 'owner.retained'
 
 
+class _MissingRetirementLock(FileNotFoundError):
+    """The initial open found no lock; later lock failures are distinct."""
+
+
 class PosixRetirement:
-    def __init__(self, authority=None, *, parent=None, wait=False, create=True):
+    def __init__(self, authority=None, *, parent=None, wait=False, create=True,
+                 expected_parent_identity=None, expected_registry_identity=None):
         if (authority is None) == (parent is None):
             raise ValueError('Provide either admitted stage or recovery parent')
         if type(wait) is not bool:
             raise ValueError('Registry wait flag must be Boolean')
         if type(create) is not bool:
             raise ValueError('Registry creation flag must be Boolean')
+        if (expected_parent_identity is not None
+                and (type(expected_parent_identity) is not tuple or len(expected_parent_identity) != 2
+                     or any(type(value) is not int or value < 0 for value in expected_parent_identity))):
+            raise ValueError('Invalid retirement parent identity')
+        if (expected_registry_identity is not None
+                and (type(expected_registry_identity) is not tuple or len(expected_registry_identity) != 2
+                     or any(type(value) is not int or value < 0 for value in expected_registry_identity))):
+            raise ValueError('Invalid retirement registry identity')
+        if expected_registry_identity is not None and create:
+            raise ValueError('Bound retirement recovery cannot create a registry')
         self.create = create
+        self.expected_parent_identity = expected_parent_identity
+        self.expected_registry_identity = expected_registry_identity
         self.lock_timeout = 10 if wait else 0
         self.authority = authority
         self.parent = Path(parent) if authority is None else authority.path.parent
@@ -68,6 +85,9 @@ class PosixRetirement:
                                      os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             self.stack.callback(os.close, self.parent_fd)
             parent = self.parent_fd
+            if (self.expected_parent_identity is not None
+                    and identity(os.fstat(parent)) != self.expected_parent_identity):
+                raise StageDirectoryChanged('Retirement parent changed before registry admission')
             if (self.authority is not None and identity(os.fstat(parent))
                     != identity(os.fstat(self.authority.parent_fd))):
                 raise StageDirectoryChanged('Retirement parent changed')
@@ -80,9 +100,17 @@ class PosixRetirement:
             self.fd = os.open(DIRECTORY, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                               dir_fd=parent)
             self.stack.callback(os.close, self.fd)
+            if (self.expected_registry_identity is not None
+                    and identity(os.fstat(self.fd)) != self.expected_registry_identity):
+                raise StageDirectoryChanged('Retirement registry changed before admission')
             self.check()
-            lock_fd = os.open(LOCK, os.O_RDWR | (os.O_CREAT if self.create else 0) | os.O_NOFOLLOW | os.O_NONBLOCK,
-                              0o600, dir_fd=self.fd)
+            try:
+                lock_fd = os.open(LOCK, os.O_RDWR | (os.O_CREAT if self.create else 0) | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                  0o600, dir_fd=self.fd)
+            except FileNotFoundError as error:
+                if not self.create:
+                    raise _MissingRetirementLock('Retirement lock is missing') from error
+                raise
             stream = self.stack.enter_context(os.fdopen(lock_fd, 'r+b'))
             self.lock_stream = stream
             info = os.fstat(stream.fileno())
@@ -905,21 +933,78 @@ class PosixRetirement:
         return self.slot_fd, 'stage'
 
 
-def reclaim_retired_slots(parent, *, max_remove):
+def reclaim_retired_slots(parent, *, max_remove, expected_parent_identity=None):
     """Bounded private-slot discovery; failures preserve the affected slot."""
     result = {'removed': [], 'preserved': [], 'errors': []}
     if type(max_remove) is not int or max_remove <= 0:
         raise ValueError('Retirement removal budget must be a positive integer')
+    if (expected_parent_identity is not None
+            and (type(expected_parent_identity) is not tuple or len(expected_parent_identity) != 2
+                 or any(type(value) is not int or value < 0 for value in expected_parent_identity))):
+        raise ValueError('Invalid retirement parent identity')
     parent = Path(parent)
+    # Hold the admitted parent open through every registry re-open so its
+    # identity cannot be recycled between the initial observation and use.
+    from export_staging import _pin_recovery_parent
     try:
-        (parent / DIRECTORY).lstat()
+        with _pin_recovery_parent(os.path.realpath(parent), with_fd=True) as (pinned_identity, pinned_fd):
+            if expected_parent_identity is not None and pinned_identity != expected_parent_identity:
+                result['errors'].append(f'{parent}: retirement parent changed before registry admission')
+                return result
+            with ExitStack() as pinned_registry:
+                try:
+                    if pinned_fd is None:
+                        (parent / DIRECTORY).lstat()
+                        registry_identity = None
+                    else:
+                        if os.open not in os.supports_dir_fd:
+                            raise StageDirectoryChanged('Descriptor-relative retirement is unavailable')
+                        registry_fd = os.open(DIRECTORY, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                              dir_fd=pinned_fd)
+                        pinned_registry.callback(os.close, registry_fd)
+                        registry_identity = identity(os.fstat(registry_fd))
+                except FileNotFoundError:
+                    return result
+                return _reclaim_retired_slots_bound(parent, max_remove=max_remove,
+                                                    expected_parent_identity=pinned_identity,
+                                                    expected_registry_identity=registry_identity,
+                                                    pinned_parent_fd=pinned_fd,
+                                                    pinned_registry_fd=registry_fd if pinned_fd is not None else None)
     except FileNotFoundError:
         return result
+    except OSError as error:
+        result['errors'].append(f'{parent}: {error}')
+        return result
+
+
+def _reclaim_retired_slots_bound(parent, *, max_remove, expected_parent_identity,
+                                 expected_registry_identity, pinned_parent_fd, pinned_registry_fd):
+    result = {'removed': [], 'preserved': [], 'errors': []}
     try:
-        with PosixRetirement(parent=parent) as registry:
+        with PosixRetirement(parent=parent, create=False,
+                             expected_parent_identity=expected_parent_identity,
+                             expected_registry_identity=expected_registry_identity) as registry:
             names = registry.slot_names()
     except TimeoutError:
         result['preserved'].append(str(parent / DIRECTORY))
+        return result
+    except _MissingRetirementLock as error:
+        # A crash between creating an empty registry and its first lock leaves
+        # no stage to recover. Do not create a new lock: a nonempty registry
+        # could have a live holder of a removed lock. An empty check consumes
+        # only one entry and remains bound to both pinned directory identities.
+        try:
+            if pinned_parent_fd is None or pinned_registry_fd is None:
+                raise error
+            with os.scandir(pinned_registry_fd) as entries:
+                if next(entries, None) is not None:
+                    raise error
+            if (identity(os.stat(parent, follow_symlinks=False)) != expected_parent_identity
+                    or identity(os.stat(DIRECTORY, dir_fd=pinned_parent_fd, follow_symlinks=False))
+                    != expected_registry_identity):
+                raise StageDirectoryChanged('Retirement registry changed during empty check')
+        except OSError as check_error:
+            result['errors'].append(f'{parent / DIRECTORY}: {check_error}')
         return result
     except OSError as error:
         result['errors'].append(f'{parent / DIRECTORY}: {error}')
@@ -927,7 +1012,9 @@ def reclaim_retired_slots(parent, *, max_remove):
     for name in names:
         path = parent / DIRECTORY / name
         try:
-            with PosixRetirement(parent=parent) as registry:
+            with PosixRetirement(parent=parent, create=False,
+                                 expected_parent_identity=expected_parent_identity,
+                                 expected_registry_identity=expected_registry_identity) as registry:
                 # Discovery releases the registry between slots. Another
                 # admitted reaper may already have completed this one; renew
                 # existence under the reacquired gate, without treating a

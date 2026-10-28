@@ -480,6 +480,24 @@ def get_alignment_counts(frozen_entries, response_entries):
                                  if isinstance(response_entries, list) else None)}
 
 
+def coerce_index(value):
+    """Return an unambiguous JSON index as int, matching model transport (#623).
+
+    Integral floats and digit strings are accepted where an index is required;
+    bools stay bool so callers can reject them explicitly.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdecimal():
+            try:
+                return int(stripped)
+            except ValueError:
+                return value
+    return value
+
+
 def index_head_check(frozen_entries, response_entries):
     """Return (ok, reason, ordered) for the immutable-index contract.
 
@@ -496,13 +514,7 @@ def index_head_check(frozen_entries, response_entries):
     for item in response_entries:
         if not isinstance(item, dict):
             return False, "entry is not a JSON object", None
-        n = item.get("n")
-        if isinstance(n, float) and n.is_integer():
-            n = int(n)
-        # A model with no response schema (manual transport, #623) echoes the
-        # index it was shown as text: "8" for 8. A digit string is unambiguous.
-        if isinstance(n, str) and n.strip().isdigit():
-            n = int(n.strip())
+        n = coerce_index(item.get("n"))
         if isinstance(n, bool) or not isinstance(n, int) or not (0 <= n < k):
             return False, f"entry has a missing or out-of-range index n={n!r}", None
         if n in by_index:
@@ -555,7 +567,7 @@ _VALIDATION_EXPECTED = {
     "invalid_gap": "one of normal, beat, cut_off, trailing",
     "missing_action": "a non-empty playable verb",
     "missing_delivery": "a non-empty acoustic delivery note",
-    "invalid_answers": "null or the index of another entry in this request",
+    "invalid_answers": "null or the index of an earlier entry in this request",
 }
 
 # Pass 3 delivery-direction modes (#1258); "off" is the shipped instruct-only contract.
@@ -1040,7 +1052,7 @@ def validate_instruct(prior_entries, response_entries, delivery_direction="off")
     non-empty instruct on every entry. A delivery-direction mode (#1258) also
     requires its fields: a known gap, and in the directed modes an action, a
     delivery note (directed only; action_only discards it) and an `answers`
-    that is null or another entry of this request, in place of the instruct."""
+    that is null or an earlier entry of this request, in place of the instruct."""
     ok, reason, ordered = index_head_check(prior_entries, response_entries)
     if not ok:
         return {"passed": False,
@@ -1070,9 +1082,13 @@ def validate_instruct(prior_entries, response_entries, delivery_direction="off")
             add("missing_action", i, prior, "Every entry needs an action.")
         if delivery_direction == "directed" and not is_text(item.get("delivery")):
             add("missing_delivery", i, prior, "Every entry needs a delivery note.")
-        answers = item.get("answers")
-        if answers is not None and (isinstance(answers, bool) or not isinstance(answers, int)
-                                    or not 0 <= answers < len(prior_entries) or answers == i - 1):
+        if "answers" not in item:
             add("invalid_answers", i, prior,
-                "answers must be null or the index of another entry in this request.")
+                "Every directed entry needs an answers key (null when there is no reply).")
+            continue
+        answers = coerce_index(item.get("answers"))
+        if answers is not None and (isinstance(answers, bool) or not isinstance(answers, int)
+                                    or not 0 <= answers < i - 1):
+            add("invalid_answers", i, prior,
+                "answers must be null or the index of an earlier entry in this request.")
     return {"passed": not findings, "findings": findings}
