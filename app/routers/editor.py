@@ -799,7 +799,7 @@ async def drift_check_endpoint(request: DriftCheckRequest, background_tasks: Bac
 
 def apply_guarded_chunk_update(index, update):
     root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root):
+    with ensure_book_state(root, timeout=0.25):
         if (update.expected_book_token is not None
                 and update.expected_book_token != get_snapshot_digest(get_editor_book_identity(root))):
             raise HTTPException(status_code=409, detail="Active book changed; reload the Editor before saving")
