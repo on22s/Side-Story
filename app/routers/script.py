@@ -1,3 +1,4 @@
+from book_state_transaction import ensure_saved_book_state
 from script_recovery_facts import get_saved_script_recovery_manifest
 from review_report import save_review_report
 from book_state_transaction import (ensure_book_state, apply_book_input_selection,
@@ -13,6 +14,7 @@ import logging
 import os
 import posixpath
 import re
+import stat
 import sys
 import tempfile
 import threading
@@ -72,11 +74,16 @@ from utils import file_lock
 from alexandria_alignment import validate_epub_archive
 from epub_package import get_epub_package
 from epub_publication import get_epub_publication_candidate, get_epub_publication_origin
+from epub_extraction_report import EpubExtractionReport
 from project_scope_files import capture_scope_file
 from source_upload_publication import create_source_upload_stage, publish_completed_upload
+from source_upload_stage import OwnedSourceUploadStage, get_upload_stage_accounting
+from docx_preview import extract_docx_preview, MAX_ARCHIVE as MAX_DOCX_ARCHIVE
+from docx_publication import DocxStorageLimit, publish_docx_upload
 from publication_source import (PublicationSourceLimit, get_upload_publication_update,
     apply_publication_source_update, restore_publication_source_update,
-    get_saved_publication_source_bytes, get_publication_source_path)
+    get_saved_publication_source_bytes, get_publication_source_path,
+    get_new_upload_publication_bytes)
 
 from core import (
     _saved_book_meta_path,
@@ -138,6 +145,8 @@ MAX_MANUAL_REPLY_CHARACTERS = 2 * 1024 * 1024
 MAX_UPLOAD_STORAGE_BYTES = 8 * 1024**3
 MAX_SCRIPT_UPLOAD_BYTES = 512 * 1024**2
 MAX_UPLOAD_HASH_CACHE_ENTRIES = 512
+SELECTABLE_SOURCE_EXTENSIONS = frozenset({'.txt', '.md'})
+BATCH_SOURCE_EXTENSIONS = SELECTABLE_SOURCE_EXTENSIONS | {'.epub'}
 _upload_hash_cache = OrderedDict()
 _upload_hash_lock = threading.Lock()
 _upload_dedupe_lock = threading.Lock()
@@ -404,6 +413,7 @@ class _HTMLTextExtractor(HTMLParser):
         self._pending_newline = 0
         self._skip_depth = 0
         self._anchor_ids = frozenset(anchor_ids or ())
+        self.anchor_counts = {}
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -417,6 +427,7 @@ class _HTMLTextExtractor(HTMLParser):
             anchor_id = (attributes.get('id') or attributes.get('xml:id')
                          or (attributes.get('name') if tag == 'a' else None))
             if anchor_id in self._anchor_ids:
+                self.anchor_counts[anchor_id] = self.anchor_counts.get(anchor_id, 0) + 1
                 self.parts.append(('anchor', anchor_id))
 
     def handle_endtag(self, tag):
@@ -464,13 +475,15 @@ def _resolve_epub_href(base_path, href):
     return path, unquote(parsed.fragment) or None
 
 
-def _get_epub3_toc_entries(zf, manifest):
+def _get_epub3_toc_entries(zf, manifest, *, report=None):
+    decisions = []
     nav_items = [item for item in manifest.values()
                  if 'nav' in item['properties'].split()]
     for nav_item in nav_items:
         try:
             root = ET.fromstring(zf.read(nav_item['path']))
         except (KeyError, ET.ParseError):
+            decisions.append((nav_item['path'], 'missing_or_malformed_navigation'))
             continue
         for nav in root.iter():
             if nav.tag.rsplit('}', 1)[-1] != 'nav':
@@ -481,18 +494,23 @@ def _get_epub3_toc_entries(zf, manifest):
                 continue
             entries = []
             for link in nav.iter():
-                if link.tag.rsplit('}', 1)[-1] != 'a' or not link.get('href'):
+                if link.tag.rsplit('}', 1)[-1] != 'a':
                     continue
                 label = ' '.join(''.join(link.itertext()).split())
-                path, fragment = _resolve_epub_href(nav_item['path'], link.get('href'))
+                href = link.get('href')
+                path, fragment = _resolve_epub_href(nav_item['path'], href or '')
                 if label and path:
                     entries.append((path, fragment, label))
+                elif report is not None:
+                    report.apply_row('navigation_link', resource=nav_item['path'], href=href, label=label,
+                                     reason='missing_href' if not href else 'empty_label' if not label else 'unsupported_target')
             if entries:
-                return entries
-    return []
+                return entries, decisions + [(nav_item['path'], 'selected_epub3_navigation')]
+        decisions.append((nav_item['path'], 'no_usable_toc_entries'))
+    return [], decisions
 
 
-def _get_epub2_toc_entries(zf, opf, opf_ns, manifest):
+def _get_epub2_toc_entries(zf, opf, opf_ns, manifest, *, report=None):
     spine = opf.find(f'.//{opf_ns}spine')
     toc_id = spine.get('toc') if spine is not None else None
     ncx_item = manifest.get(toc_id) if toc_id else None
@@ -500,11 +518,11 @@ def _get_epub2_toc_entries(zf, opf, opf_ns, manifest):
         ncx_item = next((item for item in manifest.values()
                          if item['media_type'] == 'application/x-dtbncx+xml'), None)
     if ncx_item is None:
-        return []
+        return [], [(None, 'no_epub2_navigation')]
     try:
         root = ET.fromstring(zf.read(ncx_item['path']))
     except (KeyError, ET.ParseError):
-        return []
+        return [], [(ncx_item['path'], 'missing_or_malformed_navigation')]
     entries = []
     for nav_point in root.iter():
         if nav_point.tag.rsplit('}', 1)[-1] != 'navPoint':
@@ -517,11 +535,13 @@ def _get_epub2_toc_entries(zf, opf, opf_ns, manifest):
                 label = ' '.join(''.join(child.itertext()).split())
             elif local_name == 'content' and href is None:
                 href = child.get('src')
-        if label and href:
-            path, fragment = _resolve_epub_href(ncx_item['path'], href)
-            if path:
-                entries.append((path, fragment, label))
-    return entries
+        path, fragment = _resolve_epub_href(ncx_item['path'], href or '')
+        if label and path:
+            entries.append((path, fragment, label))
+        elif report is not None:
+            report.apply_row('navigation_link', resource=ncx_item['path'], href=href, label=label,
+                             reason='missing_href' if not href else 'empty_label' if not label else 'unsupported_target')
+    return entries, [(ncx_item['path'], 'selected_epub2_navigation' if entries else 'no_usable_toc_entries')]
 
 
 _TOC_QUOTES_RE = re.compile(r"[‘’“”\"'`]")
@@ -574,13 +594,14 @@ def _toc_title_already_present(label, window):
     return False
 
 
-def _insert_epub_toc_titles(text, anchor_positions, toc_targets):
-    """Insert missing TOC labels at their resolved positions in one document."""
-    insertions = []
+def _get_epub_toc_title_decisions(text, anchor_positions, toc_targets):
+    decisions = []
     seen = set()
     for fragment, label in toc_targets:
         key = (fragment, label.casefold())
         if key in seen:
+            decisions.append({'fragment': fragment, 'label': label, 'position': None,
+                              'reason': 'duplicate_navigation_entry'})
             continue
         seen.add(key)
         if fragment is None:
@@ -588,9 +609,21 @@ def _insert_epub_toc_titles(text, anchor_positions, toc_targets):
         elif fragment in anchor_positions:
             position = anchor_positions[fragment]
         else:
+            decisions.append({'fragment': fragment, 'label': label, 'position': None,
+                              'reason': 'unresolved_anchor'})
             continue
-        if not _toc_title_already_present(label, text[position:position + 500]):
-            insertions.append((position, label))
+        reason = ('label_already_near_target' if _toc_title_already_present(label, text[position:position + 500])
+                  else 'insert_navigation_label')
+        decisions.append({'fragment': fragment, 'label': label, 'position': position, 'reason': reason})
+    return decisions
+
+
+def _insert_epub_toc_titles(text, anchor_positions, toc_targets, *, decisions=None):
+    """Insert missing TOC labels at their resolved positions in one document."""
+    if decisions is None:
+        decisions = _get_epub_toc_title_decisions(text, anchor_positions, toc_targets)
+    insertions = [(row['position'], row['label']) for row in decisions
+                  if row['reason'] == 'insert_navigation_label']
     # BACK TO FRONT BY POSITION, not by TOC order. Inserting shifts every
     # offset after the insertion point, so each insert must happen at a
     # position no earlier than the ones already applied. `reversed()` alone
@@ -620,12 +653,18 @@ def get_epub_xhtml_text(data: bytes) -> str:
     return data.decode(encoding, errors="replace")
 
 
-def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None) -> str:
+def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None, include_report=False):
     """Extract plain text from an EPUB file, ordered by spine (reading order).
 
     Parses the EPUB ZIP structure directly using stdlib only:
     META-INF/container.xml -> .opf manifest+spine -> XHTML content files.
     """
+    if include_report and archive_bytes is None:
+        with open(epub_path, 'rb') as source:
+            archive_bytes = source.read(MAX_SCRIPT_UPLOAD_BYTES + 1)
+        if len(archive_bytes) > MAX_SCRIPT_UPLOAD_BYTES:
+            raise ValueError('EPUB exceeds source upload limit')
+    report = EpubExtractionReport(archive_bytes) if include_report else None
     if archive_bytes is None:
         validate_epub_archive(epub_path)
     else:
@@ -633,7 +672,12 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None) -> 
     source = io.BytesIO(archive_bytes) if archive_bytes is not None else epub_path
     with zipfile.ZipFile(source, 'r') as zf:
         # Share the package parser with bounded publication metadata review.
-        opf_path, opf = get_epub_package(zf)
+        if report is not None:
+            opf_path, opf, package_details = get_epub_package(zf, include_details=True)
+            report.apply_row('package', resource=opf_path, sha256=hashlib.sha256(zf.read(opf_path)).hexdigest(),
+                             digest_scope='original_archive_member_bytes', **package_details)
+        else:
+            opf_path, opf = get_epub_package(zf)
         # Detect OPF namespace (varies between EPUB 2 and 3)
         opf_ns = opf.tag.split('}')[0] + '}' if '}' in opf.tag else ''
 
@@ -659,23 +703,39 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None) -> 
                 spine_ids.append(idref)
 
         # 3. Read EPUB3 navigation, falling back to EPUB2 NCX.
-        toc_entries = _get_epub3_toc_entries(zf, manifest)
+        toc_entries, navigation = _get_epub3_toc_entries(zf, manifest, report=report)
         if not toc_entries:
-            toc_entries = _get_epub2_toc_entries(zf, opf, opf_ns, manifest)
+            toc_entries, fallback = _get_epub2_toc_entries(zf, opf, opf_ns, manifest, report=report)
+            navigation += [(None, 'epub3_unavailable_or_empty_try_epub2')] + fallback
+        if report is not None:
+            for resource, reason in navigation:
+                report.apply_row('navigation_source', resource=resource, reason=reason)
         toc_by_path = {}
         for path, fragment, label in toc_entries:
             toc_by_path.setdefault(path, []).append((fragment, label))
 
         # 4. Extract text from each spine item in order.
         chapters = []
-        for item_id in spine_ids:
+        processed_paths = set()
+        skipped_paths = {}
+        for spine_index, item_id in enumerate(spine_ids):
             item = manifest.get(item_id)
             if item is None or 'html' not in item['media_type']:
+                if item is not None:
+                    skipped_paths[item['path']] = 'non_html_resource'
+                if report is not None:
+                    report.apply_row('spine', index=spine_index, item_id=item_id,
+                                     resource=item['path'] if item else None,
+                                     reason='non_html_resource' if item else 'missing_manifest_item')
                 continue
             href = item['path']
             try:
                 html_bytes = zf.read(href)
             except KeyError:
+                skipped_paths[href] = 'missing_archive_resource'
+                if report is not None:
+                    report.apply_row('spine', index=spine_index, item_id=item_id, resource=href,
+                                     reason='missing_archive_resource')
                 continue
             html_content = get_epub_xhtml_text(html_bytes)
             targets = toc_by_path.get(href, [])
@@ -683,11 +743,41 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None) -> 
             extractor = _HTMLTextExtractor(anchor_ids)
             extractor.feed(html_content)
             text, anchor_positions = extractor.get_text_with_anchor_positions()
-            text = _insert_epub_toc_titles(text, anchor_positions, targets).strip()
+            body_characters = len(text.strip())
+            processed_paths.add(href)
+            decisions = _get_epub_toc_title_decisions(text, anchor_positions, targets) if report is not None else None
+            insertion_options = {'decisions': decisions} if report is not None else {}
+            text = _insert_epub_toc_titles(text, anchor_positions, targets, **insertion_options).strip()
+            if report is not None:
+                for decision in decisions:
+                    report.apply_row('navigation_target', resource=href, spine_index=spine_index,
+                                     coordinate_scope='plain_resource_before_titles_and_normalization',
+                                     anchor_occurrences=extractor.anchor_counts.get(decision['fragment'], 0),
+                                     **decision)
+                resolved = list(anchor_positions.values())
+                report.apply_row('resource_policy', resource=href,
+                                 reason='all_extracted_text_kept_including_before_first_target',
+                                 characters_before_first_resolved_anchor=min(resolved) if resolved else None,
+                                 duplicate_anchor_policy='first_occurrence',
+                                 inserted_navigation_labels=sum(row['reason'] == 'insert_navigation_label' for row in decisions),
+                                 body_characters_before_titles=body_characters)
+                report.apply_row('spine', index=spine_index, item_id=item_id, resource=href,
+                                 reason='included' if body_characters else 'navigation_label_only' if text else 'no_readable_text',
+                                 resource_sha256=hashlib.sha256(html_bytes).hexdigest(),
+                                 text_sha256=hashlib.sha256(normalize_extracted_text(text).encode('utf-8')).hexdigest())
             if text:
                 chapters.append(text)
 
-    return normalize_extracted_text('\n\n'.join(chapters))
+        if report is not None:
+            archive_paths = set(zf.namelist())
+            manifest_paths = {item['path'] for item in manifest.values()}
+            for path, fragment, label in toc_entries:
+                if path not in processed_paths:
+                    report.apply_row('navigation_target', resource=path, fragment=fragment, label=label,
+                                     reason=skipped_paths.get(path) or ('missing_archive_resource' if path not in archive_paths
+                                         else 'target_not_in_manifest' if path not in manifest_paths else 'target_outside_spine_not_extracted'))
+    text = normalize_extracted_text('\n\n'.join(chapters))
+    return (text, report.get_report(text)) if report is not None else text
 
 
 def _get_upload_hash(path: str) -> str:
@@ -718,16 +808,21 @@ def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
     # concurrent uploads can each select the other as canonical and remove
     # both files, or one scan can stat a path the other just removed.
     with _upload_dedupe_lock:
-        size = os.path.getsize(path)
-        digest = _get_upload_hash(path)
+        owned = isinstance(path, OwnedSourceUploadStage)
+        size = path.size if owned else os.path.getsize(path)
+        digest = path.sha256() if owned else _get_upload_hash(path)
         for entry in sorted(os.scandir(UPLOADS_DIR), key=lambda item: item.name):
             try:
-                if (not entry.is_file() or entry.path == path or
-                        os.path.splitext(entry.name)[1].lower() not in {".txt", ".md"} or
-                        entry.stat().st_size != size):
+                # Windows DirEntry.stat can leave st_nlink at zero. Query the
+                # actual named file before applying the single-link rule.
+                facts = os.lstat(entry.path)
+                if (not entry.is_file(follow_symlinks=False)
+                        or facts.st_nlink != 1 or entry.path == path or
+                        os.path.splitext(entry.name)[1].lower() not in SELECTABLE_SOURCE_EXTENSIONS or
+                        facts.st_size != size):
                     continue
                 if _get_upload_hash(entry.path) == digest:
-                    os.remove(path)
+                    path.close() if owned else os.remove(path)
                     return entry.path, True
             except FileNotFoundError:
                 continue
@@ -737,14 +832,24 @@ def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
 def _get_reusable_uploads() -> List[dict]:
     uploads = []
     for entry in sorted(os.scandir(UPLOADS_DIR), key=lambda item: item.name.casefold()):
-        if not entry.is_file() or os.path.splitext(entry.name)[1].lower() not in {".txt", ".md"}:
+        try:
+            facts = os.lstat(entry.path)
+            if (not entry.is_file(follow_symlinks=False) or not stat.S_ISREG(facts.st_mode)
+                    or facts.st_nlink != 1
+                    or os.path.splitext(entry.name)[1].lower() not in SELECTABLE_SOURCE_EXTENSIONS):
+                continue
+            uploads.append({
+                "filename": entry.name, "size": facts.st_size, "modified": facts.st_mtime,
+                "sha256": _get_upload_hash(entry.path),
+            })
+        except FileNotFoundError:
             continue
-        stat = entry.stat()
-        uploads.append({
-            "filename": entry.name, "size": stat.st_size, "modified": stat.st_mtime,
-            "sha256": _get_upload_hash(entry.path),
-        })
     return uploads
+
+
+def _encode_epub_text(text):
+    """Validate and encode potentially large extracted text off the event loop."""
+    return text.encode('utf-8') if text.strip() else None
 
 
 def _apply_upload_selection(path, before_publication=None):
@@ -753,22 +858,40 @@ def _apply_upload_selection(path, before_publication=None):
     with ensure_book_switch_allowed(hold_task_mutex=False):
         try:
             options = {'timeout': 0}
+            from docx_publication import capture_docx_group
+            capture_docx_group(path)
             if before_publication is not None:
                 options['before_publication'] = before_publication
-            apply_book_input_selection(DATA_DIR, path,
+            return apply_book_input_selection(DATA_DIR, path,
                 secure_filename(os.path.splitext(os.path.basename(path))[0]), **options)
+        except TimeoutError:
+            raise HTTPException(status_code=409, detail=(
+                'Book metadata is busy; retry the selection shortly.')) from None
         except ValueError:
             raise HTTPException(status_code=409, detail=(
                 'Book metadata requires inspection; existing book files were preserved.')) from None
 
 
-def _select_upload(filename: str) -> str:
+def _select_upload(filename: str, *, include_identity=False):
     safe_name = _require_safe_filename(filename, "Invalid upload filename")
     path = os.path.join(UPLOADS_DIR, safe_name)
-    if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in {".txt", ".md"}:
+    try:
+        facts = os.lstat(path)
+    except OSError:
+        facts = None
+    if (facts is None or not stat.S_ISREG(facts.st_mode) or facts.st_nlink != 1
+            or os.path.splitext(path)[1].lower() not in SELECTABLE_SOURCE_EXTENSIONS):
         raise HTTPException(status_code=404, detail=f"Reusable upload '{filename}' not found.")
-    _apply_upload_selection(path)
-    return path
+    token = _apply_upload_selection(path)
+    return (path, token) if include_identity else path
+
+
+def _is_single_link_regular_file(path):
+    try:
+        facts = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(facts.st_mode) and facts.st_nlink == 1
 
 
 @router.get("/api/uploads")
@@ -782,8 +905,9 @@ class ExistingUploadRequest(BaseModel):
 
 @router.post("/api/uploads/select")
 async def select_existing_upload(request: ExistingUploadRequest):
-    path = await asyncio.to_thread(_select_upload, request.filename)
-    return {"status": "selected", "stored_filename": os.path.basename(path), "path": path}
+    path, token = await asyncio.to_thread(_select_upload, request.filename, include_identity=True)
+    return {"status": "selected", "stored_filename": os.path.basename(path), "path": path,
+            "book_identity_token": token}
 
 
 
@@ -795,19 +919,37 @@ async def select_existing_upload(request: ExistingUploadRequest):
 
 
 def get_upload_storage_bytes():
-    """Count regular files retained in the flat source-upload directory."""
+    """Count named files and request-owned anonymous extents under the lease."""
+    active_names, active_bytes = get_upload_stage_accounting(UPLOADS_DIR)
     with os.scandir(UPLOADS_DIR) as entries:
-        return sum(entry.stat(follow_symlinks=False).st_size for entry in entries
-                   if entry.is_file(follow_symlinks=False))
+        named = sum(entry.stat(follow_symlinks=False).st_size for entry in entries
+                    if entry.name not in active_names and entry.is_file(follow_symlinks=False))
+    return named + active_bytes
 
 
 from upload_operation import await_upload_operation
 
+@router.get("/api/uploads/docx-retained")
+def get_docx_retained_uploads():
+    from docx_retention import get_retained_docx_inventory
+    return get_retained_docx_inventory(UPLOADS_DIR, MAX_UPLOAD_STORAGE_BYTES)
+
 @router.post("/api/upload")
-async def upload_file(file: UploadFile = File(...), select_active: bool = True):
+async def upload_file(file: UploadFile = File(...), select_active: bool = True, include_extraction_report: bool = False,
+                      docx_preview: bool = False, docx_confirmed: bool = False,
+                      docx_preview_digest: Optional[str] = None):
     safe_name = _require_safe_filename(file.filename or "", "Invalid or empty filename")
-    if os.path.splitext(safe_name)[1].lower() not in {".txt", ".md", ".epub"}:
-        raise HTTPException(status_code=400, detail="Supported source formats are TXT, Markdown and EPUB.")
+    is_docx = safe_name.lower().endswith('.docx')
+    if os.path.splitext(safe_name)[1].lower() not in BATCH_SOURCE_EXTENSIONS | {'.docx'}:
+        raise HTTPException(status_code=400, detail="Supported source formats are TXT, Markdown, EPUB and confirmed single-book DOCX.")
+    if is_docx:
+        if select_active or (not docx_preview and (not docx_confirmed
+                or not re.fullmatch('[0-9a-f]{64}', docx_preview_digest or ''))):
+            raise HTTPException(status_code=400, detail='DOCX requires preview, explicit confirmation and select_active=false before separate selection.')
+        if docx_preview and (docx_confirmed or docx_preview_digest is not None):
+            raise HTTPException(status_code=400, detail='DOCX preview cannot also confirm an upload.')
+    elif docx_preview or docx_confirmed or docx_preview_digest is not None:
+        raise HTTPException(status_code=400, detail='DOCX confirmation options require a DOCX file.')
     await asyncio.to_thread(os.makedirs, UPLOADS_DIR, exist_ok=True)
     # The lease is outside uploads so it is neither listed nor quota-counted.
     # Acquire in a worker; waiting for another upload must not block the loop.
@@ -819,44 +961,110 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
     if cancelled is not None:
         storage_lock.__exit__(None, None, None)
         raise cancelled
-    owned_paths = set()
+    owned_stages = []
+    stage_cleanup = contextlib.ExitStack()
     selection = {'publication_started': False}
     def retain_selected_source(path=None):
         # Worker handoff: after publication starts its outcome may be unknown.
         # Preserve valid uploaded files/provenance even if cancellation or an I/O
         # error arrives after a book-state rename. They remain quota-accounted.
         selection['publication_started'] = True
-    publication = publication_update = None
+    publication = publication_update = publication_bytes = None
+    extraction_report = None
+    request_error = None
     try:
         available = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
         if available <= 0:
             raise HTTPException(status_code=413, detail="Source upload storage limit reached.")
+        capture_limit = min(MAX_SCRIPT_UPLOAD_BYTES, available, MAX_DOCX_ARCHIVE if is_docx else MAX_SCRIPT_UPLOAD_BYTES)
         file_path, cancelled = await await_upload_operation(
-            asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR))
-        owned_paths.add(file_path)
+            asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR,
+                              limit=capture_limit))
+        owned_stages.append(file_path)
+        stage_cleanup.callback(file_path.close)
         if cancelled is not None:
             raise cancelled
         _, cancelled = await await_upload_operation(
-            _save_upload_limited(file, file_path, min(MAX_SCRIPT_UPLOAD_BYTES, available)))
+            _save_upload_limited(file, file_path, capture_limit))
         if cancelled is not None:
             raise cancelled
+        if is_docx:
+            try:
+                raw, cancelled = await await_upload_operation(asyncio.to_thread(file_path.read_bytes))
+                if cancelled is not None:
+                    raise cancelled
+                preview, cancelled = await await_upload_operation(asyncio.to_thread(extract_docx_preview, raw))
+                if cancelled is not None:
+                    raise cancelled
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=redact_text(str(error))) from error
+            except (OSError, MemoryError) as error:
+                raise HTTPException(status_code=503, detail='DOCX processing is temporarily unavailable.') from error
+            if len(preview['text'].encode('utf-8')) > MAX_SCRIPT_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail='Extracted DOCX text exceeds source upload limits.')
+            if docx_preview:
+                return {'status': 'preview', **preview}
+            if preview['preview_digest'] != docx_preview_digest:
+                raise HTTPException(status_code=409, detail='DOCX preview changed; preview and accept this exact file again.')
+            remaining = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
+            try:
+                result, cancelled = await await_upload_operation(asyncio.to_thread(
+                    publish_docx_upload, file_path, preview, safe_name, remaining=remaining))
+            except DocxStorageLimit as error:
+                raise HTTPException(status_code=413, detail=str(error)) from error
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            except (OSError, MemoryError) as error:
+                raise HTTPException(status_code=503, detail='DOCX publication was not confirmed; any already published recovery material remains retained. Check existing uploads before retrying.') from error
+            if cancelled is not None:
+                raise cancelled
+            path, names = result
+            return {'filename': file.filename, 'stored_filename': os.path.basename(path),
+                    'path': path, 'reused': False, 'book_identity_token': None,
+                    'docx_source': names, 'preview_digest': preview['preview_digest']}
         if safe_name.lower().endswith('.epub'):
             try:
-                captured, cancelled = await await_upload_operation(asyncio.to_thread(
-                    capture_scope_file, Path(file_path).parent.resolve(), os.path.basename(file_path),
-                    limit=MAX_SCRIPT_UPLOAD_BYTES, include_bytes=True))
+                archive_bytes, cancelled = await await_upload_operation(
+                    asyncio.to_thread(file_path.read_bytes))
                 if cancelled is not None:
                     raise cancelled
-                _, archive_bytes = captured
-                text, cancelled = await await_upload_operation(asyncio.to_thread(
-                    extract_epub_text, file_path, archive_bytes=archive_bytes))
+                options = {'include_report': True} if include_extraction_report else {}
+                extracted, cancelled = await await_upload_operation(asyncio.to_thread(
+                    extract_epub_text, safe_name, archive_bytes=archive_bytes, **options))
                 if cancelled is not None:
                     raise cancelled
+                if include_extraction_report:
+                    text, extraction_report = extracted
+                else:
+                    text = extracted
+            except FileNotFoundError as error:
+                # Captured archive bytes are the parser's only input. A
+                # missing-path error here describes a malformed internal EPUB
+                # reference, not unavailable server storage.
+                raise HTTPException(status_code=400, detail=(
+                    'Failed to process EPUB: ' + redact_text(str(error)))) from error
+            except (MemoryError, OSError) as error:
+                raise HTTPException(status_code=503, detail=(
+                    'EPUB processing is temporarily unavailable: ' +
+                    redact_text(str(error)))) from error
             except Exception as error:
                 raise HTTPException(status_code=400, detail=f"Failed to process EPUB: {redact_text(str(error))}") from error
-            if not text.strip():
+            try:
+                text_bytes, cancelled = await await_upload_operation(
+                    asyncio.to_thread(_encode_epub_text, text))
+            except (MemoryError, OSError) as error:
+                raise HTTPException(status_code=503, detail=(
+                    'EPUB processing is temporarily unavailable: ' +
+                    redact_text(str(error)))) from error
+            if cancelled is not None:
+                raise cancelled
+            if text_bytes is None:
                 raise HTTPException(status_code=400, detail="No readable text content found in EPUB.")
-            text_bytes = text.encode('utf-8')
+            # The captured archive bytes now own parsing/provenance input; do
+            # not reserve both its stage and the extracted text simultaneously.
+            _, cancelled = await await_upload_operation(asyncio.to_thread(file_path.close))
+            if cancelled is not None:
+                raise cancelled
             available = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
             if len(text_bytes) > min(MAX_SCRIPT_UPLOAD_BYTES, available):
                 raise HTTPException(status_code=413, detail="Extracted EPUB text exceeds source upload storage limits.")
@@ -867,35 +1075,45 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
                     return get_epub_publication_candidate(archive_bytes, **options)
                 except (ValueError, KeyError, ET.ParseError, zipfile.BadZipFile, RuntimeError, ImportError) as error:
                     result = get_epub_publication_origin(archive_bytes, **options)
-                    result['warnings'] = ['Publication suggestions unavailable: ' + str(error)[:2000]]
+                    result['warnings'] = [
+                        'Publication suggestions unavailable: ' + redact_text(str(error))[:2000]]
                     return result
-            publication, cancelled = await await_upload_operation(asyncio.to_thread(capture_publication))
+            try:
+                publication, cancelled = await await_upload_operation(
+                    asyncio.to_thread(capture_publication))
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=(
+                    'Invalid EPUB publication metadata: ' + redact_text(str(error)))) from error
             if cancelled is not None:
                 raise cancelled
             safe_name = os.path.splitext(safe_name)[0] + '.txt'
             txt_path, cancelled = await await_upload_operation(
-                asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR))
-            owned_paths.add(txt_path)
+                asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR, limit=len(text_bytes)))
+            owned_stages.append(txt_path)
+            stage_cleanup.callback(txt_path.close)
             if cancelled is not None:
                 raise cancelled
-            _, cancelled = await await_upload_operation(asyncio.to_thread(Path(txt_path).write_bytes, text_bytes))
+            _, cancelled = await await_upload_operation(asyncio.to_thread(txt_path.write, text_bytes))
             if cancelled is not None:
                 raise cancelled
-            os.remove(file_path)
             file_path = txt_path
-        result, cancelled = await await_upload_operation(asyncio.to_thread(_reuse_duplicate_upload, file_path))
+        try:
+            result, cancelled = await await_upload_operation(
+                asyncio.to_thread(_reuse_duplicate_upload, file_path))
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
         file_path, reused = result
         if cancelled is not None:
             raise cancelled
         if publication is not None:
             try:
                 remaining = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
-                publication_update, cancelled = await await_upload_operation(asyncio.to_thread(
-                    get_upload_publication_update, file_path, publication, remaining,
-                    source_limit=MAX_SCRIPT_UPLOAD_BYTES))
-                if cancelled is not None:
-                    raise cancelled
                 if reused:
+                    publication_update, cancelled = await await_upload_operation(asyncio.to_thread(
+                        get_upload_publication_update, file_path, publication, remaining,
+                        source_limit=MAX_SCRIPT_UPLOAD_BYTES))
+                    if cancelled is not None:
+                        raise cancelled
                     # This source is already library-owned. A reader may observe
                     # the atomic provenance update before this request returns.
                     retain_selected_source()
@@ -903,42 +1121,65 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True):
                         apply_publication_source_update, publication_update))
                     if cancelled is not None:
                         raise cancelled
+                else:
+                    text_digest, cancelled = await await_upload_operation(asyncio.to_thread(file_path.sha256))
+                    if cancelled is not None:
+                        raise cancelled
+                    publication_bytes, cancelled = await await_upload_operation(asyncio.to_thread(
+                        get_new_upload_publication_bytes, text_digest, publication, remaining))
+                    if cancelled is not None:
+                        raise cancelled
             except PublicationSourceLimit as error:
                 raise HTTPException(status_code=413, detail=str(error)) from error
             except ValueError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
         if not reused:
-            file_path, cancelled = await await_upload_operation(asyncio.to_thread(
-                publish_completed_upload, file_path, safe_name, retain_selected_source,
-                limit=MAX_SCRIPT_UPLOAD_BYTES,
-                companion_bytes=publication_update['new_bytes'] if publication_update else None))
+            try:
+                file_path, cancelled = await await_upload_operation(asyncio.to_thread(
+                    publish_completed_upload, file_path, safe_name, retain_selected_source,
+                    limit=MAX_SCRIPT_UPLOAD_BYTES,
+                    companion_bytes=publication_bytes))
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
             if cancelled is not None:
                 raise cancelled
+        selection_token = None
         if select_active:
-            _, cancelled = await await_upload_operation(asyncio.to_thread(
+            selection_token, cancelled = await await_upload_operation(asyncio.to_thread(
                 _apply_upload_selection, file_path, retain_selected_source))
             if cancelled is not None:
                 raise cancelled
         return {"filename": file.filename, "stored_filename": os.path.basename(file_path),
                 "path": file_path, "reused": reused,
+                "book_identity_token": selection_token,
                 "publication_status": publication['metadata_status'] if publication is not None else 'not_captured',
-                "publication_warnings": publication['warnings'] if publication is not None else []}
-    except BaseException:
-        try:
-            if publication_update is not None and not selection['publication_started']:
-                await await_upload_operation(asyncio.to_thread(restore_publication_source_update, publication_update))
-        finally:
-            # Only private stages belong to this request. Public sources were
-            # handed off at visibility and must survive another reader selecting
-            # them, including cancellation before our own book selection.
-            for path in owned_paths:
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+                "publication_warnings": publication['warnings'] if publication is not None else [],
+                **({'extraction_report': extraction_report} if include_extraction_report else {})}
+    except BaseException as error:
+        request_error = error
+        if any(stage.publication_started for stage in owned_stages):
+            retain_selected_source()
+        if publication_update is not None and not selection['publication_started']:
+            try:
+                await await_upload_operation(asyncio.to_thread(
+                    restore_publication_source_update, publication_update))
+            except BaseException as rollback_error:
+                logger.warning('Publication rollback also failed: %s',
+                               type(rollback_error).__name__)
         raise
     finally:
-        storage_lock.__exit__(None, None, None)
+        try:
+            try:
+                _, cleanup_cancelled = await await_upload_operation(asyncio.to_thread(stage_cleanup.close))
+            except Exception as error:
+                if request_error is None:
+                    raise
+                logger.warning('Upload stage cleanup also failed: %s', type(error).__name__)
+                cleanup_cancelled = None
+            if cleanup_cancelled is not None and request_error is None:
+                raise cleanup_cancelled
+        finally:
+            storage_lock.__exit__(None, None, None)
 
 class GenerateScriptRequest(BaseModel):
     strip_front_matter: bool = True
@@ -949,6 +1190,10 @@ class GenerateScriptRequest(BaseModel):
     # stopped - by design (a crash or Cancel loses nothing), but there was no
     # way to ask for a fresh run short of changing a setting (#597).
     start_over: bool = False
+    # Explicit acknowledgment for a checkpoint predating selection identity.
+    # Both tokens must still match the checkpoint and selected book at retry.
+    legacy_checkpoint_token: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{64}$')
+    legacy_book_token: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{64}$')
 
 
 def get_book_preflight_result(job_id):
@@ -1152,7 +1397,8 @@ def build_generate_script_command(input_file: str, output_path: Optional[str] = 
                                   first_person_narrator: Optional[str] = None,
                                   reasoning_effort: Optional[str] = None,
                                   cast_file: Optional[str] = None,
-                                  literal_source_preserving: bool = False) -> List[str]:
+                                  literal_source_preserving: bool = False,
+                                  selection_binding: Optional[dict] = None) -> List[str]:
     """Build the one production command used by single and batch generation.
 
     `reasoning_effort` is passed explicitly so three_pass_generate records it
@@ -1175,6 +1421,17 @@ def build_generate_script_command(input_file: str, output_path: Optional[str] = 
         raise ValueError("literal_source_preserving must be a boolean")
     if literal_source_preserving:
         command.append("--literal-source-preserving")
+    if selection_binding is not None:
+        from script_selection_binding import _digest
+        if (not isinstance(selection_binding, dict)
+                or set(selection_binding) != {'book_token', 'source_path', 'source_sha256', 'run_id'}
+                or selection_binding['source_path'] != input_file or output_path is not None):
+            raise ValueError('Invalid active generation selection')
+        if not isinstance(selection_binding['run_id'], str) or not re.fullmatch(r'[0-9a-f]{32}', selection_binding['run_id']):
+            raise ValueError('Invalid generation attempt')
+        command.extend(['--active-book-token', _digest(selection_binding['book_token']),
+                        '--active-source-sha256', _digest(selection_binding['source_sha256']),
+                        '--active-run-id', selection_binding['run_id']])
     return command
 
 
@@ -1254,11 +1511,30 @@ def _snapshot_script_sync(request):
     companion = os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json")
     metadata = _saved_book_meta_path(safe_name)
     with ensure_saved_book_destination_available(dest), ensure_book_state(DATA_DIR), \
-            ensure_book_state(SCRIPTS_DIR), contextlib.ExitStack() as locks:
+            ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR), contextlib.ExitStack() as locks:
         for path in (dest, VOICE_CONFIG_PATH, *_get_saved_book_companions(dest)):
             locks.enter_context(file_lock(path))
         if not process_state['script'].get('running'):
             raise HTTPException(status_code=409, detail='No script generation is running; use Save script instead.')
+        # A live process alone does not establish which source owns its
+        # checkpoint. Fence the snapshot to the durable run identity and the
+        # currently owned task before attaching any publication provenance.
+        import core
+        from script_selection_binding import capture_generation_selection
+        source_state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), default={})
+        try:
+            expected = source_state.get('script_generation_selection')
+            captured = capture_generation_selection(DATA_DIR, source_state.get('input_file_path'))
+            if not isinstance(expected, dict) or expected != captured:
+                raise ValueError('Generation source identity is missing or changed')
+            with core._gpu_lock:
+                owner = core._task_claims.get('script')
+                if (not owner or owner.get('phase') != 'started'
+                        or owner.get('id') != source_state.get('script_generation_run_id')
+                        or process_state['script'].get('cancel')):
+                    raise ValueError('Generation attempt is no longer current')
+        except (OSError, ValueError, TypeError, RecursionError) as error:
+            raise HTTPException(status_code=409, detail=f'Cannot snapshot this generation: {error}') from error
         checkpoint = get_current_generation_checkpoint()
         if not isinstance(checkpoint, dict):
             raise HTTPException(status_code=409, detail="The run has not written a checkpoint yet.")
@@ -1280,7 +1556,6 @@ def _snapshot_script_sync(request):
             voice_bytes = Path(VOICE_CONFIG_PATH).read_bytes()
             validate_book_json_bytes(voice_bytes, dict, 409, 'Active snapshot voices')
             replacements[os.path.basename(companion)] = voice_bytes
-        source_state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), default={})
         try:
             publication = get_saved_publication_source_bytes(source_state.get('input_file_path'), script_bytes)
         except (OSError, ValueError) as error:
@@ -1392,7 +1667,62 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
                 raise HTTPException(status_code=409, detail="Selected source changed before generation started.")
             if require_recovery and get_script_recovery_manifest() is None:
                 raise HTTPException(status_code=409, detail="Recovery checkpoint changed before start.")
+            from script_selection_binding import capture_generation_selection
+            try:
+                captured = capture_generation_selection(DATA_DIR, input_file)
+            except (OSError, ValueError) as error:
+                raise HTTPException(status_code=409, detail=(
+                    'The selected source or book could not be verified. '
+                    'Check the selection and try again; saved progress was preserved.')) from error
+            if (not require_recovery and not (request is not None and request.start_over)
+                    and os.path.isfile(three_pass_checkpoint_path(SCRIPT_PATH))
+                    and current_state.get('script_generation_selection') != captured):
+                raise HTTPException(status_code=409, detail=(
+                    'Existing generation progress belongs to another or unverified selection. '
+                    'The checkpoint was preserved; review it before starting over.'))
+            original = current_state.get('script_generation_selection') if require_recovery else captured
+            if require_recovery and original is None:
+                checkpoint = get_current_generation_checkpoint(locked=True)
+                if (request is None or not isinstance(checkpoint, dict)
+                        or request.legacy_checkpoint_token != get_script_recovery_token(checkpoint)
+                        or request.legacy_book_token != captured['book_token']):
+                    raise HTTPException(status_code=409, detail=(
+                        'This older checkpoint has no book-selection identity. '
+                        'Review the recovery details and explicitly confirm the current selection; '
+                        'the checkpoint was preserved.'))
+                # This is an explicit user choice, not a claim that the old
+                # checkpoint carried book identity. The child still refuses
+                # to resume if the source/settings fingerprint does not match.
+                original = captured
+            if original is not None and original != captured:
+                raise HTTPException(status_code=409, detail=(
+                    'The source or book selection changed since this generation started; '
+                    'the checkpoint was preserved.'))
+            if original is not None:
+                with file_lock(SCRIPT_PATH):
+                    base, _ = capture_scope_file(DATA_DIR, os.path.relpath(SCRIPT_PATH, DATA_DIR),
+                                                 limit=512 * 1024**2)
+                if (os.path.isfile(three_pass_checkpoint_path(SCRIPT_PATH))
+                        and not (request is not None and request.start_over and not require_recovery)
+                        and 'script_generation_base_sha256' in current_state
+                        and current_state['script_generation_base_sha256'] != base['sha256']):
+                    raise HTTPException(status_code=409, detail=(
+                        'The script changed since this checkpoint was started. '
+                        'The edit and saved progress were preserved; use Start over in Generate to begin again.'))
+                if (os.path.isfile(three_pass_checkpoint_path(SCRIPT_PATH))
+                        and not (request is not None and request.start_over and not require_recovery)):
+                    from three_pass_generate import _refuse_checkpoint_replay_over_edited_publication
+                    try:
+                        _refuse_checkpoint_replay_over_edited_publication(SCRIPT_PATH)
+                    except RuntimeError as error:
+                        raise HTTPException(status_code=409, detail=str(error)) from error
             claim_id = reserve_background_task("script")
+            if original is not None:
+                command.extend(['--active-book-token', original['book_token'],
+                                '--active-source-sha256', original['source_sha256'],
+                                '--active-run-id', claim_id])
+                if require_recovery:
+                    command.append('--require-matching-checkpoint')
             if request is not None and request.start_over and not require_recovery:
                 discard_script_progress(locked=True)
             if not require_recovery:
@@ -1412,6 +1742,11 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
                 # changed checkbox would invalidate the resume fingerprint.
                 state["script_generation_options"] = options
                 state["script_generation_input_file"] = input_file
+                if original is not None:
+                    state['script_generation_selection'] = original
+                    state.pop('script_generation_cancel_requested_run_id', None)
+                    state['script_generation_run_id'] = claim_id
+                    state['script_generation_base_sha256'] = base['sha256']
                 atomic_json_write(state, state_path)
             register_claimed_background_task(background_tasks, "script", claim_id, run_process, command, "script")
     except BaseException:
@@ -1452,6 +1787,21 @@ def ensure_script_recovery_response(include_detail=False):
             "failed_chunk": manifest.get("failed_chunk"),
             "failure_count": len(failures),
         }
+        state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), {})
+        if isinstance(state, dict) and state.get('script_generation_selection') is None:
+            with file_lock(three_pass_checkpoint_path(SCRIPT_PATH)):
+                try:
+                    checkpoint = get_current_generation_checkpoint(locked=True)
+                except HTTPException:
+                    # Metadata remains useful when the checkpoint is corrupt;
+                    # do not offer confirmation without a readable checkpoint.
+                    checkpoint = None
+                if isinstance(checkpoint, dict):
+                    from book_state_transaction import get_book_operation_token
+                    response['legacy_confirmation'] = {
+                        'checkpoint_token': get_script_recovery_token(checkpoint),
+                        'book_token': get_book_operation_token(DATA_DIR),
+                    }
         if include_detail:
             checkpoint = _load_failed_checkpoint()
             response["detail"] = ({"recoverable": True, **build_recovery_detail(checkpoint)}
@@ -1756,7 +2106,11 @@ async def retry_generate_script(background_tasks: BackgroundTasks,
     stored_options = state.get("script_generation_options") if isinstance(state, dict) else None
     if isinstance(stored_options, dict):
         try:
-            request = GenerateScriptRequest(**stored_options)
+            options = dict(stored_options)
+            if request is not None:
+                options['legacy_checkpoint_token'] = request.legacy_checkpoint_token
+                options['legacy_book_token'] = request.legacy_book_token
+            request = GenerateScriptRequest(**options)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=409,
                                 detail="Saved recovery settings are invalid; start a new run.") from exc
@@ -1765,7 +2119,72 @@ async def retry_generate_script(background_tasks: BackgroundTasks,
 
 @router.post("/api/generate_script/cancel")
 async def generate_script_cancel():
-    return _cancel_task("script", "No script generation is currently running.", "Script generation process already exited.")
+    return await asyncio.to_thread(_cancel_script_generation_sync)
+
+
+def _cancel_script_generation_sync():
+    """Revoke this generation before signalling its worker, or report commit."""
+    import core
+    state_path = os.path.join(DATA_DIR, 'state.json')
+    try:
+        with ensure_book_state(DATA_DIR), file_lock(state_path), core._gpu_lock:
+            task = process_state['script']
+            if not task.get('running'):
+                raise HTTPException(status_code=400, detail='No script generation is currently running.')
+            owner = core._task_claims.get('script')
+            state = safe_load_json(state_path, default={})
+            if not isinstance(state, dict):
+                raise ValueError('Book state is invalid')
+            if owner is None and not state.get('script_generation_run_id'):
+                # Compatibility for a legacy in-memory task without a claim.
+                return _cancel_task('script', 'No script generation is currently running.',
+                                    'Script generation process already exited.')
+            owner_id = owner.get('id') if owner else None
+            if owner_id and state.get('script_generation_published_run_id') == owner_id:
+                # Publication won, but the child or its descendants may still
+                # be running. Stop their cleanup without calling the committed
+                # script cancelled in the task's final status.
+                task['_script_published_cleanup_stop'] = True
+                try:
+                    stopped = _cancel_task('script', 'No script generation is currently running.',
+                                           'Script generation process already exited.')
+                except HTTPException as error:
+                    process = task.get('process')
+                    if (error.status_code != 400 or error.detail != 'Script generation process already exited.'
+                            or sys.platform != 'win32' or process is None
+                            or getattr(process, '_alexandria_windows_owner', None) is None):
+                        raise HTTPException(status_code=409, detail=(
+                            'The script was already published, but stopping its worker was not confirmed. '
+                            'Check task activity.')) from error
+                    from windows_subprocess_job import WindowsJobClosedError
+                    try:
+                        core.terminate_windows_process_tree(process, force=True)
+                    except WindowsJobClosedError:
+                        # A published owner is exposed only after admission;
+                        # its normal close waits for zero job membership.
+                        return {'status': 'published_cleanup_stop', 'worker': 'already stopped'}
+                    except OSError as force_error:
+                        raise HTTPException(status_code=409, detail=(
+                            'The script was already published, but stopping its worker was not confirmed. '
+                            'Check task activity.')) from force_error
+                    # The owner retains the job until the kernel confirms exit.
+                    return {'status': 'published_cleanup_stop_requested',
+                            'worker': 'force stop requested'}
+                return {'status':'published_cleanup_stop', 'worker':stopped['status']}
+            if not owner_id or state.get('script_generation_run_id') != owner_id:
+                raise HTTPException(status_code=409, detail=(
+                    'This task is not the current script generation; check its activity before cancelling.'))
+            state['script_generation_cancel_requested_run_id'] = owner_id
+            atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
+            stopped = _cancel_task('script', 'No script generation is currently running.',
+                                   'Script generation process already exited.')
+            state.pop('script_generation_run_id', None)
+            state.pop('script_generation_cancel_requested_run_id', None)
+            atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
+            return stopped
+    except (OSError, ValueError, TimeoutError) as error:
+        raise HTTPException(status_code=409, detail=(
+            'Cancellation could not be safely recorded; check the task state before trying again.')) from error
 
 
 
@@ -1784,10 +2203,45 @@ async def generate_script_resume():
 @router.post("/api/review_script")
 async def review_script(background_tasks: BackgroundTasks, request: Optional[ReviewRequest] = None):
     """Review the current annotated script. Accepts empty POST or JSON body."""
+    return await asyncio.to_thread(_with_published_script, _start_review_script, background_tasks, request)
+
+
+def _with_published_script(callback, *args):
+    _require_published_script()
+    return callback(*args)
+
+
+def _require_published_script():
+    with ensure_book_state(DATA_DIR):
+        _require_published_selection()
+        if not os.path.exists(SCRIPT_PATH):
+            raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
+
+
+def _require_published_selection():
+    from script_selection_binding import require_published_selection
+    try:
+        require_published_selection(DATA_DIR)
+    except (OSError, ValueError, RecursionError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _run_published_script_process(command, task_name):
+    # Recheck after task ownership is claimed to close the admission race.
+    try:
+        _require_published_script()
+    except HTTPException as error:
+        state = process_state[task_name]
+        state['status'] = 'failed'
+        state['return_code'] = 1
+        state['logs'] = [f"Task {task_name} could not start: {error.detail}"]
+        return 1
+    return run_process(command, task_name)
+
+
+def _start_review_script(background_tasks, request):
     if request is None:
         request = ReviewRequest()  # Use defaults
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     check_global_gpu_lock("review")
 
@@ -1796,13 +2250,15 @@ async def review_script(background_tasks: BackgroundTasks, request: Optional[Rev
     if request.dedupe_speakers:
         cmd += ["--dedupe-speakers", "--remap-voice-config", VOICE_CONFIG_PATH,
                 "--alias-registry", CHARACTER_ALIASES_PATH]
-    schedule_claimed_background_task(background_tasks, "review", run_process, cmd, "review")
+    schedule_claimed_background_task(background_tasks, "review", _run_published_script_process, cmd, "review")
     return {"status": "started", "dedupe_speakers": request.dedupe_speakers}
 
 @router.post("/api/review_script_contextual")
 async def review_script_contextual(request: ContextualReviewRequest, background_tasks: BackgroundTasks):
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
+    return await asyncio.to_thread(_with_published_script, _start_contextual_review, request, background_tasks)
+
+
+def _start_contextual_review(request, background_tasks):
 
     check_global_gpu_lock("review")
 
@@ -1830,7 +2286,7 @@ async def review_script_contextual(request: ContextualReviewRequest, background_
         cmd += ["--dedupe-speakers", "--remap-voice-config", VOICE_CONFIG_PATH,
                 "--alias-registry", CHARACTER_ALIASES_PATH]
     schedule_claimed_background_task(background_tasks, "review",
-        run_process,
+        _run_published_script_process,
         cmd,
         "review"
     )
@@ -1866,13 +2322,15 @@ async def review_script_resume():
 @router.post("/api/find_nicknames")
 async def find_nicknames_endpoint(background_tasks: BackgroundTasks):
     """Scan the working script for character nicknames/aliases and write character_aliases.json."""
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
+    return await asyncio.to_thread(_with_published_script, _start_find_nicknames, background_tasks)
+
+
+def _start_find_nicknames(background_tasks):
     # nicknames runs the LLM, so it must claim the GPU lock (this also guards
     # against a duplicate start, replacing the old running-flag check).
     cmd = [sys.executable, "-u", "find_nicknames.py",
            "--aliases-file", CHARACTER_ALIASES_PATH, "--append"]
-    schedule_claimed_background_task(background_tasks, "nicknames", run_process, cmd, "nicknames")
+    schedule_claimed_background_task(background_tasks, "nicknames", _run_published_script_process, cmd, "nicknames")
     return {"status": "started"}
 
 
@@ -2028,7 +2486,7 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
     total = len(names)
 
     def _run():
-        with ensure_book_state(SCRIPTS_DIR):
+        with ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR):
             pass
         state = process_state["batch_review"]
         prefix = "bidirectional " if bidirectional else ""
@@ -2064,6 +2522,23 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
             if not os.path.exists(script_path):
                 state["logs"].append(f"--- [{i+1}/{total}]{tag} Skipping — not found: {name} ---")
                 state["tasks"][i]["status"] = "failed"
+                return True
+
+            # Rewriting a saved script that is also the active source would
+            # invalidate the active book's identity and could discard edits.
+            # Refuse before discovery, checkpoints, or voice settings change;
+            # the child rechecks under the publication lock.
+            from script_selection_binding import saved_script_is_active_source
+            try:
+                with ensure_book_state(DATA_DIR):
+                    active_source = saved_script_is_active_source(DATA_DIR, script_path)
+            except (OSError, ValueError, TimeoutError):
+                state['logs'].append(f'[{i+1}]{tag} Cannot verify active book; {name} was not reviewed.')
+                state['tasks'][i]['status'] = 'failed'
+                return True
+            if active_source:
+                state['logs'].append(f'[{i+1}]{tag} {name} is currently loaded; switch books before reviewing it.')
+                state['tasks'][i]['status'] = 'failed'
                 return True
 
             state["logs"].append(f"--- [{i+1}/{total}]{tag} Reviewing '{name}' ---")
@@ -2191,11 +2666,10 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
             return True
 
         def _process_book(i: int, name: str, tag: str = "") -> bool:
-            safe_name = secure_filename(name)
-            if not safe_name:
-                return _process_book_unlocked(i, name, tag)
-            with file_lock(os.path.join(SCRIPTS_DIR, f"{safe_name}.json")):
-                return _process_book_unlocked(i, name, tag)
+            # The batch owns its destination for its entire lifetime. The
+            # child takes the short-lived saved-book and file locks at commit
+            # and refuses if its exact input changed during inference.
+            return _process_book_unlocked(i, name, tag)
 
         # Forward pass (reading order)
         state["current_pass"] = "fwd"
@@ -2332,18 +2806,25 @@ def _resolve_batch_script_input(filename: str) -> str:
     safe_filename = secure_filename(filename)
     if not safe_filename or safe_filename != filename:
         raise ValueError(f"Invalid filename: {filename}")
+    if os.path.splitext(safe_filename)[1].lower() not in BATCH_SOURCE_EXTENSIONS:
+        raise ValueError(f"Unsupported batch source format: {filename}")
     input_path = os.path.join(UPLOADS_DIR, safe_filename)
     if not os.path.exists(input_path) and os.path.splitext(safe_filename)[1].lower() == ".epub":
         input_path = os.path.join(UPLOADS_DIR, os.path.splitext(safe_filename)[0] + ".txt")
-    if not os.path.isfile(input_path):
+    if not _is_single_link_regular_file(input_path):
         raise ValueError(f"Source is not a regular file: {filename}")
     return input_path
 
 
 def _read_and_validate_batch_script_source(job):
     """Read one batch source and reject unattested narrator metadata."""
-    with open(job["input_path"], encoding="utf-8") as source:
-        text = fix_mojibake(source.read())
+    from docx_publication import capture_docx_group
+    group = capture_docx_group(job['input_path'])
+    if group is not None:
+        text = fix_mojibake(group['text_bytes'].decode('utf-8'))
+    else:
+        with open(job["input_path"], encoding="utf-8") as source:
+            text = fix_mojibake(source.read())
     text, normalization_count = normalize_known_source_corruptions(text)
     narrator = job.get("first_person_narrator")
     if narrator and not is_narrator_attested(narrator, text):
@@ -2360,6 +2841,9 @@ def get_batch_script_source_identity(path):
 
 def get_validated_batch_script_source(job):
     """Reuse this request's validated source only while file identity matches."""
+    from docx_publication import get_docx_group_names
+    if get_docx_group_names(job['input_path']) is not None:
+        return _read_and_validate_batch_script_source(job)
     cached = job.get("prepared_source")
     if cached and get_batch_script_source_identity(job["input_path"]) == cached["identity"]:
         return cached["text"], cached["normalizations"]
@@ -2696,7 +3180,7 @@ async def generate_script_batch_start(request: BatchScriptRequest, background_ta
     prepared_jobs = await asyncio.to_thread(get_prepared_batch_script_jobs, request)
 
     def _run():
-        with ensure_book_state(SCRIPTS_DIR):
+        with ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR):
             pass
         state = process_state["batch_script"]
         _init_batch_state(state,
@@ -2801,7 +3285,12 @@ async def get_annotated_script():
     No SPA caller - intentionally kept as a programmatic/curl-accessible
     read endpoint (exercised by test_api.py's test_get_annotated_script).
     """
+    return await asyncio.to_thread(_get_annotated_script_sync)
+
+
+def _get_annotated_script_sync():
     with ensure_book_state(DATA_DIR):
+        _require_published_selection()
         if not os.path.exists(SCRIPT_PATH):
             raise HTTPException(status_code=404, detail="No annotated script found")
         with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
@@ -2815,6 +3304,7 @@ async def get_annotated_script_diff():
 def _ensure_annotated_script_diff():
     """Compare annotation with the same source policy as editor merge admission."""
     with ensure_book_state(DATA_DIR):
+        _require_published_selection()
         if not os.path.exists(SCRIPT_PATH):
             raise HTTPException(status_code=404, detail="No annotated script found")
         state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})

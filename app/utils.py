@@ -39,9 +39,29 @@ def get_unique_id(prefix: str) -> str:
 
 
 def get_runtime_data_dir(root_dir: str) -> str:
-    """Return the single mutable-data root for this application instance."""
+    """Return the single mutable-data root for this application instance.
+
+    The root is captured in one admitted spelling so later paths and workers
+    do not resolve an ancestor alias again; a spelling the trust policy
+    refuses is left as written for book-root admission to report rather than
+    silently following it.
+    """
+    from direct_path_admission import get_direct_spelling
     configured = os.environ.get("ALEXANDRIA_DATA_DIR", "").strip()
-    return os.path.abspath(configured or root_dir)
+    return get_direct_spelling(configured or root_dir)
+
+
+def get_app_storage_path(data_dir: str, root_dir: str, app_dir: str, name: str) -> str:
+    """Keep legacy app-local storage while isolating configured runtimes.
+
+    A captured data root spells the repo root differently when an admitted
+    ancestor alias is involved, so equality is decided on normalized paths and
+    the legacy location keeps its canonical spelling.
+    """
+    normalize = os.path.abspath if os.name == 'nt' else os.path.realpath
+    if normalize(data_dir) == normalize(root_dir):
+        return os.path.join(normalize(app_dir), name)
+    return os.path.join(data_dir, name)
 
 
 def get_app_config_path(data_dir: str, root_dir: str, app_dir: str) -> str:
@@ -49,9 +69,8 @@ def get_app_config_path(data_dir: str, root_dir: str, app_dir: str) -> str:
     configured_path = os.environ.get("ALEXANDRIA_CONFIG_PATH")
     if configured_path:
         return os.path.abspath(os.path.expanduser(configured_path))
-    if os.path.abspath(data_dir) == os.path.abspath(root_dir):
-        return os.path.join(app_dir, "config.json")
-    return os.path.join(data_dir, "config.json")
+    return get_app_storage_path(data_dir, root_dir, app_dir, "config.json")
+
 
 # --- GPU stats (rocm-smi) ---
 # Canonical implementation lives in gpu_stats.py at the repo root, shared
@@ -252,7 +271,7 @@ def safe_load_json(path, default=None):
 
 
 def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trailing_newline=False,
-                      allow_nonatomic_fallback=True):
+                      newline=None, allow_nonatomic_fallback=True):
     """Atomically write JSON data using a temp file and os.replace.
 
     Includes retry logic with exponential backoff for Windows file locking
@@ -262,13 +281,19 @@ def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trai
     succeeds rather than raising an unhandled OSError.
     Set allow_nonatomic_fallback=False when publication must refuse a
     cross-device rename instead of risking partial replacement by copying.
+    newline is passed to the text stream: None (the default) keeps each
+    platform's native line ending; newline="\\n" writes the LF bytes a
+    byte-pinned artifact was committed with regardless of platform.
     """
     if not isinstance(max_retries, int) or max_retries < 1:
         raise ValueError("max_retries must be a positive integer")
+    if newline is not None and (not isinstance(newline, str)
+                                or newline not in ("", "\n", "\r", "\r\n")):
+        raise ValueError("newline must be None or a valid text-stream line ending")
     directory = os.path.dirname(target_path) or "."
     fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
             json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=sort_keys)
             if trailing_newline:
                 f.write("\n")
@@ -411,6 +436,24 @@ def backup_file_with_timestamp(path):
     backup = get_timestamped_backup_path(path)
     shutil.copy2(path, backup)
     return backup
+
+
+def open_or_create_file(name, flags, mode=0o600, *, dir_fd=None):
+    """Open name, creating it if missing, safely against a concurrent creator.
+
+    macOS fails a descriptor-relative (dir_fd) O_CREAT open with ENOENT while
+    another thread or process creates the same new name: measured on an Apple
+    M4, one of two racers failed every time, while O_CREAT|O_EXCL never did and
+    path-based opens were unaffected (Linux: neither). So create exclusively,
+    and open the existing name if that loses. flags must not include O_CREAT,
+    O_EXCL or O_TRUNC.
+    """
+    if flags & (os.O_CREAT | os.O_EXCL | os.O_TRUNC):
+        raise ValueError('open_or_create_file decides creation; pass access flags only')
+    try:
+        return os.open(name, flags | os.O_CREAT | os.O_EXCL, mode, dir_fd=dir_fd)
+    except FileExistsError:
+        return os.open(name, flags, dir_fd=dir_fd)
 
 
 @contextlib.contextmanager

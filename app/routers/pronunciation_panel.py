@@ -207,6 +207,10 @@ class PronunciationOccurrenceTarget(BaseModel):
     expected_uid: str = Field(min_length=1, max_length=128)
 
 
+class PronunciationHomographQuery(PronunciationOccurrenceTarget):
+    revision: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
 class PronunciationOccurrenceQuery(PronunciationOccurrenceTarget):
     revision: str = Field(pattern=r'^[0-9a-f]{64}$')
     query: str = Field(min_length=1, max_length=128)
@@ -300,7 +304,8 @@ def get_occurrence_response(request, row, rules, revision, projection, settings_
             'revision': revision, 'rules': rules, 'coordinate_space': pronunciation.OCCURRENCE_COORDINATE_SPACE,
             'offset_unit': 'unicode_codepoint', 'context': projection['context'],
             'context_source': settings_source,
-            'preview': {'text': projection['text'], 'decisions': projection.get('pronunciation_decisions', [])}}
+            'preview': {'text': projection['text'],
+                        'decisions': projection.get('pronunciation_decisions', [])}}
 
 
 def get_occurrence_editor(request):
@@ -322,6 +327,27 @@ def get_occurrence_editor(request):
                 current = (get_occurrence_speech_projection(row, request.index, voices, settings['settings'])
                            if isinstance(request, PronunciationOccurrenceEdit) else projection)
             result = get_occurrence_response(request, row, effective, revision, projection, settings['source'])
+            if type(request) is PronunciationOccurrenceTarget:
+                warnings = []
+                try:
+                    get_pronunciation_document()
+                except HTTPException as error:
+                    warnings.append(str(error.detail))
+                except OSError:
+                    warnings.append('Shared pronunciation file could not be read; substitutions may be unavailable.')
+                if settings['source'] == 'configured':
+                    try:
+                        with open(project_manager.config_path, encoding='utf-8') as source:
+                            configured = json.load(source)
+                        if not isinstance(configured, dict):
+                            raise ValueError('Settings must be an object')
+                    except (OSError, ValueError):
+                        warnings.append('Saved settings could not be validated; preparation may use defaults.')
+                elif settings['source'] == 'unknown':
+                    warnings.append('Active engine settings are unavailable.')
+                result['preview'].update(
+                    kind='current_settings_preview', authored_text=row.get('text', ''),
+                    transformations=projection['transformations'], warnings=warnings)
             if isinstance(request, PronunciationOccurrenceEdit):
                 result['audio_will_be_detached'] = current['text'] != projection['text']
             if isinstance(request, PronunciationOccurrenceQuery):
@@ -329,9 +355,13 @@ def get_occurrence_editor(request):
                 candidates = pronunciation.get_occurrence_pronunciation_candidates(
                     prepared, row['uid'], row.get('text', ''), request.query)
                 result.update(truncated=candidates['truncated'], candidates=[
-                    {'anchor': {key: value for key, value in candidate.items() if key not in ('before', 'after')},
+                    {'anchor': pronunciation.get_occurrence_candidate_anchor(candidate),
                      'before': candidate['before'], 'after': candidate['after']}
                     for candidate in candidates['candidates']])
+            if isinstance(request, PronunciationHomographQuery):
+                prepared = get_prelexicon_speech_normalization(row.get('text', ''))['text']
+                result.update(pronunciation.get_homograph_candidates(
+                    prepared, row['uid'], row.get('text', ''), result['context'].get('language')))
             return result
     except HTTPException:
         raise
@@ -355,9 +385,14 @@ async def get_occurrence_preview_endpoint(request: PronunciationOccurrenceEdit):
     return await asyncio.to_thread(get_occurrence_editor, request)
 
 
+@router.post('/api/pronunciation/occurrences/homographs')
+async def get_homograph_candidates_endpoint(request: PronunciationHomographQuery):
+    return await asyncio.to_thread(get_occurrence_editor, request)
+
+
 def _save_occurrence_rules_admitted(request):
     with ensure_book_switch_allowed(operation='save occurrence rules'):
-        with ensure_book_state(os.path.dirname(SCRIPT_PATH)):
+        with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
             settings = project_manager.get_pronunciation_preview_settings()
             voices = project_manager.get_voice_config_for_update()
             with project_manager._chunks_lock, file_lock(project_manager.chunks_path):

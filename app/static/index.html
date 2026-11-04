@@ -9,16 +9,18 @@
     <title>Alexandria Audiobook</title>
     <link href="/static/vendor/bootstrap-5.3.0/bootstrap.min.css" rel="stylesheet">
     <link href="/static/vendor/font-awesome-6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="/static/css/casting.css?v=__APP_BUILD__" rel="stylesheet">
     <style>
+        .casting-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
         /* Shared workflow layout: preserve the original controls and actions. */
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .card-header { flex-wrap: wrap; gap: .75rem; }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(.card-header > .d-flex, .card-body > .d-flex) { flex-wrap: wrap; max-width: 100%; gap: .75rem; }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(.input-group, .form-select, .form-control) { max-width: 100%; min-width: 0; }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(button, summary) { min-height: 2.25rem; }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(button, summary, input, select, textarea, a):focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .btn-link { color: var(--text-primary); text-decoration: underline; }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .accordion-button { background: var(--bg-card-header); color: var(--text-primary); }
-        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .log-window { max-width: 100%; overflow: auto; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) .card-header { flex-wrap: wrap; gap: .75rem; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) :is(.card-header > .d-flex, .card-body > .d-flex) { flex-wrap: wrap; max-width: 100%; gap: .75rem; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) :is(.input-group, .form-select, .form-control) { max-width: 100%; min-width: 0; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) :is(button, summary) { min-height: 2.25rem; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) :is(button, summary, input, select, textarea, a):focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) .btn-link { color: var(--text-primary); text-decoration: underline; }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) .accordion-button { background: var(--bg-card-header); color: var(--text-primary); }
+        :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) .log-window { max-width: 100%; overflow: auto; }
         .workflow-disclosure { border: 1px solid var(--border-input); border-radius: var(--radius-md); padding: 1rem; background: var(--bg-card-header); }
         .workflow-disclosure > summary { cursor: pointer; font-weight: 600; color: var(--text-primary); }
         .workflow-disclosure :is(label.form-label, .form-text, p) { color: var(--text-primary); }
@@ -27,9 +29,9 @@
         .navbar .nav-link:not(.active) { color: #c4dcff; }
         html #theme-toggle, html[data-theme] body #theme-toggle { color: #edf4ff; border-color: #a5b4c8; }
         @media (max-width: 575px) {
-            :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) .card-header > .d-flex { flex-basis: 100%; }
+            :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) .card-header > .d-flex { flex-basis: 100%; }
             :is(#voices-tab, #training-tab, #voicelab-tab) .input-group { flex-wrap: wrap; }
-            :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab) :is(.card-header, .card-body) { overflow-wrap: anywhere; }
+            :is(#voices-tab, #editor-tab, #training-tab, #voicelab-tab, #casting-tab) :is(.card-header, .card-body) { overflow-wrap: anywhere; }
         }
         #home-tab .text-muted { color: var(--text-primary) !important; }
         #home-tab :is(button, summary):focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
@@ -906,7 +908,6 @@
         .settings-category { display: flex; align-items: center; gap: .8rem; text-align: left; padding: .65rem; width: 100%; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); }
         .settings-category > i { width: 1rem; color: var(--accent); }
         .settings-category strong, .settings-category small { display: block; }
-        .settings-category > .help-nav-glyph { margin-left: auto; }
         .settings-category small { font-size: .75rem; color: var(--text-muted); margin-top: .15rem; }
         .settings-category:hover { background: var(--bg-card); border-color: var(--border-input); }
         .settings-category[aria-current="true"] { background: var(--accent-fill); color: #fff; }
@@ -961,24 +962,20 @@
         .task-guide-card span { font-size:.9rem; }
         #task-guide-detail { scroll-margin-top:5rem; }
         #task-guide-return { position:fixed; bottom:1rem; right:1rem; z-index:1030; max-width:calc(100vw - 2rem); }
-        /* Field help (app-help.js): a small ⓘ after a control's label. */
-        .help-tip { border: 0; background: none; padding: 0 0 0 .3rem; font-size: .85em; line-height: 1;
-                    color: var(--bs-secondary-color); cursor: help; vertical-align: baseline; }
-        .help-tip:hover, .help-tip:focus-visible { color: var(--bs-info); }
-        .help-tip { display: inline-block; flex: 0 0 auto; align-self: center; user-select: none; }
-        .help-tip:focus-visible { outline: 2px solid var(--bs-info); outline-offset: 2px; border-radius: .2rem; }
-        .help-action-group { display: inline-flex; align-items: center; gap: .25rem; }
-        .help-list-action { display: flex; }
-        .help-list-action > .report-list-item { flex: 1; min-width: 0; border-width: 0 0 1px; border-radius: 0; }
-        .help-nav-glyph { margin-left: .25rem; font-size: .75em; }
-        .input-group > .help-tip { padding: .25rem; }
+        .help-disabled-control { display: inline-flex; vertical-align: middle; min-width: 0; }
+        .help-disabled-block { display: flex; width: 100%; }
+        .help-disabled-block > :is(.form-control, .form-select, .form-range) { width: 100%; min-width: 0; }
+        .input-group > .help-disabled-block { flex: 1 1 auto; width: 1%; }
+        .input-group > .help-disabled-control:not(:first-child) > * { border-top-left-radius: 0; border-bottom-left-radius: 0; }
+        .input-group > .help-disabled-control:not(:last-child) > * { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+        .form-check > .help-disabled-control { float: left; margin-left: -1.5em; }
+        .form-check > .help-disabled-control > .form-check-input { margin-left: 0; }
+        .help-disabled-control:focus-visible { outline: 2px solid var(--bs-info); outline-offset: 2px; }
         .accordion-header { display: flex; align-items: center; }
         .accordion-header > .accordion-button { flex: 1; width: auto; min-width: 0; }
-        .accordion-header > .help-tip { margin-right: 1rem; font-size: .85rem; }
         .tooltip { --bs-tooltip-color: #fff; --bs-tooltip-bg: #000; }
         .tooltip-inner { max-width: 340px; text-align: left; }
-        .help-tooltip { pointer-events: auto; }
-        .help-tooltip:not(.show) { pointer-events: none; }
+        .help-tooltip { pointer-events: none; }
         .settings-preview { background: var(--bg-card-header); overflow-wrap: anywhere; }
         #llm-active-mode-badge { white-space: normal; text-align: left; line-height: 1.4; }
         .settings-preview-row { border-bottom: 1px solid var(--border-input); padding: .75rem 0; }
@@ -1021,6 +1018,7 @@
                     <li class="nav-item"><a href="#audio" class="nav-link nav-pipeline" data-tab="audio">5. Result</a></li>
                     <li class="nav-section-label nav-advanced-start" aria-hidden="true">Advanced</li>
                     <li class="nav-item"><a href="#designer" class="nav-link nav-advanced" data-tab="designer">Designer</a></li>
+                    <li class="nav-item"><a href="#casting" class="nav-link nav-advanced" data-tab="casting">Casting</a></li>
                     <li class="nav-item"><a href="#preparer" class="nav-link nav-advanced" data-tab="preparer">Preparer</a></li>
                     <li class="nav-item"><a href="#dataset-builder" class="nav-link nav-advanced" data-tab="dataset-builder">Dataset</a></li>
                     <li class="nav-item"><a href="#training" class="nav-link nav-advanced" data-tab="training">Training</a></li>
@@ -1148,12 +1146,16 @@
 <button type="button" class="settings-category" data-settings-target="settings-strategy" aria-controls="settings-strategy" aria-current="false" onclick="openSetupSettingsSection('settings-strategy')"><i class="fas fa-book-open" aria-hidden="true"></i><span><strong>Script strategy</strong><small>Segmentation &amp; speakers</small></span></button>
 <button type="button" class="settings-category" data-settings-target="settings-prompts" aria-controls="settings-prompts" aria-current="false" onclick="openSetupSettingsSection('settings-prompts')"><i class="fas fa-code" aria-hidden="true"></i><span><strong>Prompt studio</strong><small>Advanced instructions &amp; presets</small></span></button>
 </nav>
-                        <div class="settings-finder">                        <label class="form-label" for="setup-settings-search">Find a setting</label>
+                        <label class="form-label mt-3" for="setup-ui-locale">Setup UI language (partial coverage)</label>
+                        <select id="setup-ui-locale" class="form-select" aria-describedby="setup-ui-locale-hint setup-ui-locale-status" onchange="changeSetupUiLocale(this.value)"><option value="en">English</option><option value="qps-ploc">Pseudo-English (layout test, not a translation)</option></select>
+                        <div id="setup-ui-locale-hint" class="form-text">Only the setting finder's text, including search feedback, preview action/title/close text, default-count summary and the Saved/Would save headings change. Counts are preserved. Setting names, values, default markers, help and safety warnings remain English. No reviewed translation or RTL locale is offered.</div>
+                        <div id="setup-ui-locale-status" class="form-text" role="status"></div>
+                        <div class="settings-finder">                        <label class="form-label" for="setup-settings-search" data-setup-message="label">Find a setting</label>
                         <div class="d-flex align-items-center gap-2">
-                            <input type="search" class="form-control" id="setup-settings-search" maxlength="120" placeholder="Try context, memory, language or retries" aria-describedby="setup-settings-search-hint" aria-controls="setup-settings-results" oninput="renderSetupSettingsSearch()" onkeydown="onSetupSettingsSearchKeydown(event)">
-                            <button type="button" class="btn btn-outline-secondary" id="setup-settings-clear" onclick="clearSetupSettingsSearch()" hidden>Clear</button>
+                            <input type="search" class="form-control" id="setup-settings-search" data-setup-message="placeholder" maxlength="120" placeholder="Try context, memory, language or retries" aria-describedby="setup-settings-search-hint" aria-controls="setup-settings-results" oninput="renderSetupSettingsSearch()" onkeydown="onSetupSettingsSearchKeydown(event)">
+                            <button type="button" class="btn btn-outline-secondary" id="setup-settings-clear" data-setup-message="clear" onclick="clearSetupSettingsSearch()" hidden>Clear</button>
                         </div>
-                        <div class="form-text" id="setup-settings-search-hint">Search labels and help for your current services.</div>
+                        <div class="form-text" id="setup-settings-search-hint" data-setup-message="hint">Search labels and help for your current services.</div>
                         <div id="setup-settings-search-status" class="small mt-2" role="status" aria-live="polite"></div>
                         <div id="setup-settings-results" class="settings-search-results" hidden></div>
 </div>
@@ -1162,14 +1164,14 @@
                     <form id="config-form">
                         <div class="config-save-bar d-flex flex-wrap align-items-center gap-2 mb-3 p-2 border rounded">
                             <button id="config-save-button-top" data-config-save-action type="submit" class="btn btn-primary"><i class="fas fa-save me-2"></i>Save Configuration</button>
-                            <button type="button" id="config-preview-button" data-config-save-action class="btn btn-outline-secondary" onclick="previewSetupChanges()">Preview changes</button>
+                            <button type="button" id="config-preview-button" data-config-save-action data-setup-message="previewAction" class="btn btn-outline-secondary" onclick="previewSetupChanges()">Preview changes</button>
                             <span class="small text-muted">Save applies edits across every category.</span>
                             <span id="config-save-status" class="small" role="status" aria-live="polite"></span>
                         </div>
 <section id="setup-preview-panel" class="settings-preview border rounded p-3 mb-3" aria-labelledby="setup-preview-title" hidden>
     <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
-        <h5 id="setup-preview-title" tabindex="-1" class="m-0">Settings change preview</h5>
-        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="closeSetupPreview()">Close preview</button>
+        <h5 id="setup-preview-title" tabindex="-1" class="m-0" data-setup-message="previewTitle">Settings change preview</h5>
+        <button type="button" class="btn btn-outline-secondary btn-sm" data-setup-message="previewClose" onclick="closeSetupPreview()">Close preview</button>
     </div>
     <p id="setup-preview-status" role="status" aria-live="polite" class="mt-2"></p>
     <div id="setup-preview-results" hidden>
@@ -1179,7 +1181,7 @@
         <p id="setup-preview-unmanaged" class="small"></p>
         <div id="setup-preview-changes"></div>
         <details id="setup-preview-default-details" class="mt-3">
-            <summary id="setup-preview-default-summary">Default values</summary>
+            <summary id="setup-preview-default-summary" data-setup-message="previewDefaults" data-setup-count="0">0 missing settings filled with defaults</summary>
             <div id="setup-preview-defaults" class="settings-preview-defaults mt-2"></div>
         </details>
     </div>
@@ -1330,11 +1332,13 @@
 <h5 id="settings-tts-heading" tabindex="-1">Speech engine</h5>
 <details class="mb-3 border rounded p-3">
     <summary>TTS timing, loaded models and support report</summary>
-    <p class="small text-muted mt-2">Recent operations in this app process, across books. Timings show observed work; unavailable stages are not zero. Nested and worker stage times can overlap. The report excludes text, names, paths, URLs and raw errors.</p>
+    <p class="small text-muted mt-2">Recent operations in this app process, across books. Timings show observed work; unavailable stages are not zero. Nested and worker stage times can overlap. The report excludes source text, private book/speaker/reference names, paths, URLs and raw errors.</p>
     <button type="button" class="btn btn-outline-secondary btn-sm" onclick="refreshTtsDiagnostics()">Refresh report</button>
     <button type="button" class="btn btn-outline-secondary btn-sm" id="tts-diagnostics-download" onclick="downloadTtsDiagnostics()" disabled>Download support report</button>
     <p id="tts-diagnostics-status" class="small mt-2" role="status">No timings requested.</p>
     <div id="tts-diagnostics-records" class="small text-break"></div>
+    <p class="small mt-2">Exact download contents below. Refresh reads only this AA2 server; it never contacts a model server or uploads a report. Null means unobserved or excluded. Review before sharing separately.</p>
+    <pre id="tts-diagnostics-preview" class="small border rounded p-2" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto" tabindex="0" role="region" aria-label="Exact support report JSON"></pre>
 </details>
 <p class="settings-intro">Choose where voices are generated and the language used for synthesis. Assign individual character voices in Voices.</p>
 <p id="tts-capability-summary" class="small border rounded p-2" role="status">Backend capabilities have not loaded. Existing settings are preserved.</p>
@@ -1345,6 +1349,7 @@
                                 <select class="form-select" id="tts-mode" onchange="toggleTTSMode()">
                                     <option value="local" selected>Local Model (built in)</option>
                                     <option value="external">External Server</option>
+                                    <option value="mlx">Apple MLX (experimental, Apple Silicon)</option>
                                 </select>
                                 <div class="form-text">Local loads the built-in model on this machine. External requires a running Gradio TTS server. Use Auto-Configure to check suitable settings for your hardware.</div>
                             </div>
@@ -1897,8 +1902,27 @@
                     <!-- Single Mode -->
                     <div id="script-single-area">
                         <div class="mb-4">
-                            <label class="form-label" for="file-upload">Select Book/Novel (Text, Markdown, or EPUB)</label>
-                            <input type="file" class="form-control" id="file-upload" accept=".txt,.md,.epub">
+                            <label class="form-label" for="file-upload">Select Book/Novel (Text, Markdown, EPUB, or DOCX)</label>
+                            <input type="file" class="form-control" id="file-upload" accept=".txt,.md,.epub,.docx">
+                            <div class="form-text">DOCX policy v2 supports body paragraphs, literal headings, known metadata and checked style inheritance. Tables, notes, tracked changes, hidden text, numbering and other unsupported structures are refused. Review and accept the extracted text before selection. Batch DOCX is unsupported.</div>
+                            <button type="button" class="btn btn-secondary" onclick="openRetainedDocxDetails()">Inspect retained DOCX files</button>
+                            <pre id="docx-retained-details" hidden style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto"></pre>
+                            <section id="docx-preview-panel" class="mt-2" hidden aria-label="DOCX extraction preview">
+                                <p id="docx-preview-policy"></p>
+                                <pre id="docx-preview-warnings" style="white-space:pre-wrap"></pre>
+                                <pre id="docx-preview-text" tabindex="0" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto"></pre>
+                                <button id="docx-preview-accept" type="button" class="btn btn-primary" onclick="acceptDocxPreview()">Accept this exact text and select book</button>
+                                <button id="docx-preview-cancel" type="button" class="btn btn-secondary" onclick="cancelDocxPreview()">Cancel preview</button>
+                            </section>
+                            <div class="form-check mt-2">
+                                <input class="form-check-input" type="checkbox" id="epub-extraction-report-enabled">
+                                <label class="form-check-label" for="epub-extraction-report-enabled">Include an EPUB extraction report with this import</label>
+                            </div>
+                            <details id="epub-extraction-report-panel" class="mt-2" hidden>
+                                <summary>EPUB import snapshot</summary>
+                                <p class="small">Shows source hashes, reading order, navigation and title decisions from this upload. It does not certify later editor changes or apply exclusions or formatting. Re-upload an EPUB to inspect another revision. Labels and archive paths may contain private information; review before sharing. Omitted rows and shortened fields are marked in the report.</p>
+                                <pre id="epub-extraction-report-json" class="small" tabindex="0" role="region" aria-label="EPUB extraction report JSON" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto"></pre>
+                            </details>
                             <label class="form-label mt-3" for="existing-upload-select">Or reuse an existing upload</label>
                             <select class="form-select" id="existing-upload-select" onchange="selectExistingScriptUpload()">
                                 <option value="">Choose an existing TXT/MD file…</option>
@@ -2272,6 +2296,7 @@
                             <label class="form-check-label" for="voices-hide-ready">Hide ready</label>
                         </div>
                         <span id="voice-save-status" class="text-muted small" role="status" aria-live="polite" aria-atomic="true"></span>
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="voices-open-casting" onclick="document.querySelector('[data-tab=casting]').click();"><i class="fas fa-users me-1"></i>Casting library</button>
                     </div>
                 </div>
                 <div class="card-body">
@@ -2477,6 +2502,126 @@
                     <div id="designed-voices-load-status" class="small text-warning mb-2" role="status" aria-live="polite"></div>
                     <div id="designed-voices-list">
                         <p class="text-muted mb-0">No designed voices yet. Generate and save a preview above.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Casting Tab (#1532) -->
+        <div id="casting-tab" class="tab-content" style="display:none;">
+            <div class="mb-3">
+                <h4>Casting library</h4>
+                <p class="text-muted mb-0">Listen, organize and shortlist voices across books. Research collections do not change character assignments.</p>
+            </div>
+            <div id="casting-workspace" class="casting-workspace">
+            <aside class="card casting-sidebar mb-3" aria-label="Voice filters">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="m-0">Find voices</h5>
+                    <button type="button" class="btn btn-sm btn-outline-primary" id="casting-refresh"><i class="fas fa-sync me-1"></i>Refresh</button>
+                </div>
+                <div class="card-body">
+                    <p class="small text-muted">Combine filters to narrow the library. Use Clear filters to start again.</p>
+                    <div class="row g-2 mb-2">
+                        <div class="col-lg-6">
+                            <label class="form-label fw-bold" for="casting-search">Search</label>
+                            <input type="search" class="form-control" id="casting-search" placeholder="gender:female tone:calm -status:reject" aria-describedby="casting-search-help">
+                            <div class="form-text" id="casting-search-help">Words match name, description and sample line. Fields: book, gender, age, tone, texture, status, priority, tag, collection, stars, circles, source, name. Put - in front to exclude.</div>
+                        </div>
+                        <div class="col-6 col-lg-2">
+                            <label class="form-label fw-bold" for="casting-book">Book</label>
+                            <select class="form-select" id="casting-book"><option value="">All books</option></select>
+                        </div>
+                        <div class="col-6 col-lg-2">
+                            <label class="form-label fw-bold" for="casting-gender">Gender</label>
+                            <select class="form-select" id="casting-gender"><option value="">Any</option></select>
+                        </div>
+                        <div class="col-6 col-lg-1">
+                            <label class="form-label fw-bold" for="casting-age">Age</label>
+                            <select class="form-select" id="casting-age"><option value="">Any</option></select>
+                        </div>
+                        <div class="col-6 col-lg-1">
+                            <label class="form-label fw-bold" for="casting-status">Status</label>
+                            <select class="form-select" id="casting-status"><option value="">Any</option></select>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <div class="small text-muted mb-1">Tone</div>
+                        <div id="casting-tones" class="d-flex flex-wrap gap-1"></div>
+                        <div class="small text-muted mt-2 mb-1">Texture</div>
+                        <div id="casting-textures" class="d-flex flex-wrap gap-1"></div>
+                    </div>
+                    <div class="d-flex align-items-center gap-2 flex-wrap">
+                        <div class="btn-group btn-group-sm" role="group" aria-label="Casting view">
+                            <button type="button" class="btn btn-outline-secondary active" id="casting-view-cards" aria-pressed="true">Cards</button>
+                            <button type="button" class="btn btn-outline-secondary" id="casting-view-table" aria-pressed="false">Table</button>
+                        </div>
+                        <select class="form-select form-select-sm w-auto" id="casting-sort" aria-label="Sort voices">
+                            <option value="name">Name A-Z</option><option value="book">Book</option><option value="status">Review status</option><option value="priority">Priority</option>
+                        </select>
+                        <button type="button" class="btn btn-sm btn-primary" id="casting-review"><i class="fas fa-headphones me-1"></i>Review</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="casting-clear">Clear filters</button>
+                    </div>
+                    <div id="casting-research" class="mt-3"></div>
+                </div>
+            </aside>
+            <div class="card casting-main">
+                <div class="card-body">
+                    <div class="casting-research-row mb-3">
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="casting-play-all"><i class="fas fa-play me-1"></i>Play all</button>
+                        <span id="casting-playback-status" class="small" role="status" aria-live="polite"></span>
+                        <span id="casting-summary" class="text-muted small ms-auto" role="status" aria-live="polite"></span>
+                    </div>
+                    <div id="casting-research-toolbar" class="casting-research-toolbar mb-3" aria-label="Research controls"></div>
+                    <div id="casting-load-status" class="small text-warning mb-2" role="status" aria-live="polite"></div>
+                    <div class="d-flex flex-wrap gap-2 mb-2">
+                        <select id="casting-health" class="form-select form-select-sm w-auto" aria-label="Data health filter"><option value="">All data health</option></select>
+                        <span id="casting-health-counts" class="small" role="status"></span>
+                    </div>
+                    <div id="casting-skipped" class="small mb-2"></div>
+                    <details class="mb-3"><summary>Coverage of the current view</summary><div id="casting-coverage" class="table-responsive"></div></details>
+                    <details class="border rounded p-2 mb-3">
+                        <summary>Saved casts &amp; character assignment</summary>
+                        <p class="small text-muted mt-2">Saved casts map voices to named characters. Review the mappings before applying them to the active book. Research collections only organize voices.</p>
+                        <label for="casting-collection" class="small">Saved cast</label>
+                        <select id="casting-collection" class="form-select form-select-sm" aria-label="Saved cast"><option value="">Choose a saved cast</option></select>
+                        <div class="input-group input-group-sm mt-2"><input id="casting-collection-name" class="form-control" maxlength="200" aria-label="New saved cast name" placeholder="New saved cast name"><button id="casting-create-collection" type="button" class="btn btn-outline-secondary">Create saved cast</button></div>
+                        <button id="casting-match-collection" type="button" class="btn btn-sm btn-outline-success mt-2">Review saved cast for active book</button>
+                        <div id="casting-collection-review" class="mt-2"></div>
+                    </details>
+                    <div class="small text-muted mb-2">Audio similarity is not available: ECAPA has not passed the required regenerated-speaker controls. Name variants are not proof of the same voice.</div>
+                    <div id="casting-results"><p class="text-muted mb-0">Open this tab to load the casting library.</p></div>
+                    <div id="casting-pagination" class="mt-3" aria-label="Results navigation"></div>
+                    <div class="text-center mt-3"><button type="button" class="btn btn-sm btn-outline-secondary" id="casting-more" hidden>Load more</button></div>
+                    <details class="mt-3"><summary>Studio activity</summary><div id="casting-activity" class="small mt-2" aria-live="polite"></div></details>
+                </div>
+            </div>
+            </div>
+            <div class="modal fade" id="casting-review-modal" tabindex="-1" aria-labelledby="casting-review-title" aria-hidden="true">
+                <div class="modal-dialog modal-xl modal-dialog-scrollable">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="casting-review-title">Review voices</h5>
+                            <span id="casting-review-position" class="text-muted small ms-3"></span>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="progress mb-3" role="progressbar" aria-label="Review progress"><div class="progress-bar" id="casting-review-progress" style="width:0%"></div></div>
+                            <div id="casting-review-body"></div>
+                            <label class="form-label fw-bold mt-3" for="casting-review-notes">Notes</label>
+                            <textarea class="form-control" id="casting-review-notes" rows="3" maxlength="2000" placeholder="Pronunciation, casting instinct, next action"></textarea>
+                            <div class="mt-2"><button type="button" class="btn btn-sm btn-outline-secondary" id="casting-review-save-notes">Save notes</button></div>
+                        </div>
+                        <div class="modal-footer justify-content-between">
+                            <div class="small text-muted">Keys: S shortlist, C callback, R reject, Space play, arrows move</div>
+                            <div class="d-flex gap-2 flex-wrap">
+                                <button type="button" class="btn btn-outline-secondary" id="casting-review-prev"><i class="fas fa-arrow-left me-1"></i>Previous</button>
+                                <button type="button" class="btn btn-outline-primary" id="casting-review-play"><i class="fas fa-play me-1"></i>Play</button>
+                                <button type="button" class="btn btn-outline-success" id="casting-review-shortlist" data-casting-status="shortlist">Shortlist</button>
+                                <button type="button" class="btn btn-outline-warning" id="casting-review-callback" data-casting-status="callback">Callback</button>
+                                <button type="button" class="btn btn-outline-danger" id="casting-review-reject" data-casting-status="reject">Reject</button>
+                                <button type="button" class="btn btn-outline-secondary" id="casting-review-next">Next<i class="fas fa-arrow-right ms-1"></i></button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -3239,6 +3384,7 @@
                          <div class="d-flex flex-wrap gap-2 mb-2">
                              <button id="pronunciation-occurrence-load" type="button" class="btn btn-outline-secondary btn-sm" title="Read the chosen line’s occurrence rules without generating audio." onclick="loadOccurrencePronunciation()">Load line rules</button>
                              <button id="pronunciation-occurrence-find" type="button" class="btn btn-outline-secondary btn-sm" title="Find exact matches for the original spelling above in this line’s spoken text." onclick="findPronunciationOccurrences()" disabled>Find original spelling</button>
+                             <button id="pronunciation-occurrence-homographs" type="button" class="btn btn-outline-secondary btn-sm" title="Scan this saved English line for lead, read and wind; choose meanings and draft replacements without generation." onclick="findPronunciationHomographs()" disabled>Discover English homographs</button>
                              <button id="pronunciation-occurrence-preview" type="button" class="btn btn-outline-primary btn-sm" title="Preview approved line rules and why each applies or is bypassed; no audio is generated." onclick="previewOccurrencePronunciation()" disabled>Preview line</button>
                              <button id="pronunciation-occurrence-save" type="button" class="btn btn-primary btn-sm" title="Save these line rules. Wait for active work to finish or cancel it first." onclick="saveOccurrencePronunciation()" disabled>Save line rules</button>
                          </div>
@@ -3268,20 +3414,23 @@
                        <div class="editor-review-main">
                          <section class="editor-review-panel mb-3" aria-labelledby="editor-quality-title">
                              <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
-                                 <h5 id="editor-quality-title" class="m-0">Quality inbox</h5>
+                                 <h5 id="editor-quality-title" class="m-0">Take review queue</h5>
                                  <button type="button" class="btn btn-outline-secondary btn-sm" onclick="loadChunks(false)">Refresh review</button>
                              </div>
-                             <p class="small mt-2 mb-2">Saved flags to inspect, not a quality certificate. Opening a finding does not run a check or change the line.</p>
+                             <p class="small mt-2 mb-2">Saved findings and missing speech evidence, not a quality certificate. Inspect the selected take or compare retained candidates without running a model or changing audio. Listen before explicitly choosing Check &amp; restore; existing compatibility, retention and cancellation controls still apply. Historical evidence is not a current approval.</p>
                              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
                                  <label for="editor-quality-filter">Show</label>
                                  <select id="editor-quality-filter" class="form-select form-select-sm" style="width:auto;" onchange="renderEditorQualityInbox(true)">
                                      <option value="all">All findings</option><option value="unknown">Unknown speakers</option><option value="failed">Failed renders</option><option value="missing">Missing audio files</option><option value="drift">Voice drift</option>
                                      <option value="speech_rejected">Rejected speech attempts</option><option value="speech_review">Speech review needed</option><option value="speech_unavailable">Speech check unavailable</option><option value="speech_difference">Speech content differences</option><option value="speech_historical">Historical speech evidence</option>
+                                     <option value="speech_not_checked">No current speech evidence</option>
+                                     <option value="all_lines">All saved lines (including unchecked and unrendered)</option>
                                  </select>
                                  <button class="btn btn-outline-secondary btn-sm" id="btn-drift-check" onclick="runDriftCheck()" title="Run the existing voice check against saved reference voices">Check Voices</button>
                                  <div class="form-check mb-0"><input class="form-check-input" type="checkbox" id="chk-drift-only" onchange="applyDriftFilter()"><label class="form-check-label" for="chk-drift-only">Show only drift in table</label></div>
                              </div>
                              <p id="editor-quality-status" role="status" aria-live="polite" class="small mb-2">Review facts have not been loaded.</p>
+                             <p id="editor-quality-binding" class="small text-break" role="status"></p>
                              <div id="editor-quality-list"></div>
                              <button type="button" id="editor-quality-more" class="btn btn-outline-secondary btn-sm mt-2" onclick="showMoreEditorFindings()" hidden>Show 50 more</button>
                          </section>
@@ -3324,7 +3473,7 @@
                                        <button type="button" class="btn btn-outline-primary btn-sm" id="editor-line-play" onclick="playEditorReviewLine()">Play line</button>
                                        <button type="button" class="btn btn-outline-success btn-sm" id="editor-line-generate" onclick="generateEditorReviewLine()">Generate line…</button>
                                    </div>
-                                   <details class="mb-3"><summary title="Save and audition immutable copies, or explicitly check an eligible snapshot for restoration.">Saved take snapshots</summary>
+                                   <details class="mb-3" id="editor-take-details"><summary title="Save and audition immutable copies, or explicitly check an eligible snapshot for restoration.">Saved take snapshots</summary>
                                        <p class="small mt-2">Save a good performance explicitly or enable automatic history above. Audition keeps the current selection. Check &amp; restore selects a saved performance only when its original inputs, voice, settings and pronunciation still match; it retains the displaced take. Verification may load the native voice model. Other snapshots remain available for audition.</p>
                                        <div class="d-flex flex-wrap gap-2 mb-2">
                                            <button type="button" id="editor-take-save" class="btn btn-outline-primary btn-sm" onclick="saveEditorTakeSnapshot()" title="Save an immutable copy of the selected saved performance, including its recorded metadata.">Save this take</button>
@@ -3352,7 +3501,8 @@
                                        <dt>Audio and voice check</dt><dd id="editor-line-quality" class="small"></dd><dd id="editor-line-drift-detail" class="small"></dd>
                                        <dt>Speech content check</dt><dd id="editor-line-speech" class="small"></dd><dd id="editor-line-speech-attempt" class="small"></dd>
                                        <dd><div class="d-flex flex-wrap gap-2"><button type="button" id="editor-line-speech-recheck" class="btn btn-outline-primary btn-sm" onclick="recheckEditorSpeech()" title="Recheck this saved take using its recorded synthesis input and cached CPU models. Existing audio is retained.">Recheck speech</button><button type="button" id="editor-line-speech-cancel" class="btn btn-outline-secondary btn-sm" onclick="cancelEditorSpeechVerification()" title="Request cancellation of the active speech recheck and keep saved audio." disabled>Cancel recheck</button></div><p id="editor-line-speech-status" class="small mt-2" role="status">Saved takes with recorded synthesis input can be rechecked. Takes without recorded input must be regenerated with speech checks enabled.</p></dd>
-                                       <dd><details><summary>Speech input and saved evidence</summary><p id="editor-line-speech-expected" class="small editor-line-text"></p><pre id="editor-line-speech-evidence" class="small editor-line-text"></pre></details></dd>
+                                       <dd><details><summary>Speech input and saved evidence</summary><p id="editor-line-recorded-status" class="small" role="status"></p><p id="editor-line-recorded-binding" class="small editor-line-text"></p><p id="editor-line-speech-expected" class="small editor-line-text"></p><p class="small">Occurrence rules affect the synthesis copy, not authored Script text. Each rule applies at most once; duplicate, overlapping, stale and out-of-scope rules are not applied. Recorded decisions below are historical, not a preview of today's rules. Historical number/symbol transformations and complete engine settings are not recorded here and are not reconstructed.</p><pre id="editor-line-recorded-pronunciation" class="small editor-line-text"></pre><pre id="editor-line-speech-evidence" class="small editor-line-text"></pre></details></dd>
+                                       <dd><details><summary>Saved-line preparation preview (not historical proof)</summary><button type="button" id="editor-line-input-preview" class="btn btn-outline-secondary btn-sm" title="Inspect saved text and its preparation without loading a model or changing a take." onclick="previewEditorSpeechInput()">Preview saved line with current settings</button><p id="editor-line-input-status" class="small" role="status"></p><pre id="editor-line-input-details" class="small editor-line-text"></pre></details></dd>
                                        <dt>Source entries</dt><dd id="editor-line-source" class="small"></dd>
                                    </dl>
                                </div>
@@ -3759,6 +3909,8 @@
     <script src="/static/js/app-project-scope.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-speaker-review.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-character-roster.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-casting-research.js?v=__APP_BUILD__"></script>
+    <script src="/static/js/app-casting.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-editor-repair.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-editor-review.js?v=__APP_BUILD__"></script>
     <script src="/static/js/app-word-timing.js?v=__APP_BUILD__"></script>

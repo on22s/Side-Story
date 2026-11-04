@@ -486,9 +486,19 @@ def _get_editor_chunk_views(chunks, book_token):
     return views
 
 
+def _ensure_editor_selection():
+    """Refuse operations against retained chunks from an older selection."""
+    try:
+        from script_selection_binding import require_published_selection
+        require_published_selection(os.path.dirname(SCRIPT_PATH))
+    except (ValueError, OSError, RecursionError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 def _ensure_editor_chunks():
     """Load rows without inventing IDs or discarding persisted progress."""
     try:
+        _ensure_editor_selection()
         chunks = project_manager.load_chunks()
     except (ValueError, OSError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -602,6 +612,7 @@ def _get_undo_take_rows():
 def check_chunk_identity(index, expected_book_token=None, expected_uid=None):
     """Caller holds the book lock through the following mutation."""
     root = os.path.dirname(SCRIPT_PATH)
+    _ensure_editor_selection()
     if (expected_book_token is not None
             and expected_book_token != get_snapshot_digest(get_editor_book_identity(root))):
         raise HTTPException(status_code=409, detail="Active book changed; reload the Editor before saving")
@@ -627,6 +638,7 @@ def ensure_audio_generation_requests(indices, expected_book_token=None, expected
     """Read and bind selection once while its caller owns the audio reservation."""
     root = os.path.dirname(SCRIPT_PATH)
     with ensure_book_state(root):
+        _ensure_editor_selection()
         identity = get_snapshot_digest(get_editor_book_identity(root))
         if (expected_book_token is not None and expected_book_token != identity):
             raise HTTPException(status_code=409, detail="Active book changed; reload before rendering")
@@ -646,15 +658,43 @@ def ensure_audio_generation_requests(indices, expected_book_token=None, expected
         return selected, get_chunk_generation_requests(chunks, selected)
 
 
+def apply_editor_gap(index, expected_book_token, expected_uid, expected_revision):
+    with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
+        check_chunk_identity(index, expected_book_token, expected_uid)
+        if expected_revision is None:
+            return project_manager.get_gap_suggestion(index)
+        return project_manager.apply_gap_suggestion(index, expected_uid, expected_revision)
+
+
+class GapSuggestionRequest(BaseModel):
+    expected_revision: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@router.get('/api/chunks/{index}/gap_suggestion')
+async def get_gap_suggestion_endpoint(index: int,
+        expected_book_token: Annotated[str, Query(min_length=64, max_length=64)],
+        expected_uid: Annotated[str, Query(min_length=1, max_length=128)]):
+    return await asyncio.to_thread(_apply_chunk_edit, apply_editor_gap, index,
+        expected_book_token, expected_uid, None)
+
+
+@router.post('/api/chunks/{index}/gap_suggestion')
+async def apply_gap_suggestion_endpoint(index: int, request: GapSuggestionRequest,
+        expected_book_token: Annotated[str, Query(min_length=64, max_length=64)],
+        expected_uid: Annotated[str, Query(min_length=1, max_length=128)]):
+    return await asyncio.to_thread(_apply_chunk_edit, apply_editor_gap, index,
+        expected_book_token, expected_uid, request.expected_revision)
+
+
 def apply_chunk_insertion(index, expected_book_token=None, expected_uid=None):
-    with ensure_book_state(os.path.dirname(SCRIPT_PATH)):
+    with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
         check_chunk_identity(index, expected_book_token, expected_uid)
         return project_manager.insert_chunk(index)
 
 
 def apply_chunk_deletion(index, expected_book_token=None, expected_uid=None):
     root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root):
+    with ensure_book_state(root, timeout=0.25):
         check_chunk_identity(index, expected_book_token, expected_uid)
         result = project_manager.delete_chunk(index)
         if result is None:
@@ -674,7 +714,7 @@ def apply_chunk_deletion(index, expected_book_token=None, expected_uid=None):
 
 def apply_chunk_restore(request):
     root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root):
+    with ensure_book_state(root, timeout=0.25):
         receipt = _deleted_chunk_receipts.get(request.undo_token)
         if (receipt is None or time.monotonic() - receipt['created'] > 60
                 or receipt['book'] != get_editor_book_identity(root)
@@ -697,6 +737,8 @@ def _apply_chunk_edit(operation, *args):
         check_global_gpu_lock("audio")
         try:
             return operation(*args)
+        except TimeoutError as error:
+            raise HTTPException(status_code=409, detail='The edit could not be confirmed. Refresh the Editor and check the line before retrying.') from error
         except (ValueError, OSError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -757,7 +799,7 @@ async def drift_check_endpoint(request: DriftCheckRequest, background_tasks: Bac
 
 def apply_guarded_chunk_update(index, update):
     root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root):
+    with ensure_book_state(root, timeout=0.25):
         if (update.expected_book_token is not None
                 and update.expected_book_token != get_snapshot_digest(get_editor_book_identity(root))):
             raise HTTPException(status_code=409, detail="Active book changed; reload the Editor before saving")
@@ -883,6 +925,7 @@ def get_export_quality_attempt(request, state, *, audacity=False):
     # A cancelled queued worker must not start book I/O for evidence capture.
     ensure_audio_export_active(lambda: state.get('cancel', False))
     with ensure_book_state(DATA_DIR):
+        _ensure_editor_selection()
         token = get_snapshot_digest(get_editor_book_identity(DATA_DIR))
     options = getattr(request, 'export_quality', None)
     return ExportQualityAttempt(state, token,
@@ -1032,6 +1075,8 @@ async def export_audacity_endpoint(background_tasks: BackgroundTasks):
     # where two rapid POSTs both pass a plain running check before either sets it).
     # audacity_export is a NON_GPU_TASK, so this only guards against self-double-start.
 
+    await asyncio.to_thread(_ensure_editor_selection)
+
     def task():
         process_state["audacity_export"]["logs"] = ["Starting Audacity export..."]
         quality_attempt = None
@@ -1120,6 +1165,7 @@ def get_unready_export_speakers():
 
 
 async def validate_export_readiness(require_ready):
+    await asyncio.to_thread(_ensure_editor_selection)
     if require_ready:
         missing = await asyncio.to_thread(get_unready_export_speakers)
         if missing:
@@ -1637,7 +1683,7 @@ def _apply_audio_cancel():
             with ensure_startup_recovery(DATA_DIR, timeout=0) as idle:
                 if not idle:
                     raise HTTPException(status_code=409, detail="Another worker owns an active task; cancel it on its owning server")
-                with ensure_book_state(os.path.dirname(SCRIPT_PATH)):
+                with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
                     for chunk in project_manager.load_chunks():
                         if chunk.get("status") == "generating":
                             updated = project_manager._update_chunk_fields_by_uid(
