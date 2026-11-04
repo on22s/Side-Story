@@ -1124,7 +1124,7 @@ class ProjectManager:
                 new = get_occurrence_speech_projection(chunk, index, voices, after)
                 if old["text"] != new["text"]:
                     updated[index] = {**chunk, "status": "pending", "audio_path": None,
-                                      "error": None, "drift": None, "voice_revision": uuid.uuid4().hex}
+                                      "error": None, "drift": None, "outlier": None, "voice_revision": uuid.uuid4().hex}
                     changed.append(chunk["uid"])
         if changed:
             self._save_chunks_locked(updated, uids_backfilled=True)
@@ -1270,7 +1270,7 @@ class ProjectManager:
                       self.get_chunk_voice_inputs(after, chunk, index)]
         updated = copy.deepcopy(chunks)
         for index in changed:
-            updated[index].update(status="pending", audio_path=None, error=None, drift=None,
+            updated[index].update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                                   voice_revision=uuid.uuid4().hex)
         if changed:
             self._save_chunks_locked(updated, uids_backfilled=True)
@@ -1318,7 +1318,7 @@ class ProjectManager:
             if old_index is not None and old_index != index and (
                     self.get_chunk_voice_inputs(voices, chunk, old_index) !=
                     self.get_chunk_voice_inputs(voices, chunk, index)):
-                chunk.update(status="pending", audio_path=None, error=None, drift=None,
+                chunk.update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                              voice_revision=uuid.uuid4().hex)
 
     def insert_chunk(self, after_index):
@@ -1398,7 +1398,7 @@ class ProjectManager:
             captured_voice = chunk_data.pop("_deleted_voice_inputs", None)
             if chunk_data.get("audio_path") and (captured_voice is None or
                     captured_voice != self.get_chunk_voice_inputs(self._get_chunk_edit_voices(), chunk_data, at_index)):
-                chunk_data.update(status="pending", audio_path=None, error=None, drift=None,
+                chunk_data.update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                                   voice_revision=uuid.uuid4().hex)
 
             # Re-number all IDs
@@ -1427,7 +1427,7 @@ class ProjectManager:
         for index, row in enumerate(after):
             old = previous.get(row.get("uid"))
             if old is not None and self.get_chunk_voice_inputs(voices, old[1], old[0]) != self.get_chunk_voice_inputs(voices, row, index):
-                row.update(status="pending", audio_path=None, error=None, drift=None,
+                row.update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                            voice_revision=uuid.uuid4().hex)
 
     def _is_project_audio_path(self, path):
@@ -1460,6 +1460,37 @@ class ProjectManager:
             self._save_chunks_locked(chunks, uids_backfilled=True)
             return chunks[index]
 
+    def apply_outlier_results(self, snapshot, results, cancel_check):
+        from book_state_transaction import ensure_book_state, get_book_snapshot
+        from chunk_outlier_check import get_outlier_population_key, get_outlier_voice_config, OutlierCheckError
+        from editor_poll_snapshot import get_snapshot_digest
+        root = snapshot['root']
+        with ensure_book_state(root), self._chunks_lock, file_lock(self.chunks_path):
+            if os.path.realpath(self.root_dir) != root:
+                raise OutlierCheckError('The selected project changed; refresh Editor and repeat the outlier check.')
+            current = get_book_snapshot(root, include_voices=False)
+            current['voices'] = get_outlier_voice_config(root)
+            if current != snapshot['book']:
+                raise OutlierCheckError('Book inputs changed; refresh Editor and repeat the outlier check.')
+            chunks = self._read_chunks()
+            population = get_outlier_population_key(chunks)
+            if population != snapshot['population_key']:
+                raise OutlierCheckError('Saved takes changed; refresh Editor and repeat the outlier check.')
+            targets = [index for index, chunk in enumerate(chunks)
+                       if chunk.get('status') == 'done' and chunk.get('audio_path')]
+            if (len(results) != len(targets) or
+                    any(result.get('index') != index or result.get('uid') != chunks[index].get('uid')
+                        for index, result in zip(targets, results))):
+                raise ValueError('Outlier results do not cover the captured population')
+            updated = copy.deepcopy(chunks)
+            voices_key = get_snapshot_digest(snapshot['book']['voices'])
+            for index, result in zip(targets, results):
+                updated[index]['outlier'] = {**result, 'population_key': population,
+                                             'voices_key': voices_key}
+            cancel_check()
+            self._save_chunks_locked(updated, uids_backfilled=True)
+            return len(results)
+
     def update_chunk(self, index, data):
         """Thread-safe chunk update. See _modify_chunk."""
         def mutator(chunk):
@@ -1490,7 +1521,10 @@ class ProjectManager:
             if render_changed:
                 chunk["status"] = "pending"
                 chunk["audio_path"] = None
-                chunk["drift"] = None
+                if "outlier" in chunk:
+                    chunk["outlier"] = None
+                if "drift" in chunk:
+                    chunk["drift"] = None
                 # The source mapping belonged to the old text/speaker.
                 for field in ("spoken", "source_speaker", "source_span",
                               "dialogue_ambiguity"):
@@ -1728,7 +1762,7 @@ class ProjectManager:
                 updated = self._update_chunk_fields_by_uid(
                     chunk["uid"], expected_chunk=chunk, audio_source=staged_path,
                     publication_audio=publication['audio'] if publication is not None else None,
-                    status="done", audio_revision=revision, error=None, drift=None, **authority_options, **evidence)
+                    status="done", audio_revision=revision, error=None, drift=None, outlier=None, **authority_options, **evidence)
             if updated is None:
                 raise ValueError(GENERATION_INPUTS_CHANGED)
             if recovery_parent is not None:
