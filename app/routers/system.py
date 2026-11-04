@@ -87,10 +87,30 @@ def get_tts_diagnostics():
     from tts_diagnostics import get_tts_diagnostics_bundle
     from tts import TTSEngine
     from device_utils import get_loaded_torch_device_observation
-    return get_tts_diagnostics_bundle(residency=project_manager.get_model_residency(),
-                                      runtime=get_runtime_info(ROOT_DIR),
-                                      assets=TTSEngine.get_local_model_inventory(),
-                                      device=get_loaded_torch_device_observation())
+    from lora_evidence import get_tts_model_settings
+    from config_settings import load_app_config_result
+    def observe_configuration():
+        loaded = load_app_config_result(project_manager.config_path)
+        if loaded.warnings:
+            raise ValueError('Configuration observation unavailable')
+        return get_tts_model_settings(loaded.data)
+    values = {}
+    collection = {}
+    for name, observe in (
+            ('residency', project_manager.get_model_residency),
+            ('runtime', lambda: get_runtime_info(ROOT_DIR)),
+            ('assets', TTSEngine.get_local_model_inventory),
+            ('device', get_loaded_torch_device_observation),
+            ('configuration', observe_configuration)):
+        try:
+            values[name] = observe()
+            collection[name] = 'collected'
+        except Exception as error:
+            values[name] = None
+            collection[name] = 'unavailable'
+            logger.warning('Support report collector %s unavailable (%s)', name,
+                           'missing_dependency' if isinstance(error, ImportError) else 'collection_failed')
+    return get_tts_diagnostics_bundle(**values, collection=collection)
 
 
 def _builtin_prompt_presets() -> list[dict]:
@@ -1107,7 +1127,7 @@ def apply_pronunciation_config_change(config, manager):
             return True
 
     with ensure_book_switch_allowed(operation="change synthesis window, recovery, speech verification or conditional pronunciation settings"):
-        with ensure_book_state(root, recover=False):
+        with ensure_book_state(root, timeout=0.25, recover=False):
             before = manager.get_pronunciation_preview_settings()["settings"]
             try:
                 with manager._chunks_lock, file_lock(manager.chunks_path), file_lock(CONFIG_PATH):
@@ -1171,7 +1191,7 @@ def _clear_synthesis_recovery_sync(expected_book_token):
     from synthesis_recovery_cache import CACHE_DIRECTORY, RecoveryCacheStorage, RecoveryCacheUnavailable
     root = project_manager.root_dir
     with ensure_book_switch_allowed(operation='clear retained synthesis recovery windows'):
-        with ensure_book_state(root):
+        with ensure_book_state(root, timeout=0.25):
             if get_snapshot_digest(get_book_operation_identity(root)) != expected_book_token:
                 raise HTTPException(status_code=409, detail='Active book changed; reload Editor before clearing recovery windows.')
             removed = 0

@@ -131,7 +131,7 @@ These are the installer paths, not a guarantee for every GPU or driver:
 | NVIDIA on Windows/Linux | PyTorch 2.7 / CUDA 12.8 | A CUDA-compatible GPU and driver; optional attention wheels depend on Python/platform compatibility |
 | AMD on Linux | PyTorch 2.10 / ROCm 7.0 | Your GPU and host ROCm/driver compatibility; the installer identifies RX 9070 XT / RDNA4 as its tested target, not all AMD cards |
 | AMD on Windows | CPU | This installer does not provide AMD GPU acceleration on Windows |
-| macOS (Apple Silicon) | MPS when available, otherwise CPU | `auto` selects MPS if PyTorch reports it available; end-to-end performance and compatibility are not guaranteed |
+| macOS (Apple Silicon) | CPU, or optional Apple MLX | `auto` uses CPU. MPS can be selected explicitly, but on an M4 it was slower and less accurate. Install also sets up an optional MLX environment; choose it under TTS mode in Setup |
 | macOS (Intel) | CPU fallback | The installer uses an older PyTorch pin; validate your environment with a short sample |
 | Other CPU-only setups | CPU | Expect slower generation; start with a short sample |
 

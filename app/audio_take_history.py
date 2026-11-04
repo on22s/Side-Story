@@ -67,16 +67,16 @@ def _version(info):
 
 
 def _ensure_plain_path(path, root):
+    from direct_path_admission import is_plain_path
     path = Path(os.path.abspath(path))
+    if not is_plain_path(path) or not is_plain_path(root):
+        raise ValueError('Take history does not accept file or directory aliases.')
+    # Admitted administrator aliases (#1659) resolve away; compare canonical forms.
+    path = Path(os.path.realpath(path))
     try:
-        parts = path.relative_to(root).parts
+        parts = path.relative_to(os.path.realpath(root)).parts
     except ValueError as error:
         raise ValueError('Take audio must stay inside the project.') from error
-    current = root
-    for part in parts:
-        current /= part
-        if (current.is_symlink() or os.path.normcase(os.path.realpath(current)) != os.path.normcase(str(current))):
-            raise ValueError('Take history does not accept file or directory aliases.')
     return path
 
 
@@ -202,6 +202,13 @@ class AudioTakeHistory:
                 raise ValueError('Take metadata changed while reading; it was preserved.')
         if _version(_ensure_plain_path(self.manifest, self.root).stat()) != _version(info):
             raise ValueError('Take metadata changed while reading; it was preserved.')
+        return self.parse_manifest_bytes(data)
+
+    def parse_manifest_bytes(self, data, *, cancel_check=None):
+        """Validate an already captured manifest without rereading its path."""
+        _check_cancelled(cancel_check)
+        if not isinstance(data, bytes) or len(data) > MAX_MANIFEST_BYTES:
+            raise ValueError('Take history manifest exceeds its size limit.')
         try:
             document = json.loads(data)
         except RecursionError as error:
@@ -211,7 +218,10 @@ class AudioTakeHistory:
                                        max_record_bytes=MAX_RECORD_BYTES,
                                        max_manifest_bytes=MAX_MANIFEST_BYTES,
                                        check_depth=_ensure_metadata_depth)
-        return self._validate(document)
+        for _ in self._iter_validated_record_bytes(document):
+            _check_cancelled(cancel_check)
+        _check_cancelled(cancel_check)
+        return document
 
     def _validate(self, document):
         for _ in self._iter_validated_record_bytes(document):
@@ -330,6 +340,7 @@ class AudioTakeHistory:
     @staticmethod
     def _summary(row):
         from take_publication import KEY, validate_take_publication
+        from speech_verification_receipt import get_archived_speech_evidence
         result = {key: copy.deepcopy(row.get(key)) for key in (
             'version', 'book_token', 'book_label', 'uid', 'sha256', 'bytes', 'state',
             'protected', 'created', 'take', 'audio_revision', 'shape')}
@@ -343,6 +354,9 @@ class AudioTakeHistory:
                 'uid':row['uid'], 'audio_revision':row.get('audio_revision'), KEY:captured.get(KEY)}) is not None
         except ValueError:
             result['has_restore_evidence'] = False
+        result['speech_evidence'] = get_archived_speech_evidence(
+            captured.get('speech_verification'), captured.get('generation_inputs'), row['uid'],
+            row.get('audio_revision'), row['book_token'], {'sha256': row['sha256'], 'size': row['bytes']})
         return result
 
     def list(self, book_token=None, uid=None, offset=0):

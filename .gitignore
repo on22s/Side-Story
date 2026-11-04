@@ -3,6 +3,7 @@ node_modules
 venv
 env
 app/env/
+mlx_env/
 .env
 .*
 !.github/

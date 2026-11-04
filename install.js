@@ -48,6 +48,25 @@ module.exports = {
       }
     },
     {
+      "when": "{{platform === 'darwin' && arch === 'arm64' && exists('mlx_env') && !exists('mlx_env/bin/python3.11')}}",
+      "method": "fs.rm",
+      "params": {
+        "path": "mlx_env"
+      }
+    },
+    {
+      "when": "{{platform === 'darwin' && arch === 'arm64'}}",
+      "method": "shell.run",
+      "params": {
+        "venv": "mlx_env",
+        "venv_python": "3.11",
+        "message": [
+          "uv pip install -r requirements-mlx.txt",
+          "python -c \"from huggingface_hub import snapshot_download as s; [s('Qwen/Qwen3-TTS-12Hz-1.7B-' + f) for f in ('CustomVoice', 'Base', 'VoiceDesign')]\""
+        ]
+      }
+    },
+    {
       "method": "notify",
       "params": {
         "html": "Installation Complete! Click 'Start' to launch. Optional Voice Lab / Preparer dependencies are available separately under 'Install Voice Tools'."

@@ -652,6 +652,8 @@
                 loadVoices(false);
             } else if (selectedLink.dataset.tab === 'designer') {
                 loadDesignedVoices();
+            } else if (selectedLink.dataset.tab === 'casting') {
+                window.loadCastingLibrary?.();
             } else if (selectedLink.dataset.tab === 'training') {
                 loadLoraDatasets();
                 loadLoraModels();
@@ -889,7 +891,7 @@
                 await API._handleError(res);
                 return res.json();
             },
-            post: async (url, data, {timeoutMs = null} = {}) => {
+            post: async (url, data, {timeoutMs = null, timeoutMessage = 'The voice save timed out. Your edits are retained; the server save could not be confirmed.'} = {}) => {
                 if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
                     throw new Error('The request deadline must be a positive finite duration.');
                 }
@@ -908,7 +910,7 @@
                 if (!controller) { return request(); }
                 const deadline = new Promise((resolve, reject) => {
                     timer = setTimeout(() => {
-                        reject(new Error('The voice save timed out. Your edits are retained; the server save could not be confirmed.'));
+                        reject(new Error(timeoutMessage));
                         controller.abort();
                     }, timeoutMs);
                 });
@@ -923,10 +925,11 @@
                 await API._handleError(res);
                 return res.json();
             },
-            upload: async (file, {selectActive = true} = {}) => {
+            upload: async (file, {selectActive = true, includeExtractionReport = false} = {}) => {
                 const formData = new FormData();
                 formData.append('file', file);
-                const res = await fetch(`/api/upload?select_active=${selectActive}`, {
+                const reportQuery = includeExtractionReport ? '&include_extraction_report=true' : '';
+                const res = await fetch(`/api/upload?select_active=${selectActive}${reportQuery}`, {
                     method: 'POST',
                     body: formData
                 });
@@ -1819,9 +1822,13 @@
 
         let currentBookFilename = '';
         let bookSelectionGeneration = 0;
+        window._bookSelectionEpoch = 0;
         function applyCurrentBookFilename(filename) {
             bookSelectionGeneration++;
+            window.resetDocxPreview?.();
+            window.renderEpubExtractionReport?.(null);
             window.retirePlaybackSequence?.();
+            window._selectedUploadIdentity = null;
             currentBookFilename = typeof filename === 'string' ? filename : '';
             window.resetEditorReview?.();
             window.resetPronunciationBook?.();
@@ -2242,6 +2249,16 @@
         });
 
         // --- Script Tab ---
+        function renderEpubExtractionReport(report) {
+            const panel = document.getElementById('epub-extraction-report-panel');
+            const preview = document.getElementById('epub-extraction-report-json');
+            if (!panel || !preview) { return; }
+            preview.textContent = report ? JSON.stringify(report, null, 2) : '';
+            panel.hidden = !report;
+            panel.open = false;
+        }
+        window.renderEpubExtractionReport = renderEpubExtractionReport;
+
         let existingUploadsLoadRequest = 0;
 
         async function loadExistingScriptUploads() {
@@ -2270,9 +2287,11 @@
         window.selectExistingScriptUpload = async () => {
             const select = document.getElementById('existing-upload-select');
             if (!select.value) { return; }
+            window.resetDocxPreview?.();
             const filename = select.value;
             let book = currentBookFilename;
             const request = {};
+            window._bookSelectionEpoch++;
             window._existingUploadSelectionRequest = request;
             const isCurrent = () => window._existingUploadSelectionRequest === request
                 && select.value === filename && currentBookFilename === book;
@@ -2281,6 +2300,7 @@
                 return;
             }
             if (!isCurrent()) { return; }
+            window.renderEpubExtractionReport?.(null);
             const statusEl = document.getElementById('upload-status');
             const selecting = enqueueBookSelection(request, async () => {
                 if (!isCurrent()) { return; }
@@ -2288,6 +2308,9 @@
                 if (!isCurrent()) { return; }
                 applyCurrentBookFilename(result.stored_filename);
                 book = currentBookFilename;
+                if (/^[0-9a-f]{64}$/.test(result.book_identity_token || '')) {
+                    window._selectedUploadIdentity = { filename: book, token: result.book_identity_token, request };
+                }
                 document.getElementById('file-upload').value = '';
                 statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Reusing: ${escapeHtml(result.stored_filename)}</span>`;
                 document.getElementById('cast-list-panel').style.display = 'none';
@@ -2302,25 +2325,163 @@
             }
         };
 
+        window.openRetainedDocxDetails = async function() {
+            const details = document.getElementById('docx-retained-details');
+            details.hidden = false;
+            details.textContent = 'Loading retained DOCX metadata...';
+            try {
+                const inventory = await API.get('/api/uploads/docx-retained');
+                details.textContent = JSON.stringify(inventory, null, 2);
+            } catch (error) {
+                details.textContent = 'Retained DOCX inventory unavailable. Retry inspection before offline cleanup.';
+            }
+        };
+
+        let docxPreviewCandidate = null;
+        window.resetDocxPreview = function() {
+            docxPreviewCandidate = null;
+            document.getElementById('docx-preview-panel').hidden = true;
+            document.getElementById('docx-preview-cancel').disabled = false;
+            for (const id of ['docx-preview-policy', 'docx-preview-warnings', 'docx-preview-text']) {
+                document.getElementById(id).textContent = '';
+            }
+        };
+        function isCurrentDocxPreview(candidate) {
+            return docxPreviewCandidate === candidate
+                && window._existingUploadSelectionRequest === candidate.request
+                && window._bookSelectionEpoch === candidate.epoch
+                && currentBookFilename === candidate.book
+                && document.getElementById('file-upload').files[0] === candidate.file;
+        }
+        async function sendDocxUpload(file, digest = null) {
+            const body = new FormData();
+            body.append('file', file);
+            const query = digest === null ? '&docx_preview=true'
+                : `&docx_confirmed=true&docx_preview_digest=${encodeURIComponent(digest)}`;
+            const response = await fetch('/api/upload?select_active=false' + query, {method: 'POST', body});
+            await API._handleError(response);
+            return response.json();
+        }
+        window.previewDocxUpload = async function(file, request) {
+            window.resetDocxPreview();
+            const candidate = {file, request, epoch: window._bookSelectionEpoch, book: currentBookFilename, accepting: false};
+            docxPreviewCandidate = candidate;
+            const status = document.getElementById('upload-status');
+            try {
+                const preview = await sendDocxUpload(file);
+                if (!isCurrentDocxPreview(candidate)) { return; }
+                if (typeof preview.text !== 'string' || typeof preview.policy_text !== 'string'
+                    || !Array.isArray(preview.warnings) || !preview.warnings.every(value => typeof value === 'string')
+                    || !/^[0-9a-f]{64}$/.test(preview.preview_digest || '')) {
+                    throw new Error('Invalid DOCX preview response; preview this file again.');
+                }
+                candidate.preview = preview;
+                document.getElementById('docx-preview-policy').textContent = preview.policy_text;
+                document.getElementById('docx-preview-warnings').textContent = preview.warnings.join('\n');
+                document.getElementById('docx-preview-text').textContent = preview.text;
+                document.getElementById('docx-preview-accept').disabled = false;
+                document.getElementById('docx-preview-panel').hidden = false;
+                status.textContent = 'Review the entire extracted text before accepting. The current book is unchanged.';
+            } catch (error) {
+                if (!isCurrentDocxPreview(candidate)) { return; }
+                window.resetDocxPreview();
+                document.getElementById('file-upload').value = '';
+                status.textContent = error.message;
+            }
+        };
+        window.cancelDocxPreview = function() {
+            if (docxPreviewCandidate?.selecting) {
+                document.getElementById('upload-status').textContent = 'Book selection has already been submitted; wait for its result before selecting another book.';
+                return;
+            }
+            window.resetDocxPreview();
+            window._bookSelectionEpoch++;
+            window._existingUploadSelectionRequest = {};
+            document.getElementById('file-upload').value = '';
+            document.getElementById('upload-status').textContent = 'DOCX preview cancelled. No new source selected.';
+        };
+        window.acceptDocxPreview = async function() {
+            const candidate = docxPreviewCandidate;
+            if (!candidate || !candidate.preview || candidate.accepting || !isCurrentDocxPreview(candidate)) { return; }
+            candidate.accepting = true;
+            document.getElementById('docx-preview-accept').disabled = true;
+            const status = document.getElementById('upload-status');
+            try {
+                const uploaded = await sendDocxUpload(candidate.file, candidate.preview.preview_digest);
+                if (!isCurrentDocxPreview(candidate)) { return; }
+                if (uploaded.preview_digest !== candidate.preview.preview_digest || typeof uploaded.stored_filename !== 'string') {
+                    throw new Error('DOCX acceptance receipt did not match the displayed preview.');
+                }
+                await enqueueBookSelection(candidate.request, async () => {
+                    if (!isCurrentDocxPreview(candidate)) { return; }
+                    if (!await ensureCastListEditsDiscardable()) {
+                        candidate.accepting = false;
+                        document.getElementById('docx-preview-accept').disabled = false;
+                        return;
+                    }
+                    if (!isCurrentDocxPreview(candidate)) { return; }
+                    candidate.selecting = true;
+                    document.getElementById('docx-preview-cancel').disabled = true;
+                    status.textContent = 'Selecting the accepted DOCX text...';
+                    const selected = await API.post('/api/uploads/select', {filename: uploaded.stored_filename});
+                    if (!isCurrentDocxPreview(candidate)) { return; }
+                    candidate.selectedBook = selected.stored_filename;
+                    applyCurrentBookFilename(selected.stored_filename);
+                    if (/^[0-9a-f]{64}$/.test(selected.book_identity_token || '')) {
+                        window._selectedUploadIdentity = {filename: currentBookFilename, token: selected.book_identity_token, request: candidate.request};
+                    }
+                    document.getElementById('existing-upload-select').value = '';
+                    status.textContent = 'Accepted DOCX text: ' + selected.stored_filename + '. Exact original and receipt retained.';
+                    document.getElementById('cast-list-panel').style.display = 'none';
+                    clearCastListEditor();
+                    await loadCastList(false);
+                    if (window._existingUploadSelectionRequest !== candidate.request
+                        || window._bookSelectionEpoch !== candidate.epoch
+                        || currentBookFilename !== selected.stored_filename) { return; }
+                    await loadExistingScriptUploads();
+                });
+            } catch (error) {
+                if (!isCurrentDocxPreview(candidate)
+                    && !(candidate.selectedBook === currentBookFilename
+                        && window._existingUploadSelectionRequest === candidate.request
+                        && window._bookSelectionEpoch === candidate.epoch)) { return; }
+                window.resetDocxPreview();
+                status.textContent = 'DOCX acceptance or selection was not confirmed. Check existing uploads and the current book before retrying. ' + error.message;
+            }
+        };
+
         document.getElementById('file-upload').addEventListener('change', async () => {
+            window.resetDocxPreview?.();
             const fileInput = document.getElementById('file-upload');
             const statusEl = document.getElementById('upload-status');
             if (fileInput.files.length === 0) { return; }
             const file = fileInput.files[0];
+            const includeExtractionReport = /\.epub$/i.test(file.name)
+                && document.getElementById('epub-extraction-report-enabled')?.checked === true;
             if (!await ensureCastListEditsDiscardable()) { fileInput.value = ''; return; }
             if (fileInput.files[0] !== file) { return; }
+            window.renderEpubExtractionReport?.(null);
 
             const request = {};
+            window._bookSelectionEpoch++;
             window._existingUploadSelectionRequest = request;
             const isCurrent = () => window._existingUploadSelectionRequest === request
                 && fileInput.files[0] === file;
             statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Loading file...</span>';
+            if (/\.docx$/i.test(file.name)) {
+                await window.previewDocxUpload(file, request);
+                return;
+            }
             try {
                 await enqueueBookSelection(request, async () => {
                     if (!isCurrent()) { return; }
-                    const res = await API.upload(file);
+                    const res = await API.upload(file, {includeExtractionReport});
                     if (!isCurrent()) { return; }
                     applyCurrentBookFilename(res.stored_filename);
+                    window.renderEpubExtractionReport?.(res.extraction_report || null);
+                    if (/^[0-9a-f]{64}$/.test(res.book_identity_token || '')) {
+                        window._selectedUploadIdentity = { filename: currentBookFilename, token: res.book_identity_token, request };
+                    }
                     document.getElementById('existing-upload-select').value = '';
                     const verb = res.reused ? 'Reused existing copy' : 'Loaded';
                     statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>${verb}: ${escapeHtml(res.stored_filename)}</span>`;
@@ -2332,6 +2493,7 @@
                 });
             } catch (e) {
                 if (!isCurrent()) { return; }
+                window.renderEpubExtractionReport?.(null);
                 statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage('Book upload was not confirmed', e, 'Check the current loaded book and existing uploads before uploading again.'))}</span>`;
             }
         });
@@ -2585,8 +2747,8 @@
             toastType = 'warning',
         } = {}) {
             try {
-                await API.post(url, {});
-                if (onSuccess) { onSuccess(); }
+                const result = await API.post(url, {});
+                if (onSuccess) { onSuccess(result); }
                 return true;
             } catch (e) {
                 showToast(errorMessage(e), toastType);
@@ -2614,10 +2776,12 @@
             hint.hidden = false;
             hint.textContent = `Requesting cancellation of ${label}…`;
             const accepted = await cancelTask(url, {
-                onSuccess: () => {
+                onSuccess: (result) => {
                     if (scriptCancellationRequests.get(taskName) !== operation) { return; }
                     _resetPauseBtn(pauseId);
-                    hint.textContent = `Cancelling ${label}… Waiting for the worker to stop.`;
+                    hint.textContent = ['published_cleanup_stop', 'published_cleanup_stop_requested'].includes(result?.status)
+                        ? 'The script was already published. Waiting for its worker to stop.'
+                        : `Cancelling ${label}… Waiting for the worker to stop.`;
                 },
             });
             if (!accepted && scriptCancellationRequests.get(taskName) === operation) {
@@ -2894,8 +3058,17 @@
             const pauseBtn = document.getElementById('btn-pause-script');
             retryBtn.disabled = true;
             try {
-                await API.post('/api/generate_script/retry', {
-                });
+                const recovery = await API.get('/api/generate_script/recovery');
+                const payload = {};
+                if (recovery.legacy_confirmation) {
+                    const confirmed = await showConfirm(
+                        'This older checkpoint does not record which book it belongs to. Resume only if you recognize it as progress for the currently selected book. The source and generation settings must still match.',
+                        {title: 'Confirm older checkpoint', actionLabel: 'Resume this checkpoint'});
+                    if (!confirmed) { return; }
+                    payload.legacy_checkpoint_token = recovery.legacy_confirmation.checkpoint_token;
+                    payload.legacy_book_token = recovery.legacy_confirmation.book_token;
+                }
+                await API.post('/api/generate_script/retry', payload);
                 retryBtn.style.display = 'none';
                 genBtn.disabled = true;
                 cancelBtn.style.display = 'inline-block';
@@ -4651,6 +4824,8 @@
         };
 
         async function refreshVoiceMetadata() {
+            const expectedSelection = arguments[0]?.expectedSelection || null;
+            const selectionEpoch = window._bookSelectionEpoch;
             await flushVoiceSaves();
             const localRevision = voiceSaveQueue.getRevision();
             const rosterFilename = currentBookFilename;
@@ -4659,6 +4834,12 @@
             if (voiceSaveQueue.isDirty() || localRevision !== voiceSaveQueue.getRevision() || rosterFilename !== currentBookFilename
                     || rosterGeneration !== bookSelectionGeneration) {
                 throw new Error('Voice edits changed while refreshing. Your edits are still pending; try again.');
+            }
+            if (expectedSelection && (window._selectedUploadIdentity !== expectedSelection
+                    || window._bookSelectionEpoch !== selectionEpoch
+                    || window._existingUploadSelectionPending
+                    || snapshot.book_identity_token !== expectedSelection.token)) {
+                throw new Error('Active book changed while refreshing voices; existing edits were preserved.');
             }
             if (!Array.isArray(snapshot.voices) || !/^[0-9a-f]{64}$/.test(snapshot.revision) || !/^[0-9a-f]{64}$/.test(snapshot.book_token)) {
                 throw new Error('Invalid voice snapshot; your voice settings were not replaced.');
@@ -7070,6 +7251,7 @@
                 chunkSnapshotBook = refreshBook;
                 chunkSnapshotBookToken = snapshotBookToken;
                 chunkSnapshotRevision = snapshot.revision;
+                window.renderEditorQualityInbox?.();
                 return chunks;
             }
 
@@ -7093,6 +7275,7 @@
                 chunkSnapshotBook = refreshBook;
                 chunkSnapshotBookToken = snapshotBookToken;
                 chunkSnapshotRevision = snapshot.revision;
+                window.renderEditorQualityInbox?.();
 
                 // Continue polling if generating
                 if (!isRenderingAll && chunks.some(c => c.status === 'generating')) {
@@ -7176,6 +7359,7 @@
                                 <div class="chunk-pause-row d-none mt-1 align-items-center gap-1">
                                     <small class="text-muted text-nowrap">Pause after (ms):</small>
                                     <input type="number" class="form-control form-control-sm chunk-pause-after" style="width:80px;" value="${chunk.pause_after ?? ''}" placeholder="default" min="0"${typeof maxPauseMs !== 'undefined' && maxPauseMs != null ? ` max="${maxPauseMs}"` : ''} step="50" onchange="updateChunk(${chunk.id}, 'pause_after', this.value === '' ? null : parseInt(this.value))">
+                                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="suggestChunkGap(${chunk.id}, this)" title="Opt-in gap suggestion; uses the exact NARRATOR speaker label. Explicit pauses are not replaced.">Suggest gap</button>
                                 </div>
                             </td>
                             <td><span class="badge bg-${statusColor}">${escapeHtml(chunk.status)}</span>${_driftBadge(chunk)}</td>
@@ -7237,6 +7421,7 @@
             chunkSnapshotBook = refreshBook;
             chunkSnapshotBookToken = snapshotBookToken;
             chunkSnapshotRevision = snapshot.revision;
+            window.renderEditorQualityInbox?.();
 
             // If any chunk is generating, poll (without full redraw)
             if (!isRenderingAll && chunks.some(c => c.status === 'generating')) {
@@ -7737,6 +7922,7 @@
             pendingChunkEdits.set(id, request);
             request.finally(() => {
                 if (pendingChunkEdits.get(id) === request) { pendingChunkEdits.delete(id); }
+                window.renderEditorLineInspector?.();
                 void refreshEditorIntegrity();
             }).catch(() => {});
             return request;
@@ -7785,6 +7971,31 @@
             return incomingLines.map((line, index) => line + (
                 savedEndings[index] || (index < incomingLines.length - 1 ? '\n' : ''))).join('');
         }
+        window.suggestChunkGap = async (id, button) => {
+            button.disabled = true;
+            try {
+                await ensureEditorRenderSnapshot();
+                const target = captureChunkMutation(id);
+                const url = `/api/chunks/${id}/gap_suggestion?${target.query}`;
+                const suggestion = await API.get(url);
+                if (!target.isCurrent()) { throw new Error('Active book changed; request a new suggestion.'); }
+                if (suggestion.pause_after === null) {
+                    showToast('No suggested gap here. Existing explicit pauses are kept.', 'info');
+                    return;
+                }
+                if (!await showConfirm(`Set pause after this line to ${suggestion.pause_after} ms? Uses NARRATOR as the narrator. Speech, delivery instructions and takes stay unchanged.`, {title: 'Apply suggested gap?', actionLabel: 'Apply gap'})) { return; }
+                await flushChunkEdits();
+                if (!target.isCurrent()) { throw new Error('Active book changed; request a new suggestion.'); }
+                await API.post(url, {expected_revision: suggestion.revision});
+                if (!target.isCurrent()) { return; }
+                await loadChunks();
+                showToast('Gap saved. Re-export to update joined audio; no speech regeneration needed.', 'success');
+            } catch (error) {
+                showActionError('Suggest gap', error);
+            } finally {
+                button.disabled = false;
+            }
+        };
 
         window.updateChunk = async (id, field, value) => {
             try {

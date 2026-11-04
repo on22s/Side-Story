@@ -31,7 +31,7 @@ from audio_generation_owner import (AUDIO_GENERATION_CANCELLED, AudioGenerationC
                                     ensure_audio_generation_owner)
 from project import ProjectManager
 from config_settings import load_app_config
-from utils import (atomic_json_write, get_app_config_path, get_runtime_data_dir,
+from utils import (atomic_json_write, get_app_config_path, get_app_storage_path, get_runtime_data_dir,
                    is_generic_speaker, is_path_inside, safe_load_json,
                    secure_filename)
 from lmstudio_settings import (get_active_llm_config, get_current_status, get_effective_max_tokens,
@@ -133,6 +133,22 @@ def check_disk_space(path, required_gb):
 
 async def _save_upload_limited(file: UploadFile, path: str, max_bytes: int) -> None:
     """Stream an upload to disk and remove it if it exceeds max_bytes."""
+    from source_upload_stage import OwnedSourceUploadStage
+    if isinstance(path, OwnedSourceUploadStage):
+        written = 0
+        try:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded file is too large.")
+                await asyncio.to_thread(path.write, chunk)
+        except Exception:
+            try:
+                await asyncio.to_thread(path.close)
+            except Exception as error:
+                logger.warning('Upload stage cleanup also failed: %s', type(error).__name__)
+            raise
+        return
     written = 0
     try:
         async with aiofiles.open(path, "wb") as out_file:
@@ -156,7 +172,7 @@ VOICE_CONFIG_PATH = os.path.join(DATA_DIR, "voice_config.json")
 SCRIPT_PATH = os.path.join(DATA_DIR, "annotated_script.json")
 AUDIOBOOK_PATH = os.path.join(DATA_DIR, "cloned_audiobook.mp3")
 M4B_PATH = os.path.join(DATA_DIR, "audiobook.m4b")
-UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR != ROOT_DIR else os.path.join(BASE_DIR, "uploads")
+UPLOADS_DIR = get_app_storage_path(DATA_DIR, ROOT_DIR, BASE_DIR, "uploads")
 SCRIPTS_DIR = os.path.join(DATA_DIR, "scripts")
 CHUNKS_PATH = os.path.join(DATA_DIR, "chunks.json")
 VOICE_LIBRARY_PATH = os.path.join(DATA_DIR, "voice_library.json")
@@ -170,9 +186,10 @@ EVALUATION_REVIEWS_DIR = os.path.join(DATA_DIR, "evaluation_reviews")
 os.makedirs(API_LOG_DIR, exist_ok=True)
 
 
-def get_active_book_id() -> Optional[str]:
+def get_active_book_id(*, state=None) -> Optional[str]:
     """Return the stable active-book id stored in state.json, if available."""
-    state = safe_load_json(os.path.join(DATA_DIR, "state.json"), default={})
+    if state is None:
+        state = safe_load_json(os.path.join(DATA_DIR, "state.json"), default={})
     book_id = secure_filename(state.get("active_book_id") or "")
     if book_id:
         return book_id
@@ -737,7 +754,8 @@ def ensure_book_switch_allowed(*, operation="switch books", hold_task_mutex=True
                 task_mutex.close()
             yield
     except TimeoutError as exc:
-        raise HTTPException(status_code=409, detail="Book is busy; try switching again.") from exc
+        raise HTTPException(status_code=409, detail=(
+            f"Could not complete or confirm {operation}; check the current state before retrying.")) from exc
 
 
 def _reap_gpu_leases():
@@ -804,6 +822,8 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources
                     threading.Thread(target=_reap_gpu_leases, daemon=True).start()
             if "cancel" in process_state[task_name]:
                 process_state[task_name]["cancel"] = False
+            if task_name == 'script':
+                process_state[task_name].pop('_script_published_cleanup_stop', None)
             process_state[task_name]["running"] = True
             claim_id = uuid.uuid4().hex
             _task_claims[task_name] = {"id": claim_id, "phase": "claimed", "lease": task_lease,
@@ -1137,6 +1157,8 @@ def _compute_eta(state: dict) -> dict:
 def run_process(command: List[str], task_name: str, cwd: str = None):
     """Run a subprocess and stream its output into process_state logs."""
     state = process_state[task_name]
+    if task_name == 'script':
+        state.pop('_script_published_cleanup_stop', None)
 
     # NOTE: do NOT bail out here if state["running"] is already True. GPU tasks
     # reserve their slot via claim_gpu_task() on the request thread (which sets
@@ -1166,7 +1188,11 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
         return_code, _ = _stream_subprocess_to_logs(
             command, cwd or BASE_DIR, state, log_file=log_path, env=env)
 
-        if state.get("cancel"):
+        if task_name == 'script' and state.get('_script_published_cleanup_stop'):
+            state['logs'].append('The worker was stopped after script publication.')
+            state['logs'].append('Task script completed successfully.')
+            if 'status' in state: state['status'] = 'done'
+        elif state.get("cancel"):
             state["logs"].append(f"Task {task_name} cancelled.")
             if "status" in state: state["status"] = "cancelled"
         elif return_code == 0:
@@ -1221,7 +1247,11 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
         # is unexpected (e.g. AttributeError, KeyError from internal bugs).
         logger.exception(f"Error running {task_name}: {e}")
         state["logs"].append(f"Error: {str(e)}")
-        if "status" in state:
+        if task_name == 'script' and state.get('_script_published_cleanup_stop'):
+            state['logs'].append('The script was published; worker cleanup reported an error.')
+            state['logs'].append('Task script completed successfully.')
+            if 'status' in state: state['status'] = 'done'
+        elif "status" in state:
             state["status"] = "cancelled" if state.get("cancel") else "failed"
     finally:
         if "process"     in state: state["process"]     = None
@@ -1355,6 +1385,8 @@ def _run_claimed_background_task(task_name: str, callback) -> None:
                     logger.exception("Could not record artifact for run %s", run_id)
             if error is not None or state.get("status") == "failed":
                 final_status = "failed"
+            elif task_name == 'script' and state.get('_script_published_cleanup_stop'):
+                final_status = 'completed'
             elif state.get("cancel") or state.get("status") == "cancelled":
                 final_status = "cancelled"
             else:
@@ -1376,8 +1408,16 @@ def ensure_failed_subprocess_stopped(process, state):
 
 
 def get_gpu_task_environment(state: dict, env: dict = None) -> dict:
-    """Copy subprocess settings and describe this task's held kernel lease."""
+    """Copy subprocess settings and describe this task's held kernel lease.
+
+    A worker inherits this runtime's admitted data root instead of resolving
+    an ancestor alias again; an explicitly isolated root that differs from
+    this process's own setting keeps the caller's meaning.
+    """
     environment = dict(os.environ if env is None else env)
+    configured = os.environ.get('ALEXANDRIA_DATA_DIR')
+    if configured and environment.get('ALEXANDRIA_DATA_DIR') == configured:
+        environment['ALEXANDRIA_DATA_DIR'] = DATA_DIR
     with _gpu_lock:
         for task_name, task_state in process_state.items():
             handle = _gpu_leases.get(task_name)
