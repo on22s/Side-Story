@@ -481,7 +481,8 @@ def test_get_voices():
 
 
 def test_save_voice_config():
-    r = post("/api/save_voice_config", json={
+    snapshot = get('/api/voice_config/snapshot').json()
+    r = post("/api/save_voice_config", params={k: snapshot[k] for k in ('revision', 'book_token')}, json={
         f"{TEST_PREFIX}voice": {
             "type": "custom",
             "voice": "Ryan",
