@@ -285,7 +285,7 @@ instructは口調と読み方の短い指示です。既定のdelivery段階は�
 ### 声と音声
 
 - `GET /api/voices`：話者と声設定。
-- `POST /api/save_voice_config`：話者をキーに更新。例 `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`。
+- `POST /api/save_voice_config?revision=...&book_token=...`：話者をキーに更新。例 `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`。`revision` と `book_token` は `GET /api/voice_config/snapshot` から取得します。指定がない場合は `409` を返します。
 - `POST /api/generate_personas`：生成開始。taskは `persona`。
 - `GET /api/chunks`：状態／音声パス付きの順序付き配列。
 - `POST /api/chunks/{index}`：更新。`POST /api/chunks/{index}/generate`：生成。

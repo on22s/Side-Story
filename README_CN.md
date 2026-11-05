@@ -287,7 +287,7 @@ Compose 只将端口发布到 `127.0.0.1:4200`；容器内部绑定 `0.0.0.0` �
 ### 声音与生成
 
 - `GET /api/voices`：读取说话人及声音配置。
-- `POST /api/save_voice_config`：按说话人保存，例如 `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`。
+- `POST /api/save_voice_config?revision=...&book_token=...`：按说话人保存，例如 `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`。`revision` 和 `book_token` 取自 `GET /api/voice_config/snapshot`；缺少它们时返回 `409`。
 - `POST /api/generate_personas`：生成角色及参考音频，对应任务名 `persona`。
 - `GET /api/chunks`：读取按编辑器顺序排列的片段数组，包含状态和音频路径。
 - `POST /api/chunks/{index}`：修改片段；`POST /api/chunks/{index}/generate`：生成该片段。

@@ -448,7 +448,7 @@ Use the base URL shown by your running launcher. Pinokio selects an available po
 ### Voices and rendering
 
 - `GET /api/voices`: list script speakers and their current voice configuration.
-- `POST /api/save_voice_config`: update speaker-keyed settings, such as `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`.
+- `POST /api/save_voice_config?revision=...&book_token=...`: update speaker-keyed settings, such as `{"NARRATOR":{"type":"custom","voice":"Ryan","character_style":"calm"}}`. Take `revision` and `book_token` from `GET /api/voice_config/snapshot`; without them the save returns `409`.
 - `POST /api/generate_personas`: generate personas and voice references; track task `persona`.
 - `GET /api/chunks`: retrieve the editor’s ordered chunk array, including status and audio paths.
 - `POST /api/chunks/{index}`: update a chunk; `POST /api/chunks/{index}/generate`: render it.
