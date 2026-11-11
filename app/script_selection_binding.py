@@ -51,43 +51,57 @@ def _finite_float(value):
     return number
 
 
-def _read_source_snapshot(path, *, include_bytes=False):
+def _capture_raw_source(path, *, owning_root=None, include_bytes=True):
+    """One raw-source authority decision shared by both raw readers.
+
+    Resolves the owning root (known book data directory where the HTTP
+    generation context provides it, else the source's own parent so
+    explicit CLI sources in ordinary directories keep working) and reads
+    through project_scope_files.capture_scope_file, so descriptor,
+    plain-path and hardlink guards apply consistently: an aliased
+    (symlinked / junction) source parent is refused instead of followed
+    into outside bytes (DS3076). `include_bytes` is passed through
+    unchanged: digest-only callers stream the hash without retaining
+    up to 512 MiB of source bytes.
+    """
+    from project_scope_files import capture_scope_file
+    source_abs = Path(os.path.abspath(path))
+    if owning_root is not None:
+        root_abs = Path(os.path.abspath(owning_root))
+        try:
+            relative = source_abs.relative_to(root_abs)
+        except ValueError:
+            raise ValueError('Selected source is outside the book data directory') from None
+    else:
+        root_abs = source_abs.parent
+        relative = Path(source_abs.name)
+    return capture_scope_file(root_abs, relative.as_posix(),
+                              limit=512 * 1024**2, include_bytes=include_bytes)
+
+
+def _read_source_snapshot(path, *, include_bytes=False, owning_root=None,
+                          missing_as_fnf=False):
+    """Read a raw selected source through the shared confined capture seam.
+
+    A plain missing source raises ValueError by default (existing
+    contract); callers whose contract is FileNotFoundError opt in
+    explicitly via missing_as_fnf=True.
+    """
     from docx_publication import capture_docx_group
-    group = capture_docx_group(path)
+    group = capture_docx_group(path, owning_root=owning_root)
     if group is not None:
         return group['proofs']['text']['sha256'], group['text_bytes'] if include_bytes else None
-    source = Path(path)
-    if source.is_symlink() or not source.is_file():
-        raise ValueError('Selected source is unavailable or is a symlink')
-    digest = hashlib.sha256()
-    pieces = [] if include_bytes else None
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
-    descriptor = os.open(source, flags)
-    with os.fdopen(descriptor, 'rb') as f:
-        before = os.fstat(f.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError('Selected source must be a regular file')
-        if before.st_size > 512 * 1024**2:
-            raise ValueError('Selected source exceeds size limit')
-        count = 0
-        for block in iter(lambda: f.read(1024 * 1024), b''):
-            count += len(block)
-            if count > 512 * 1024**2:
-                raise ValueError('Selected source exceeds size limit')
-            digest.update(block)
-            if pieces is not None:
-                pieces.append(block)
-        after = os.fstat(f.fileno())
-    current = source.lstat()
-    signature = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size,
-                              stat.st_mtime_ns, stat.st_ctime_ns)
-    if signature(before) != signature(after) or signature(after) != signature(current):
-        raise ValueError('Selected source changed while it was read')
-    return digest.hexdigest(), b''.join(pieces) if pieces is not None else None
+    proof, raw = _capture_raw_source(path, owning_root=owning_root,
+                                     include_bytes=include_bytes)
+    if not proof.get('exists'):
+        if missing_as_fnf:
+            raise FileNotFoundError(str(path))
+        raise ValueError('Selected source is unavailable')
+    return proof['sha256'], raw
 
 
-def _source_digest(path):
-    return _read_source_snapshot(path)[0]
+def _source_digest(path, *, owning_root=None):
+    return _read_source_snapshot(path, owning_root=owning_root)[0]
 
 
 def _read_selection_state(data_dir, *, required):
@@ -121,7 +135,7 @@ def capture_generation_selection(data_dir, expected_source_path):
             raise ValueError('Selected source changed before script generation')
         return {'book_token': get_book_operation_token(data_dir, state=state),
                 'source_path': expected_source_path,
-                'source_sha256': _source_digest(expected_source_path)}
+                'source_sha256': _source_digest(expected_source_path, owning_root=data_dir)}
 
 
 def _path_digest(source_path):
@@ -187,6 +201,22 @@ def check_binding_source(raw, book_token, source_sha256, *, source_path):
     return binding['published_script_sha256']
 
 
+def saved_binding_matches(binding, *, script_sha256, entries=None, entries_sha256=None):
+    """Self-consistency predicate for a parsed saved binding (single source).
+
+    Shared by the collection overview, the load path and
+    ``updated_saved_binding`` so the saved-binding rule cannot drift
+    between the view and the gate. ``entries`` is fingerprinted in-place;
+    ``entries_sha256`` reuses an already computed fingerprint (the
+    overview's lazy single computation).
+    """
+    from completed_review_receipt import get_review_entries_fingerprint
+    fingerprint = (entries_sha256 if entries_sha256 is not None
+                   else get_review_entries_fingerprint(entries))
+    return (binding.get('published_script_sha256') == script_sha256
+            and binding.get('published_entries_sha256') == fingerprint)
+
+
 def _binding_for_controlled_edit_locked(data_dir, old_script, new_script):
     """Build an edit binding while book admission and the state lock are held."""
     from project_scope_files import capture_scope_file
@@ -205,7 +235,8 @@ def _binding_for_controlled_edit_locked(data_dir, old_script, new_script):
     if not isinstance(source_path, str) or not source_path:
         raise ValueError('Missing source path')
     selected = {'book_token': get_book_operation_token(data_dir, state=state),
-                'source_path': source_path, 'source_sha256': _source_digest(source_path)}
+                'source_path': source_path,
+                'source_sha256': _source_digest(source_path, owning_root=data_dir)}
     published = check_binding_source(raw, selected['book_token'], selected['source_sha256'],
                                      source_path=selected['source_path'])
     if hashlib.sha256(old_script).hexdigest() != published:
@@ -367,8 +398,8 @@ def updated_saved_binding(raw, old_script, new_script):
     if raw is None:
         return None
     binding = parse_script_binding(raw)
-    if (binding['published_script_sha256'] != hashlib.sha256(old_script).hexdigest()
-            or binding['published_entries_sha256'] != get_review_entries_fingerprint(old_entries)):
+    if not saved_binding_matches(binding, script_sha256=hashlib.sha256(old_script).hexdigest(),
+                                 entries=old_entries):
         raise ValueError('Saved script differs from its binding')
     binding['published_script_sha256'] = hashlib.sha256(new_script).hexdigest()
     binding['published_entries_sha256'] = get_review_entries_fingerprint(new_entries)
@@ -522,7 +553,7 @@ def publish_generated_script(data_dir, expected_token, expected_source_path,
                                                limit=512 * 1024**2)
         if current_script['sha256'] != base:
             raise ValueError('Active script changed during generation; edits were preserved')
-        if _source_digest(expected_source_path) != expected_source_sha256:
+        if _source_digest(expected_source_path, owning_root=data_dir) != expected_source_sha256:
             raise ValueError('Selected source changed during script generation')
         binding = make_script_selection_binding(expected_token, expected_source_sha256,
                                                 script_bytes, source_path=expected_source_path)

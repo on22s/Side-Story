@@ -1,12 +1,90 @@
+[English](lora.md) | [中文](lora_CN.md) | [日本語](lora_JA.md) | [Español](lora_ES.md)
+
 # Qwen3-TTS LoRA Training Guide for Alexandria
+
+## What Is LoRA? (Plain English)
+
+LoRA (Low-Rank Adaptation) is a way to **teach the TTS model a new voice** without retraining the entire thing. Think of it like this:
+
+- The base TTS model already knows how to speak — it just doesn't know **your specific voice**
+- A LoRA adapter is a small file (usually under 100 MB) that teaches the model what your voice sounds like
+- Once trained, you can use this adapter to make the TTS model speak in that voice consistently
+
+### Who Is This For?
+
+- **You want a persistent custom voice** that you can reuse across projects
+- **You have clean audio samples** of the voice you want to clone (at least 30 short clips)
+- **You have a GPU with 8+ GB VRAM** (16 GB+ recommended)
+
+### How Does This Relate to the Rest of Alexandria?
+
+1. **Dataset Builder tab** — Where you create the training dataset (audio clips + text)
+2. **Training tab** — Where you run the LoRA training
+3. **Voices tab** — Where you use the trained LoRA adapter by selecting "LoRA Voice" and pointing to the adapter file
+
+### Quick Start: Train Your First Voice
+
+#### Step 1: Prepare Your Audio
+
+You need **30-120 short audio clips** (2-10 seconds each) of the voice you want to clone:
+- Clear recording, minimal background noise
+- Each clip should be a single spoken sentence or phrase
+- Save them as WAV files (16-bit, 24 kHz preferred)
+
+#### Step 2: Create a Dataset
+
+In Alexandria's web UI:
+1. Go to the **Dataset** tab
+2. Upload your audio clips one by one
+3. For each clip, type the text that was spoken
+4. Click **Save Dataset** when done
+
+#### Step 3: Train the LoRA Adapter
+
+1. Go to the **Training** tab
+2. Select your dataset
+3. Use these settings for your first training:
+   - **Epochs:** 9-10 (for ~60 samples)
+   - **Learning Rate:** 1e-6 (the app's default)
+   - **LoRA Rank:** 64
+   - **LoRA Alpha:** 128
+   - **Gradient Accumulation:** 4
+4. Click **Start Training**
+5. Watch the **Loss** number — stop training when it reaches **4.1-4.2**
+
+#### Step 4: Use Your New Voice
+
+1. Go to the **Voices** tab
+2. Select **LoRA Voice** as the voice type
+3. Point to your trained adapter file
+4. Your new voice is ready to use!
+
+### Understanding the Loss Number
+
+The **Loss** is how well the model is learning your voice:
+- **Above 4.5:** The voice sounds clear but doesn't match your target well (undertrained)
+- **4.1-4.2:** The sweet spot — clear audio, good voice match, follows instructions
+- **Below 4.1:** Risk of garbled or broken audio (overtrained) — **stop training immediately**
+- **Below 3.5:** Audio is consistently garbled — you trained too long
+
+**Rule of thumb:** Check the loss every few minutes. When it hits 4.15, stop training. Don't push it lower.
+
+---
 
 ## Quick Reference
 
 | Dataset Size | Epochs | Learning Rate | LoRA r | LoRA Alpha | Grad Accum | Target Loss |
 |-------------|--------|---------------|--------|------------|------------|-------------|
-| ~30 samples | 10-15 | 5e-6 | 64 | 128 | 4 | 4.1-4.2 |
-| ~60 samples | 5-8 | 3e-6 | 64 | 128 | 4 | 4.1-4.2 |
-| ~120 samples | 3 | 2e-6 | 64 | 128 | 4 | 4.1-4.2 |
+| ~30 samples | not measured at 1e-6 | 1e-6 | 64 | 128 | 4 | 4.1-4.2 |
+| ~60 samples | 9-10 | 1e-6 | 64 | 128 | 4 | 4.1-4.2 |
+| ~120 samples | not measured at 1e-6 | 1e-6 | 64 | 128 | 4 | 4.1-4.2 |
+
+> **Use a learning rate of 1e-6.** Earlier versions of this guide recommended 2e-6 to
+> 5e-6. Adapters trained at 5e-6 never stop talking: they don't produce an end of
+> speech, and the training loss looks normal, so the loss can't warn you (see
+> [RECIPES.md](../../RECIPES.md)). The 9-10 epochs above come from the 61-sample runs
+> at 1e-6 in the table at the end of this guide (male-lora-03 and -05). No other
+> dataset size has been measured at 1e-6, so watch the loss and listen to the result.
 
 **Target loss: 4.1-4.2** — this is the sweet spot for voice identity + instruct following + clean audio. Loss 4.1 is the floor; below this, garbling becomes increasingly likely. Note that identical settings can produce slightly different losses between runs, so aim for 4.15-4.2 for a reliable margin.
 

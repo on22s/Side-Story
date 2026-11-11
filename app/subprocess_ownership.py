@@ -102,6 +102,7 @@ def stop_owned_subprocess(process, interrupt=False, timeout=5, *, force_after_gr
     """Stop owned work, retaining the caller's grace and forced-tail policy."""
     graceful_signal = signal.SIGINT if interrupt and sys.platform != 'win32' else signal.SIGTERM
     deadline = time.monotonic() + timeout
+    owner_reaped = False
     try:
         if is_subprocess_tree_running(process):
             try:
@@ -109,8 +110,11 @@ def stop_owned_subprocess(process, interrupt=False, timeout=5, *, force_after_gr
             except ProcessLookupError:
                 pass
             except OSError:
-                if not force_after_grace:
+                if not force_after_grace and not (
+                        sys.platform == 'win32'
+                        and getattr(process, '_alexandria_windows_owner', None) is not None):
                     raise
+                logger.warning('Graceful subprocess stop failed; retaining forced cleanup', exc_info=True)
         if force_after_grace:
             deadline = time.monotonic() + timeout
         while is_subprocess_tree_running(process) and time.monotonic() < deadline:
@@ -124,17 +128,28 @@ def stop_owned_subprocess(process, interrupt=False, timeout=5, *, force_after_gr
                     send_subprocess_signal(process, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            except OSError:
-                if not force_after_grace:
+            except BrokenPipeError:
+                if sys.platform == 'win32' or getattr(process, '_alexandria_control', None) is None:
                     raise
-    if force_after_grace:
-        process.wait()
-    else:
-        process.wait(timeout=timeout)
+                # The POSIX owner may finish and close its channel before the
+                # force tail arrives. Only its bounded, confirmed exit proves
+                # descendant cleanup; a live owner must still fail loudly.
+                process.wait(timeout=timeout)
+                owner_reaped = True
+            except OSError:
+                # A failed force tail must reach the owner's cleanup recovery.
+                raise
+    if not owner_reaped:
+        if force_after_grace:
+            process.wait()
+        else:
+            process.wait(timeout=timeout)
 
 
-def run_owned_capture(command, *, timeout, **kwargs):
+def run_owned_capture(command, *, timeout, cancel_check=None, **kwargs):
     """Capture a bounded command, stopping and reaping its owned descendants."""
+    if cancel_check is not None and cancel_check():
+        raise ValueError("Owned capture cancelled")
     process = start_owned_subprocess(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=(os.name == 'posix'),
@@ -142,7 +157,23 @@ def run_owned_capture(command, *, timeout, **kwargs):
         termination_grace=1, **kwargs)
     try:
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            if cancel_check is None:
+                stdout, stderr = process.communicate(timeout=timeout)
+            else:
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while True:
+                    if cancel_check():
+                        raise ValueError("Owned capture cancelled")
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    try:
+                        stdout, stderr = process.communicate(
+                            timeout=.1 if remaining is None else max(0, min(.1, remaining)))
+                        break
+                    except subprocess.TimeoutExpired as error:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise subprocess.TimeoutExpired(
+                                error.cmd, timeout, output=error.output,
+                                stderr=error.stderr) from error
         except BaseException:
             stop_owned_subprocess(process, timeout=1)
             raise

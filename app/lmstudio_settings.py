@@ -676,8 +676,6 @@ def invalidate_remote_status_cache(ssh_alias=None):
             _remote_status_cache_epoch += 1
             _remote_status_alias_epochs.clear()
             _local_status_cache_epoch += 1
-            _remote_status_cache_epoch += 1
-            _remote_status_alias_epochs.clear()
             _remote_status_cache.clear()
         else:
             _remote_status_alias_epochs.pop(ssh_alias, None)

@@ -20,8 +20,7 @@ from types import MappingProxyType
 from core import llm_timeout_seconds
 from source_encoding import read_source_text, get_normalized_source_newlines
 from llm_provider import (make_llm_client, make_run_client, get_run_model_binding,
-                          get_run_fingerprint_identity, get_provider_extra_body,
-                          is_manual_client)
+                          get_run_fingerprint_identity, get_provider_extra_body)
 from llm_request_budget import get_prompt_token_estimate
 
 from judge_reason_log import record_judge_run
@@ -1890,14 +1889,8 @@ def validate_attribution_vote_settings(votes, temperature):
 
 def get_segment_chunk_records(source_text, chunk_size, params):
     """Bound opt-in large Pass-1 targets with the same prompt/output budget."""
-    if chunk_size <= 30000:
+    if chunk_size <= 30000 or not params.context_length:
         return split_into_chunk_records(source_text, max_size=chunk_size)
-    # Offline admission has no model context yet, but can still split to
-    # the configured response ceiling. Runtime applies the real context too.
-    # Keep source chunks within the initial allowance; later attribution and
-    # instruction admission may use retry headroom for observed reasoning.
-    sizing_params = replace(
-        params, hard_max_tokens=min(params.max_tokens, params.hard_max_tokens))
     size = chunk_size
     system_prompt, user_template = load_segment_prompts()
     if params.segment_system_prompt:
@@ -1909,7 +1902,7 @@ def get_segment_chunk_records(source_text, chunk_size, params):
         if chunk_size <= 30000 or not params.context_length:
             return records
         if all(does_request_fit_context(system_prompt, user_template.format(chunk=record["text"]),
-                                        sizing_params, resolve_completion_ceiling(
+                                        params, resolve_completion_ceiling(
                                             len(record["text"].split()), params,
                                             source_text=record["text"]))
                for record in records):
@@ -2689,12 +2682,8 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
         list(iter_entry_windows([], attribute_batch_size, target))
     if is_three_pass_context_required(chunk_size, attribute_context_chars,
                                       attribute_target_chars, instruct_target_chars, instruct_context_chars):
-        # Manual transport has no serving API from which to discover context.
-        # Keep its output-budget checks, without inventing a model context or
-        # requiring one before the user can receive a copy-and-paste request.
-        if (not is_manual_client(client)
-                and (not params.context_length or params.context_length <= 0)):
-            raise TokenBudgetError("Character batching and larger targets require a configured model context length.")
+        if not params.context_length or params.context_length <= 0:
+            raise TokenBudgetError("Character batching and larger targets require a known model context length. Set Total context budget (tokens) in Setup for this LLM profile, or use a server exposing its loaded context.")
     # Preserve None in checkpoint identity while validating explicit controls.
     get_context_rescue_windows(context_windows)
     validate_attribution_vote_settings(attribution_votes, vote_temperature)
@@ -3717,7 +3706,7 @@ def get_output_paths(data_dir, requested_output=None):
 
 
 def get_prepared_source(path, strip_front_matter=True, report=lambda message: None,
-                        expected_source_sha256=None):
+                        expected_source_sha256=None, owning_root=None):
     """-> (text, unicode_report): the source exactly as generation sees it.
 
     One sequence for every caller that sends the book to a model - generation
@@ -3726,15 +3715,19 @@ def get_prepared_source(path, strip_front_matter=True, report=lambda message: No
     receives the same notices main() has always printed. Raises ValueError for
     a source the shared gate refuses.
     """
-    if expected_source_sha256 is None:
-        book, source_encoding = read_source_text(path)
-    else:
-        from script_selection_binding import _read_source_snapshot, _digest
-        from source_encoding import get_decoded_source_text
-        digest, raw = _read_source_snapshot(path, include_bytes=True)
-        if digest != _digest(expected_source_sha256):
-            raise ValueError('Selected source changed before it was read for generation')
-        book, source_encoding = get_decoded_source_text(raw)
+    # One raw capture/decoding authority for BOTH branches: the confined
+    # snapshot refuses aliased/hardlinked sources exactly as the bound
+    # generation path does, so cast-list and speaker-review callers
+    # (which pass no expected digest) can never build a cast from
+    # outside bytes generation would refuse. The expected digest is
+    # compared only when supplied.
+    from script_selection_binding import _read_source_snapshot, _digest
+    from source_encoding import get_decoded_source_text
+    digest, raw = _read_source_snapshot(path, include_bytes=True,
+                                        owning_root=owning_root)
+    if expected_source_sha256 is not None and digest != _digest(expected_source_sha256):
+        raise ValueError('Selected source changed before it was read for generation')
+    book, source_encoding = get_decoded_source_text(raw)
     book = get_normalized_source_newlines(book)
     if source_encoding != "utf-8":
         report(f"Read {path} as {source_encoding} (not valid UTF-8)")
@@ -3865,16 +3858,21 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    # HTTP generation (active-book identity present) runs with the known
+    # owning book root; an explicit CLI source keeps its parent authority.
+    owning_root = data_dir if args.active_book_token is not None else None
     input_source_sha256 = None
     if args.literal_source_preserving:
         from script_selection_binding import _read_source_snapshot
-        input_source_sha256, _ = _read_source_snapshot(args.input_file)
+        input_source_sha256, _ = _read_source_snapshot(
+            args.input_file, owning_root=owning_root)
     try:
         expected_source_sha256 = (args.active_source_sha256
                                   if args.active_book_token is not None
                                   else input_source_sha256)
         book, unicode_report = get_prepared_source(
             args.input_file, args.strip_front_matter, report=print,
+            owning_root=owning_root,
             **({'expected_source_sha256': expected_source_sha256}
                if expected_source_sha256 is not None else {}))
     except ValueError as exc:

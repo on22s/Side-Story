@@ -1,9 +1,235 @@
-"""Runtime ECAPA speaker comparison used by the voice-drift check."""
-import json
-import os
-import subprocess
+"""How close is each shipped LoRA voice to the narrator it was trained on?
 
-APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WHAT THIS IS FOR. The library holds 75 trained adapters. Their quality has
+never been measured against the humans they imitate - `clone_vs_lora` and
+`ljspeech_score` used purpose-built eval sets, not the voices that actually
+ship. Every source dataset carries the narrator's own audio and transcripts, so
+the comparison is available and has simply never been run.
+
+CONTAMINATION, STATED FIRST BECAUSE IT BOUNDS EVERYTHING BELOW. Each dataset zip
+splits 180 train / 20 val with zero overlap. `train_lora.py` loads the ROOT
+`metadata.jsonl`, which is all 200, so **the adapters were trained on their own
+validation set** - 67 of 75 record num_samples=200. The split exists and the
+trainer ignores it.
+
+So these scores are an UPPER BOUND: the model has heard every line it is being
+asked to reproduce. What they can still do is RANK, because every adapter is
+contaminated identically. A voice that scores badly here scores badly on
+material it memorised, which is a strong signal. A voice that scores well has
+proven only that it can repeat its own training data.
+
+An honest held-out number needs clips from the source audiobooks that never
+entered any dataset. That is a preparer run, not this script.
+
+METRICS. Speaker embedding (ECAPA, via the sibling interpreter that has
+speechbrain), plus the preservation set: vocal tract length from formant
+dispersion, f0 median and spread, jitter, shimmer, HNR, and duration ratio.
+Deliberately NOT a gender or age label - this asks only whether the adapter
+carried the narrator's own properties across.
+"""
+import argparse
+import json
+import math
+from pathlib import Path
+import os
+import statistics
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+APP = os.path.join(REPO, "app")
+sys.path.insert(0, APP)
+
+DEFAULT_ZIPS = os.environ.get(
+    "ALEXANDRIA_VOICE_ZIPS",
+    os.path.join(os.path.expanduser("~"), "Desktop", "zips2",
+                 "_deduped_labeled"))
+
+
+# A retrain's reference sample lives in the campaign's working directory, whose
+# layout is <campaign>/<adapter>/data/ref.wav - so the parent directory is the
+# literal word "data", and for two adapters "train". Inferring the dataset from
+# that path yielded those words for 56 of 75 adapters, no zip matched them, and
+# every fidelity figure since has described 18 adapters while reading as though
+# it described the library. GOALS 2.7 recorded the cause as "their source zips
+# are absent"; the zips were there all along.
+#
+# training_meta is NOT wrong - ref_sample_audio faithfully records where that
+# sample sits. The inference from it was. manifest.json carries `dataset_id`
+# per adapter, which is the recorded answer rather than a reconstructed one,
+# and is authoritative here (Rule 15): checked against all 19 adapters whose
+# path-derived name was already a real dataset, it agrees 19/19 with none
+# disagreeing, and it supplies an id for all 56 placeholders - every one of
+# which then finds its zip.
+PLACEHOLDER_DATASETS = {"data", "train"}
+
+
+def get_manifest_dataset_ids(models_dir):
+    """-> {adapter_id: dataset_id} from lora_models/manifest.json, if present."""
+    path = os.path.join(models_dir, "manifest.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            entries = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return {e["id"]: e["dataset_id"] for e in entries
+            if isinstance(e, dict) and e.get("id") and e.get("dataset_id")}
+
+
+def adapter_sources(models_dir):
+    """-> [(adapter_name, dataset_name, meta)] for every adapter with a source.
+
+    The dataset is the manifest's recorded `dataset_id` where there is one, and
+    the directory holding ref_sample_audio otherwise, so an adapter missing
+    from the manifest still resolves exactly as it did before.
+    """
+    recorded = get_manifest_dataset_ids(models_dir)
+    out = []
+    for name in sorted(os.listdir(models_dir)):
+        meta_path = os.path.join(models_dir, name, "training_meta.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        ref = str(meta.get("ref_sample_audio") or "")
+        dataset = os.path.basename(os.path.dirname(ref)) if ref else ""
+        # A placeholder is never a dataset, so it must not survive as one even
+        # when the manifest has nothing to say: reporting "data" as an identity
+        # is what made 56 adapters look measurable and score nothing.
+        if dataset in PLACEHOLDER_DATASETS:
+            dataset = recorded.get(name, "")
+        else:
+            dataset = recorded.get(name, dataset)
+        if dataset:
+            out.append((name, dataset, meta))
+    return out
+
+
+def find_zip(dataset, zip_dir, _cache={}):
+    """Match a dataset name to its source zip.
+
+    The zip names carry punctuation the dataset names have had stripped
+    (colons, brackets), so this compares on alphanumerics only rather than
+    trying to reverse the slugging.
+    """
+    if "index" not in _cache:
+        idx = {}
+        for f in os.listdir(zip_dir):
+            if f.endswith(".zip"):
+                key = "".join(c for c in f.lower() if c.isalnum())
+                idx[key] = os.path.join(zip_dir, f)
+        _cache["index"] = idx
+    key = "".join(c for c in dataset.lower() if c.isalnum())
+    for zkey, path in _cache["index"].items():
+        if zkey.startswith(key):
+            return path
+    return None
+
+
+def get_val_clip_entries(archive, limit):
+    """Return the producer's ordered, available validation clips without extraction."""
+    names = set(archive.namelist())
+    if "val/metadata.jsonl" not in names:
+        return []
+    entries = [json.loads(line) for line in
+               archive.read("val/metadata.jsonl").decode("utf-8").splitlines() if line.strip()]
+    return [entry for entry in entries[:limit]
+            if entry.get("audio_filepath") and entry["audio_filepath"] in names]
+
+
+def extract_val(zip_path, out_dir, limit):
+    """Extract selected validation clips; own creation of the destination directory."""
+    os.makedirs(out_dir, exist_ok=True)
+    rows = []
+    with zipfile.ZipFile(zip_path) as archive:
+        for entry in get_val_clip_entries(archive, limit):
+            dest = os.path.join(out_dir, os.path.basename(entry["audio_filepath"]))
+            with open(dest, "wb") as handle:
+                handle.write(archive.read(entry["audio_filepath"]))
+            rows.append((dest, entry.get("text") or ""))
+    return rows
+
+
+def get_fidelity_expected_clips(models, zips, lines, limit_adapters=0):
+    """Read current benchmark scope, refusing unavailable source prerequisites."""
+    try:
+        if type(lines) is not int or lines < 1:
+            raise ValueError("positive validation clip count required")
+        pairs = adapter_sources(models)
+        if limit_adapters:
+            pairs = pairs[:limit_adapters]
+        if not pairs:
+            raise ValueError("no measurable adapters")
+        expected, cache = {}, {}
+        for name, dataset, _ in pairs:
+            source = find_zip(dataset, zips, cache)
+            if source is None:
+                raise ValueError(f"source ZIP not found for {name}: {dataset}")
+            with zipfile.ZipFile(source) as archive:
+                clips = get_val_clip_entries(archive, lines)
+            names = [os.path.basename(entry["audio_filepath"]) for entry in clips]
+            if not names or len(set(names)) != len(names):
+                raise ValueError(f"missing or ambiguous validation clips for {name}")
+            expected[name] = (dataset, names)
+        return expected
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(f"cannot validate fidelity source scope: {exc}") from exc
+
+
+def get_completed_library_fidelity(path, models, zips, work, lines, seed, limit_adapters=0):
+    """Read a complete result for this seed/scope; never start models or repair it."""
+    try:
+        __import__("soundfile")
+    except ImportError as exc:
+        raise RuntimeError(f"cannot validate fidelity audio dependency: {exc}") from exc
+    expected = get_fidelity_expected_clips(models, zips, lines, limit_adapters)
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if (not isinstance(document, dict) or type(document.get("seed")) is not int
+            or document["seed"] != seed or type(document.get("lines_per_adapter")) is not int
+            or document["lines_per_adapter"] != lines or document.get("ecapa_error") is not None):
+        raise ValueError("fidelity result has different seed/scope or an ECAPA failure")
+    results = document.get("results")
+    if not isinstance(results, list) or any(not isinstance(row, dict) for row in results):
+        raise ValueError("fidelity requires adapter records")
+    names = [row.get("adapter") for row in results]
+    if any(not isinstance(name, str) for name in names) or len(set(names)) != len(names) or set(names) != set(expected):
+        raise ValueError("fidelity adapter coverage is incomplete or duplicated")
+    from audio_validation import validate_generated_audio, GeneratedAudioError
+    for result in results:
+        name = result["adapter"]
+        dataset, clips = expected[name]
+        rows = result.get("rows")
+        if (result.get("error") or result.get("dataset") != dataset
+                or not isinstance(rows, list) or len(rows) != len(clips)):
+            raise ValueError(f"fidelity clip coverage incomplete for {name}")
+        scores = []
+        for index, (row, clip) in enumerate(zip(rows, clips)):
+            if not isinstance(row, dict) or row.get("error"):
+                raise ValueError(f"fidelity generation failed for {name} clip {index}")
+            score = row.get("ecapa")
+            if type(score) not in (float, int) or not math.isfinite(score) or not -1 <= score <= 1:
+                raise ValueError(f"invalid fidelity score for {name} clip {index}")
+            scores.append(score)
+            for field, filename in (("human_wav", clip), ("gen_wav", f"gen_{index}.wav")):
+                value = row.get(field)
+                if not isinstance(value, str) or (Path(REPO) / value).resolve() != (Path(work) / name / filename).resolve():
+                    raise ValueError(f"wrong fidelity audio identity for {name} clip {index}")
+                try:
+                    validate_generated_audio(str(Path(REPO) / value), "cached fidelity")
+                except GeneratedAudioError as exc:
+                    raise ValueError(str(exc)) from exc
+        aggregate = result.get("ecapa")
+        if (type(aggregate) not in (float, int) or not math.isfinite(aggregate)
+                or aggregate != round(statistics.median(scores), 4)):
+            raise ValueError(f"fidelity aggregate does not match clips for {name}")
+    return document
 
 
 def ecapa_pairs(pairs, python_bin, timeout=3600):
@@ -52,3 +278,166 @@ def ecapa_pairs(pairs, python_bin, timeout=3600):
         return json.loads(out.stdout.strip().splitlines()[-1]), None
     except Exception as exc:                                # noqa: BLE001
         return [None] * len(pairs), str(exc)[:140]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--models", default=os.path.join(REPO, "lora_models"))
+    ap.add_argument("--zips", default=DEFAULT_ZIPS)
+    ap.add_argument("--lines", type=int, default=4,
+                    help="val clips per adapter")
+    ap.add_argument("--limit-adapters", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--work", default=os.path.join(
+        REPO, "ab_test_runtime", "library_fidelity"))
+    ap.add_argument("--ecapa-python", default=os.environ.get(
+        "ALEXANDRIA_SIBLING_PYTHON",
+        os.path.join(os.path.dirname(REPO), "alexandria-audiobook.git",
+                     "app", "env", "bin", "python")))
+    ap.add_argument("--out", default=os.path.join(
+        REPO, "ab_test_runtime", "experiments", "library_voice_fidelity.json"))
+    ap.add_argument("--check-artifact", action="store_true",
+                    help="read-only cache admission: 0 complete, 1 rerun, 2 prerequisites unavailable")
+    args = ap.parse_args()
+    if args.check_artifact:
+        try:
+            get_completed_library_fidelity(args.out, args.models, args.zips, args.work,
+                                           args.lines, args.seed, args.limit_adapters)
+        except RuntimeError as exc:
+            print(f"REFUSING: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"INCOMPLETE: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            print(f"REFUSING: fidelity admission failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print("COMPLETE: fidelity seed and all adapter/clip records validated")
+        return
+
+    sys.path.insert(0, os.path.join(APP, "experiments"))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "vcv", os.path.join(APP, "experiments", "voice_compare_view.py"))
+    vcv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vcv)
+
+    from tts import TTSEngine
+    from experiments.generation import render, GenerationFailed
+    config = json.load(open(os.path.join(APP, "config.json"), encoding="utf-8"))
+    engine = TTSEngine(config)
+
+    pairs = adapter_sources(args.models)
+    if args.limit_adapters:
+        pairs = pairs[:args.limit_adapters]
+    os.makedirs(args.work, exist_ok=True)
+    print(f"{len(pairs)} adapters, {args.lines} val clips each\n")
+
+    results, ecapa_jobs, ecapa_index = [], [], []
+    for name, dataset, meta in pairs:
+        zpath = find_zip(dataset, args.zips)
+        if not zpath:
+            results.append({"adapter": name, "dataset": dataset,
+                            "error": "source zip not found"})
+            print(f"  {name[:34]:36} NO ZIP")
+            continue
+        wdir = os.path.join(args.work, name)
+        os.makedirs(wdir, exist_ok=True)
+        clips = extract_val(zpath, wdir, args.lines)
+        if not clips:
+            results.append({"adapter": name, "dataset": dataset,
+                            "error": "no val clips"})
+            print(f"  {name[:34]:36} NO VAL")
+            continue
+
+        entry = {"type": "lora",
+                 "adapter_path": os.path.relpath(
+                     os.path.join(args.models, name), REPO),
+                 "seed": str(args.seed)}
+        rows = []
+        for i, (human_wav, text) in enumerate(clips):
+            gen = os.path.join(wdir, f"gen_{i}.wav")
+            try:
+                render(engine, text, "", "SPEAKER", {"SPEAKER": entry}, entry, gen)
+            except GenerationFailed as exc:
+                rows.append({"error": str(exc)[:100]})
+                continue
+            hq, aq = vcv.voice_quality(human_wav), vcv.voice_quality(gen)
+            hp, apn = vcv.pitch_stats(human_wav), vcv.pitch_stats(gen)
+            hv, av = vcv.vocal_tract_length(human_wav), vcv.vocal_tract_length(gen)
+            import soundfile as sf
+            hs = sf.info(human_wav).frames / sf.info(human_wav).samplerate
+            gs = sf.info(gen).frames / sf.info(gen).samplerate
+
+            def ratio(a, b):
+                return round(a / b, 4) if (a and b) else None
+            rows.append({
+                "human_wav": os.path.relpath(human_wav, REPO),
+                "gen_wav": os.path.relpath(gen, REPO),
+                "dur_ratio": round(gs / hs, 3) if hs else None,
+                "vtl_ratio": ratio(av, hv),
+                "f0_median_ratio": ratio(apn.get("f0_median"), hp.get("f0_median")),
+                "f0_spread_ratio": ratio(apn.get("f0_spread"), hp.get("f0_spread")),
+                "jitter_ratio": ratio(aq.get("jitter_local"), hq.get("jitter_local")),
+                "shimmer_ratio": ratio(aq.get("shimmer_local"), hq.get("shimmer_local")),
+                "hnr_ratio": ratio(aq.get("hnr_db"), hq.get("hnr_db")),
+            })
+            ecapa_jobs.append([human_wav, gen])
+            ecapa_index.append((len(results), len(rows) - 1))
+
+        rec = {"adapter": name, "dataset": dataset,
+               "num_samples_trained": meta.get("num_samples"),
+               "final_loss": meta.get("final_loss"), "rows": rows}
+        results.append(rec)
+        ok = [r for r in rows if not r.get("error")]
+        if ok:
+            def med(k):
+                v = [r[k] for r in ok if r.get(k) is not None]
+                return round(statistics.median(v), 3) if v else None
+            rec.update({"dur_ratio": med("dur_ratio"),
+                        "vtl_ratio": med("vtl_ratio"),
+                        "f0_median_ratio": med("f0_median_ratio"),
+                        "f0_spread_ratio": med("f0_spread_ratio")})
+            print(f"  {name[:34]:36} dur {rec['dur_ratio']}  vtl {rec['vtl_ratio']}"
+                  f"  f0 {rec['f0_median_ratio']}  spread {rec['f0_spread_ratio']}")
+
+    cos, err = ecapa_pairs(ecapa_jobs, args.ecapa_python)
+    if err:
+        print(f"\n  ECAPA unavailable: {err}")
+    else:
+        for (ri, rj), value in zip(ecapa_index, cos):
+            results[ri]["rows"][rj]["ecapa"] = value
+        for rec in results:
+            vals = [r.get("ecapa") for r in rec.get("rows", [])
+                    if r.get("ecapa") is not None]
+            if vals:
+                rec["ecapa"] = round(statistics.median(vals), 4)
+
+    scored = [r for r in results if r.get("ecapa") is not None]
+    scored.sort(key=lambda r: r["ecapa"])
+    if scored:
+        print(f"\n  {'WORST 10 by speaker similarity':46}{'ecapa':>8}{'vtl':>7}{'f0':>7}")
+        for r in scored[:10]:
+            print(f"  {r['adapter'][:44]:46}{r['ecapa']:8.3f}"
+                  f"{r.get('vtl_ratio') or float('nan'):7.2f}"
+                  f"{r.get('f0_median_ratio') or float('nan'):7.2f}")
+
+    doc = {"contamination": "adapters trained on their own val split; scores "
+                            "are an upper bound, useful for ranking only",
+           "lines_per_adapter": args.lines, "seed": args.seed,
+           "ecapa_error": err, "results": results}
+    try:
+        from experiments.provenance import provenance
+        doc["provenance"] = provenance(__file__, args)
+    except Exception as exc:                                # noqa: BLE001
+        doc["provenance"] = {"error": str(exc)[:120]}
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    from utils import atomic_json_write
+    atomic_json_write(doc, args.out)
+    print(f"\nwrote {args.out}")
+    if not scored:
+        sys.exit(3)
+
+
+if __name__ == "__main__":
+    main()

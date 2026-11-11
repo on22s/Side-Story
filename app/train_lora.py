@@ -902,7 +902,7 @@ def train(args):
     # consistent with "occasional large batch hit a VRAM limit" - bail out
     # loudly instead of finishing quietly on almost no real training.
     MAX_CONSECUTIVE_OOM_SKIPS = 10
-
+    
     # Access underlying model structure (stable references)
     base_talker = peft_talker.base_model.model  # original talker with LoRA layers
     transformer = base_talker.model  # Qwen3TTSTalkerModel

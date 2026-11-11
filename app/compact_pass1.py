@@ -144,7 +144,6 @@ def segment_chunk_compact(client, model_name, chunk, params, attempt_sink=None):
         max(1, len(chunk.split())), params, reasoning_allowance=params.reasoning_allowance)
     cap = min(params.max_tokens, ceiling, COMPACT_MAX_TOKENS)
     bounded = replace(
-        # Side-Story's Pass 1 (_call_segment) bounds these two only.
         params, max_tokens=cap, hard_max_tokens=min(params.hard_max_tokens, cap),
         request_output_ceiling=min(params.request_output_ceiling or cap, cap),
         temperature=(params.segment_temperature

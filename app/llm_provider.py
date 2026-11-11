@@ -158,8 +158,6 @@ def classify_llm_error(error):
         return {"category": "timeout", "status_code": status_code, "retryable": True}
     if "connect" in lowered:
         return {"category": "connection_error", "status_code": status_code, "retryable": True}
-    if any(token in lowered for token in ("content policy", "content filter", "safety", "nsfw")):
-        return {"category": "content_policy", "status_code": status_code, "retryable": False}
     return {"category": "api_error", "status_code": status_code, "retryable": True}
 
 
@@ -426,13 +424,6 @@ class _FailoverCompletions:
 
     def __getattr__(self, name):
         return getattr(self._owner._client().chat.completions, name)
-
-
-def is_manual_client(client):
-    """Whether the currently serving transport is the manual reply queue."""
-    if isinstance(client, FailoverClient):
-        client = client._pair[client.get_active_profile_index()][0]
-    return isinstance(client, ManualClient)
 
 
 def make_run_client(config, active_llm_config, timeout):

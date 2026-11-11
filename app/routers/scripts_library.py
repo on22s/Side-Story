@@ -11,7 +11,7 @@ import uuid
 import contextlib
 from pathlib import Path
 from book_state_transaction import (ensure_book_state, apply_book_state_locked,
-                                    get_book_operation_token)
+                                    get_book_operation_token, get_book_snapshot)
 from publication_source import (get_publication_source_path, get_publication_source_capture,
                                 get_saved_publication_source_bytes)
 
@@ -36,6 +36,7 @@ from core import (
     process_state, is_task_running,
 )
 from project import CHAPTER_EXPORT_DIR
+from translated_edition import PROPOSALS_DIR as TRANSLATION_PROPOSALS_DIR
 from review_script import _checkpoint_path, clear_checkpoint
 from completed_review_receipt import get_review_receipt_path
 from generate_script import get_generation_checkpoint_path, get_generation_quality_path
@@ -44,8 +45,8 @@ from script_preflight import audit_script
 from script_repair import build_deterministic_repair
 from script_selection_binding import (BINDING_NAME, MAX_BINDING_BYTES,
     capture_generation_selection, check_binding_source, parse_script_binding,
-    make_script_selection_binding, updated_saved_binding, _read_selection_state,
-    saved_script_is_active_source)
+    make_script_selection_binding, saved_binding_matches, updated_saved_binding,
+    _read_selection_state, saved_script_is_active_source)
 from editor_poll_snapshot import get_snapshot_digest
 from completed_review_receipt import get_review_entries_fingerprint
 from speaker_repair import apply_speaker_selections, build_speaker_review
@@ -54,7 +55,8 @@ from utils import (atomic_json_write, backup_file_with_timestamp, file_lock,
                    get_timestamped_backup_path, is_generic_speaker, safe_load_json)
 from sound_design_registry import (ACTIVE_CUES, get_saved_sound_design_path,
                                    MAX_REGISTRY_BYTES)
-from project_scope_files import capture_scope_file
+from project_scope_files import capture_scope_file, MAX_SCRIPT_BYTES
+from collection_overview import MAX_OVERVIEW_BOOKS
 from speech_numbers import STATE_KEY as DATE_ORDER_KEY, DATE_ORDER_CHOICES
 from sound_design_renditions import (ACTIVE_RENDITIONS, get_saved_sound_renditions_path,
                                      capture_sound_design_companions, MAX_RENDITION_BYTES)
@@ -62,7 +64,6 @@ from sound_design_renditions import (ACTIVE_RENDITIONS, get_saved_sound_renditio
 
 logger = logging.getLogger("AlexandriaUI")
 router = APIRouter()
-MAX_SCRIPT_BYTES = 512 * 1024**2
 
 
 def _get_saved_book_companions(path):
@@ -134,6 +135,25 @@ def _saved_mutation_admission():
         yield
 
 
+def _discard_another_book_proposals():
+    """Remove a different book's translation proposals after a committed load.
+
+    Best effort by design: proposals are optional review artifacts, are saved
+    under the book's id, and ``translated_edition.get_proposal`` refuses one
+    whose id is not the active book. A removal failure therefore must never
+    turn an already-committed book load into an error; it is logged instead.
+    """
+    path = os.path.join(DATA_DIR, TRANSLATION_PROPOSALS_DIR)
+    try:
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+    except OSError as error:
+        logger.warning(
+            f"Could not remove another book's translation proposals: {error}")
+
+
 def _require_saved_book_idle():
     busy = [name for name in ("script", "review", "persona", "nicknames",
                              "batch_script", "batch_review")
@@ -192,10 +212,12 @@ def _get_book_workspace_sync():
 
     try:
         with ensure_book_state(DATA_DIR, recover=False):
-            return get_book_workspace(DATA_DIR, {"MP3": AUDIOBOOK_PATH, "M4B": M4B_PATH},
-                                      get_voice_rows, project_manager.get_chunk_audio_path, export_states=process_state)
-    except (OSError, ValueError, TypeError) as error:
-        logger.warning("Book workspace inputs could not be read: %s", type(error).__name__)
+            workspace = get_book_workspace(DATA_DIR, {"MP3": AUDIOBOOK_PATH, "M4B": M4B_PATH},
+                                          get_voice_rows, project_manager.get_chunk_audio_path, export_states=process_state)
+            workspace["collection_overview_limit"] = MAX_OVERVIEW_BOOKS
+            return workspace
+    except (OSError, ValueError, TypeError, RecursionError, AttributeError, KeyError) as error:
+        logger.warning("Book workspace inputs could not be read: %s: %s", type(error).__name__, str(error)[:240])
         raise HTTPException(status_code=409, detail=(
             "Book workspace could not read the saved book. Complete any pending book recovery "
             "or inspect the script and voice settings. No recovery was attempted. "
@@ -206,6 +228,128 @@ def _get_book_workspace_sync():
 async def get_book_workspace_status():
     """Summarize selected-book progress without initializing chunks or generating audio."""
     return await asyncio.to_thread(_get_book_workspace_sync)
+
+
+def _get_book_recovery_sync():
+    from book_state_recovery import get_book_recovery_summary
+    try:
+        return get_book_recovery_summary(DATA_DIR)
+    except (OSError, ValueError) as error:
+        logger.warning("Book recovery state could not be read: %s: %s", type(error).__name__, str(error)[:240])
+        raise HTTPException(status_code=409, detail=(
+            "Book recovery state could not be read. Run python app/book_state_recovery.py inspect "
+            "to see why. Nothing was changed.")) from error
+
+
+@router.get("/api/book/recovery")
+async def get_book_recovery_status():
+    """Read-only: an interrupted book switch, set-aside evidence, and the commands that help (#1660)."""
+    return await asyncio.to_thread(_get_book_recovery_sync)
+
+
+class CollectionOverviewRequest(BaseModel):
+    names: list[str] = Field(default_factory=list, max_length=MAX_OVERVIEW_BOOKS)
+
+
+def _active_byte_hashes():
+    """Exact DATA_DIR script/voice byte hashes for active fencing."""
+    try:
+        script_info, _ = capture_scope_file(DATA_DIR, 'annotated_script.json',
+                                            limit=MAX_SCRIPT_BYTES, include_bytes=False)
+    except (OSError, ValueError, TypeError, RecursionError) as error:
+        raise ValueError('Active script identity requires inspection') from error
+    script_hash = script_info.get('sha256') if script_info.get('exists') else None
+    if script_info.get('exists') and not isinstance(script_hash, str):
+        raise ValueError('Active script identity requires inspection')
+    try:
+        voice_info, _ = capture_scope_file(DATA_DIR, 'voice_config.json',
+                                          limit=MAX_SCRIPT_BYTES, include_bytes=False)
+    except (OSError, ValueError, TypeError, RecursionError) as error:
+        raise ValueError('Active voices identity requires inspection') from error
+    voice_hash = voice_info.get('sha256') if voice_info.get('exists') else None
+    if voice_info.get('exists') and not isinstance(voice_hash, str):
+        raise ValueError('Active voices identity requires inspection')
+    # None with a missing file must still fence against a present saved
+    # copy; old direct callers pass None for "not supplied".
+    return script_hash, voice_hash
+
+
+def _capture_active_facts(safe_names):
+    """Active workspace + hashes; a failing active read never aborts the rows.
+
+    Returns (workspace, saved_name, script_sha, voice_sha). Uses the fenced
+    component digests already captured by the workspace (efficiency-4)
+    and only falls back to a separate fenced capture when the revision
+    was unavailable.
+    """
+    from book_workspace import get_book_workspace
+    from routers.voices import get_voice_rows
+    from core import project_manager
+    for safe in safe_names:
+        if not saved_script_is_active_source(DATA_DIR, os.path.join(SCRIPTS_DIR, f"{safe}.json")):
+            continue
+        try:
+            workspace = get_book_workspace(DATA_DIR, {"MP3": AUDIOBOOK_PATH, "M4B": M4B_PATH},
+                                          get_voice_rows, project_manager.get_chunk_audio_path,
+                                          export_states=process_state, include_input_revision=True)
+        except (OSError, ValueError, TypeError, RecursionError, AttributeError, KeyError) as error:
+            logger.warning("Collection overview active book %s could not be read: %s: %s",
+                           safe, type(error).__name__, str(error)[:240])
+            return None, safe, None, None
+        input_hashes = (workspace.get('export_review') or {}).get('input_hashes') or {}
+        script_sha, voice_sha = input_hashes.get('script'), input_hashes.get('voice')
+        if not isinstance(script_sha, str) or (voice_sha is not None and not isinstance(voice_sha, str)):
+            try:
+                script_sha, voice_sha = _active_byte_hashes()
+            except (OSError, ValueError, TypeError, RecursionError) as error:
+                logger.warning("Collection overview active book %s identity requires inspection: %s: %s",
+                               safe, type(error).__name__, str(error)[:240])
+                return None, safe, None, None
+        return workspace, safe, script_sha, voice_sha
+    return None, None, None, None
+
+
+def _get_collection_overview_sync(names):
+    """Read-only projection for explicitly selected saved books.
+
+    Never switches the active book, starts inference, changes settings,
+    approves review or publishes output. The active book's workspace facts
+    are attached only to the row that is the active source.
+    """
+    from collection_overview import get_collection_overview
+    from routers.voices import get_voice_rows
+    safe_names = []
+    for name in names:
+        safe = _require_saved_book_name(name)
+        if safe not in safe_names:
+            safe_names.append(safe)
+    try:
+        # The active (DATA_DIR) lock is held only while the bounded active
+        # facts are captured; the per-book saved scan then runs under the
+        # saved-book lock alone so inactive rows never queue behind it
+        # (efficiency-7). Both admissions are recover=False throughout.
+        with (ensure_book_state(DATA_DIR, recover=False),
+              ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR, recover=False)):
+            active_workspace, active_saved_name, active_script_sha256, active_voice_sha256 = \
+                _capture_active_facts(safe_names)
+        with ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR, recover=False):
+            return get_collection_overview(SCRIPTS_DIR, safe_names, get_voice_rows,
+                                           active_workspace=active_workspace,
+                                           active_saved_name=active_saved_name,
+                                           active_script_sha256=active_script_sha256,
+                                           active_voice_sha256=active_voice_sha256)
+    except (OSError, ValueError, TypeError, RecursionError, AttributeError, KeyError) as error:
+        logger.warning("Collection overview could not be read: %s: %s",
+                       type(error).__name__, str(error)[:240])
+        raise HTTPException(status_code=409, detail=(
+            "Collection overview could not read the selected saved books. "
+            "No book was switched and no work was started.")) from error
+
+
+@router.post("/api/collection/overview")
+async def get_collection_overview_status(request: CollectionOverviewRequest):
+    """Project script/review/voice/render/export state for selected saved books."""
+    return await asyncio.to_thread(_get_collection_overview_sync, request.names)
 
 
 class ScriptSaveRequest(BaseModel):
@@ -422,11 +566,15 @@ async def save_script(request: ScriptSaveRequest):
 
 class ScriptLoadRequest(BaseModel):
     name: str
+    expected_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 @router.post("/api/scripts/load")
 async def load_script(request: ScriptLoadRequest):
     'Load a saved script, replacing the current annotated_script.json and chunks.'
-    return await asyncio.to_thread(_load_script_sync, request)
+    try:
+        return await asyncio.to_thread(_load_script_sync, request)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail="Book is busy; try loading again.") from exc
 
 
 def _load_script_sync(request: ScriptLoadRequest):
@@ -452,22 +600,38 @@ def _load_script_sync(request: ScriptLoadRequest):
             raise HTTPException(status_code=409,
                 detail=f"Cannot load a script while these tasks are running: {', '.join(busy)}.")
         try:
-            _, script_bytes = capture_scope_file(SCRIPTS_DIR, os.path.basename(src),
-                                                 limit=MAX_SCRIPT_BYTES, include_bytes=True)
+            script_info, script_bytes = capture_scope_file(SCRIPTS_DIR, os.path.basename(src),
+                                                          limit=MAX_SCRIPT_BYTES, include_bytes=True)
             if script_bytes is None:
                 raise ValueError('Saved script disappeared')
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, TypeError, RecursionError) as error:
             raise HTTPException(status_code=409, detail=(
                 'Saved script identity requires inspection; existing files were preserved.')) from error
         validate_book_json_bytes(script_bytes, list, 400, "Saved script")
+        script_sha256 = script_info.get('sha256') if script_info.get('exists') else None
+        if script_sha256 is None:
+            script_sha256 = hashlib.sha256(script_bytes).hexdigest()
+        load_entries = json.loads(script_bytes)
+        if request.expected_revision is not None:
+            try:
+                from collection_overview import compute_saved_book_revision
+                current_revision = compute_saved_book_revision(
+                    SCRIPTS_DIR, safe_name, script_bytes=script_bytes,
+                    script_sha256=script_sha256, script_entries=load_entries)
+            except (OSError, ValueError, TypeError, RecursionError) as error:
+                raise HTTPException(status_code=409, detail=(
+                    'Saved script identity requires inspection; existing files were preserved.')) from error
+            if current_revision != request.expected_revision:
+                raise HTTPException(status_code=409, detail=(
+                    'The saved book changed after the collection overview was shown; show it again before loading.'))
         saved_binding_path = os.path.splitext(src)[0] + '.selection_binding.json'
         try:
             _, saved_binding_raw = capture_scope_file(SCRIPTS_DIR, os.path.basename(saved_binding_path),
                                                        limit=MAX_BINDING_BYTES, include_bytes=True)
             if saved_binding_raw is not None:
                 saved_binding = parse_script_binding(saved_binding_raw)
-                if (saved_binding['published_script_sha256'] != hashlib.sha256(script_bytes).hexdigest()
-                        or saved_binding['published_entries_sha256'] != get_review_entries_fingerprint(json.loads(script_bytes))):
+                if not saved_binding_matches(saved_binding, script_sha256=script_sha256,
+                                             entries=load_entries):
                     raise ValueError('Saved script differs from its binding')
         except (OSError, ValueError, TypeError, RecursionError) as error:
             raise HTTPException(status_code=409, detail='Saved script identity requires inspection; existing files were preserved.') from error
@@ -481,6 +645,20 @@ def _load_script_sync(request: ScriptLoadRequest):
             raise HTTPException(status_code=409, detail=f'Saved publication provenance requires review: {error}') from error
         state_path = os.path.join(DATA_DIR, "state.json")
         state = safe_load_json(state_path, default={})
+        # The previous book's identity, read through the same snapshot the
+        # translation preview uses for its book binding. Proposals are kept
+        # only when the loaded book is that same book; a different book must
+        # not inherit the previous book's reviewable proposals. An unreadable
+        # active workspace is NOT a reason to refuse the load (the load path
+        # was tolerant of it before this preview existed): an unknown previous
+        # identity can never equal a saved book id, so its proposals are
+        # treated as another book's and discarded below.
+        try:
+            previous_book_id = get_book_snapshot(
+                DATA_DIR, allow_missing_script=True, include_voices=False,
+                include_script=False)["book_id"]
+        except (OSError, ValueError, TypeError, RecursionError):
+            previous_book_id = None
         book_id = _get_saved_book_id(safe_name)
         cue_bytes, rendition_bytes = _capture_sound_companions(SCRIPTS_DIR,
             os.path.basename(get_saved_sound_design_path(src)),
@@ -522,6 +700,12 @@ def _load_script_sync(request: ScriptLoadRequest):
                     three_pass_manifest_path(SCRIPT_PATH),
                     *get_generation_checkpoint_artifacts(get_generation_checkpoint_path(SCRIPT_PATH)),
                     get_generation_quality_path(SCRIPT_PATH)]
+        # Reloading the same book keeps its reviewable proposals (they stay
+        # bound to that book_id and the stale check still applies). Proposals
+        # from another book are discarded after the switch commits, by the
+        # best-effort removal below: they are optional review artifacts and a
+        # failed removal must never turn a committed book load into an error.
+        discard_another_book_proposals = previous_book_id != book_id
         if saved_binding_raw is None:
             removals.append(os.path.join(DATA_DIR, BINDING_NAME))
         if cue_bytes is None:
@@ -544,9 +728,23 @@ def _load_script_sync(request: ScriptLoadRequest):
             removals.append(VOICE_CONFIG_PATH)
         apply_book_state_locked(DATA_DIR, replacements,
                                 [os.path.relpath(path, DATA_DIR) for path in removals])
+        if discard_another_book_proposals:
+            _discard_another_book_proposals()
+        # Identity seam for the loading tab (DS3074): derive the response
+        # token from the committed B state WHILE STILL under this load's
+        # book-state lease, using the exact state record just committed.
+        # An unscoped current-state read after releasing ownership could
+        # return another tab's newer book C for a load of B. Failure to
+        # derive yields None, which the client treats as no authority:
+        # its next unscoped read must not adopt any server book.
+        try:
+            book_identity_token = get_book_operation_token(DATA_DIR, state=state)
+        except (OSError, ValueError):
+            book_identity_token = None
 
     logger.info(f"Script '{request.name}' loaded")
-    return {"status": "loaded", "name": request.name}
+    return {"status": "loaded", "name": request.name,
+            "book_identity_token": book_identity_token}
 
 
 class ScriptPreflightRequest(BaseModel):

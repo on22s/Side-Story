@@ -1,0 +1,45 @@
+#!/bin/bash
+# Verify the identity gate catches the real thing: it must PASS the retrained
+# adapter (0.685) and FAIL the original one (0.027). Same adapter name, same
+# dataset - only the weights differ. Rule 12: a gate that has not been shown to
+# refuse a known-bad input is not a gate.
+set -uo pipefail
+REPO=/home/fakemitch/pinokio/api/alexandria-audiobook2.git
+# NO GPU_LOCK EXPORT. This line used to name $HOME/.alexandria_gpu.lock, a
+# third lock file that serialised against neither the repo lock the other
+# chains use nor gpu_job.sh's own - and it sat BELOW the self-re-exec above,
+# so this chain's outer wrapper and its inner jobs took different locks.
+# gpu_job.sh now defaults to the repo lock; letting it decide is the point.
+export GPU_QLOG="$REPO/ab_test_runtime/logs/gpu_jobq.log"
+A=husky_baritone_20s_m_anime
+DATA="$REPO/ab_test_runtime/retrain_honest/$A/data"
+cd "$REPO/app"
+
+failures=0
+
+echo "=== KNOWN GOOD: the retrained adapter (scored 0.685) ==="
+"$REPO/gpu_job.sh" gate_known_good \
+  "$REPO/app/env/bin/python" -u experiments/verify_adapter_identity.py \
+    --adapter "$REPO/ab_test_runtime/retrain_honest/$A/adapter" \
+    --dataset "$DATA" --lines 5 \
+    --out "$REPO/ab_test_runtime/experiments/gate_known_good.json"
+rc=$?
+echo "  exit=$rc  (expect 0)"
+if [ "$rc" -ne 0 ]; then
+    echo "FAIL: known-good adapter returned $rc; expected 0." >&2
+    failures=1
+fi
+
+echo "=== KNOWN BAD: the original shipped adapter (scored 0.027) ==="
+"$REPO/gpu_job.sh" gate_known_bad \
+  "$REPO/app/env/bin/python" -u experiments/verify_adapter_identity.py \
+    --adapter "$REPO/lora_models/$A" \
+    --dataset "$DATA" --lines 5 \
+    --out "$REPO/ab_test_runtime/experiments/gate_known_bad.json"
+rc=$?
+echo "  exit=$rc  (expect 3)"
+if [ "$rc" -ne 3 ]; then
+    echo "FAIL: known-bad adapter returned $rc; expected 3." >&2
+    failures=1
+fi
+exit "$failures"

@@ -140,7 +140,7 @@ def get_vram_usage():
                     continue
     except Exception:
         pass  # nvidia-smi not available either
-
+    
     return (worst_used, worst_total) if worst_total > 0 else None
 
 
@@ -177,12 +177,12 @@ def wait_for_vram_headroom(fail_fast=False):
     while waited < VRAM_MAX_WAIT:
         time.sleep(VRAM_POLL_INTERVAL)
         waited += VRAM_POLL_INTERVAL
-
+        
         # Report progress every 30 seconds so user knows we're still waiting
         if waited - last_reported >= 30:
             print(f"  Still waiting for VRAM to drop... ({waited}s elapsed, max {VRAM_MAX_WAIT}s)")
             last_reported = waited
-
+        
         usage = get_vram_usage()
         if usage is None:
             return True
@@ -212,7 +212,8 @@ def get_completed_review_fingerprint(config, llm_config, params, args, client, m
     profiles = []
     for profile in (llm_config, get_failover_llm_config(config)):
         profiles.append({key: value for key, value in profile.items()
-                         if key not in ('concurrency', 'concurrency_for', 'concurrency_environment')})
+                         if key not in ('concurrency', 'concurrency_for', 'concurrency_environment',
+                                        'concurrency_revision')})
         profiles[-1]['resolved_api_key'] = resolve_api_key(profile.get('api_key'))
     identity = {'algorithm': REVIEW_ALGORITHM_VERSION, 'profiles': profiles,
         'model_binding': get_run_model_binding(client, model_name),

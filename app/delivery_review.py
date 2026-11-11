@@ -44,20 +44,16 @@ def get_delivery_retry_chunks(before, after, chunks):
     # Recognise stored canonical layouts before the CJK limits or narration
     # coalescing changed. Preserve their boundaries; rebuilds use new defaults.
     # Current rules win when several profiles reconstruct the stored layout.
-    for language_aware, coalesce_unlocated in (
+    for cjk_limits, coalesce_unlocated in (
             (True, True), (True, False), (False, True), (False, False)):
         old_groups = group_into_chunks(before, include_source_indices=True,
-                                       language_aware=language_aware,
-                                       legacy_chunking=not language_aware,
-                                       coalesce_unlocated=coalesce_unlocated)
+                                       cjk_limits=cjk_limits, coalesce_unlocated=coalesce_unlocated)
         if is_stored_grouping(old_groups, chunks):
             break
     else:
         raise ValueError("Editor text or delivery changed; review those edits before retrying delivery.")
     new_groups = group_into_chunks(after, include_source_indices=True,
-                                   language_aware=language_aware,
-                                   legacy_chunking=not language_aware,
-                                   coalesce_unlocated=coalesce_unlocated)
+                                   cjk_limits=cjk_limits, coalesce_unlocated=coalesce_unlocated)
     policy = get_literal_policy(before)
     for chunk in chunks:
         ensure_literal_chunk(chunk, policy)

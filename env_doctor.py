@@ -1,11 +1,14 @@
-"""Stdlib-only health checks for the lean app and optional Voice Tools.
+"""Stdlib-only doctor for the two Python interpreters this project depends
+on: `app/env` (the FastAPI app's own venv) and `rocm_python` (the sibling
+repo's env that Voice Lab's dedup/profiling stages run under - see
+CLAUDE.md's "Voice Lab pipeline" section).
 
-Run `python env_doctor.py` to check app/env, or add --voice-tools to also
-check Voice Lab's configured interpreter and the isolated preparer_env.
-No probing happens on import, only inside main()/its helpers.
+Catches env drift before it surfaces mid-run, e.g. a required package
+missing from `app/env`, or a `rocm_python` whose torch build is older than
+documented. Run directly (`python3 env_doctor.py`) - no probing happens on
+import, only inside main()/its helpers.
 """
 
-import argparse
 import json
 import os
 import subprocess
@@ -36,9 +39,6 @@ ENV_SPECS = {
         "optional": [],
         "version_hint": {"torch": "2.10.0+rocm"},
     },
-}
-
-VOICE_TOOL_ENV_SPECS = {
     "rocm_python": {
         # Resolved at run time from voicelab_config.json's "rocm_python" key
         # (same file/key the app reads via core.py's VOICELAB_DEFAULTS /
@@ -52,17 +52,6 @@ VOICE_TOOL_ENV_SPECS = {
         "optional": ["matplotlib", "seaborn", "umap", "pyannote.audio"],
         "version_hint": {},
     },
-    "preparer_env": {
-        # Resolve the override at probe time, without importing the web app.
-        "path": None,
-        "required": [
-            "torch", "torchaudio", "numpy", "soundfile", "librosa",
-            "transformers", "mutagen", "intervaltree", "EbookLib",
-            "beautifulsoup4", "silero-vad", "llama_cpp",
-        ],
-        "optional": ["pyannote.audio"],
-        "version_hint": {},
-    },
 }
 
 # Import name overrides for packages whose distribution name differs from
@@ -72,9 +61,6 @@ _IMPORT_NAME_OVERRIDES = {
     "llama_cpp": "llama_cpp",
     "umap": "umap",
     "pyannote.audio": "pyannote.audio",
-    "EbookLib": "ebooklib",
-    "beautifulsoup4": "bs4",
-    "silero-vad": "silero_vad",
 }
 
 _OPTIONAL_ABSENCE_NOTES = {
@@ -113,20 +99,7 @@ def resolve_rocm_python_path() -> str:
                 data = json.load(f)
         except (json.JSONDecodeError, ValueError, OSError):
             pass
-    return get_voicelab_python(data, default_python=os.environ.get(
-        "ALEXANDRIA_ROCM_PYTHON", get_app_python(ROOT_DIR)))
-
-
-def resolve_preparer_python_path() -> str:
-    """Check the optional isolated environment or its explicit override."""
-    override = os.environ.get("ALEXANDRIA_PREPARER_PYTHON", "")
-    if override:
-        return override
-    return os.path.join(
-        ROOT_DIR, "preparer_env",
-        "Scripts" if sys.platform == "win32" else "bin",
-        "python.exe" if sys.platform == "win32" else "python",
-    )
+    return get_voicelab_python(data)
 
 
 
@@ -238,8 +211,7 @@ def run_all(specs: dict) -> Tuple[Dict[str, List[dict]], bool]:
     for env_name, spec in specs.items():
         path = spec["path"]
         if path is None:
-            path = (resolve_preparer_python_path() if env_name == "preparer_env"
-                    else resolve_rocm_python_path())
+            path = resolve_rocm_python_path()
         packages = list(dict.fromkeys(spec.get("required", []) + spec.get("optional", [])))
         probe_result = probe_interpreter(path, packages) if path else None
         rows, ok = evaluate_env({**spec, "path": path}, probe_result)
@@ -249,16 +221,12 @@ def run_all(specs: dict) -> Tuple[Dict[str, List[dict]], bool]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--json", action="store_true", help="Print machine-readable diagnostics")
-    parser.add_argument("--voice-tools", action="store_true",
-                        help="Also check optional Voice Lab and Preparer dependencies")
-    args = parser.parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    as_json = "--json" in argv
 
-    specs = {**ENV_SPECS, **VOICE_TOOL_ENV_SPECS} if args.voice_tools else ENV_SPECS
-    all_rows, overall_ok = run_all(specs)
+    all_rows, overall_ok = run_all(ENV_SPECS)
 
-    if args.json:
+    if as_json:
         print(json.dumps({
             "envs": {name: data for name, data in all_rows.items()},
             "ok": overall_ok,

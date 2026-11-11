@@ -13,7 +13,6 @@ here. Refuses a source over the limit rather than truncating it.
     python -u cast_list.py book.txt --out cast.json [--no-strip-front-matter]
 """
 import argparse
-from contextlib import nullcontext
 import hashlib
 import json
 import os

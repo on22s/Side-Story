@@ -2,7 +2,7 @@ from book_state_transaction import ensure_saved_book_state
 from script_recovery_facts import get_saved_script_recovery_manifest
 from review_report import save_review_report
 from book_state_transaction import (ensure_book_state, apply_book_input_selection,
-                                    apply_book_state_locked)
+                                    apply_book_state_locked, get_book_operation_token)
 import asyncio
 import contextlib
 import copy
@@ -27,13 +27,14 @@ from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 from math import ceil
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from speaker_identity import get_validated_alias_graph
 from diagnostics import redact_text
@@ -44,7 +45,7 @@ from generation_checkpoint_shards import (get_generation_checkpoint_artifacts,
 from config_settings import load_app_config
 from generate_script import fix_mojibake
 from lmstudio_settings import (ensure_ideal_settings, get_active_llm_config,
-                               get_planned_ideal_settings, get_planned_request_context)
+                               get_planned_request_context)
 from narrator_prompt import get_valid_narrator_name, is_narrator_attested
 from script_preflight import audit_unicode_text
 from source_normalization import normalize_known_source_corruptions
@@ -70,14 +71,16 @@ from pass_quality import (split_outer_quote_regions, validate_attribution,
                           validate_instruct, validate_segment_quality)
 from speaker_identity import stabilize_speaker_identities
 from generate_script import LLMGenParams
-from utils import file_lock
+from utils import file_lock, is_path_inside
 from alexandria_alignment import validate_epub_archive
 from epub_package import get_epub_package
 from epub_publication import get_epub_publication_candidate, get_epub_publication_origin
 from epub_extraction_report import EpubExtractionReport
 from project_scope_files import capture_scope_file
-from source_upload_publication import create_source_upload_stage, publish_completed_upload
-from source_upload_stage import OwnedSourceUploadStage, get_upload_stage_accounting
+from source_upload_publication import (create_source_upload_stage, publish_completed_upload,
+                                     publish_retained_epub_upload, get_retained_epub_name)
+
+from source_upload_stage import OwnedSourceUploadStage, UploadPublicationHeldError, get_upload_stage_accounting
 from docx_preview import extract_docx_preview, MAX_ARCHIVE as MAX_DOCX_ARCHIVE
 from docx_publication import DocxStorageLimit, publish_docx_upload
 from publication_source import (PublicationSourceLimit, get_upload_publication_update,
@@ -86,6 +89,7 @@ from publication_source import (PublicationSourceLimit, get_upload_publication_u
     get_new_upload_publication_bytes)
 
 from core import (
+    AppError,
     _saved_book_meta_path,
     is_task_running,
     get_active_book_id,
@@ -150,6 +154,15 @@ BATCH_SOURCE_EXTENSIONS = SELECTABLE_SOURCE_EXTENSIONS | {'.epub'}
 _upload_hash_cache = OrderedDict()
 _upload_hash_lock = threading.Lock()
 _upload_dedupe_lock = threading.Lock()
+
+# Held-file publication failure (issue #1784): the native rename did not commit
+# and nothing was published. Wording stays honest about the cause: the file
+# "appears" to be held and "may" be held by scanning or sync software.
+_HELD_UPLOAD_DETAIL = (
+    'The upload could not be completed because the file appears to be held by '
+    'another program; nothing was published. The file may be held by antivirus '
+    'scanning, backup or sync software. Try again shortly, and check that '
+    'software if it keeps failing.')
 
 
 class ReviewRequest(BaseModel):
@@ -411,18 +424,27 @@ class _HTMLTextExtractor(HTMLParser):
         super().__init__()
         self.parts = []
         self._pending_newline = 0
-        self._skip_depth = 0
+        # Skipped-element names are kept on a stack only so the EOF
+        # diagnostic can name the pending element. End tags pop count-wise
+        # (the original tolerant balancing): on the qualified raw/RCDATA
+        # parsers a skipped close is only delivered for the open skipped
+        # element, and XHTML structure is owned by the XML parser before
+        # this extractor runs, so no name-mismatch policy is needed here.
+        # HTMLParser itself treats <script>/<style> as raw text and
+        # <title> as RCDATA, so markup inside them is data, never a
+        # nested start/end tag here.
+        self._skip_stack = []
         self._anchor_ids = frozenset(anchor_ids or ())
         self.anchor_counts = {}
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         if tag in self.SKIP_TAGS:
-            self._skip_depth += 1
+            self._skip_stack.append(tag)
         elif tag in self.BLOCK_TAGS:
             self._pending_newline = max(
                 self._pending_newline, 2 if tag in self.PARAGRAPH_TAGS else 1)
-        if self._skip_depth == 0 and self._anchor_ids:
+        if not self._skip_stack and self._anchor_ids:
             attributes = dict(attrs)
             anchor_id = (attributes.get('id') or attributes.get('xml:id')
                          or (attributes.get('name') if tag == 'a' else None))
@@ -431,22 +453,37 @@ class _HTMLTextExtractor(HTMLParser):
                 self.parts.append(('anchor', anchor_id))
 
     def handle_endtag(self, tag):
-        if tag.lower() in self.SKIP_TAGS and self._skip_depth > 0:
-            self._skip_depth -= 1
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS and self._skip_stack:
+            self._skip_stack.pop()
 
     def handle_data(self, data):
-        if self._skip_depth > 0:
+        if self._skip_stack:
             return
         if self._pending_newline and self.parts:
             self.parts.append('\n' * self._pending_newline)
         self._pending_newline = 0
         self.parts.append(data)
 
+    def _ensure_skipped_elements_closed(self):
+        # Balance is validated here, in the text accessors, rather than by
+        # flushing the parser with close(): feed() alone leaves any skipped
+        # element still open at the end of the fed document on the stack,
+        # while close() would decode/flush buffered trailing data first -
+        # including the skipped payload itself - changing extraction
+        # semantics for incomplete EOF markup unrelated to skipped elements.
+        if self._skip_stack:
+            raise ValueError(
+                f'unclosed <{self._skip_stack[-1]}> element: '
+                'skipped content would hide the rest of the resource')
+
     def get_text(self):
+        self._ensure_skipped_elements_closed()
         return ''.join(part for part in self.parts if isinstance(part, str))
 
     def get_text_with_anchor_positions(self):
         """Return extracted text and character offsets for requested anchors."""
+        self._ensure_skipped_elements_closed()
         text_parts = []
         positions = {}
         length = 0
@@ -457,6 +494,213 @@ class _HTMLTextExtractor(HTMLParser):
                 text_parts.append(part)
                 length += len(part)
         return ''.join(text_parts), positions
+
+
+# Conservative hint for the XML pass below, derived from the same
+# SKIP_TAGS set: a resource with no possible '<skip-name' opening (XML
+# name boundary, case-insensitive) cannot contain a real ignored element
+# or a metadata literal that could become a phantom ignored start, so it
+# needs neither the UTF-8 copy nor the Expat pass. False positives (e.g.
+# a literal opening inside CDATA/PI/DTD text) simply take the XML path.
+_POTENTIAL_SKIP_OPEN_RE = re.compile(
+    r'<(?:' + '|'.join(sorted(_HTMLTextExtractor.SKIP_TAGS)) +
+    r')(?=[\t\n\r\f />]|$)', re.IGNORECASE | re.ASCII)
+
+
+def _omit_xml_ignored_subtrees(html_content: str) -> str:
+    """Omit true XML ignored subtrees, preserving everything outside them.
+
+    Well-formed XHTML can carry literal skipped-element markup inside CDATA
+    sections, comments and processing instructions (only the CDATA/comment
+    terminator ends those constructs). HTMLParser's raw-text scanning would
+    end the skipped element at the literal close and reinterpret a literal
+    open as a phantom element, falsely rejecting the book or silently
+    swallowing following chapters. Expat (stdlib, no fetch, no entity
+    expansion) locates the real ignored elements in a UTF-8 copy of the
+    already-decoded resource; the untouched outside slices - CRLF,
+    whitespace, anchors and all - are fed to the HTML extractor instead.
+    Ignored means exactly the HTML extractor's exact lowercased SKIP_TAGS:
+    prefixed names such as <x:script> are ordinary elements and are never
+    omitted. Nonspoken PIs outside ignored elements are omitted likewise,
+    and a DOCTYPE whose internal subset or identifiers could carry literal
+    skip markup makes the whole nonspoken prolog be omitted at the root
+    element (its lexical start is not directly reported by Expat).
+    Resources with no possible skip opening at all skip the copy and the
+    XML pass entirely (see _POTENTIAL_SKIP_OPEN_RE).
+    Outside bytes accumulate in a single bytearray candidate (bounded by
+    the input size) rather than a per-element record list, and only
+    cursor/depth/omission-flag state is retained. Only ignored elements
+    are counted, so no per-tag retained records accumulate for ordinary
+    elements (transient name strings from the parser callbacks aside).
+    This helper is invoked only for application/xhtml+xml resources
+    (see extract_epub_text): if the resource is not XML well-formed, a
+    genuine ExpatError rejects actionably with the pending ignored
+    element named when one is open. Ordinary HTML media never reaches
+    this helper and keeps the legacy tolerant HTML path. No partial
+    transformed output is ever fed on XML failure.
+    """
+    if not _POTENTIAL_SKIP_OPEN_RE.search(html_content):
+        return html_content
+    try:
+        data = html_content.encode('utf-8')
+    except UnicodeEncodeError as error:
+        # A declared nonstandard codec can decode to lone surrogates
+        # (e.g. unicode_escape with a literal \ud800), which cannot be
+        # represented in UTF-8 for the XML pass. Fail closed with an
+        # actionable error (the caller adds spine index/resource) instead
+        # of silently falling back to the raw-HTML path, which can drop
+        # chapters. Ordinary ExpatError tolerant fallback is unaffected.
+        raise ValueError(
+            'invalid Unicode: decoded resource cannot be encoded as UTF-8'
+        ) from error
+    view = memoryview(data)
+    skip_tags = _HTMLTextExtractor.SKIP_TAGS
+
+    def is_skipped(name):
+        # Identical semantics to _HTMLTextExtractor.handle_starttag:
+        # exact lowercased tag names only. Prefixed names are ordinary.
+        return name.lower() in skip_tags
+
+    candidate = bytearray()
+    cursor = 0
+    ignored_depth = 0
+    omitted = False
+    seen_root = False
+    doctype_hazard = False
+    pending_ignored = None
+    parser = expat.ParserCreate(encoding='utf-8')
+    # DefaultHandler (not DefaultHandlerExpand) inhibits entity expansion
+    # and reporting in character content; attribute values still undergo
+    # Expat's standard entity normalization. No external entity/DTD
+    # handler is registered, so no external fetching occurs; Expat's
+    # default amplification protection is left at its default.
+    parser.DefaultHandler = lambda _data: None
+
+    def start_doctype(name, system_id, public_id, has_internal_subset):
+        nonlocal doctype_hazard
+        if has_internal_subset or _POTENTIAL_SKIP_OPEN_RE.search(
+                name or '') or _POTENTIAL_SKIP_OPEN_RE.search(
+                    system_id or '') or _POTENTIAL_SKIP_OPEN_RE.search(
+                        public_id or ''):
+            doctype_hazard = True
+
+    def processing_instruction(_target, _data):
+        nonlocal cursor, omitted
+        if ignored_depth:
+            return
+        start = parser.CurrentByteIndex
+        if start < 0:
+            raise ValueError(
+                'invalid XML: processing instruction position unavailable')
+        end = data.find(b'?>', start)
+        if end < 0:
+            raise ValueError(
+                'invalid XML: processing instruction terminator unavailable')
+        candidate.extend(view[cursor:start])
+        cursor = end + 2
+        omitted = True
+
+    def start_element(name, _attrs):
+        nonlocal ignored_depth, omitted, seen_root, cursor, pending_ignored
+        start = parser.CurrentByteIndex
+        if start < 0:
+            raise ValueError('invalid XML: element position unavailable')
+        if not seen_root:
+            seen_root = True
+            if doctype_hazard:
+                # Omit the whole nonspoken prolog (declaration, DOCTYPE,
+                # comments, PIs, whitespace): Expat does not report the
+                # DOCTYPE's lexical start, and any of it could carry the
+                # literal markup. Discard anything accumulated so far.
+                candidate.clear()
+                cursor = start
+                omitted = True
+        if is_skipped(name):
+            if ignored_depth == 0:
+                candidate.extend(view[cursor:start])
+                omitted = True
+                pending_ignored = name.lower()
+            ignored_depth += 1
+
+    def end_element(name):
+        nonlocal ignored_depth, cursor, pending_ignored
+        if not is_skipped(name):
+            return
+        if ignored_depth == 0:
+            return
+        ignored_depth -= 1
+        if ignored_depth:
+            return
+        pending_ignored = None
+        end = parser.CurrentByteIndex
+        if end < 0:
+            raise ValueError('invalid XML: end element position unavailable')
+        else:
+            # Paired vs self-closing is decided by the end tag's exact
+            # name at this index, not by a bare '</' test: a self-closing
+            # element's index points just past '/>', which may be exactly
+            # at a following *parent* end tag (e.g. <script/></div> or
+            # </textarea>) that must be retained. A paired end names this
+            # element; a self-closing element's following end names its
+            # parent. For an outermost removed element there can be no
+            # ignored ancestor it could be confused with. The XML name
+            # boundary after the name prevents prefix collisions.
+            closing = b'</' + name.encode('utf-8')
+            if data[end:end + len(closing)] == closing:
+                boundary = data[end + len(closing):end + len(closing) + 1]
+                if boundary in (b'>', b' ', b'\t', b'\r', b'\n', b''):
+                    close_end = data.find(b'>', end)
+                    if close_end < 0:
+                        raise ValueError(
+                            'invalid XML: end tag terminator unavailable')
+                    end = close_end + 1
+        # Otherwise self-closing: CurrentByteIndex is already just past '/>'.
+        cursor = end
+
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
+    parser.StartDoctypeDeclHandler = start_doctype
+    parser.ProcessingInstructionHandler = processing_instruction
+    try:
+        try:
+            parser.Parse(data, True)
+        except expat.ExpatError as error:
+            # This helper is only invoked for XHTML resources (see the
+            # caller): with possible ignored content present, a genuine
+            # XML error must reject actionably rather than fall back to
+            # the raw-HTML path, which can silently drop chapters. One
+            # static construction: the real Expat reason
+            # (expat.ErrorString - never body/attribute snippets) with the
+            # pending ignored element as context when one is open, plus
+            # parser location. Pending state alone does not prove an end
+            # tag is missing (e.g. a closed title with an undefined
+            # entity, or a closed script with raw ampersands).
+            reason = expat.ErrorString(error.code) or 'parse error'
+            location = (f'(line {parser.ErrorLineNumber}, '
+                        f'column {parser.ErrorColumnNumber})')
+            if pending_ignored is not None:
+                raise ValueError(
+                    f'invalid XML while <{pending_ignored}> element is '
+                    f'open: {reason} {location}') from error
+            raise ValueError(
+                f'invalid XML: {reason} {location}') from error
+    finally:
+        # Break the parser->handler->closure->parser cycle so completed
+        # chapter buffers release deterministically, success or failure.
+        parser.StartElementHandler = None
+        parser.EndElementHandler = None
+        parser.StartDoctypeDeclHandler = None
+        parser.ProcessingInstructionHandler = None
+        parser.DefaultHandler = None
+    if not omitted:
+        return html_content
+    candidate.extend(view[cursor:])
+    try:
+        return candidate.decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            'invalid Unicode: transformed resource cannot be decoded '
+            'as UTF-8') from error
 
 
 def _resolve_epub_href(base_path, href):
@@ -720,7 +964,13 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None, inc
         skipped_paths = {}
         for spine_index, item_id in enumerate(spine_ids):
             item = manifest.get(item_id)
-            if item is None or 'html' not in item['media_type']:
+            # One canonical media-type value drives both spine admission
+            # and the strict-XML dispatch below (RFC 6838 sec. 4.2: MIME
+            # type/subtype is case-insensitive). Parameters are stripped
+            # from the value, never searched for HTML classification.
+            media_type = (item['media_type'].split(';', 1)[0].strip().lower()
+                          if item is not None else '')
+            if item is None or 'html' not in media_type:
                 if item is not None:
                     skipped_paths[item['path']] = 'non_html_resource'
                 if report is not None:
@@ -741,8 +991,32 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None, inc
             targets = toc_by_path.get(href, [])
             anchor_ids = {fragment for fragment, _ in targets if fragment}
             extractor = _HTMLTextExtractor(anchor_ids)
-            extractor.feed(html_content)
-            text, anchor_positions = extractor.get_text_with_anchor_positions()
+            try:
+                # XHTML resources are XML: omit true ignored subtrees via
+                # the strict XML path. Ordinary HTML media keeps the
+                # legacy tolerant HTML formatter semantics untouched.
+                # Rebind so the original string is released before the
+                # HTML parser accumulates its parts; html_bytes (used for
+                # report hashes) is unchanged by this.
+                if media_type == 'application/xhtml+xml':
+                    html_content = _omit_xml_ignored_subtrees(html_content)
+                extractor.feed(html_content)
+                # The text accessor validates skipped-element balance.
+                # close() is deliberately not called here: it would flush
+                # incomplete EOF markup (and decode buffered skipped
+                # content) into extraction, changing feed-only semantics.
+                text, anchor_positions = extractor.get_text_with_anchor_positions()
+            except ValueError as error:
+                # Report and ordinary extraction share this path, so a
+                # malformed resource is an actionable error in both. The
+                # static reason and bounded spine index come before the
+                # user-controlled resource path, so diagnostics truncation
+                # (2000 chars) cannot push the reason out of the detail
+                # for a very long internal member name. Resource text is
+                # never included.
+                raise ValueError(
+                    f'Malformed EPUB resource at spine index {spine_index}: '
+                    f'{error} (resource {href!r})') from error
             body_characters = len(text.strip())
             processed_paths.add(href)
             decisions = _get_epub_toc_title_decisions(text, anchor_positions, targets) if report is not None else None
@@ -781,7 +1055,7 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None, inc
 
 
 def _get_upload_hash(path: str) -> str:
-    """Return SHA-256 from a bounded cache of current upload versions."""
+    """Return an advisory SHA-256 hint from a bounded size/mtime cache."""
     stat = os.stat(path)
     version = (stat.st_size, stat.st_mtime_ns)
     with _upload_hash_lock:
@@ -802,6 +1076,82 @@ def _get_upload_hash(path: str) -> str:
     return value
 
 
+def _get_fresh_upload_hash(path: str) -> str:
+    """Return a fresh bounded SHA-256 for a named upload, bypassing the cache.
+
+    Pure read via the shared scope capture (streaming, single-link and
+    descriptor/path identity checks, no whole-file buffering). The
+    size/mtime cache above is advisory only: a same-size rewrite with a
+    restored mtime keeps its cached digest, so destructive dedupe must
+    confirm the candidate's current bytes here before reusing it. Raises
+    FileNotFoundError, ValueError or OSError when the file is missing,
+    changed while reading, oversized, or otherwise unverifiable; callers
+    fail closed by skipping the candidate.
+    """
+    absolute = os.path.abspath(path)
+    proof, _raw = capture_scope_file(os.path.dirname(absolute),
+                                     os.path.basename(absolute),
+                                     limit=MAX_SCRIPT_UPLOAD_BYTES)
+    if not proof.get('exists') or proof.get('sha256') is None:
+        raise FileNotFoundError(path)
+    return proof['sha256']
+
+
+def _evict_disproven_upload_hash_hint(candidate_path: str, cached_entry) -> None:
+    """Drop a stale advisory hint disproven by a fresh read.
+
+    Cache invalidation only: the fresh authority already proved the current
+    bytes differ from the advisory digest, so the cached (size, mtime)
+    entry is stale. The entry is removed only when it is still the exact
+    immutable tuple observed after the advisory lookup, so a newer or
+    ABA replacement installed during the fresh read is never clobbered. A
+    later advisory miss rehashes the current bytes. Failed or cancelled
+    fresh reads never reach this helper.
+    """
+    if cached_entry is None:
+        return
+    with _upload_hash_lock:
+        if _upload_hash_cache.get(candidate_path) is cached_entry:
+            _upload_hash_cache.pop(candidate_path, None)
+
+
+def _is_candidate_upload_hash_match(candidate_path: str, digest: str) -> bool:
+    """Return True only when a candidate matches digest on both hashes.
+
+    Shared candidate policy for TXT/MD and EPUB dedupe (Rule 15): the
+    advisory size/mtime cache is a pre-filter only; a match also requires
+    the bounded fresh read in _get_fresh_upload_hash. When the advisory
+    digest matches but the fresh read succeeds with a different digest,
+    just that disproven cached hint is evicted so later checks do not
+    repeat the fresh scan. An unverifiable candidate (ValueError/OSError
+    from either read, including a permission/lock failure on the advisory
+    or fresh read) is always a conservative non-match without eviction,
+    so callers skip it and retain the incoming bytes. Control-flow
+    exceptions such as CancelledError (a BaseException, not
+    ValueError/OSError) always propagate exactly.
+    """
+    try:
+        if _get_upload_hash(candidate_path) != digest:
+            return False
+    except (ValueError, OSError):
+        return False
+    # Capture the exact advisory tuple that matched, then release the lock
+    # before any fresh I/O. If the hint is absent or its digest differs
+    # from the expected one, there is nothing to invalidate.
+    with _upload_hash_lock:
+        cached_entry = _upload_hash_cache.get(candidate_path)
+        if cached_entry is not None and cached_entry[1] != digest:
+            cached_entry = None
+    try:
+        fresh_digest = _get_fresh_upload_hash(candidate_path)
+    except (ValueError, OSError):
+        return False
+    if fresh_digest == digest:
+        return True
+    _evict_disproven_upload_hash_hint(candidate_path, cached_entry)
+    return False
+
+
 def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
     """Remove path and return an existing identical text upload when present."""
     # Serialize the scan-and-remove decision. Without this, two identical
@@ -810,7 +1160,16 @@ def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
     with _upload_dedupe_lock:
         owned = isinstance(path, OwnedSourceUploadStage)
         size = path.size if owned else os.path.getsize(path)
-        digest = path.sha256() if owned else _get_upload_hash(path)
+        if owned:
+            # The sealed descriptor digest is the fresh authority.
+            digest = path.sha256()
+        else:
+            # Legacy str incoming: a cached digest could be stale after a
+            # same-size/restored-mtime rewrite, so it is never used here.
+            # The fresh digest is computed lazily below, once a distinct
+            # eligible candidate actually exists, so a unique input is not
+            # read needlessly before the scan.
+            digest = None
         for entry in sorted(os.scandir(UPLOADS_DIR), key=lambda item: item.name):
             try:
                 # Windows DirEntry.stat can leave st_nlink at zero. Query the
@@ -821,7 +1180,24 @@ def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
                         os.path.splitext(entry.name)[1].lower() not in SELECTABLE_SOURCE_EXTENSIONS or
                         facts.st_size != size):
                     continue
-                if _get_upload_hash(entry.path) == digest:
+                if not owned and os.path.samefile(entry.path, path):
+                    # The exact-string check above cannot see an equivalent
+                    # spelling of the incoming file itself (absolute "./",
+                    # relative, or Windows differing case). Exclude the
+                    # same native file so it can never select and delete
+                    # its own bytes.
+                    continue
+                if digest is None:
+                    # First eligible distinct candidate: confirm the legacy
+                    # incoming bytes freshly before any candidate is
+                    # considered. Failure retains it.
+                    try:
+                        digest = _get_fresh_upload_hash(path)
+                    except (ValueError, OSError):
+                        return path, False
+                # Advisory cache pre-filter only: confirm current bytes
+                # before the destructive removal below.
+                if _is_candidate_upload_hash_match(entry.path, digest):
                     path.close() if owned else os.remove(path)
                     return entry.path, True
             except FileNotFoundError:
@@ -830,6 +1206,7 @@ def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
 
 
 def _get_reusable_uploads() -> List[dict]:
+    """List uploads with freshly captured SHA-256, or None when unverifiable."""
     uploads = []
     for entry in sorted(os.scandir(UPLOADS_DIR), key=lambda item: item.name.casefold()):
         try:
@@ -838,9 +1215,15 @@ def _get_reusable_uploads() -> List[dict]:
                     or facts.st_nlink != 1
                     or os.path.splitext(entry.name)[1].lower() not in SELECTABLE_SOURCE_EXTENSIONS):
                 continue
+            try:
+                digest = _get_fresh_upload_hash(entry.path)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                digest = None
             uploads.append({
                 "filename": entry.name, "size": facts.st_size, "modified": facts.st_mtime,
-                "sha256": _get_upload_hash(entry.path),
+                "sha256": digest,
             })
         except FileNotFoundError:
             continue
@@ -910,6 +1293,219 @@ async def select_existing_upload(request: ExistingUploadRequest):
             "book_identity_token": token}
 
 
+SINGLE_NARRATOR_PREVIEW_CHARS = 4000
+
+
+def _get_single_narrator_source_preview():
+    """Bounded, book-bound source preview for the single-narrator guide (#1724).
+
+    Read-only: takes no path input, reads only the active book's recorded
+    source (state.json input_file_path), applies the existing ownership/size
+    controls, and never writes. Returns a truncated excerpt plus the source
+    digest and book token so the client can bind inspection to this source.
+
+    The read is descriptor-confined via project_scope_files.capture_scope_file
+    (both for DOCX groups and for plain TXT/MD sources): a realpath/lstat
+    check followed by open() is not sufficient here because a swapped source
+    parent (e.g. a junction substituted after the check) would otherwise
+    feed outside bytes under the trusted pathname. capture_scope_file opens
+    via os.open and freezes the file version before/after the read, so any
+    swap mid-read fails instead of returning outside bytes.
+    """
+    from docx_publication import capture_docx_group
+    from project_scope_files import capture_scope_file
+    from source_encoding import get_decoded_source_text
+
+    def load_book_state():
+        # Bounded strict selection-state reader shared with script
+        # generation (duplicate keys, nonfinite numbers, size and
+        # descriptor confinement). Missing is distinct from corrupt or
+        # unreadable: safe_load_json would fold both into {} and
+        # misreport a corrupt book as "No input file selected".
+        from script_selection_binding import _read_selection_state
+        try:
+            return _read_selection_state(DATA_DIR, required=False)
+        except ValueError:
+            raise HTTPException(status_code=409, detail=(
+                "Active book state is corrupt; restore it before previewing the source."))
+        except OSError:
+            raise HTTPException(status_code=409, detail=(
+                "Active book state is unreadable; restore it before previewing the source."))
+
+    with ensure_book_state(DATA_DIR):
+        state = load_book_state()
+        source_path = state.get("input_file_path")
+        if not isinstance(source_path, str) or not source_path:
+            raise AppError(400, 'No input file selected for the active book.', key='error.upload.no_input_active')
+        # Resolve exactly like the shared generation/source capture
+        # resolver (_capture_raw_source): relative spellings resolve
+        # against the process CWD, never silently against DATA_DIR, so
+        # preview shows the exact source generation reads. Confine to
+        # DATA_DIR by spelling (no trust yet); the descriptor capture
+        # below re-checks containment and freezes file identity.
+        root_abs = Path(os.path.abspath(DATA_DIR))
+        source_abs = Path(os.path.abspath(source_path))
+        try:
+            relative = source_abs.relative_to(root_abs)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Active source is outside the book data directory.")
+        if not relative.parts:
+            raise HTTPException(status_code=403, detail="Active source is outside the book data directory.")
+        # No dot-part check: both operands are abspath-normalized, so a
+        # successful relative_to() can never yield '.'/'..'/'' parts (#1724 C082).
+        resolved = os.path.realpath(source_abs)
+        if not is_path_inside(resolved, os.path.realpath(DATA_DIR)):
+            raise HTTPException(status_code=403, detail="Active source is outside the book data directory.")
+        try:
+            group = capture_docx_group(source_abs, owning_root=DATA_DIR)
+        except ValueError:
+            raise HTTPException(status_code=409, detail=(
+                "Active source could not be verified; inspect it in Script instead."))
+        except OSError:
+            # A member deleted/made unreadable mid-capture is a clear refusal,
+            # never an unhandled 500 (#1724 C028).
+            raise HTTPException(status_code=409, detail=(
+                "Active source could not be verified; inspect it in Script instead."))
+        imported_source_name = None
+        if group is not None:
+            raw = group["text_bytes"]
+            if not isinstance(raw, bytes):
+                raise HTTPException(status_code=409, detail=(
+                    "Active source could not be verified; inspect it in Script instead."))
+            # Reuse the capture proof digest instead of re-hashing (#1724 C065).
+            source_sha256 = group["proofs"]["text"]["sha256"]
+            # Verified imported identity from the DOCX receipt (DS3007):
+            # the selected/imported document is distinct from the
+            # retained extracted-text file the excerpt actually shows.
+            imported_source_name = group.get("uploaded_filename")
+        else:
+            extension = os.path.splitext(str(source_abs))[1].lower()
+            if extension in (".docx", ".epub"):
+                # Raw zip bytes are never source text: only the retained
+                # DOCX group's text or an EPUB-derived extracted file previews.
+                raise HTTPException(status_code=409, detail=(
+                    "Source preview is unavailable for this file format; inspect the "
+                    "extracted text in Script instead."))
+            # JSON is a retained annotated script, not original source
+            # prose: refuse honestly with saved-script guidance instead of
+            # relabelling JSON as the extracted source.
+            if extension == ".json":
+                # Saved-library books stay honestly unavailable: no
+                # verified prose link survives as readable original text,
+                # and the annotated JSON is not original prose. No
+                # provenance read is attempted here (DS3077).
+                raise HTTPException(status_code=409, detail=(
+                    "Source preview is unavailable for this saved book: no retained "
+                    "original prose is linked to its saved script, and the annotated "
+                    "JSON is not original prose. Inspect the saved script in Script "
+                    "instead."))
+            if extension not in SELECTABLE_SOURCE_EXTENSIONS:
+                raise HTTPException(status_code=409, detail=(
+                    "Source preview is unavailable for this file format; inspect the "
+                    "extracted text in Script instead."))
+            try:
+                proof, raw = capture_scope_file(DATA_DIR, relative.as_posix(),
+                    limit=MAX_SCRIPT_UPLOAD_BYTES + 1, include_bytes=True)
+            except ValueError:
+                # The shared capture helper conflates size/hardlink/type in
+                # untyped messages: use a conservative integrity refusal
+                # instead of fragile English-substring classification.
+                raise HTTPException(status_code=409, detail=(
+                    "Active source could not be verified; inspect it in Script instead."))
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail="Active source file not found.")
+            except OSError:
+                raise HTTPException(status_code=409, detail=(
+                    "Active source could not be verified; inspect it in Script instead."))
+            if not proof.get('exists'):
+                raise HTTPException(status_code=404, detail="Active source file not found.")
+            if not isinstance(raw, bytes):
+                raise HTTPException(status_code=404, detail="Active source file not found.")
+            source_sha256 = proof["sha256"]
+        # One size/empty/source_name policy for both branches (#1724 C062).
+        if len(raw) > MAX_SCRIPT_UPLOAD_BYTES:
+            raise AppError(400, 'Source exceeds the upload storage limit.', key='error.upload.source_too_large')
+        if not raw:
+            raise AppError(400, 'Active source is empty; import a non-empty book first.', key='error.upload.source_empty')
+        source_name = Path(source_abs).name
+        # Reuse the shared decoder policy; programmer errors (e.g. a
+        # non-bytes raw from an internal defect) propagate instead of being
+        # swallowed as a 409. Only UTF-16/32 BOM and NUL refuse; a UTF-8
+        # BOM that the canonical decoder represents is ordinary text.
+        if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+            raise HTTPException(status_code=409, detail=(
+                "Active source text could not be decoded; inspect it in Script instead."))
+        text, encoding = get_decoded_source_text(raw)
+        if encoding == "utf-8/replace":
+            # The decoder's last-resort replacement would show garbled text as
+            # a confirmable excerpt; fail loud instead (#1724 C034).
+            raise HTTPException(status_code=409, detail=(
+                "Active source text could not be decoded; inspect it in Script instead."))
+        if '\x00' in text:
+            raise HTTPException(status_code=409, detail=(
+                "Active source text could not be decoded; inspect it in Script instead."))
+        # Zero-length check only (CR2068): do not strip-scan the whole
+        # book. The bounded excerpt check below refuses empty, whitespace-
+        # leading and whitespace-only previews honestly without certifying
+        # whole-book emptiness; decoder/BOM/NUL/counts above are unchanged.
+        if not text:
+            raise AppError(400, 'Active source is empty; import a non-empty book first.', key='error.upload.source_empty')
+        _excerpt = text[:SINGLE_NARRATOR_PREVIEW_CHARS]
+        if not _excerpt.strip():
+            raise HTTPException(status_code=400, detail=(
+                "Source excerpt is empty or blank in the displayed excerpt; import a book whose beginning is readable before confirming."))
+        # Zero-width/format-only excerpts (U+200B/U+2060/BOM-only) render
+        # as nothing: refuse when the bounded excerpt has no readable,
+        # non-format content. BOM followed by text stays valid; this
+        # scans only the bounded excerpt, never the whole source.
+        if not ''.join(char for char in _excerpt
+                       if not char.isspace()
+                       and unicodedata.category(char) not in ('Cf', 'Cc')):
+            raise HTTPException(status_code=400, detail=(
+                "Source excerpt is empty or blank in the displayed excerpt; import a book whose beginning is readable before confirming."))
+        # Derive the operation token from the already-loaded state instead
+        # of re-reading state.json for every token use. Token derivation
+        # can raise ValueError (filesystem admission/alias race): map it
+        # to an honest 409, never an unhandled 500. Narrow try only.
+        try:
+            book_token = get_book_operation_token(DATA_DIR, state=state)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=(
+                "Active book could not be verified while reading the preview.")) from exc
+        # Re-read state identity after the read so a concurrent selection cannot
+        # bind this excerpt to a different book than the one returned.
+        state_after = load_book_state()
+        if state_after.get("input_file_path") != source_path:
+            raise AppError(409, 'Active book changed while reading the preview.', key='safety.book.changed_while_preview')
+        try:
+            token_after = get_book_operation_token(DATA_DIR, state=state_after)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=(
+                "Active book could not be verified while reading the preview.")) from exc
+        if token_after != book_token:
+            raise AppError(409, 'Active book changed while reading the preview.', key='safety.book.changed_while_preview')
+        return {"book_token": book_token, "source_name": source_name,
+                "imported_source_name": imported_source_name,
+                "source_sha256": source_sha256, "encoding": encoding,
+                "total_chars": len(text), "truncated": len(text) > SINGLE_NARRATOR_PREVIEW_CHARS,
+                "text_start": text[:SINGLE_NARRATOR_PREVIEW_CHARS]}
+
+
+@router.get("/api/single-narrator/source-preview")
+async def get_single_narrator_source_preview():
+    try:
+        return await asyncio.to_thread(_get_single_narrator_source_preview)
+    except TimeoutError:
+        raise AppError(503, 'Book state is busy; retry the preview shortly.', key='error.book.busy_preview') from None
+    except (ValueError, OSError) as exc:
+        # Admission/recovery failures (root swap, invalid/legacy journal,
+        # lock-file OSError) from ensure_book_state and token derivation
+        # are honest 409 refusals, never unhandled 500. HTTPException is
+        # not a ValueError/OSError, so inner 400/403/404 refusals pass through.
+        raise HTTPException(status_code=409, detail=(
+            "Active book could not be verified while reading the preview.")) from exc
+
+
 
 
 
@@ -921,9 +1517,24 @@ async def select_existing_upload(request: ExistingUploadRequest):
 def get_upload_storage_bytes():
     """Count named files and request-owned anonymous extents under the lease."""
     active_names, active_bytes = get_upload_stage_accounting(UPLOADS_DIR)
+    named = 0
     with os.scandir(UPLOADS_DIR) as entries:
-        named = sum(entry.stat(follow_symlinks=False).st_size for entry in entries
-                    if entry.name not in active_names and entry.is_file(follow_symlinks=False))
+        for entry in entries:
+            if entry.name in active_names:
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                named += entry.stat(follow_symlinks=False).st_size
+            except FileNotFoundError:
+                # Skip only a single vanished entry.  A missing,
+                # inaccessible, or non-directory root after a successful
+                # scandir open is a root failure, not free capacity:
+                # re-open the root (O(1), failure-only) and let any
+                # error propagate; success proves the root is present.
+                with os.scandir(UPLOADS_DIR):
+                    pass
+                continue
     return named + active_bytes
 
 
@@ -934,6 +1545,11 @@ def get_docx_retained_uploads():
     from docx_retention import get_retained_docx_inventory
     return get_retained_docx_inventory(UPLOADS_DIR, MAX_UPLOAD_STORAGE_BYTES)
 
+@router.get("/api/uploads/epub-retained")
+def get_epub_retained_uploads():
+    from source_upload_publication import get_retained_epub_inventory
+    return get_retained_epub_inventory(UPLOADS_DIR, MAX_UPLOAD_STORAGE_BYTES)
+
 @router.post("/api/upload")
 async def upload_file(file: UploadFile = File(...), select_active: bool = True, include_extraction_report: bool = False,
                       docx_preview: bool = False, docx_confirmed: bool = False,
@@ -941,7 +1557,7 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
     safe_name = _require_safe_filename(file.filename or "", "Invalid or empty filename")
     is_docx = safe_name.lower().endswith('.docx')
     if os.path.splitext(safe_name)[1].lower() not in BATCH_SOURCE_EXTENSIONS | {'.docx'}:
-        raise HTTPException(status_code=400, detail="Supported source formats are TXT, Markdown, EPUB and confirmed single-book DOCX.")
+        raise AppError(400, 'Supported source formats are TXT, Markdown, EPUB and confirmed single-book DOCX.', key='error.upload.unsupported_format')
     if is_docx:
         if select_active or (not docx_preview and (not docx_confirmed
                 or not re.fullmatch('[0-9a-f]{64}', docx_preview_digest or ''))):
@@ -957,7 +1573,7 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
     try:
         _, cancelled = await await_upload_operation(asyncio.to_thread(storage_lock.__enter__))
     except TimeoutError as error:
-        raise HTTPException(status_code=503, detail="Upload storage is busy; retry shortly.") from error
+        raise AppError(503, 'Upload storage is busy; retry shortly.', key='error.upload.storage_busy') from error
     if cancelled is not None:
         storage_lock.__exit__(None, None, None)
         raise cancelled
@@ -971,11 +1587,16 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
         selection['publication_started'] = True
     publication = publication_update = publication_bytes = None
     extraction_report = None
+    epub_retained_bytes = None
+    retained_stage = None
+    retained_epub_path = None
+    retained_unknown_error = None
+    pending_retained_attach = False
     request_error = None
     try:
         available = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
         if available <= 0:
-            raise HTTPException(status_code=413, detail="Source upload storage limit reached.")
+            raise AppError(413, 'Source upload storage limit reached.', key='error.upload.storage_limit')
         capture_limit = min(MAX_SCRIPT_UPLOAD_BYTES, available, MAX_DOCX_ARCHIVE if is_docx else MAX_SCRIPT_UPLOAD_BYTES)
         file_path, cancelled = await await_upload_operation(
             asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR,
@@ -1001,17 +1622,24 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
             except (OSError, MemoryError) as error:
                 raise HTTPException(status_code=503, detail='DOCX processing is temporarily unavailable.') from error
             if len(preview['text'].encode('utf-8')) > MAX_SCRIPT_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail='Extracted DOCX text exceeds source upload limits.')
+                raise AppError(413, 'Extracted DOCX text exceeds source upload limits.', key='error.upload.docx_text_too_large')
             if docx_preview:
                 return {'status': 'preview', **preview}
             if preview['preview_digest'] != docx_preview_digest:
-                raise HTTPException(status_code=409, detail='DOCX preview changed; preview and accept this exact file again.')
+                raise AppError(409, 'DOCX preview changed; preview and accept this exact file again.', key='safety.upload.docx_preview_changed')
             remaining = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
             try:
                 result, cancelled = await await_upload_operation(asyncio.to_thread(
                     publish_docx_upload, file_path, preview, safe_name, remaining=remaining))
             except DocxStorageLimit as error:
                 raise HTTPException(status_code=413, detail=str(error)) from error
+            except UploadPublicationHeldError as error:
+                raise HTTPException(status_code=503, detail=(
+                    'DOCX upload could not be completed because the file appears '
+                    'to be held by another program; the file may be held by '
+                    'antivirus scanning or a sync tool. Try again shortly; any '
+                    'already published recovery material remains retained. Check '
+                    'existing uploads before retrying.')) from error
             except ValueError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             except (OSError, MemoryError) as error:
@@ -1059,15 +1687,19 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
             if cancelled is not None:
                 raise cancelled
             if text_bytes is None:
-                raise HTTPException(status_code=400, detail="No readable text content found in EPUB.")
-            # The captured archive bytes now own parsing/provenance input; do
-            # not reserve both its stage and the extracted text simultaneously.
+                raise AppError(400, 'No readable text content found in EPUB.', key='error.upload.epub_empty')
+            # Archive bytes are retained for read-aloud (#1779). Windows admits
+            # one rename guard per directory, so the capture stage is closed
+            # here and a fresh retained stage is published later from memory
+            # (already bounded by the capture limit) once the TXT is new.
+            epub_retained_bytes = archive_bytes
             _, cancelled = await await_upload_operation(asyncio.to_thread(file_path.close))
             if cancelled is not None:
                 raise cancelled
+            file_path = None
             available = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
             if len(text_bytes) > min(MAX_SCRIPT_UPLOAD_BYTES, available):
-                raise HTTPException(status_code=413, detail="Extracted EPUB text exceeds source upload storage limits.")
+                raise AppError(413, 'Extracted EPUB text exceeds source upload storage limits.', key='error.upload.epub_text_too_large')
             def capture_publication():
                 options = dict(filename=file.filename or safe_name,
                                text_sha256=hashlib.sha256(text_bytes).hexdigest())
@@ -1087,33 +1719,256 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
             if cancelled is not None:
                 raise cancelled
             safe_name = os.path.splitext(safe_name)[0] + '.txt'
-            txt_path, cancelled = await await_upload_operation(
-                asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR, limit=len(text_bytes)))
-            owned_stages.append(txt_path)
-            stage_cleanup.callback(txt_path.close)
+            text_sha256 = hashlib.sha256(text_bytes).hexdigest()
+            def find_duplicate_text():
+                with _upload_dedupe_lock:
+                    for entry in sorted(os.scandir(UPLOADS_DIR), key=lambda item: item.name):
+                        try:
+                            facts = os.lstat(entry.path)
+                            if (not entry.is_file(follow_symlinks=False)
+                                    or facts.st_nlink != 1
+                                    or os.path.splitext(entry.name)[1].lower() not in SELECTABLE_SOURCE_EXTENSIONS
+                                    or facts.st_size != len(text_bytes)):
+                                continue
+                            # Advisory cache pre-filter only: the retained
+                            # EPUB fence checks original bytes, not this
+                            # canonical TXT, so confirm its current bytes
+                            # before selecting it.
+                            if _is_candidate_upload_hash_match(entry.path, text_sha256):
+                                return entry.path
+                        except FileNotFoundError:
+                            continue
+                    return None
+            canonical, cancelled = await await_upload_operation(asyncio.to_thread(find_duplicate_text))
             if cancelled is not None:
                 raise cancelled
-            _, cancelled = await await_upload_operation(asyncio.to_thread(txt_path.write, text_bytes))
+            if canonical is not None:
+                file_path = canonical
+                # Original-bytes authority (R5): a canonical TXT may only be
+                # reused when an existing retained EPUB holds the identical
+                # original bytes. A present retained file that differs
+                # (different edition or tampered bytes) refuses before any
+                # companion update; an untrusted/symlink/hardlink collision
+                # also refuses without overwriting. A genuinely missing
+                # retained file is attached below after quota reservation.
+                from source_upload_publication import get_retained_epub_path
+                canonical_retained = get_retained_epub_path(canonical)
+                try:
+                    retained_facts = os.lstat(canonical_retained)
+                except FileNotFoundError:
+                    pending_retained_attach = True
+                except OSError as error:
+                    raise HTTPException(status_code=409, detail=(
+                        'Retained EPUB is unavailable; refusing to reuse the '
+                        'canonical source. Inspect uploads via '
+                        'GET /api/uploads/epub-retained before retrying.')) from error
+                else:
+                    if not stat.S_ISREG(retained_facts.st_mode) or retained_facts.st_nlink != 1:
+                        raise HTTPException(status_code=409, detail=(
+                            f"Retained EPUB '{os.path.basename(canonical_retained)}' "
+                            'is not a regular single-link file; refusing to reuse foreign '
+                            'or linked bytes. Remove the conflicting file manually via '
+                            'GET /api/uploads/epub-retained before re-uploading.'))
+                    if retained_facts.st_size > MAX_SCRIPT_UPLOAD_BYTES:
+                        raise HTTPException(status_code=409, detail=(
+                            f"Retained EPUB '{os.path.basename(canonical_retained)}' "
+                            'exceeds the retained EPUB limit; refusing to reuse it. '
+                            'Inspect uploads via GET /api/uploads/epub-retained.'))
+                    try:
+                        # Original-byte authority requires a fresh descriptor
+                        # read with before/after identity checks. The dedupe
+                        # cache's size/mtime key cannot prove retained bytes
+                        # after a timestamp-preserving restore.
+                        captured_retained, hash_cancelled = await await_upload_operation(
+                            asyncio.to_thread(capture_scope_file, UPLOADS_DIR,
+                                              os.path.basename(canonical_retained),
+                                              limit=MAX_SCRIPT_UPLOAD_BYTES))
+                        retained_identity, _raw = captured_retained
+                        if not retained_identity['exists']:
+                            raise ValueError('Retained EPUB disappeared during verification')
+                        retained_sha = retained_identity['sha256']
+                    except OSError as error:
+                        raise HTTPException(status_code=409, detail=(
+                            'Retained EPUB could not be verified; refusing to reuse '
+                            'the canonical source.')) from error
+                    except ValueError as error:
+                        raise HTTPException(status_code=409, detail=(
+                            'Retained EPUB identity changed during verification; '
+                            'refusing to reuse the canonical source.')) from error
+                    if hash_cancelled is not None:
+                        raise hash_cancelled
+                    new_sha = hashlib.sha256(epub_retained_bytes).hexdigest()
+                    if retained_sha != new_sha:
+                        raise HTTPException(status_code=409, detail=(
+                            'Uploaded EPUB original differs from the retained EPUB '
+                            'for this text; refusing to reuse the canonical source '
+                            'or overwrite its provenance. Re-upload the exact '
+                            'retained bytes, or remove the existing TXT / retained / '
+                            'companion group via GET /api/uploads/epub-retained and '
+                            'import this edition as a new book.'))
+                    retained_epub_path = canonical_retained
+            else:
+                # One Windows guard at a time: publish retention first, then TXT.
+                # Jointly select one stem for TXT + companion + retained so
+                # collision numbering can never split the group (for example
+                # retained book_2.source.epub alongside TXT book.txt).
+                base, ext = os.path.splitext(safe_name)
+                chosen_txt = chosen_retained = None
+                for number in range(1, 1002):
+                    candidate_txt = safe_name if number == 1 else f"{base}_{number}{ext}"
+                    candidate_retained = get_retained_epub_name(candidate_txt)
+                    if (os.path.lexists(os.path.join(UPLOADS_DIR, candidate_txt))
+                            or os.path.lexists(os.path.join(UPLOADS_DIR, candidate_txt + '.publication.json'))
+                            or os.path.lexists(os.path.join(UPLOADS_DIR, candidate_retained))):
+                        continue
+                    chosen_txt, chosen_retained = candidate_txt, candidate_retained
+                    break
+                if chosen_txt is None:
+                    raise HTTPException(status_code=409, detail="Too many source upload filename collisions")
+                safe_name, retained_name = chosen_txt, chosen_retained
+                remaining = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
+                if len(epub_retained_bytes) > min(MAX_SCRIPT_UPLOAD_BYTES, remaining):
+                    raise HTTPException(status_code=413, detail="Retained EPUB exceeds source upload storage limits.")
+                # Reserve retained + TXT + companion together before any
+                # publish so a companion-quota 413 leaves no orphan retained.
+                companion_room = remaining - len(epub_retained_bytes) - len(text_bytes)
+                if companion_room < 0:
+                    raise HTTPException(status_code=413, detail="Retained EPUB and extracted text exceed source upload storage limits.")
+                try:
+                    _early_companion, early_cancelled = await await_upload_operation(asyncio.to_thread(
+                        get_new_upload_publication_bytes, text_sha256, publication, companion_room))
+                except PublicationSourceLimit as error:
+                    raise HTTPException(status_code=413, detail=str(error)) from error
+                except ValueError as error:
+                    raise HTTPException(status_code=409, detail=str(error)) from error
+                if early_cancelled is not None:
+                    raise early_cancelled
+                try:
+                    retained_stage, cancelled = await await_upload_operation(asyncio.to_thread(
+                        create_source_upload_stage, UPLOADS_DIR, limit=len(epub_retained_bytes)))
+                    if cancelled is not None:
+                        raise cancelled
+                    owned_stages.append(retained_stage)
+                    stage_cleanup.callback(retained_stage.close)
+                    _, cancelled = await await_upload_operation(asyncio.to_thread(
+                        retained_stage.write, epub_retained_bytes))
+                    if cancelled is not None:
+                        raise cancelled
+                    retained_epub_path, cancelled = await await_upload_operation(asyncio.to_thread(
+                        publish_retained_epub_upload, retained_stage, retained_name,
+                        limit=MAX_SCRIPT_UPLOAD_BYTES,
+                        on_visible=retain_selected_source, exact=True))
+                except UploadPublicationHeldError as error:
+                    raise HTTPException(status_code=503, detail=_HELD_UPLOAD_DETAIL) from error
+                except ValueError as error:
+                    raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
+                except OSError as error:
+                    # Unknown commit outcome (writer-close / rename alias
+                    # check): the retained file is already visible. Do not
+                    # discard it or abort before the TXT publish so the
+                    # source+provenance the caller must review still exists;
+                    # the stored error is re-raised after the TXT publish.
+                    stage = retained_stage
+                    published = getattr(stage, 'published_path', None) if stage is not None else None
+                    if stage is not None and getattr(stage, 'publication_started', False) and published is not None:
+                        retained_unknown_error = error
+                        retained_epub_path = published
+                        # Release the Windows rename guard so the TXT stage
+                        # can be created; the file stays published.
+                        try:
+                            stage.close()
+                        except BaseException:
+                            pass
+                    else:
+                        raise
+                if cancelled is not None:
+                    raise cancelled
+                txt_path, cancelled = await await_upload_operation(
+                    asyncio.to_thread(create_source_upload_stage, UPLOADS_DIR, limit=len(text_bytes)))
+                owned_stages.append(txt_path)
+                stage_cleanup.callback(txt_path.close)
+                if cancelled is not None:
+                    raise cancelled
+                _, cancelled = await await_upload_operation(asyncio.to_thread(txt_path.write, text_bytes))
+                if cancelled is not None:
+                    raise cancelled
+                file_path = txt_path
+        if epub_retained_bytes is not None:
+            # EPUB dedupe already decided above; skip the generic scan.
+            reused = isinstance(file_path, str) and not hasattr(file_path, 'size')
+        else:
+            try:
+                result, cancelled = await await_upload_operation(
+                    asyncio.to_thread(_reuse_duplicate_upload, file_path))
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
+            file_path, reused = result
             if cancelled is not None:
                 raise cancelled
-            file_path = txt_path
-        try:
-            result, cancelled = await await_upload_operation(
-                asyncio.to_thread(_reuse_duplicate_upload, file_path))
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
-        file_path, reused = result
-        if cancelled is not None:
-            raise cancelled
         if publication is not None:
             try:
                 remaining = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
                 if reused:
+                    # Reserve quota for the deferred retained attach so a
+                    # companion+archive 413 leaves no new retained file.
+                    _reserve = len(epub_retained_bytes) if pending_retained_attach else 0
                     publication_update, cancelled = await await_upload_operation(asyncio.to_thread(
-                        get_upload_publication_update, file_path, publication, remaining,
-                        source_limit=MAX_SCRIPT_UPLOAD_BYTES))
+                        get_upload_publication_update, file_path, publication,
+                        remaining - _reserve, source_limit=MAX_SCRIPT_UPLOAD_BYTES))
                     if cancelled is not None:
                         raise cancelled
+                    if pending_retained_attach:
+                        # A missing retained file may only be attached for an
+                        # edition already present in provenance (or when no
+                        # provenance exists yet). Attaching a different
+                        # edition while old origins have no retained bytes
+                        # would leave partial provenance, so refuse before any
+                        # retained publish.
+                        if publication_update['old_bytes'] is not None:
+                            from publication_source import get_publication_source_document
+                            try:
+                                old_doc = get_publication_source_document(publication_update['old_bytes'])
+                            except ValueError as error:
+                                raise HTTPException(status_code=409, detail=str(error)) from error
+                            old_ids = {row['id'] for row in old_doc.get('candidates', [])}
+                            if old_ids and publication['id'] not in old_ids:
+                                raise HTTPException(status_code=409, detail=(
+                                    'Retained EPUB is missing and this upload is a '
+                                    'different edition than the stored provenance; '
+                                    'refusing to attach it. Re-upload the exact '
+                                    'retained edition, or remove the existing group via '
+                                    'GET /api/uploads/epub-retained and import this edition '
+                                    'as a new book.'))
+                        # Exact retained name: a collision steps would split the
+                        # TXT/retained group, so a foreign file here refuses
+                        # instead of stepping to a numbered name.
+                        from source_upload_publication import get_retained_epub_path
+                        _att_name = os.path.basename(get_retained_epub_path(file_path))
+                        remaining2 = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
+                        if len(epub_retained_bytes) > min(MAX_SCRIPT_UPLOAD_BYTES, remaining2):
+                            raise HTTPException(status_code=413, detail="Retained EPUB exceeds source upload storage limits.")
+                        try:
+                            retained_stage, cancelled = await await_upload_operation(asyncio.to_thread(
+                                create_source_upload_stage, UPLOADS_DIR, limit=len(epub_retained_bytes)))
+                            if cancelled is not None:
+                                raise cancelled
+                            owned_stages.append(retained_stage)
+                            stage_cleanup.callback(retained_stage.close)
+                            _, cancelled = await await_upload_operation(asyncio.to_thread(
+                                retained_stage.write, epub_retained_bytes))
+                            if cancelled is not None:
+                                raise cancelled
+                            retained_epub_path, cancelled = await await_upload_operation(asyncio.to_thread(
+                                publish_retained_epub_upload, retained_stage, _att_name,
+                                limit=MAX_SCRIPT_UPLOAD_BYTES,
+                                on_visible=retain_selected_source, exact=True))
+                        except UploadPublicationHeldError as error:
+                            raise HTTPException(status_code=503, detail=_HELD_UPLOAD_DETAIL) from error
+                        except ValueError as error:
+                            raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
+                        if cancelled is not None:
+                            raise cancelled
+                        pending_retained_attach = False
                     # This source is already library-owned. A reader may observe
                     # the atomic provenance update before this request returns.
                     retain_selected_source()
@@ -1130,19 +1985,105 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
                     if cancelled is not None:
                         raise cancelled
             except PublicationSourceLimit as error:
+                if retained_epub_path is not None:
+                    raise HTTPException(status_code=413, detail=(
+                        f"{error}; retained EPUB '{os.path.basename(retained_epub_path)}' "
+                        'remains as recovery material via GET /api/uploads/epub-retained.')) from error
                 raise HTTPException(status_code=413, detail=str(error)) from error
             except ValueError as error:
+                if retained_epub_path is not None:
+                    raise HTTPException(status_code=409, detail=(
+                        f"{error}; retained EPUB '{os.path.basename(retained_epub_path)}' "
+                        'remains as recovery material via GET /api/uploads/epub-retained.')) from error
                 raise HTTPException(status_code=409, detail=str(error)) from error
+            except OSError as error:
+                if retained_epub_path is not None:
+                    raise HTTPException(status_code=500, detail=(
+                        f"EPUB publication is temporarily unavailable; retained EPUB "
+                        f"'{os.path.basename(retained_epub_path)}' remains as recovery material.")) from error
+                raise
+        if pending_retained_attach:
+            # No companion to reserve (unreachable for EPUB uploads with
+            # publication); publish the deferred attach now.
+            from source_upload_publication import get_retained_epub_path
+            _att_name = os.path.basename(get_retained_epub_path(file_path))
+            remaining = MAX_UPLOAD_STORAGE_BYTES - await asyncio.to_thread(get_upload_storage_bytes)
+            if len(epub_retained_bytes) > min(MAX_SCRIPT_UPLOAD_BYTES, remaining):
+                raise HTTPException(status_code=413, detail="Retained EPUB exceeds source upload storage limits.")
+            try:
+                retained_stage, cancelled = await await_upload_operation(asyncio.to_thread(
+                    create_source_upload_stage, UPLOADS_DIR, limit=len(epub_retained_bytes)))
+                if cancelled is not None:
+                    raise cancelled
+                owned_stages.append(retained_stage)
+                stage_cleanup.callback(retained_stage.close)
+                _, cancelled = await await_upload_operation(asyncio.to_thread(
+                    retained_stage.write, epub_retained_bytes))
+                if cancelled is not None:
+                    raise cancelled
+                retained_epub_path, cancelled = await await_upload_operation(asyncio.to_thread(
+                    publish_retained_epub_upload, retained_stage, _att_name,
+                    limit=MAX_SCRIPT_UPLOAD_BYTES,
+                    on_visible=retain_selected_source, exact=True))
+            except UploadPublicationHeldError as error:
+                raise HTTPException(status_code=503, detail=_HELD_UPLOAD_DETAIL) from error
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
+            if cancelled is not None:
+                raise cancelled
+            pending_retained_attach = False
         if not reused:
             try:
                 file_path, cancelled = await await_upload_operation(asyncio.to_thread(
                     publish_completed_upload, file_path, safe_name, retain_selected_source,
                     limit=MAX_SCRIPT_UPLOAD_BYTES,
                     companion_bytes=publication_bytes))
+            except UploadPublicationHeldError as error:
+                # Known non-commit: the native rename exhausted its bounded
+                # sharing-violation retry and did not publish. Files already
+                # published (e.g. a retained EPUB) stay as recovery material
+                # and are named in the message; nothing else was published.
+                if retained_epub_path is not None:
+                    name = os.path.basename(retained_epub_path)
+                    raise HTTPException(status_code=503, detail=(
+                        'The upload could not be completed because the file '
+                        'appears to be held by another program; retained EPUB '
+                        f"'{name}' remains as recovery material and counts "
+                        'toward quota. Inspect it with '
+                        'GET /api/uploads/epub-retained, then remove it '
+                        'manually before retrying; no existing group was '
+                        'overwritten. The file may be held by antivirus '
+                        'scanning or a sync tool.')) from error
+                raise HTTPException(status_code=503, detail=_HELD_UPLOAD_DETAIL) from error
             except ValueError as error:
+                # A confirmed retained EPUB is never unlinked after it became
+                # visible (``on_visible`` fired). ``publication_started`` is
+                # intentionally unknown-protecting: a failed TXT publish
+                # cannot prove the retained file unobserved, so it stays as
+                # quota-accounted recovery, visible via the inventory.
+                if retained_epub_path is not None:
+                    name = os.path.basename(retained_epub_path)
+                    raise HTTPException(status_code=409, detail=(
+                        f"TXT publication failed ({redact_text(str(error))}); "
+                        f"retained EPUB '{name}' remains as recovery material "
+                        'and counts toward quota. Remove it manually via '
+                        'GET /api/uploads/epub-retained inventory before retrying; '
+                        'no existing group was overwritten.')) from error
                 raise HTTPException(status_code=409, detail=redact_text(str(error))) from error
+            except OSError:
+                # Preserve the unknown-commit type: plain-TXT and EPUB
+                # writer-close failures must stay OSError for direct callers
+                # (frozen visibility contract). Files already published stay
+                # retained and quota-accounted; the HTTP 500 is the failure
+                # signal and the inventory shows the recovery group.
+                raise
             if cancelled is not None:
                 raise cancelled
+            if retained_unknown_error is not None:
+                raise retained_unknown_error
+        # Identical-bytes duplicate: the canonical retained EPUB already holds
+        # these exact original bytes (verified above); no second file is
+        # created and no duplicate quota is charged.
         selection_token = None
         if select_active:
             selection_token, cancelled = await await_upload_operation(asyncio.to_thread(
@@ -1151,6 +2092,8 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
                 raise cancelled
         return {"filename": file.filename, "stored_filename": os.path.basename(file_path),
                 "path": file_path, "reused": reused,
+                "retained_epub": (os.path.basename(retained_epub_path)
+                                 if retained_epub_path is not None else None),
                 "book_identity_token": selection_token,
                 "publication_status": publication['metadata_status'] if publication is not None else 'not_captured',
                 "publication_warnings": publication['warnings'] if publication is not None else [],
@@ -1180,6 +2123,180 @@ async def upload_file(file: UploadFile = File(...), select_active: bool = True, 
                 raise cleanup_cancelled
         finally:
             storage_lock.__exit__(None, None, None)
+
+# --- Calibre OPDS import (thin wrapper; service lazy-singleton keyed by DATA_DIR,
+# injectable in tests via ``_calibre_services``; no networking in construction) ---
+
+from calibre_catalog import CatalogError as _CalibreCatalogError
+from calibre_import import ImportRefused as _CalibreImportRefused
+from fastapi import Query as _CalibreQuery
+
+_calibre_services = {}
+_calibre_services_lock = threading.Lock()
+
+
+def _get_calibre_pair():
+    with _calibre_services_lock:
+        pair = _calibre_services.get(DATA_DIR)
+        if pair is None:
+            from calibre_catalog import CalibreCatalogService
+            from calibre_import import CalibreImportService
+            catalog = CalibreCatalogService(DATA_DIR)
+            service = CalibreImportService(DATA_DIR, catalog=catalog,
+                                           max_upload_bytes=MAX_SCRIPT_UPLOAD_BYTES)
+            pair = (catalog, service)
+            _calibre_services[DATA_DIR] = pair
+        return pair
+
+
+def _calibre_error(exc):
+    raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+
+
+class CalibreConfigRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    root_url: Optional[str] = Field(default=None, max_length=2048)
+    username: Optional[str] = Field(default=None, max_length=200)
+    password: Optional[Any] = Field(default=None)
+
+
+class CalibreTokenRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    token: str = Field(pattern=r'^[0-9a-f]{32}$')
+
+
+class CalibreImportRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    confirmation_token: str = Field(pattern=r'^[0-9a-f]{32}$')
+    sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@router.get("/api/calibre/config")
+async def get_calibre_config():
+    catalog, _service = _get_calibre_pair()
+    return await asyncio.to_thread(catalog.get_config)
+
+
+@router.post("/api/calibre/config")
+async def save_calibre_config(request: CalibreConfigRequest):
+    catalog, service = _get_calibre_pair()
+    if request.password is not None and not isinstance(request.password, str):
+        raise HTTPException(status_code=400, detail='Password must be a string.')
+    try:
+        result = await asyncio.to_thread(
+            catalog.save_config, request.root_url, request.username, request.password)
+    except _CalibreCatalogError as exc:
+        _calibre_error(exc)
+    service.on_config_changed()
+    return result
+
+
+@router.post("/api/calibre/browse-root")
+async def calibre_browse_root():
+    catalog, _service = _get_calibre_pair()
+    try:
+        return await asyncio.to_thread(catalog.browse_root_page)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+@router.post("/api/calibre/browse-next")
+async def calibre_browse_next(request: CalibreTokenRequest):
+    catalog, _service = _get_calibre_pair()
+    try:
+        return await asyncio.to_thread(catalog.browse_next_page, request.token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+@router.get("/api/calibre/preview")
+async def calibre_preview(preview_token: str = _CalibreQuery(pattern=r'^[0-9a-f]{32}$')):
+    catalog, _service = _get_calibre_pair()
+    try:
+        # Pure server-held metadata only; explicit capture is the sole EPUB action.
+        return await asyncio.to_thread(catalog.get_metadata_preview, preview_token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+@router.post("/api/calibre/review/approve")
+async def calibre_review_approve(request: CalibreTokenRequest):
+    catalog, _service = _get_calibre_pair()
+    try:
+        return await asyncio.to_thread(catalog.approve_review, request.token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+@router.post("/api/calibre/capture")
+async def calibre_capture(request: CalibreTokenRequest):
+    catalog, service = _get_calibre_pair()
+    try:
+        review = await asyncio.to_thread(catalog.request_capture_review, request.token)
+        if review.get("review_required"):
+            return review
+        job_token = await asyncio.to_thread(service.start_capture, request.token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+    return {"job_token": job_token, "status": "capturing"}
+
+
+@router.get("/api/calibre/capture/status")
+async def calibre_capture_status(job_token: str = _CalibreQuery(pattern=r'^[0-9a-f]{32}$')):
+    _catalog, service = _get_calibre_pair()
+    try:
+        await asyncio.to_thread(service.purge_expired)
+        return await asyncio.to_thread(service.get_capture_status, job_token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+@router.post("/api/calibre/capture/cancel")
+async def calibre_capture_cancel(request: CalibreTokenRequest):
+    _catalog, service = _get_calibre_pair()
+    try:
+        return await asyncio.to_thread(service.cancel_capture, request.token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+@router.post("/api/calibre/capture/discard")
+async def calibre_capture_discard(request: CalibreTokenRequest):
+    _catalog, service = _get_calibre_pair()
+    try:
+        return await asyncio.to_thread(service.discard_capture, request.token)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
+
+async def _calibre_upload_through_authority(raw_bytes, synthetic_name):
+    """Handoff the verified immutable snapshot to the upload authority."""
+    import io as _io
+    handle = _io.BytesIO(raw_bytes)
+    try:
+        upload = UploadFile(file=handle, filename=synthetic_name)
+        return await upload_file(file=upload, select_active=False,
+                                 include_extraction_report=True,
+                                 docx_preview=False, docx_confirmed=False,
+                                 docx_preview_digest=None)
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+@router.post("/api/calibre/import")
+async def calibre_import(request: CalibreImportRequest):
+    _catalog, service = _get_calibre_pair()
+    def uploader(raw_bytes, synthetic_name):
+        return asyncio.run(_calibre_upload_through_authority(raw_bytes, synthetic_name))
+    try:
+        return await asyncio.to_thread(service.import_confirmed, request.confirmation_token,
+                                       request.sha256, uploader)
+    except (_CalibreCatalogError, _CalibreImportRefused) as exc:
+        _calibre_error(exc)
+
 
 class GenerateScriptRequest(BaseModel):
     strip_front_matter: bool = True
@@ -1274,7 +2391,7 @@ def start_book_preflight(background_tasks, request):
                     raise ValueError("Source changed while preparing preflight.")
                 signature = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
             if len(source_bytes) > MAX_SCRIPT_UPLOAD_BYTES:
-                raise HTTPException(status_code=400, detail="Source exceeds the upload storage limit.")
+                raise AppError(400, 'Source exceeds the upload storage limit.', key='error.upload.source_too_large')
             source_copy = os.path.join(private.name, "source" + Path(source_path).suffix)
             Path(source_copy).write_bytes(source_bytes)
             config = load_app_config(CONFIG_PATH)
@@ -1497,7 +2614,7 @@ async def snapshot_script(request: SnapshotRequest):
     try:
         return await asyncio.to_thread(_snapshot_script_sync, request)
     except TimeoutError as error:
-        raise HTTPException(status_code=409, detail='Book or saved snapshot is busy; retry shortly.') from error
+        raise AppError(409, 'Book or saved snapshot is busy; retry shortly.', key='error.book.snapshot_busy') from error
 
 
 def _snapshot_script_sync(request):
@@ -1603,9 +2720,7 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
     """Queue the one production generation command, optionally from a checkpoint."""
     require_whole_source_generation(safe_load_json(os.path.join(DATA_DIR, 'state.json'), {}))
     if require_recovery and ensure_script_recovery_manifest() is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No failed or incomplete three-pass generation is available to resume.")
+        raise AppError(409, 'No failed or incomplete three-pass generation is available to resume.', key='error.generation.no_recovery')
     check_global_gpu_lock("script")
     try:
         options = {
@@ -1664,9 +2779,9 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
             current_state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
             require_whole_source_generation(current_state)
             if current_state.get("input_file_path") != input_file:
-                raise HTTPException(status_code=409, detail="Selected source changed before generation started.")
+                raise AppError(409, 'Selected source changed before generation started.', key='safety.generation.source_changed_before_start')
             if require_recovery and get_script_recovery_manifest() is None:
-                raise HTTPException(status_code=409, detail="Recovery checkpoint changed before start.")
+                raise AppError(409, 'Recovery checkpoint changed before start.', key='safety.generation.recovery_changed')
             from script_selection_binding import capture_generation_selection
             try:
                 captured = capture_generation_selection(DATA_DIR, input_file)
@@ -1762,7 +2877,7 @@ async def generate_script(background_tasks: BackgroundTasks,
     # Get input file from state.json
     state_path = os.path.join(DATA_DIR, "state.json")
     if not os.path.exists(state_path):
-        raise HTTPException(status_code=400, detail="No input file selected")
+        raise AppError(400, 'No input file selected', key='error.generation.no_input')
 
     state = safe_load_json(state_path, default={})
     input_file = state.get("input_file_path")
@@ -2390,7 +3505,7 @@ def get_current_cast_list_target():
     state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
     input_file = state.get("input_file_path") if isinstance(state, dict) else None
     if not input_file or not os.path.isfile(input_file):
-        raise HTTPException(status_code=400, detail="No input file selected")
+        raise AppError(400, 'No input file selected', key='error.generation.no_input')
     return input_file, get_cast_list_path(input_file, DATA_DIR)
 
 
@@ -2457,8 +3572,7 @@ def delete_current_cast_list():
     if not os.path.isfile(path):
         return {"status": "deleted"}
     with file_lock(path):
-        if os.path.isfile(path):
-            Path(path).unlink(missing_ok=True)
+        Path(path).unlink(missing_ok=True)
     return {"status": "deleted"}
 
 
@@ -2816,27 +3930,101 @@ def _resolve_batch_script_input(filename: str) -> str:
     return input_path
 
 
-def _read_and_validate_batch_script_source(job):
-    """Read one batch source and reject unattested narrator metadata."""
+def _batch_source_identity_from_proof(proof):
+    """One proof -> batch identity tuple formula for producer + getter."""
+    return (proof['sha256'], proof['size'], tuple(proof['file_version'] or ()))
+
+
+def _capture_and_validate_batch_script_source(job):
+    """Capture, decode and validate one batch source; return its proof.
+
+    Returns (text, normalizations, identity) where identity is derived
+    from THE SAME bounded captured bytes that were decoded, normalized
+    and narrator-validated here — never a separate stat/hash read — so
+    a cached text can never be bound under a different content identity
+    (A/B/A fast-edit/revert). DOCX groups use the verified group
+    capture; other sources use the confined raw capture. The decoded
+    text is not mutated into the caller's job (Rule 17).
+    """
     from docx_publication import capture_docx_group
+    from script_selection_binding import _capture_raw_source
+    from source_encoding import get_decoded_source_text, get_normalized_source_newlines
+    from utils import get_unsafe_text_controls
     group = capture_docx_group(job['input_path'])
     if group is not None:
-        text = fix_mojibake(group['text_bytes'].decode('utf-8'))
+        proof = group['proofs']['text']
+        raw = group['text_bytes']
     else:
-        with open(job["input_path"], encoding="utf-8") as source:
-            text = fix_mojibake(source.read())
+        proof, raw = _capture_raw_source(job['input_path'], owning_root=None,
+                                         include_bytes=True)
+        if not proof.get('exists'):
+            raise FileNotFoundError(str(job['input_path']))
+    # ONE shared preparation policy after either capture: shared
+    # decoder (UTF-8, then CP1252), universal-newline policy, then
+    # mojibake. Identity stays on the original raw bytes / group
+    # proof above, never on the decoded text.
+    decoded, encoding = get_decoded_source_text(raw)
+    if encoding == "utf-8/replace":
+        # Lossy tier: bytes undecodable as UTF-8 or CP1252. Refuse
+        # explicitly before preflight/dispatch can offer damaged text
+        # as clean; the existing ValueError boundaries map this to a
+        # clear 400 on both batch routes. Retained bytes are untouched.
+        # Genuinely CP1252-decodable text remains supported by design
+        # and cannot be assumed wrong (residual human-inspection limit).
+        raise ValueError(
+            f"{job['filename']}: source text could not be decoded as "
+            "UTF-8 or CP1252; it contains undecodable bytes. Save the "
+            "source as UTF-8 or CP1252 text and try again.")
+    # Canonical unsafe-control gate (same shared helper the preflight
+    # audit and canonical preparation use): e.g. UTF-16 BOM/NUL bytes
+    # decode through the CP1252 fallback without hitting the replace
+    # tier above, but NUL and other Cc/Cs/bidi controls are known
+    # unsupported and canonical generation refuses them. Refuse here,
+    # before preflight/dispatch can offer them; ordinary whitespace
+    # stays valid. Valid UTF-8/CP1252 without unsafe controls passes.
+    _unsafe_controls = get_unsafe_text_controls(decoded)
+    if _unsafe_controls:
+        raise ValueError(
+            f"{job['filename']}: source text contains unsupported control "
+            f"characters ({', '.join(_unsafe_controls)}); canonical "
+            "generation refuses them. Save the source as UTF-8 or CP1252 "
+            "text without control characters and try again.")
+    text = fix_mojibake(get_normalized_source_newlines(decoded))
     text, normalization_count = normalize_known_source_corruptions(text)
     narrator = job.get("first_person_narrator")
     if narrator and not is_narrator_attested(narrator, text):
         raise ValueError(
             f"{job['filename']}: first-person narrator must appear by name "
             "at least three times in the source")
+    identity = _batch_source_identity_from_proof(proof)
+    return text, normalization_count, identity
+
+
+def _read_and_validate_batch_script_source(job):
+    """Read one batch source and reject unattested narrator metadata."""
+    text, normalization_count, _identity = _capture_and_validate_batch_script_source(job)
     return text, normalization_count
 
 
 def get_batch_script_source_identity(path):
-    stat = os.stat(path)
-    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    """Content-authoritative identity for the prepared-source cache.
+
+    The cached decoded text may be reused only while the exact source
+    bytes are unchanged. A stat tuple alone cannot prove that: timestamp
+    resolution is OS/filesystem dependent, and a same-sized rewrite can
+    restore mtime (and on some filesystems leave the whole stat tuple
+    unchanged) while the bytes change. Hash the raw bytes through the
+    shared confined capture seam (plain-path, single-link regular-file
+    and 512 MiB bounds, digest-only stream) and keep the file version
+    alongside it, so a touch still misses conservatively. A missing
+    source raises FileNotFoundError, matching the previous os.stat
+    contract; an aliased/hardlinked source raises ValueError.
+    """
+    from script_selection_binding import _capture_raw_source
+    proof, _raw = _capture_raw_source(path, owning_root=None, include_bytes=False)
+    if not proof.get('exists'):
+        raise FileNotFoundError(str(path))
+    return _batch_source_identity_from_proof(proof)
 
 
 def get_validated_batch_script_source(job):
@@ -2881,7 +4069,8 @@ def get_batch_script_source_preflight(job, text, settings, context, context_wind
 def build_batch_script_preflight(jobs):
     """Build the shared read-only sizing report used by the UI and dispatcher."""
     config = load_app_config(CONFIG_PATH)
-    parallel, context = get_planned_llm_capacity(config)
+    planned = get_planned_request_context(config)
+    parallel, context = planned["parallel"], planned["context"]
     generation = config.get("generation") or {}
     settings = resolve_three_pass_generation_settings(config)
     context_windows = generation.get("context_rescue_windows")
@@ -2929,37 +4118,26 @@ def build_batch_script_preflight(jobs):
 UNQUOTED_BOOK_THRESHOLD = 0.5
 
 
-def get_planned_llm_capacity(config):
-    """-> (parallel, context_length) the active LLM profile will run with;
-    context_length is 0 when the server does not report it."""
-    llm = get_active_llm_config(config)
-    status = get_planned_ideal_settings(
-        config.get("llm_mode", "local"), llm.get("base_url", ""),
-        llm.get("model_name", ""), config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
-    return max(1, int(status.get("parallel") or 1)), int(status.get("context_length") or 0)
-
-
 def get_three_pass_admission_context(config, settings):
-    """-> (context_length, refusal) for one admission snapshot. Probes model
-    capacity only when the configured request sizes need it."""
+    """One guarded capacity probe for a preparation/admission snapshot."""
     if not is_three_pass_context_required(
             settings["chunk_size"], settings["attribute_context_chars"],
             settings["attribute_target_chars"], settings["instruct_target_chars"],
             settings["instruct_context_chars"]):
         return 0, None
     try:
-        _, context = get_planned_llm_capacity(config)
+        planned = get_planned_request_context(config)
     except Exception as error:
         if settings["instruct_context_chars"] > LARGE_CONTEXT_CHARS:
             return 0, ("Could not determine model context for Step 3 extra text. "
-                       "Check the endpoint before retrying.")
-        # Preserve the earlier admission deferral for the preexisting controls.
+                       "Check the endpoint or declare its context budget before retrying.")
+        # Preserve legacy admission deferral for the preexisting controls.
         print(f"Context admission skipped; the run will check it: {type(error).__name__}: {error}")
         return 0, None
-    if not context:
-        return 0, ("Larger requests require a known model context. Use a server "
-                   "that reports its loaded context length.")
-    return context, None
+    if not planned["known"]:
+        return 0, ("Larger requests require a known model context. Set Total context budget "
+                   "(tokens) in Setup for the active LLM profile, or use a server exposing its loaded context.")
+    return planned["context"], None
 
 
 def three_pass_refusal(jobs, *, config=None, settings=None, admission=None):
@@ -3034,7 +4212,14 @@ async def generate_script_batch_preflight(request: BatchScriptRequest):
                 for task in request.tasks]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await asyncio.to_thread(build_batch_script_preflight, jobs)
+    # Same read-only domain boundary as batch/start: confined/group
+    # capture refusals (hardlink, missing companion, changed source)
+    # are 400, never 500. Cancellation and genuine programmer
+    # exceptions propagate unchanged.
+    try:
+        return await asyncio.to_thread(build_batch_script_preflight, jobs)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @contextlib.contextmanager
@@ -3148,8 +4333,12 @@ def get_prepared_batch_script_jobs(request):
             raise ValueError(refusal)
         prepared = []
         for job in jobs:
-            identity = get_batch_script_source_identity(job["input_path"])
-            text, normalizations = _read_and_validate_batch_script_source(job)
+            # The cached text and its identity come from the one
+            # captured record; the recheck below compares the CURRENT
+            # digest-only identity against THAT captured identity, so
+            # an A/B/A edit during preparation refuses before sizing
+            # and dispatch instead of binding B under A.
+            text, normalizations, identity = _capture_and_validate_batch_script_source(job)
             if get_batch_script_source_identity(job["input_path"]) != identity:
                 raise ValueError(f"Source changed while preparing: {job['filename']}")
             sizing_identity = get_batch_script_sizing_identity(text, settings, context_windows, context)
