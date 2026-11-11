@@ -32,6 +32,7 @@ from utils import (atomic_json_write, safe_load_json, is_oom_failure, is_path_in
 from chunk_status_journal import (ChunkStatusJournal, get_chunk_status_journal_path,
                                   get_chunk_audio_key)
 from adapter_publication import sync_adapter_directory
+from export_file_io import replace_export_output
 from config_settings import load_app_config
 from export_limits import ensure_legacy_pcm_allowed
 from lora_evidence import get_tts_model_settings
@@ -49,6 +50,7 @@ from synthesis_recovery_context import (RecoveryParent, RecoveryAdmissionError, 
 from synthesis_recovery_identity import get_recovery_digest
 from dialogue_continuity import get_dialogue_gap_suggestion
 from speech_verification_settings import get_enabled_speech_verification_settings
+from speech_retry import get_speech_retry_budget
 from book_state_transaction import get_book_operation_token
 from take_retention import (KEY as RETAINED_TAKE_KEY, POLICY as TAKE_HISTORY_POLICY, admit_take_history_edit,
     get_take_history_policy, preserve_retained_takes, make_retained_take,
@@ -87,7 +89,7 @@ MAX_CHUNK_CHARS = 500
 # Korean (Hangul) was NOT measured, so it keeps MAX_CHUNK_CHARS.
 CJK_SPEECH_RATE_FACTORS = {"ja": 2.09, "zh": 2.72}
 CJK_IDEOGRAPH_NAME_PREFIXES = ("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")
-KANA_NAME_PREFIXES = ("HIRAGANA", "KATAKANA", "HALFWIDTH KATAKANA")
+KANA_NAME_PREFIXES = ("HIRAGANA", "KATAKANA")
 CHAPTER_HEADING_RE = re.compile(
     r'^(chapter|part|book|volume|prologue|epilogue|introduction|conclusion|act|section)\b',
     re.IGNORECASE
@@ -589,10 +591,9 @@ def get_chunk_text_key(text):
 
 
 def is_han_or_kana_letter(ch):
-    """True for Han, kana and Bopomofo characters (issue #1332)."""
+    """True for Han, Hiragana and Katakana characters (issue #1332)."""
     name = unicodedata.name(ch, "")
-    return name.startswith(CJK_IDEOGRAPH_NAME_PREFIXES + KANA_NAME_PREFIXES
-                           + ("BOPOMOFO",))
+    return name.startswith(CJK_IDEOGRAPH_NAME_PREFIXES + KANA_NAME_PREFIXES)
 
 
 def is_kana_letter(ch):
@@ -606,34 +607,25 @@ def get_chunk_char_limit(text, base=MAX_CHUNK_CHARS):
     Chinese and Japanese characters take longer to speak than English ones
     (issue #1332), so their chunks must be shorter. Latin, Cyrillic, Hangul
     and letterless text keep the English base limit."""
-    if text.isascii():
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
         return base
-    letters = han_or_kana = kana = 0
-    for ch in text:
-        if not ch.isalpha():
-            continue
-        letters += 1
-        if is_han_or_kana_letter(ch):
-            han_or_kana += 1
-            if is_kana_letter(ch):
-                kana += 1
-    if not han_or_kana:
+    han_or_kana = sum(1 for ch in letters if is_han_or_kana_letter(ch))
+    if han_or_kana * 2 < len(letters):
         return base
-    # Any Han/kana text gets the shorter budget. A mixed passage takes the
-    # lower Chinese limit unless kana clearly dominates.
-    chosen = "ja" if kana * 2 >= han_or_kana else "zh"
-    return max(1, int(base / CJK_SPEECH_RATE_FACTORS[chosen]))
+    language = "ja" if any(is_kana_letter(ch) for ch in letters) else "zh"
+    return max(1, int(base / CJK_SPEECH_RATE_FACTORS[language]))
 
 
 def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
-                      review_sink=None, include_source_indices=False,
-                      language_aware=True, legacy_chunking=False, coalesce_unlocated=True):
+                      review_sink=None, include_source_indices=False, cjk_limits=True,
+                      coalesce_unlocated=True):
     """Group consecutive entries by same speaker into chunks up to max_chars
 
-    language_aware=False with legacy_chunking=True reproduces grouping from
-    before the Chinese/Japanese limits, so chunks made then can still be
-    recognised. coalesce_unlocated=False preserves the older missing/False
-    spoken-context boundaries for delivery retry. Rebuilds keep the defaults.
+    cjk_limits=False reproduces grouping from before the Chinese/Japanese
+    limits (#1353), so chunks made then can still be recognised.
+    coalesce_unlocated=False preserves the older missing/False spoken-context
+    boundaries for delivery retry. Rebuilds keep the current defaults.
     """
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
@@ -673,8 +665,7 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
                 and not _is_structural_text(current_text)
                 and not _is_structural_text(text)):
             combined = current_text + ("" if JOINS_WITHOUT_SPACE.match(text) else " ") + text
-            limit = get_chunk_char_limit(combined, max_chars) if language_aware else max_chars
-            if len(combined) <= limit:
+            if len(combined) <= (get_chunk_char_limit(combined, max_chars) if cjk_limits else max_chars):
                 current_text = combined
                 if include_source_indices:
                     current_indices = sorted(set(current_indices + entry["_source_entry_indices"]))
@@ -702,33 +693,18 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS,
     bounded = []
     for chunk in chunks:
         remaining = chunk["text"]
-        while True:
-            limit = get_chunk_char_limit(remaining, max_chars) if language_aware else max_chars
-            if len(remaining) <= limit:
-                break
-            pattern = (r"\s+|[.!?。！？]" if legacy_chunking
-                       else r"\s+|[.!?。！？，、；：…]")
-            boundaries = list(re.finditer(pattern, remaining[:limit]))
+        limit = get_chunk_char_limit(chunk["text"], max_chars) if cjk_limits else max_chars
+        while len(remaining) > limit:
+            boundaries = list(re.finditer(r"\s+|[.!?。！？]", remaining[:limit]))
             cut = boundaries[-1].end() if boundaries else limit
             if cut < max(1, limit // 2):
                 cut = limit
             piece = {**chunk, "text": remaining[:cut]}
-            if legacy_chunking:
-                piece.pop("pause_after", None)
-            else:
-                # A mid-sentence continuation must not inherit the 250 ms
-                # same-speaker export default; a sentence-ending cut may.
-                piece["pause_after"] = (None if remaining[:cut].rstrip().endswith(
-                    (".", "!", "?", "。", "！", "？")) else 0)
+            piece.pop("pause_after", None)
             bounded.append(piece)
             chunk = {**chunk, "_chapter_start": False}
             remaining = remaining[cut:]
-        if (not legacy_chunking and remaining.strip()
-                and not any(ch.isalnum() for ch in remaining) and bounded):
-            bounded[-1]["text"] += remaining
-            bounded[-1]["pause_after"] = chunk.get("pause_after")
-        else:
-            bounded.append({**chunk, "text": remaining})
+        bounded.append({**chunk, "text": remaining})
     normalized = []
     for chunk in bounded:
         chunk = {**chunk, "text": get_tts_chunk_text(chunk["text"])}
@@ -1063,7 +1039,7 @@ class ProjectManager:
 
     def load_chunks(self):
         """Load chunks from disk, regenerating if missing or corrupted.
-
+        
         Uses _chunks_lock to prevent race conditions with concurrent saves.
         """
         with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
@@ -1155,16 +1131,57 @@ class ProjectManager:
         self._uids_file_version = (self._get_chunks_file_version()
                                    if uids_backfilled else None)
 
+    def _read_chunks_snapshot(self):
+        """-> (bytes, (dev, ino)) of chunks.json read through one descriptor,
+        or (None, None) when it is missing or unreadable."""
+        flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+        try:
+            descriptor = os.open(self.chunks_path, flags)
+        except OSError:
+            return None, None
+        try:
+            info = os.fstat(descriptor)
+            with os.fdopen(os.dup(descriptor), 'rb') as stream:
+                return stream.read(), (info.st_dev, info.st_ino)
+        except OSError:
+            return None, None
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _parse_chunks_snapshot(raw):
+        """safe_load_json's tolerance, on bytes already read: None when absent
+        or corrupt."""
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, ValueError) as error:
+            logger.warning("Corrupted/unreadable JSON at %s, using default: %s", "chunks.json", error)
+            return None
+
     def _read_chunks(self):
         """Read chunks.json, regenerating from script if missing or corrupted.
 
         Internal method - callers must hold _chunks_lock. Always returns a
-        list (possibly empty), never None.
+        list (possibly empty), never None. A book switch's placeholder at
+        either name (#1660) is refused rather than parsed, renamed aside as
+        corrupt, or regenerated over: the switch owns that name.
         """
-        if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
+        from book_placeholder import is_book_placeholder, is_book_placeholder_bytes
+        switching = "A book switch is in progress; chunks are not available yet"
+        journal_path = get_chunk_status_journal_path(self.chunks_path)
+        if is_book_placeholder(journal_path):
+            raise ValueError(switching)
+        if os.path.exists(journal_path):
+            # A placeholder landing after the check fails to parse: an error,
+            # never a write.
             return self._get_status_journal_locked().get_rows()
         file_version = self._get_chunks_file_version()
-        chunks = safe_load_json(self.chunks_path)
+        raw, read_identity = self._read_chunks_snapshot()
+        if raw is not None and is_book_placeholder_bytes(raw):
+            raise ValueError(switching)
+        chunks = self._parse_chunks_snapshot(raw)
         if not isinstance(chunks, list) or not all(isinstance(c, dict) for c in chunks):
             chunks = None
         if chunks is not None:
@@ -1191,6 +1208,19 @@ class ProjectManager:
             # Back the corrupted file up rather than deleting it - regenerating
             # resets every chunk to pending/no-audio, so keep a copy in case the
             # user's generation progress can be salvaged from it.
+            # Only back up the object that was read and found corrupt: a
+            # switch's placeholder appearing since is not ours to rename.
+            try:
+                now = os.lstat(self.chunks_path)
+            except OSError:
+                now = None
+            if is_book_placeholder(self.chunks_path):
+                raise ValueError(switching)
+            if now is None or (now.st_dev, now.st_ino) != read_identity:
+                # Identity alone can be fooled by a reused inode number; the
+                # placeholder check above does not depend on it.
+                raise ValueError("chunks.json changed while it was being read; "
+                                 "nothing was renamed. Retry.")
             backup = self.chunks_path + ".corrupt"
             suffix = 0
             while os.path.lexists(backup):
@@ -1296,36 +1326,10 @@ class ProjectManager:
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk.get("uid")))
             return chunk
 
-    def _get_chunk_edit_voices(self):
-        """Read render inputs without hiding damaged voice data during edits."""
-        try:
-            with open(self.voice_config_path, "r", encoding="utf-8") as source:
-                voices = json.load(source)
-        except FileNotFoundError:
-            voices = {}
-        if not isinstance(voices, dict):
-            raise ValueError("Voice configuration must be an object before changing source indices")
-        return voices
-
-    def _invalidate_shifted_chunk_audio(self, chunks, old_indices):
-        """Retire renders when source-index timelines select different inputs."""
-        if not any(old_indices.get(chunk.get("uid"), index) != index
-                   for index, chunk in enumerate(chunks)):
-            return
-        voices = self._get_chunk_edit_voices()
-        for index, chunk in enumerate(chunks):
-            old_index = old_indices.get(chunk.get("uid"))
-            if old_index is not None and old_index != index and (
-                    self.get_chunk_voice_inputs(voices, chunk, old_index) !=
-                    self.get_chunk_voice_inputs(voices, chunk, index)):
-                chunk.update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
-                             voice_revision=uuid.uuid4().hex)
-
     def insert_chunk(self, after_index):
         """Insert an empty chunk after the given index. Returns the new chunk list."""
         with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
-            old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
             if not (0 <= after_index < len(chunks)):
                 return None
             before = copy.deepcopy(chunks)
@@ -1347,7 +1351,7 @@ class ProjectManager:
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
 
-            self._invalidate_shifted_chunk_audio(chunks, old_indices)
+            self._invalidate_reindexed_audio_locked(before, chunks)
             self._save_chunks_locked(chunks, uids_backfilled=True)
             return chunks
 
@@ -1355,14 +1359,13 @@ class ProjectManager:
         """Delete a chunk at the given index. Returns (deleted_chunk, updated_chunks) or None."""
         with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
-            old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
             if not (0 <= index < len(chunks)):
                 return None
             if len(chunks) <= 1:
                 return None  # don't allow deleting the last chunk
             before = copy.deepcopy(chunks)
 
-            voices = self._get_chunk_edit_voices()
+            voices = self.get_voice_config_for_update()
             deleted = chunks.pop(index)
             deleted["_deleted_voice_inputs"] = self.get_chunk_voice_inputs(voices, deleted, index)
 
@@ -1370,7 +1373,7 @@ class ProjectManager:
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
 
-            self._invalidate_shifted_chunk_audio(chunks, old_indices)
+            self._invalidate_reindexed_audio_locked(before, chunks)
             self._save_chunks_locked(chunks, uids_backfilled=True)
             return deleted, chunks
 
@@ -1383,21 +1386,20 @@ class ProjectManager:
             return None
         with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
             chunks = self._read_chunks()
-            old_indices = {chunk.get("uid"): i for i, chunk in enumerate(chunks)}
 
             chunk_data = copy.deepcopy(chunk_data)
             uid = chunk_data.get("uid")
             if uid and any(chunk.get("uid") == uid for chunk in chunks):
                 return None
-            if type(chunk_data.get("id")) is int:
-                old_indices[uid] = chunk_data["id"]
             at_index = max(0, min(at_index, len(chunks)))
             if isinstance(chunk_data, dict):
                 chunk_data.setdefault("uid", _new_chunk_uid())
             chunks.insert(at_index, chunk_data)
-            captured_voice = chunk_data.pop("_deleted_voice_inputs", None)
-            if chunk_data.get("audio_path") and (captured_voice is None or
-                    captured_voice != self.get_chunk_voice_inputs(self._get_chunk_edit_voices(), chunk_data, at_index)):
+            old_voice_inputs = chunk_data.pop("_deleted_voice_inputs", None)
+            voices = self.get_voice_config_for_update()
+            if chunk_data.get("audio_path") and (
+                    old_voice_inputs is None or
+                    old_voice_inputs != self.get_chunk_voice_inputs(voices, chunk_data, at_index)):
                 chunk_data.update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                                   voice_revision=uuid.uuid4().hex)
 
@@ -1405,7 +1407,8 @@ class ProjectManager:
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
 
-            self._invalidate_shifted_chunk_audio(chunks, old_indices)
+            self._invalidate_reindexed_audio_locked(
+                [row for row in chunks if row is not chunk_data], chunks)
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk_data.get("uid")))
             return chunks
 
@@ -1525,10 +1528,8 @@ class ProjectManager:
                     chunk["outlier"] = None
                 if "drift" in chunk:
                     chunk["drift"] = None
-                # The source mapping belonged to the old text/speaker.
-                for field in ("spoken", "source_speaker", "source_span",
-                              "dialogue_ambiguity"):
-                    chunk.pop(field, None)
+                if "speech_retry_attempts" in chunk:
+                    chunk["speech_retry_attempts"] = None
 
         return self._modify_chunk(index, mutator)
 
@@ -1544,9 +1545,8 @@ class ProjectManager:
         return self._modify_chunk(index, mutator)
 
     def _update_chunk_fields_by_uid(self, uid, expected_chunk=None, required_status=None,
-                                    audio_source=None, expected_fields=None, expected_audio=None,
-                                    expected_related_chunks=None, require_target=False,
-                                    publication_audio=None, restore_speech_receipt=False,
+                                    audio_source=None, expected_fields=None, expected_related_chunks=None,
+                                    require_target=False, publication_audio=None, restore_speech_receipt=False,
                                     audio_source_authority=None, **kwargs):
         """Conditionally publish to the live UID under one lock, preserving other rows.
 
@@ -1577,18 +1577,6 @@ class ProjectManager:
             if expected_chunk is not None and (
                     get_chunk_generation_inputs(chunk) != get_chunk_generation_inputs(expected_chunk)):
                 return None
-            if expected_audio is not None and any(
-                    chunk.get(field) != value for field, value in expected_audio.items()):
-                return None
-            for expected in expected_related_chunks or ():
-                related_uid = expected.get("uid")
-                related = (journal.get_row(related_uid) if journal else
-                           next((row for row in chunks if row.get("uid") == related_uid), None))
-                if related is None or get_chunk_generation_inputs(related) != get_chunk_generation_inputs(expected):
-                    return None
-                if any(related.get(field) != expected.get(field) for field in
-                       ("status", "audio_path", "audio_revision", "voice_revision")):
-                    return None
             if required_status is not None and chunk.get("status") != required_status:
                 return None
             if expected_fields is not None and any(chunk.get(key) != value for key, value in expected_fields.items()):
@@ -1601,6 +1589,11 @@ class ProjectManager:
                 if any(related.get(key) != expected.get(key) for key in ("status", "audio_path", "audio_revision")):
                     return None
             if audio_source is not None:
+                if "speech_retry_attempts" in chunk:
+                    kwargs.setdefault("speech_retry_attempts", None)
+                publication_retry_budget = get_speech_retry_budget()
+                if publication_retry_budget is not None:
+                    publication_retry_budget.check_active()
                 if get_take_history_policy(self.root_dir)['enabled'] and (chunk.get('audio_path') or chunk.get(RETAINED_TAKE_KEY)):
                     held = validate_retained_take(chunk)
                     if held is None or held['archive'] is None:
@@ -1667,6 +1660,8 @@ class ProjectManager:
                     kwargs['speech_verification'] = {**receipt,
                         'audio_file_version': list(publication_version[:5])}
             if kwargs:
+                if audio_source is not None and publication_retry_budget is not None:
+                    publication_retry_budget.check_active()
                 if audio_source_authority is not None:
                     if os.path.realpath(self.root_dir) != str(audio_source_authority.stage.directory.parent.parent):
                         raise SynthesisWorkspaceUnavailable('Registered publication book changed')
@@ -1736,6 +1731,12 @@ class ProjectManager:
                 chunk, temp_path, staged_path, preparation, revision)
             evidence.update(speech_verification=speech_receipt,speech_verification_failure=None,
                             speech_verification_recheck=None)
+            retry_budget = get_speech_retry_budget()
+            if retry_budget is not None:
+                retry_budget.record("verified", speech_receipt, reason="verified")
+                evidence["speech_retry_attempts"] = retry_budget.get_history()
+            elif "speech_retry_attempts" in chunk:
+                evidence["speech_retry_attempts"] = None
             from take_publication import (KEY as PUBLICATION_KEY, get_take_publication_receipt,
                                           get_take_publication_book_token)
             publication, publication_version = get_take_publication_receipt(
@@ -1745,10 +1746,14 @@ class ProjectManager:
             if publication is not None or PUBLICATION_KEY in chunk:
                 evidence[PUBLICATION_KEY] = publication
             publication_book = get_take_publication_book_token(publication_admission)
+            if retry_budget is not None:
+                retry_budget.check_active()
             with self._ensure_automatic_predecessor(chunk), self._ensure_chunk_generation_publication(
                     chunk, publication_book=publication_book) as current_book:
                 if not current_book:
                     raise ValueError(GENERATION_INPUTS_CHANGED)
+                if retry_budget is not None:
+                    retry_budget.check_deadline()
                 if staged_version is not None and self._get_speech_staged_version(staged_path) != staged_version:
                     raise ValueError('Finished audio changed before speech evidence publication')
                 if publication_version is not None and self._get_speech_staged_version(staged_path) != publication_version:
@@ -1897,6 +1902,14 @@ class ProjectManager:
 
     def _verify_generated_chunk_speech(self,chunk,temp_path,staged_path,preparation,revision):
         admission=chunk.get('_speech_verification_admission')
+        from speech_retry import SpeechRetryAttemptError
+        retry_budget=get_speech_retry_budget()
+        if retry_budget is not None:
+            ensure_audio_generation_active()
+            retry_budget.check_active()
+            if admission is None:
+                unavailable_receipt={"version":1,"status":"unavailable","stage":"input_admission","reason":"Speech verification admission is unavailable for this render path."}
+                raise SpeechRetryAttemptError("verifier_unavailable","Speech verification admission is unavailable for this render path.",receipt=unavailable_receipt)
         if admission is None:
             return None,None
         from speech_verification import verify_finished_speech
@@ -1932,6 +1945,8 @@ class ProjectManager:
                 is_audio_generation_cancelled,
                 ambiguous_expected_regions=regions)
         ensure_audio_generation_active()
+        if retry_budget is not None:
+            retry_budget.check_active()
         if staged_version[2] > MAX_AUDIO_BYTES:
             if self._get_speech_staged_version(staged_path) != staged_version:
                 raise ValueError('Finished audio changed during speech verification admission')
@@ -1946,6 +1961,15 @@ class ProjectManager:
         receipt=get_speech_verification_receipt(report,chunk,admission['book_token'],revision,speech_input)
         if report['status']=='corroborated_content_difference' and report.get('stage')=='complete':
             raise SpeechContentMismatchError(receipt)
+        if retry_budget is not None:
+            report_status=report.get("status")
+            report_stage=report.get("stage")
+            if report_status=="unavailable":
+                raise SpeechRetryAttemptError("verifier_unavailable",str(receipt.get("reason") or "Speech verification is unavailable."),receipt=receipt)
+            if report_status in ("review","review_short_acoustic_unavailable"):
+                raise SpeechRetryAttemptError("acoustic_suspicion",str(receipt.get("reason") or "Speech verification requires review."),receipt=receipt)
+            if report_status != "no_content_candidate" or report_stage != "complete":
+                raise SpeechRetryAttemptError("verifier_unavailable",str(receipt.get("reason") or "Speech verification is not complete."),receipt=receipt)
         receipt['audio_file_version']=list(current['file_version'][:5])
         return receipt,tuple(current['file_version'])
 
@@ -1990,15 +2014,16 @@ class ProjectManager:
                                   "index": index, "inputs": get_chunk_generation_inputs(captured)}),
                               claim_digest, admit)
 
-    def _restore_cancelled_generation(self, chunk):
+    def _restore_cancelled_generation(self, chunk, *, speech_retry_attempts=None):
         try:
             with ensure_audio_generation_publication(allow_cancelled=True):
                 current = self._update_chunk_fields_by_uid(chunk.get("uid"), expected_chunk=chunk)
                 if current is not None and current.get("status") == "generating":
+                    retry_fields = {} if speech_retry_attempts is None else {"speech_retry_attempts": speech_retry_attempts}
                     return self._update_chunk_fields_by_uid(
                         chunk.get("uid"), expected_chunk=chunk, required_status="generating",
                         status=(chunk.get("status", "pending") if chunk.get("status") != "generating" else "pending"),
-                        error=chunk.get("error"))
+                        error=chunk.get("error"), **retry_fields)
                 return current
         except AudioGenerationCancelled:
             # A replaced/released owner has no authority even for cleanup.
@@ -2067,8 +2092,92 @@ class ProjectManager:
             raise ValueError("Literal chunks have no matching source-policy script")
         ensure_literal_chunks(selected, policy)
 
-    @ensure_pronunciation_snapshot()
-    def _generate_captured_chunk_audio(self, index, chunk):
+    def _get_speech_retry_policies(self, engine=None):
+        from speech_retry import get_enabled_speech_retry_settings
+        engine = self.engine if engine is None else engine
+        saved_policy = get_enabled_speech_retry_settings(self._load_tts_config().get("speech_retry"))
+        active_policy = None
+        if engine is not None:
+            reader = getattr(engine, "get_speech_retry_policy", None)
+            active_value = reader() if callable(reader) else getattr(engine, "_speech_retry", None)
+            active_policy = get_enabled_speech_retry_settings(active_value)
+        return saved_policy, active_policy
+
+    def _get_speech_retry_mismatch_reason(self, engine=None):
+        engine = self.engine if engine is None else engine
+        saved_policy, active_policy = self._get_speech_retry_policies(engine)
+        saved_verification = get_enabled_speech_verification_settings(self._load_tts_config().get("speech_verification"))
+        if engine is None:
+            if saved_policy is not None and saved_verification is None:
+                return "Speech retry requires speech verification to be enabled."
+            return None
+        if active_policy != saved_policy:
+            return "Speech retry policy differs from the active TTS engine."
+        if saved_policy is None:
+            return None
+        if saved_verification is None:
+            return "Speech retry requires speech verification to be enabled."
+        active_verification = None
+        verification_reader = getattr(engine, "get_speech_verification_policy", None)
+        if callable(verification_reader):
+            try:
+                active_verification = get_enabled_speech_verification_settings(verification_reader())
+            except Exception:
+                active_verification = None
+        if active_verification != saved_verification:
+            return "Speech verification policy differs from the active TTS engine."
+        return None
+
+    def _is_speech_retry_opted_in(self, engine=None):
+        saved_policy, active_policy = self._get_speech_retry_policies(engine)
+        return saved_policy is not None or active_policy is not None
+
+    def _create_speech_retry_budget(self, chunk):
+        from speech_retry import SpeechRetryBudget
+        from speech_verification_receipt import get_speech_verification_chunk_digest
+        with ensure_audio_generation_book(self.root_dir):
+            book_token = get_book_operation_token(self.root_dir)
+            chunk_uid = chunk.get("uid") if isinstance(chunk, dict) else None
+            input_digest = get_speech_verification_chunk_digest(chunk)
+            return SpeechRetryBudget(book_token=book_token, uid=chunk_uid, input_digest=input_digest)
+
+    @staticmethod
+    def _coerce_saved_seed(value):
+        """Read integer or string seeds without inventing an invalid value."""
+        if type(value) is int:
+            return value
+        if type(value) is str:
+            try:
+                return int(value.strip())
+            except (TypeError, ValueError, OverflowError):
+                return None
+        return None
+
+    def _speech_retry_requested_seed(self, chunk, chunk_voice_config, speaker, text):
+        """Bind the materialized seed, leaving unsupported saved values unchanged."""
+        from speech_retry import MAX_SEED
+        raw_batch = chunk.get("_speech_retry_batch_seed")
+        if raw_batch is not None:
+            batch_seed = self._coerce_saved_seed(raw_batch)
+            if batch_seed is None or batch_seed < -1:
+                return None
+        voice = chunk_voice_config.get(speaker) if isinstance(chunk_voice_config, dict) else None
+        raw_seed = voice.get("seed") if isinstance(voice, dict) else None
+        if raw_seed is not None:
+            selected_seed = self._coerce_saved_seed(raw_seed)
+            if selected_seed is None:
+                return None
+            requested = (get_chunk_seed(text, chunk.get("take", 0))
+                         if selected_seed == -1 else selected_seed)
+        else:
+            requested = get_chunk_seed(text, chunk.get("take", 0))
+        if type(requested) is not int or not 0 <= requested <= MAX_SEED:
+            return None
+        return requested
+
+    def _generate_captured_chunk_audio_once(self, index, chunk):
+        from speech_retry import MAX_SEED, SpeechRetryAttemptError, get_speech_retry_budget
+        retry_budget = get_speech_retry_budget()
         if not chunk:
             return False, "Invalid chunk index"
         ensure_literal_chunk(chunk)
@@ -2085,6 +2194,10 @@ class ProjectManager:
                 updated = self._update_generation_fields(
                     chunk, status="error", error=message)
                 return False, message if updated is not None else GENERATION_INPUTS_CHANGED
+            if retry_budget is not None:
+                mismatch_reason = self._get_speech_retry_mismatch_reason(engine)
+                if mismatch_reason is not None:
+                    raise SpeechRetryAttemptError("admission_refusal", mismatch_reason)
 
             # atomic_json_write's write-temp+rename makes plain reads safe even
             # while app.py's voice_library endpoints hold file_lock(voice_config_path)
@@ -2110,10 +2223,29 @@ class ProjectManager:
             # Pass canonical speaker to the TTS engine so it uses the aliased config;
             # the identity anchor in force at this line (a character can change
             # from a point in the book - tts.active_character_style)
+            batch_seed_value = chunk.get("_speech_retry_batch_seed")
+            render_batch_seed = (batch_seed_value
+                                 if type(batch_seed_value) is int and batch_seed_value >= 0 else None)
             chunk_voice_config = self.get_chunk_render_voice_config(
-                voice_config, speaker_to_use, chunk, index)
+                voice_config, speaker_to_use, chunk, index, batch_seed=render_batch_seed)
+            if retry_budget is not None and retry_budget.requested_seed is None:
+                retry_budget.requested_seed = self._speech_retry_requested_seed(
+                    chunk, chunk_voice_config, speaker_to_use, text)
+            if retry_budget is not None:
+                requested_seed = retry_budget.requested_seed
+                if requested_seed is not None:
+                    if type(requested_seed) is not int or not 0 <= requested_seed <= MAX_SEED:
+                        raise SpeechRetryAttemptError("admission_refusal", "Speech retry seed is not a bounded supported integer.")
+                    if isinstance(chunk_voice_config, dict):
+                        chunk_voice_config = {voice_name: ({**voice_value, "seed": requested_seed} if isinstance(voice_value, dict) else voice_value) for voice_name, voice_value in chunk_voice_config.items()}
             chunk={**chunk,'_speech_input':None,
                    '_speech_verification_admission':self._capture_speech_verification_admission(engine)}
+            if retry_budget is not None:
+                admission_value = chunk.get("_speech_verification_admission")
+                admission_token = admission_value.get("book_token") if isinstance(admission_value, dict) else None
+                if admission_token != retry_budget.book_token:
+                    raise SpeechRetryAttemptError("admission_refusal", "Speech retry book token changed before rendering.")
+                chunk = {**chunk, "_synthesis_receipt": None, "_speech_input": None}
             failure = None
             ensure_audio_generation_active()
             recovery_parent = self._capture_synthesis_recovery_parent(engine, index, chunk)
@@ -2130,11 +2262,16 @@ class ProjectManager:
                 fd, temp_path = tempfile.mkstemp(prefix=f"chunk_{index}_", suffix=".wav", dir=self.root_dir)
                 os.close(fd)
             generation_args = (text, instruct, speaker_to_use, chunk_voice_config, temp_path)
+            if retry_budget is not None:
+                retry_budget.check_active()
+                ensure_audio_generation_active()
             with (ensure_synthesis_recovery_parent(recovery_parent),
                   ensure_occurrence_pronunciation_context(chunk, chunk.get("_pronunciation_context"))):
+                if retry_budget is not None:
+                    retry_budget.phase = "provider"
                 if callable(getattr(engine, "generate_voice_result", None)):
                     result = engine.generate_voice_result(*generation_args,
-                        **({'capture_input':True} if publication_admission is not None else {}))
+                        **({'capture_input':True} if publication_admission is not None or retry_budget is not None else {}))
                     success, failure = result.success, result.failure
                     receipt = getattr(result, "synthesis_receipt", None)
                     if receipt is not None:
@@ -2145,6 +2282,8 @@ class ProjectManager:
                 else:
                     success = engine.generate_voice(*generation_args)
 
+            if retry_budget is not None:
+                retry_budget.check_active()
             ensure_audio_generation_active()
             if success:
                 validate_generated_audio(
@@ -2152,6 +2291,8 @@ class ProjectManager:
 
                 print(f"Generated WAV size: {os.path.getsize(temp_path)} bytes")
 
+                if retry_budget is not None:
+                    retry_budget.phase = "verification"
                 audio_path = self._publish_generated_chunk_audio(
                     chunk, temp_path, speaker_to_use,
                     **({'recovery_parent': recovery_parent}
@@ -2161,11 +2302,15 @@ class ProjectManager:
                 return True, audio_path
             else:
                 message = failure.get_message() if failure else "Generation returned False"
+                if retry_budget is not None:
+                    raise SpeechRetryAttemptError("provider_failure", message)
                 updated = self._update_generation_fields(
                     chunk, status="error", error=message)
                 return False, message if updated is not None else GENERATION_INPUTS_CHANGED
 
         except Exception as e:
+            if retry_budget is not None:
+                raise
             if isinstance(e, AudioGenerationCancelled) or is_audio_generation_cancelled():
                 self._restore_cancelled_generation(chunk)
                 return False, AUDIO_GENERATION_CANCELLED
@@ -2187,6 +2332,120 @@ class ProjectManager:
             scratch.close()
             if temp_path and not registered_temp:
                 self._remove_temp_file(temp_path)
+
+    @ensure_pronunciation_snapshot()
+    def _generate_captured_chunk_audio(self, index, chunk, retry_budget=None):
+        from speech_retry import (SpeechRetryAttemptError,
+            ensure_speech_retry_budget, get_speech_retry_decision)
+        from speech_verification_receipt import SpeechContentMismatchError
+        if not chunk:
+            return False, "Invalid chunk index"
+        if retry_budget is None and not self._is_speech_retry_opted_in():
+            return self._generate_captured_chunk_audio_once(index, chunk)
+        try:
+            retry_budget = retry_budget if retry_budget is not None else self._create_speech_retry_budget(chunk)
+        except AudioGenerationCancelled:
+            self._restore_cancelled_generation(chunk)
+            return False, AUDIO_GENERATION_CANCELLED
+        working_chunk = {**chunk, "_speech_verification_admission": {"book_token": retry_budget.book_token}}
+        while True:
+            attempt_started = False
+            try:
+                ensure_audio_generation_active()
+                with ensure_audio_generation_book(self.root_dir):
+                    if get_book_operation_token(self.root_dir) != retry_budget.book_token:
+                        return False, GENERATION_INPUTS_CHANGED
+                    current = self._update_chunk_fields_by_uid(working_chunk.get("uid"), expected_chunk=working_chunk)
+                    if current is None:
+                        return False, GENERATION_INPUTS_CHANGED
+                retry_budget.check_active()
+                if not retry_budget.begin_attempt():
+                    history = retry_budget.get_history()
+                    last = history[-1] if history else None
+                    detail = (f" Last attempt: {last.get('reason') or last.get('outcome')}."
+                              if isinstance(last, dict) else "")
+                    error = SpeechRetryAttemptError("admission_refusal",
+                        "Speech retry attempts exhausted; the prior take was kept." + detail)
+                    return self._finish_speech_retry_failure(working_chunk, retry_budget, error, record_attempt=False)
+                attempt_started = True
+                retry_budget.phase = "admission"
+                with ensure_speech_retry_budget(retry_budget):
+                    mismatch_reason = self._get_speech_retry_mismatch_reason()
+                    if mismatch_reason is not None:
+                        raise SpeechRetryAttemptError("admission_refusal", mismatch_reason)
+                    success_result, result_message = self._generate_captured_chunk_audio_once(index, working_chunk)
+                if success_result:
+                    return True, result_message
+                return self._finish_speech_retry_failure(working_chunk, retry_budget,
+                    SpeechRetryAttemptError("admission_refusal", result_message))
+            except SpeechContentMismatchError as mismatch_error:
+                try:
+                    ensure_audio_generation_active()
+                    with ensure_audio_generation_book(self.root_dir):
+                        current_token = get_book_operation_token(self.root_dir)
+                        current_row = self._update_chunk_fields_by_uid(working_chunk.get("uid"), expected_chunk=working_chunk)
+                    history = retry_budget.get_history()
+                    attempted = [entry["requested_seed"] for entry in history if type(entry["requested_seed"]) is int]
+                    decision = get_speech_retry_decision("corroborated_content_difference",
+                        attempts_used=retry_budget.attempts_used, deadline=retry_budget.deadline,
+                        now=time.monotonic(), seed=retry_budget.requested_seed, attempted_seeds=attempted,
+                        cancelled=is_audio_generation_cancelled(),
+                        inputs_current=current_token == retry_budget.book_token and current_row is not None)
+                    retry_budget.record("corroborated_content_difference", mismatch_error.receipt, reason=decision["reason"])
+                    if decision["eligible"]:
+                        retry_budget.requested_seed = decision["proposed_seed"]
+                        continue
+                    return self._finish_speech_retry_failure(working_chunk, retry_budget, mismatch_error)
+                except Exception as refusal:
+                    if isinstance(refusal, AudioGenerationCancelled) or is_audio_generation_cancelled():
+                        return self._finish_speech_retry_failure(working_chunk, retry_budget, refusal)
+                    print(f"Warning: Could not evaluate speech-retry eligibility for "
+                          f"{working_chunk.get('uid')}: {refusal}")
+                    return self._finish_speech_retry_failure(working_chunk, retry_budget, mismatch_error)
+            except Exception as error:
+                return self._finish_speech_retry_failure(working_chunk, retry_budget, error, record_attempt=attempt_started)
+
+    def _finish_speech_retry_failure(self, chunk, budget, error, *, record_attempt=True):
+        from speech_retry import SpeechRetryAttemptError
+        from speech_verification import SpeechVerificationCancelled
+        from speech_verification_receipt import SpeechContentMismatchError, get_speech_verification_error_fields
+        cancelled = isinstance(error, (AudioGenerationCancelled, SpeechVerificationCancelled)) or is_audio_generation_cancelled()
+        outcome = ("cancellation" if cancelled else "corroborated_content_difference"
+                   if isinstance(error, SpeechContentMismatchError) else error.outcome
+                   if isinstance(error, SpeechRetryAttemptError) else "provider_failure"
+                   if getattr(budget, "phase", "admission") == "provider" else "admission_refusal")
+        receipt = getattr(error, "receipt", None)
+        history = budget.get_history()
+        if receipt is None and history and history[-1]["attempt_id"] == budget.pending_attempt_id:
+            receipt = history[-1]["receipt"]
+        reason = (history[-1]["reason"] if isinstance(error, SpeechContentMismatchError) and history
+                  and history[-1]["attempt_id"] == budget.pending_attempt_id else str(error))
+        if record_attempt:
+            budget.record(outcome, receipt, reason=reason)
+        history = budget.get_history()
+        if cancelled:
+            self._restore_and_release(chunk, history)
+            return False, AUDIO_GENERATION_CANCELLED
+        try:
+            updated = self._update_generation_fields(chunk, status="error", error=str(error),
+                speech_retry_attempts=history, **get_speech_verification_error_fields(error))
+            return False, str(error) if updated is not None else GENERATION_INPUTS_CHANGED
+        except AudioGenerationCancelled:
+            self._restore_and_release(chunk, history)
+            return False, AUDIO_GENERATION_CANCELLED
+        except Exception as write_error:
+            print(f"Warning: Failed to persist speech-retry failure for "
+                  f"{chunk.get('uid')}: {write_error}")
+            self._restore_and_release(chunk, history)
+            return False, str(error)
+
+    def _restore_and_release(self, chunk, history):
+        """Best-effort restore; cleanup authority loss is never fatal."""
+        try:
+            self._restore_cancelled_generation(chunk, speech_retry_attempts=history)
+        except Exception as restore_error:
+            print(f"Warning: Failed to restore cancelled generation for "
+                  f"{chunk.get('uid') if isinstance(chunk, dict) else None}: {restore_error}")
 
     def _load_pause_defaults(self):
         """Return (pause_between_speakers_ms, pause_same_speaker_ms) from config."""
@@ -2330,7 +2589,8 @@ class ProjectManager:
             ensure_export_stage_current(pending_output, quality_report, cancel_check)
             source_snapshot.verify_sources()
             with source_snapshot.ensure_publication(pending_output, quality_report):
-                os.replace(pending_output, output_path)
+                replace_export_output(pending_output, output_path)
+            quality_report = {**quality_report, 'skipped_chunks': skipped}
             notify_completed_export(output_path, output_filename, quality_report, export_quality_callback)
             if mastering_report and mastering_callback:
                 try:
@@ -2654,7 +2914,8 @@ class ProjectManager:
             ensure_export_stage_current(pending_output, quality_report, cancel_check)
             source_snapshot.verify_sources()
             with source_snapshot.ensure_publication(pending_output, quality_report):
-                os.replace(pending_output, output_path)
+                replace_export_output(pending_output, output_path)
+            quality_report = {**quality_report, 'skipped_chunks': skipped}
             notify_completed_export(output_path, 'audiobook.m4b', quality_report, export_quality_callback)
             if mastering_report and mastering_callback:
                 try:
@@ -3365,6 +3626,22 @@ class ProjectManager:
 
         all_indices = list(indices)
         audio_owner = get_audio_generation_owner()
+        speech_retry_budgets = {}
+        if self._is_speech_retry_opted_in():
+            speech_retry_budgets = {budget_index: None for budget_index in indices if captured.get(budget_index) is not None}
+
+        def render_with_retry_budget(index):
+            if cancel_check and cancel_check():
+                return False, AUDIO_GENERATION_CANCELLED
+            budget = speech_retry_budgets[index]
+            if budget is None:
+                try:
+                    budget = self._create_speech_retry_budget(captured[index])
+                except AudioGenerationCancelled:
+                    return False, AUDIO_GENERATION_CANCELLED
+                budget.cancel_check = cancel_check
+                speech_retry_budgets[index] = budget
+            return self._generate_captured_chunk_audio(index, captured[index], budget)
 
         def _run_round(round_indices, workers):
             """One pass at `workers` concurrency.
@@ -3376,9 +3653,14 @@ class ProjectManager:
             completed, oom_failed, hard_failed = [], [], []
             was_cancelled = False
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(run_with_audio_generation_owner, audio_owner,
-                                           self._generate_captured_chunk_audio, idx, captured.get(idx)): idx
-                           for idx in round_indices}
+                futures = {}
+                for idx in round_indices:
+                    if idx in speech_retry_budgets:
+                        futures[executor.submit(run_with_audio_generation_owner, audio_owner,
+                                                render_with_retry_budget, idx)] = idx
+                    else:
+                        futures[executor.submit(run_with_audio_generation_owner, audio_owner,
+                                                self._generate_captured_chunk_audio, idx, captured.get(idx))] = idx
                 for future in as_completed(futures):
                     if (is_audio_generation_cancelled() or (cancel_check and cancel_check())) and not was_cancelled:
                         was_cancelled = True
@@ -3388,23 +3670,32 @@ class ProjectManager:
                                 pending_future.cancel()
                     idx = futures[future]
                     if future.cancelled():
+                        speech_retry_budgets.pop(idx, None)
                         continue
+                    retryable_oom = False
                     try:
                         success, msg = future.result()
                         if success:
                             completed.append(idx)
                             print(f"Chunk {idx} completed: {msg}")
-                        elif audio_owner is not None and msg == AUDIO_GENERATION_CANCELLED:
+                        elif (audio_owner is not None or idx in speech_retry_budgets) and msg == AUDIO_GENERATION_CANCELLED:
                             was_cancelled = True
-                        elif is_oom_failure(msg):
+                        elif is_oom_failure(msg) and (speech_retry_budgets.get(idx) is None
+                                or speech_retry_budgets[idx].allows_memory_stepdown()):
+                            retryable_oom = workers > 1
                             oom_failed.append((idx, msg))
                             print(f"Chunk {idx} failed (VRAM): {msg}")
                         else:
                             hard_failed.append((idx, msg))
                             print(f"Chunk {idx} failed: {msg}")
                     except Exception as e:
-                        (oom_failed if is_oom_failure(e) else hard_failed).append((idx, str(e)))
+                        oom_failure = is_oom_failure(e) and (speech_retry_budgets.get(idx) is None
+                            or speech_retry_budgets[idx].allows_memory_stepdown())
+                        retryable_oom = oom_failure and workers > 1
+                        (oom_failed if oom_failure else hard_failed).append((idx, str(e)))
                         print(f"Chunk {idx} error: {e}")
+                    if not retryable_oom:
+                        speech_retry_budgets.pop(idx, None)
                     if progress_callback:
                         # oom_failed chunks aren't final yet (they get retried
                         # next round at a lower worker count), but they ARE
@@ -3664,7 +3955,7 @@ class ProjectManager:
 
         Args:
             indices: List of chunk indices to generate
-            batch_seed: Single seed for all generations (-1 for random)
+            batch_seed: Nonnegative override for all generations; -1 keeps saved voice seeds
             batch_size: Number of chunks per batch request
             progress_callback: Optional callback(completed, failed, total) for progress updates
             batch_group_by_type: Group indices by voice type before batching for
@@ -3692,9 +3983,6 @@ class ProjectManager:
         if total == 0:
             return results
 
-        print(f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed}, "
-              f"group_by_type={batch_group_by_type})...")
-
         # atomic_json_write's write-temp+rename makes plain reads safe even
         # while app.py's voice_library endpoints hold file_lock(voice_config_path)
         # for a read-modify-write — no extra locking needed here.
@@ -3717,6 +4005,18 @@ class ProjectManager:
             except (ValueError, OSError) as error:
                 results['failed'] = [(idx, str(error)) for idx in indices]
                 return results
+
+        if self._is_speech_retry_opted_in():
+            print(f"Speech retry is enabled: rendering {total} chunks one line at a time "
+                  f"(configured batch_size={batch_size} is not used)...")
+            routed_indices = list(indices)
+            if batch_group_by_type:
+                routed_indices = self._group_indices_by_voice_type(routed_indices, chunks, voice_config)
+            routed_requests = {routed_index: {**captured[routed_index], "_speech_retry_batch_seed": batch_seed} for routed_index in routed_indices if routed_index in captured}
+            return self.generate_chunks_parallel(routed_indices, max_workers=1, progress_callback=progress_callback, cancel_check=cancel_check, admitted_requests=routed_requests)
+
+        print(f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed}, "
+              f"group_by_type={batch_group_by_type})...")
 
         # Get TTS engine
         engine = self.get_engine()
@@ -3827,6 +4127,11 @@ class ProjectManager:
                         batch_chunk.update(get_narrator_generation_context(chunk))
                         batch_chunks.append(batch_chunk)
 
+                # Freeze the admitted cleanup indexes before the engine is
+                # handed the rows; the callee can mutate them before raising,
+                # so failure cleanup must use this tuple, never row state.
+                admitted_cleanup_indices = tuple(row["index"] for row in batch_chunks)
+
                 # Call batch TTS with single seed. If stale-output cleanup rejected
                 # every row, there is nothing safe to dispatch.
                 try:
@@ -3857,11 +4162,37 @@ class ProjectManager:
                             **({'capture_input':True} if publication_admissions else {}))
                             if batch_chunks and not is_audio_generation_cancelled() else {"completed": [], "failed": []})
                 except Exception:
-                    if is_audio_generation_cancelled():
+                    try:
+                        cancelled = is_audio_generation_cancelled()
+                    except Exception as admission_error:
+                        # Unknown admission authority: never infer success or
+                        # cancellation, and never unlink or reset under failed
+                        # admission. Stages stay deferred; the original error
+                        # is re-raised below with a secondary warning.
+                        logger.warning("Warning: audio generation admission failed during failed batch cleanup; deferring legacy temp retirement and state reset: %s: %s", type(admission_error).__name__, admission_error)
+                        cancelled = None
+                    if cancelled:
                         for idx in batch_indices:
                             self._remove_batch_temp_file(idx)
                         break
-                    self._reset_captured_generations(captured, indices, set())
+                    if cancelled is None:
+                        pass
+                    else:
+                        # Retire only this batch's admitted legacy stages. Rows
+                        # refused during preparation never reached batch_chunks,
+                        # so their temp slots are not ours to delete; registered
+                        # outputs are skipped inside the helper. Cleanup is
+                        # best-effort and must never mask the original exception.
+                        for idx in admitted_cleanup_indices:
+                            try:
+                                self._remove_batch_temp_file(idx)
+                            except Exception as cleanup_error:
+                                logger.warning("Warning: could not retire failed batch temp file for chunk %s: %s: %s", idx, type(cleanup_error).__name__, cleanup_error)
+                                continue
+                        try:
+                            self._reset_captured_generations(captured, indices, set())
+                        except Exception as reset_error:
+                            logger.warning("Warning: could not reset generating state after failed batch: %s: %s", type(reset_error).__name__, reset_error)
                     raise
                 if is_audio_generation_cancelled():
                     for idx in batch_indices:

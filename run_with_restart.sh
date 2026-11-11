@@ -53,15 +53,11 @@ fi
 bash "$GPU_WRAPPER" --check-lock-owner "${ALEXANDRIA_GPU_LOCK_PID:-}" || exit $?
 
 PREPARER="$SCRIPT_DIR/alexandria_preparer_rocm_compatible.py"
-# Match the optional install; retain the old app environment as a fallback.
-PYTHON="${ALEXANDRIA_PREPARER_PYTHON:-$SCRIPT_DIR/preparer_env/bin/python}"
-if [[ -z "${ALEXANDRIA_PREPARER_PYTHON:-}" && ! -x "$PYTHON" ]]; then
-    PYTHON="$SCRIPT_DIR/app/env/bin/python"
-fi
+PYTHON="$SCRIPT_DIR/app/env/bin/python"
 
 if [[ ! -x "$PYTHON" ]]; then
     echo "ERROR: python not found at $PYTHON" >&2
-    echo "       run Install Voice Tools (Optional), or set ALEXANDRIA_PREPARER_PYTHON" >&2
+    echo "       run this from the alexandria-audiobook2 project directory" >&2
     exit 2
 fi
 if [[ ! -f "$PREPARER" ]]; then

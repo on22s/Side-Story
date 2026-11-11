@@ -1,65 +1,40 @@
-const setupUiEnglish = Object.freeze({
-    label: 'Find a setting',
-    placeholder: 'Try context, memory, language or retries',
-    clear: 'Clear',
-    hint: 'Search labels and help for your current services.',
-    none: 'No matching settings for your current services. Try another label or description.',
-    one: '{count} matching setting.',
-    many: '{count} matching settings.',
-    limited: 'Showing the first {limit}; refine your search for more specific results.',
-    opened: 'Showing the original setting. Save Configuration to apply any edits.',
-    previewSaved: 'Saved',
-    previewWouldSave: 'Would save',
-    previewAction: 'Preview changes',
-    previewTitle: 'Settings change preview',
-    previewClose: 'Close preview',
-    previewDefaults: '{count} missing settings filled with defaults',
-});
-let setupUiLocale = 'en';
 let setupSearchStatus = [];
-const setupUiStorageNotice = 'Browser storage is unavailable; this UI preference applies only to this tab until reload.';
 
-function formatUiMessage(english, translated, values = {}) {
-    const placeholders = text => [...new Set(text.match(/\{[a-zA-Z][a-zA-Z0-9_]*\}/g) || [])].sort().join(',');
-    const template = typeof translated === 'string' && translated.trim() && placeholders(translated) === placeholders(english) ? translated : english;
-    return template.replace(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g, (match, name) => {
-        const value = Object.hasOwn(values, name) ? values[name] : undefined;
-        if (typeof value !== 'string' && !(typeof value === 'number' && Number.isFinite(value))) {
-            throw new Error('Missing or invalid UI message value: ' + name);
-        }
-        return String(value);
-    });
+function getSetupUiStorageNotice() {
+    return t('setup.locale.storage_notice', 'Browser storage is unavailable; this UI preference applies only to this tab until reload.');
 }
 
-function getSetupUiMessage(key, values = {}, locale = setupUiLocale) {
-    if (!Object.hasOwn(setupUiEnglish, key)) { return key; }
-    const english = setupUiEnglish[key];
-    const pseudo = locale === 'qps-ploc' ? '[' + english.split(/(\{[a-zA-Z][a-zA-Z0-9_]*\})/g).map(part =>
-        part.startsWith('{') ? part : part.replace(/[aeiouAEIOU]/g, vowel => vowel + vowel)).join('') + ']' : english;
-    return formatUiMessage(english, pseudo, values);
+function getSetupFinderMessage(form, values = {}) {
+    if (form === 'one') { return t('setup.finder.one', '{count} matching setting.', values); }
+    if (form === 'many') { return t('setup.finder.many', '{count} matching settings.', values); }
+    if (form === 'none') { return t('setup.finder.none', 'No matching settings for your current services. Try another label or description.', values); }
+    if (form === 'limited') { return t('setup.finder.limited', 'Showing the first {limit}; refine your search for more specific results.', values); }
+    if (form === 'opened') { return t('setup.finder.opened', 'Showing the original setting. Save Configuration to apply any edits.', values); }
+    throw new Error('Unknown setting finder message: ' + form);
 }
 
-function applySetupUiLocale(locale) {
-    setupUiLocale = locale === 'qps-ploc' ? locale : 'en';
-    const selector = document.getElementById('setup-ui-locale');
-    if (selector) { selector.value = setupUiLocale; }
-    for (const node of document.querySelectorAll('[data-setup-message]')) {
-        if (!Object.hasOwn(setupUiEnglish, node.getAttribute('data-setup-message'))) { continue; }
-        const values = node.hasAttribute('data-setup-count') ? {count: Number(node.getAttribute('data-setup-count'))} : {};
-        const message = getSetupUiMessage(node.getAttribute('data-setup-message'), values);
-        if (node.getAttribute('data-setup-message') === 'placeholder') { node.placeholder = message; }
-        else { node.textContent = message; }
-    }
+function changeUiLocale(locale) {
+    const applied = applyUiLocaleAndSearchStatus(locale);
+    applySystemStatusText('setup-ui-locale-status', setLocalStorageValue(UI_LOCALE_STORAGE_KEY, getUiLocale()) ? '' : getSetupUiStorageNotice());
+    return applied;
+}
+
+// JS-built chrome does not carry data-i18n attributes, so the locale change
+// repaints it here: the finder status and the Home task-guide cards. Guide
+// text is rebuilt through translateUiMessage on every render.
+function renderUiLocaleChrome() {
     renderSetupSearchStatus();
+    if (typeof renderTaskGuides === 'function') { renderTaskGuides(); }
 }
 
-function changeSetupUiLocale(locale) {
-    applySetupUiLocale(locale);
-    applySystemStatusText('setup-ui-locale-status', setLocalStorageValue('alex-ui-locale', setupUiLocale) ? '' : setupUiStorageNotice);
+function applyUiLocaleAndSearchStatus(locale) {
+    const applied = applyUiLocale(locale);
+    renderUiLocaleChrome();
+    return applied.then(renderSetupSearchStatus);
 }
 
 function renderSetupSearchStatus() {
-    const text = setupSearchStatus.map(message => getSetupUiMessage(message.key, message.values)).join(' ');
+    const text = joinUiSentences(setupSearchStatus.map(message => getSetupFinderMessage(message.form, message.values)));
     applySystemStatusText('setup-settings-search-status', text);
 }
 
@@ -76,18 +51,31 @@ function isSetupSettingAvailable(control) {
     return true;
 }
 
+// The finder indexes the displayed text and the authored English together: users
+// paste English setting names from issues and RECIPES.md, so an English query
+// must still find a translated entry (design open question 8). NFKC makes
+// full-width Japanese IME output match the half-width form.
+function normalizeSetupSearchText(text) {
+    return String(text).normalize('NFKC').toLowerCase().replace(/\s+/g, ' ');
+}
+
 function getSetupSettingsMatches(query) {
-    const terms = query.trim().toLowerCase().slice(0, 120).split(/\s+/).filter(Boolean);
+    const terms = normalizeSetupSearchText(query).trim().slice(0, 120).split(' ').filter(Boolean);
     if (!terms.length) { return []; }
     const matches = [];
     for (const control of document.querySelectorAll('#config-form input, #config-form select, #config-form textarea')) {
         if (!control.id || !isSetupSettingAvailable(control)) { continue; }
         const label = Array.from(control.labels || []).map(node => node.textContent.trim()).join(' ').replace(/\s+/g, ' ');
         if (!label) { continue; }
-        const section = control.closest('[data-settings-section]')?.getAttribute('data-settings-section') || 'Setup';
+        const sectionNode = control.closest('[data-settings-section]');
+        const section = sectionNode?.getAttribute('data-settings-section') || t('setup.search.section_fallback', 'Setup');
+        // The result row shows the translated category heading; the raw
+        // attribute value stays in the English search index below.
+        const sectionLabel = sectionNode?.querySelectorAll('h5')[0]?.textContent.trim() || section;
         const description = getItemHelpText(control);
-        const text = `${label} ${section} ${description}`.toLowerCase();
-        if (terms.every(term => text.includes(term))) { matches.push({id: control.id, label, section}); }
+        const englishDescription = getItemHelpText(control, 'en');
+        const text = normalizeSetupSearchText(`${label} ${section} ${description} ${englishDescription}`);
+        if (terms.every(term => text.includes(term))) { matches.push({id: control.id, label, section, sectionLabel}); }
     }
     return matches;
 }
@@ -102,8 +90,8 @@ function renderSetupSettingsSearch() {
     setupSearchStatus = [];
     if (!query) { renderSetupSearchStatus(); return; }
     const matches = getSetupSettingsMatches(query);
-    setupSearchStatus = [{key: !matches.length ? 'none' : matches.length === 1 ? 'one' : 'many', values: {count: matches.length}}];
-    if (matches.length > 8) { setupSearchStatus.push({key: 'limited', values: {limit: 8}}); }
+    setupSearchStatus = [{form: !matches.length ? 'none' : pluralForm(matches.length), values: {count: matches.length}}];
+    if (matches.length > 8) { setupSearchStatus.push({form: 'limited', values: {limit: 8}}); }
     renderSetupSearchStatus();
     for (const match of matches.slice(0, 8)) {
         const row = document.createElement('div');
@@ -112,7 +100,7 @@ function renderSetupSettingsSearch() {
         button.type = 'button';
         button.className = 'btn btn-outline-primary';
         button.setAttribute('data-help-key', 'openSetupSetting');
-        button.textContent = `${match.label} · ${match.section}`;
+        button.textContent = `${match.label} · ${match.sectionLabel}`;
         button.addEventListener('click', () => openSetupSetting(match.id));
         row.appendChild(button);
         results.appendChild(row);
@@ -128,7 +116,7 @@ function openSetupSetting(id) {
     const results = document.getElementById('setup-settings-results');
     results.replaceChildren();
     results.hidden = true;
-    setupSearchStatus = [{key: 'opened'}];
+    setupSearchStatus = [{form: 'opened', values: {}}];
     renderSetupSearchStatus();
     openConfigField(control);
 }
@@ -184,7 +172,7 @@ let setupPreviewPending = null;
 function invalidateSetupPreview() {
     setupPreviewRequest++;
     document.getElementById('setup-preview-results').hidden = true;
-    applySystemStatusText('setup-preview-status', 'Settings or saved state may have changed. Preview again before relying on this comparison.');
+    applySystemStatusText('setup-preview-status', t('setup.preview.invalidated', 'Settings or saved state may have changed. Preview again before relying on this comparison.'));
 }
 
 function closeSetupPreview() {
@@ -199,11 +187,10 @@ function renderSetupPreviewRows(container, rows) {
         const label = document.createElement('strong'); label.textContent = row.label;
         const scope = document.createElement('div'); scope.className = 'small'; scope.textContent = row.scope;
         const values = document.createElement('div'); values.className = 'settings-preview-values small';
-        for (const [key, text] of [['previewSaved', row.before + (row.was_default ? ' (default)' : '')], ['previewWouldSave', row.after]]) {
+        for (const [heading, text] of [
+                [createUiMessageNode('strong', 'setup.preview.saved', 'Saved'), row.before + (row.was_default ? ' (default)' : '')],
+                [createUiMessageNode('strong', 'setup.preview.would_save', 'Would save'), row.after]]) {
             const column = document.createElement('div');
-            const heading = document.createElement('strong');
-            heading.setAttribute('data-setup-message', key);
-            heading.textContent = getSetupUiMessage(key);
             const value = document.createElement('div'); value.textContent = text;
             column.append(heading, value); values.appendChild(column);
         }
@@ -232,7 +219,7 @@ async function previewSetupChanges() {
     const request = ++setupPreviewRequest;
     document.getElementById('setup-preview-panel').hidden = false;
     document.getElementById('setup-preview-results').hidden = true;
-    applySystemStatusText('setup-preview-status', 'Comparing the proposed settings with the saved configuration…');
+    applySystemStatusText('setup-preview-status', t('setup.preview.comparing', 'Comparing the proposed settings with the saved configuration…'));
     if (setupPreviewPending) { await setupPreviewPending.catch(() => {}); }
     if (request !== setupPreviewRequest) { return; }
     const pending = Promise.resolve().then(() => API.post('/api/config/preview', proposal));
@@ -241,20 +228,29 @@ async function previewSetupChanges() {
         const data = await pending;
         if (request !== setupPreviewRequest) { return; }
         if (JSON.stringify(getConfigPreviewProposal()) !== captured) { invalidateSetupPreview(); return; }
-        if (!isSetupPreviewValid(data)) { throw new Error('Incomplete settings preview'); }
+        if (!isSetupPreviewValid(data)) { throw new Error(t('setup.preview.incomplete', 'Incomplete settings preview')); }
         const baseline = data.baseline === 'read' && !data.warning_count ? ''
-            : data.baseline === 'missing' ? 'No saved configuration was found. '
-            : 'Saved configuration is damaged or incomplete; recovered/default values are shown. ';
-        applySystemStatusText('setup-preview-status', baseline + `${data.changes.length} supported settings would change; ${data.defaults.length} missing settings would be filled with defaults. No settings were applied.`);
-        document.getElementById('setup-preview-active').textContent = 'Active model after Save: ' + (data.active_after === 'local' ? 'Local' : 'Remote');
+            : data.baseline === 'missing' ? t('setup.preview.baseline_missing', 'No saved configuration was found.')
+            : t('setup.preview.baseline_damaged', 'Saved configuration is damaged or incomplete; recovered/default values are shown.');
+        applySystemStatusText('setup-preview-status', joinUiSentences([baseline, t('setup.preview.summary',
+            '{changes} supported settings would change; {defaults} missing settings would be filled with defaults. No settings were applied.',
+            {changes: data.changes.length, defaults: data.defaults.length})]));
+        document.getElementById('setup-preview-active').textContent = t('setup.preview.active', 'Active model after Save: {model}', {
+            model: data.active_after === 'local' ? t('setup.preview.local', 'Local') : t('setup.preview.remote', 'Remote')});
         document.getElementById('setup-preview-notice').textContent = data.notice;
         document.getElementById('setup-preview-timing').textContent = data.timing;
-        document.getElementById('setup-preview-unmanaged').textContent = data.unmanaged_fields
-            ? `${data.unmanaged_fields} additional saved fields are outside the supported form and would not be retained by the existing Save. Review the saved file before saving.` : '';
+        const unmanaged = document.getElementById('setup-preview-unmanaged');
+        if (data.unmanaged_fields) {
+            renderUiSafety(unmanaged, 'safety.setup.unmanaged_fields',
+                '{count} additional saved fields are outside the supported form and would not be retained by the existing Save. Review the saved file before saving.',
+                {count: data.unmanaged_fields});
+        } else {
+            unmanaged.textContent = '';
+        }
         renderSetupPreviewRows(document.getElementById('setup-preview-changes'), data.changes);
         const defaultSummary = document.getElementById('setup-preview-default-summary');
-        defaultSummary.setAttribute('data-setup-count', String(data.defaults.length));
-        defaultSummary.textContent = getSetupUiMessage('previewDefaults', {count: data.defaults.length});
+        defaultSummary.setAttribute('data-i18n-count', String(data.defaults.length));
+        defaultSummary.textContent = t('setup.preview.defaults', '{count} missing settings filled with defaults', {count: data.defaults.length});
         document.getElementById('setup-preview-default-details').hidden = !data.defaults.length;
         renderSetupPreviewRows(document.getElementById('setup-preview-defaults'), data.defaults);
         document.getElementById('setup-preview-results').hidden = false;
@@ -262,7 +258,7 @@ async function previewSetupChanges() {
     } catch (error) {
         if (request !== setupPreviewRequest) { return; }
         document.getElementById('setup-preview-results').hidden = true;
-        applySystemStatusText('setup-preview-status', 'Preview unavailable. Check model profiles, prompt presets, number ranges and JSON fields, then preview again. No settings were applied by Preview.');
+        applySystemStatusText('setup-preview-status', t('setup.preview.unavailable', 'Preview unavailable. Check model profiles, prompt presets, number ranges and JSON fields, then preview again. No settings were applied by Preview.'));
     } finally { if (setupPreviewPending === pending) { setupPreviewPending = null; } }
 }
 
@@ -271,15 +267,19 @@ document.getElementById('config-form').addEventListener('input', invalidateSetup
 document.getElementById('config-form').addEventListener('change', invalidateSetupPreview);
 
 if (document.getElementById('setup-ui-locale')) {
-    let locale = 'en';
-    try { locale = localStorage.getItem('alex-ui-locale'); }
-    catch (_) { applySystemStatusText('setup-ui-locale-status', setupUiStorageNotice); }
-    applySetupUiLocale(locale);
+    const preference = readUiLocalePreference();
+    if (!preference.available) { applySystemStatusText('setup-ui-locale-status', getSetupUiStorageNotice()); }
+    applyUiLocaleAndSearchStatus(resolveUiLocale(preference.stored));
+    renderUiLocaleOptions();
+    preloadUiCatalogs().then(() => {
+        applyUiCatalog();
+        renderUiLocaleChrome();
+    });
     window.addEventListener('storage', event => {
-        if (event.key !== 'alex-ui-locale' && event.key !== null) { return; }
+        if (event.key !== UI_LOCALE_STORAGE_KEY && event.key !== null) { return; }
         let localEvent;
         try { localEvent = event.storageArea === localStorage; }
-        catch (_) { applySystemStatusText('setup-ui-locale-status', setupUiStorageNotice); return; }
-        if (localEvent) { applySetupUiLocale(event.newValue); }
+        catch (_) { applySystemStatusText('setup-ui-locale-status', getSetupUiStorageNotice()); return; }
+        if (localEvent) { applyUiLocaleAndSearchStatus(resolveUiLocale(event.newValue)); }
     });
 }

@@ -537,7 +537,7 @@ identity() {
     script_sha=$(short_sha256_file "$SCRIPT_PATH" 2>/dev/null)
     gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
     [ -z "$gpu" ] && gpu=$(rocm-smi --showproductname 2>/dev/null \
-        | grep -oPm1 '(?<=Card Series:).*' | xargs)
+        | grep -oPm1 '(?<=Card Series:).*' | xargs) 
     printf -v command_text '%q ' "$@"
     echo "$(stamp) IDENT    $NAME commit=$commit tree=$dirty" \
          "gpu_job_sha=${script_sha:-unknown} host=$(hostname)" \

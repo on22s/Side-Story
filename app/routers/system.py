@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 from contextlib import nullcontext
@@ -10,14 +11,16 @@ from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, StrictInt, ValidationError
 
 from config_settings import (AppConfig, GenerationConfig, LLMConfig, PromptConfig, PromptVariant,
                              TTSConfig, backup_damaged_app_config, load_app_config,
                              load_app_config_result)
 from export_limits import MAX_PAUSE_MS
+from external_tts_client import ExternalTTSClient, get_external_tts_urls, get_external_tts_settings
+from external_tts_capabilities import make_unknown_capability_report, UNAVAILABLE_ERROR
 
 from default_prompts import load_default_prompts, load_instruct_prompts, load_segment_prompts
 from llm_provider import is_api_key_reference
@@ -111,6 +114,61 @@ def get_tts_diagnostics():
             logger.warning('Support report collector %s unavailable (%s)', name,
                            'missing_dependency' if isinstance(error, ImportError) else 'collection_failed')
     return get_tts_diagnostics_bundle(**values, collection=collection)
+
+
+class ExternalCapabilitiesRequest(BaseModel):
+    server_index: StrictInt = 0
+
+
+_external_capability_check_slot = threading.BoundedSemaphore(1)
+
+
+def ensure_external_capability_check_slot():
+    if not _external_capability_check_slot.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail='A saved server check is already running. Wait for it to finish.')
+    try:
+        yield
+    finally:
+        _external_capability_check_slot.release()
+
+
+def get_external_capability_settings():
+    loaded = load_app_config_result(project_manager.config_path)
+    if loaded.warnings:
+        raise ValueError("Repair saved configuration warnings before checking the server.")
+    settings = get_external_tts_settings(loaded.data.get('tts', {}))
+    return settings, get_external_tts_urls(settings)
+
+
+@router.post("/api/tts/external-capabilities", dependencies=[Depends(ensure_external_capability_check_slot)])
+def get_tts_external_capabilities(request: ExternalCapabilitiesRequest):
+    try:
+        settings, urls = get_external_capability_settings()
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail="Repair saved TTS configuration before checking the server.") from error
+    if settings["mode"] != "external":
+        raise HTTPException(status_code=400, detail="Saved TTS mode is not external.")
+    if request.server_index < 0 or request.server_index >= len(urls):
+        raise HTTPException(status_code=400, detail="Saved TTS server index is out of range.")
+    selected_url = urls[request.server_index]
+    external_client = ExternalTTSClient(selected_url, timeout=10)
+    try:
+        try:
+            report = external_client.get_capabilities()
+        except Exception:
+            report = make_unknown_capability_report(selected_url, UNAVAILABLE_ERROR)
+    finally:
+        try:
+            external_client.close()
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="Saved server worker cleanup failed. Resolve it before checking again.") from error
+    try:
+        current_settings, current_urls = get_external_capability_settings()
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=409, detail="Saved TTS settings changed during the check. Run the check again.") from error
+    if current_settings != settings or current_urls != urls:
+        raise HTTPException(status_code=409, detail="Saved TTS settings changed during the check. Run the check again.")
+    return {"server_index": request.server_index, "settings": settings, "capabilities": report}
 
 
 def _builtin_prompt_presets() -> list[dict]:
@@ -281,28 +339,7 @@ def _get_torch():
 _gpu_stats_cache = {"data": None, "timestamp": 0}
 _GPU_STATS_CACHE_TTL = 5  # seconds
 
-def get_configured_gpu_index():
-    """Use the generation device for diagnostics and automatic configuration."""
-    try:
-        device = normalize_device((load_app_config(CONFIG_PATH).get("tts") or {}).get("device", "auto"))
-        if device in ("cpu", "mps"):
-            return None
-        if device.startswith("cuda:"):
-            return int(device.split(":", 1)[1])
-        torch = _get_torch()
-        return torch.cuda.current_device() if torch is not None and torch.cuda.is_available() else 0
-    except (TypeError, ValueError, RuntimeError, AttributeError) as error:
-        logger.warning("GPU statistics unavailable for configured device: %s", error)
-        return None
-
-def get_rocm_card(data, index):
-    if not isinstance(data, dict) or len(data) != 1 or index != 0:
-        return None  # Avoid guessing physical/logical ordinals across multiple cards.
-    card = data.get(f"card{index}")
-    return card if isinstance(card, dict) else None
-
-
-def _gpu_stats_via_rocm_smi(index=0):
+def _gpu_stats_via_rocm_smi():
     """VRAM/util from rocm-smi when torch can't see the GPU (e.g. a CUDA-only
     torch build on an AMD box). Returns the same dict shape as get_gpu_stats(),
     or None on any rocm-smi failure (missing binary, timeout, bad/empty JSON)."""
@@ -310,7 +347,7 @@ def _gpu_stats_via_rocm_smi(index=0):
                              rocm_smi_path="/opt/rocm/bin/rocm-smi", timeout=2)
     if not data:
         return None
-    for card_data in [get_rocm_card(data, index)]:
+    for card_data in data.values():
         if not isinstance(card_data, dict):
             continue
         total_b = card_data.get("VRAM Total Memory (B)")
@@ -330,49 +367,65 @@ def _gpu_stats_via_rocm_smi(index=0):
         return stats
     return None
 
-def get_gpu_stats(index=None):
+def get_gpu_stats():
     """Get current GPU memory and utilization stats with caching."""
     global _gpu_stats_cache
     now = time.time()
-    if index is None:
-        index = get_configured_gpu_index()
-    if index is None:
+    try:
+        configured = normalize_device((load_app_config(CONFIG_PATH).get("tts") or {}).get("device", "auto"))
+    except (TypeError, ValueError) as error:
+        logger.warning("GPU statistics unavailable for configured device: %s", error)
         return None
+    if configured in ("cpu", "mps"):
+        return None
+
+    torch = _get_torch()
+    cuda_available = torch is not None and torch.cuda.is_available()
+    device = None
+    if cuda_available:
+        try:
+            device = int(configured.split(":", 1)[1]) if configured.startswith("cuda:") else torch.cuda.current_device()
+        except Exception as error:
+            logger.debug("Could not resolve GPU statistics device: %s", error)
+            return None
+    cache_device = (configured, device)
 
     # Return cached stats if still fresh
     cached = _gpu_stats_cache
-    if (cached.get("device_index") == index and
+    if (cached.get("device") == cache_device and
             (now - cached["timestamp"]) < _GPU_STATS_CACHE_TTL):
         return cached["data"]
-    torch = _get_torch()
-    if torch is None or not torch.cuda.is_available():
+
+    if not cuda_available:
         # torch can't see the GPU (e.g. a CUDA-only build on an AMD box) —
         # fall back to rocm-smi so AMD GPUs are still detected.
-        stats = _gpu_stats_via_rocm_smi(index)
+        stats = _gpu_stats_via_rocm_smi() if configured in ("auto", "cuda") else None
         if stats is None:
             logger.debug("GPU stats: No GPU available (torch + rocm-smi both failed)")
-        _gpu_stats_cache = {"device_index": index, "data": stats, "timestamp": now}
+        _gpu_stats_cache = {"data": stats, "timestamp": now, "device": cache_device}
         return stats
 
     stats = {}
     try:
         # Memory stats (works for both NVIDIA and AMD ROCm)
-        allocated = torch.cuda.memory_allocated(index) / 1e9  # GB
-        reserved = torch.cuda.memory_reserved(index) / 1e9    # GB
-        total = torch.cuda.get_device_properties(index).total_memory / 1e9  # GB
+        allocated = torch.cuda.memory_allocated(device) / 1e9  # GB
+        reserved = torch.cuda.memory_reserved(device) / 1e9    # GB
+        total = torch.cuda.get_device_properties(device).total_memory / 1e9  # GB
 
         if total <= 0:
             logger.warning("GPU stats: Total memory reported as 0, skipping utilization check")
-            _gpu_stats_cache = {"device_index": index, "data": None, "timestamp": now}
+            _gpu_stats_cache = {"data": None, "timestamp": now, "device": cache_device}
             return None
 
         stats['allocated_gb'] = allocated
         stats['reserved_gb'] = reserved
         stats['total_gb'] = total
         stats['allocated_percent'] = allocated / total * 100
+        stats['device_index'] = device
+        stats['name'] = torch.cuda.get_device_name(device)
     except Exception as e:
         logger.debug(f"Could not get GPU memory stats: {e}")
-        _gpu_stats_cache = {"device_index": index, "data": None, "timestamp": now}
+        _gpu_stats_cache = {"data": None, "timestamp": now, "device": cache_device}
         return None
 
     # Utilization via rocm-smi is a separate, independent try - same reason
@@ -382,8 +435,8 @@ def get_gpu_stats(index=None):
     stats['utilization_percent'] = None
     try:
         data = run_rocm_smi_json(["--showuse"], rocm_smi_path="/opt/rocm/bin/rocm-smi", timeout=2)
-        if data is not None:
-            for card_data in [get_rocm_card(data, index)]:
+        if data is not None and len(data) == 1:
+            for card_data in data.values():
                 if not isinstance(card_data, dict):
                     continue
                 stats['utilization_percent'] = _rocm_smi_utilization(card_data)
@@ -394,15 +447,14 @@ def get_gpu_stats(index=None):
         logger.debug(f"Could not get GPU utilization via rocm-smi: {e}")
 
     # Cache the result
-    _gpu_stats_cache = {"device_index": index, "data": stats, "timestamp": now}
+    _gpu_stats_cache = {"data": stats, "timestamp": now, "device": cache_device}
     return stats
 
 
 @router.get("/api/system/stats")
 def get_system_stats():
     """Return GPU memory, disk, and basic hardware statistics."""
-    gpu_index = get_configured_gpu_index()
-    gpu = get_gpu_stats(gpu_index) if gpu_index is not None else None
+    gpu = get_gpu_stats()
     has_space, free_gb = check_disk_space(ROOT_DIR, 1.0)
 
     cpu_count = os.cpu_count()
@@ -417,21 +469,18 @@ def get_system_stats():
     except (OSError, ValueError):
         pass
 
-    gpu_name = None
-    torch_cuda_ok = False
+    gpu_name = gpu.get("name") if gpu else None
+    torch_gpu_ok = False
     try:
-        torch = _get_torch()
-        if gpu_index is not None and torch is not None and torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(gpu_index)
-            torch_cuda_ok = True
+        torch_gpu_ok = get_available_gpu_device(_get_torch()) is not None
     except (RuntimeError, OSError, AttributeError):
         pass
-    if gpu_index is not None and gpu_name is None:
+    if gpu_name is None and gpu is not None:
         # torch can't see the GPU — ask rocm-smi for the product name (AMD).
         name_data = run_rocm_smi_json(["--showproductname"],
                                       rocm_smi_path="/opt/rocm/bin/rocm-smi", timeout=2)
         if name_data:
-            for card_data in [get_rocm_card(name_data, gpu_index)]:
+            for card_data in name_data.values():
                 if isinstance(card_data, dict):
                     name = card_data.get("Card Series") or card_data.get("Card Model")
                     if name and name != "N/A":
@@ -444,7 +493,7 @@ def get_system_stats():
     # showing up as "everything is slow" with no clear cause.
     gpu_mismatch = False
     gpu_vendor = None
-    if gpu_index is not None and not torch_cuda_ok:
+    if not torch_gpu_ok:
         has_gpu, gpu_vendor = system_has_gpu()
         gpu_mismatch = has_gpu
 
@@ -1155,25 +1204,6 @@ async def save_config(config: AppConfig):
     if not reset:
         await asyncio.to_thread(project_manager.reset_engine)
     return {"status": "saved"}
-
-
-@router.get("/api/features")
-async def feature_availability():
-    """Preserve the lean edition's optional-feature discovery endpoint."""
-    from core import PREPARER_SCRIPT_PATH
-    return {"preparer": os.path.isfile(PREPARER_SCRIPT_PATH)}
-
-
-@router.post("/api/unload")
-async def unload_models_endpoint():
-    """Release cached TTS models without interrupting an active render."""
-    from core import check_global_gpu_lock
-    check_global_gpu_lock("audio")
-    engine = project_manager.engine
-    if engine is None:
-        return {"status": "noop", "unloaded": []}
-    unloaded = await asyncio.to_thread(engine.unload_models)
-    return {"status": "ok", "unloaded": unloaded}
 
 
 class ClearSynthesisRecoveryRequest(BaseModel):

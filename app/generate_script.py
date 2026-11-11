@@ -216,7 +216,12 @@ def publish_completed_generation(output_path, entries, manifest, input_path, inp
     validate_generation_output_path(input_path, output_path)
     if manifest.get('status') != 'verified':
         raise ValueError('Cannot publish an unverified generation')
-    if get_file_sha256(input_path) != input_sha256:
+    # Re-verify the INPUT through the confined digest seam that bound
+    # it, not a plain hash: an aliased/hardlinked source must refuse
+    # before any output/manifest write, matching binding admission.
+    # (Output artifact hashing below stays generic/plain.)
+    from script_selection_binding import _source_digest
+    if _source_digest(input_path) != input_sha256:
         raise ValueError('Source input changed during generation; preserving prior output')
     atomic_json_write(entries, output_path)
     save_generation_quality_manifest(output_path, {
@@ -1596,10 +1601,11 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
         parse_with_provenance = getattr(codec, "parse_with_provenance", None)
         if parse_with_provenance is not None and attempt_record is not None:
             entries, parse_provenance = parse_with_provenance(json_text)
-            attempt_record["parse_provenance"] = {
-                **parse_provenance, "codec": codec.name,
-                "extraction_unchanged": extraction_unchanged,
-                "raw_fallback_used": raw_fallback_used, "salvage_used": False}
+            if attempt_record is not None:
+                attempt_record["parse_provenance"] = {
+                    **parse_provenance, "codec": codec.name,
+                    "extraction_unchanged": extraction_unchanged,
+                    "raw_fallback_used": raw_fallback_used, "salvage_used": False}
         else:
             entries = codec.parse(json_text)
         transformed = None

@@ -33,7 +33,7 @@ matplotlib==3.10.9
 seaborn==0.13.2
 # NOT here on purpose: llama-cpp-python. The profile stage needs the HIP build
 # (gfx1201); the PyPI wheel is CPU-only and would overwrite it on every update.
-# install-voice-tools.js provisions the optional backend-specific build through llama_cpp.js.
+# install.js provisions the backend-specific source build through llama_cpp.js.
 transformers==4.57.3
 peft==0.21.2
 python-multipart==0.0.32
@@ -77,5 +77,10 @@ msgpack>=1.2.1
 multidict>=6.9.1
 fsspec>=2026.6.0
 
+# Audiobookshelf delivery (issue #1727) stores its API key in the OS credential
+# store via keyring. The module imports it lazily and fails closed (explicit
+# ALEXANDRIA_ABS_API_KEY env fallback only) when it is missing, so the app
+# still starts without it — but delivery config must not be assumed usable.
+keyring>=24.3.0
 # Seekable, pre-write bounded muxing for mixed M4B delivery (Python 3.10).
 av==17.0.0

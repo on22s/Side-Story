@@ -154,7 +154,7 @@ def check(base_url, model, timeout=180, max_tokens=400, api_key="local", profile
             f"the server has THINKING ENABLED ({len(reasoning)} reasoning "
             f"characters on a trivial prompt). It can answer this probe and "
             f"still fail the real segment pass, which caps at 512 tokens. "
-            f"Disable thinking in your server settings; llama.cpp accepts "
+            f"Restart with ./ensure_llama_server.sh, which passes "
             f"--chat-template-kwargs '{{\"enable_thinking\":false}}'. "
             f"Set ALLOW_LLM_THINKING=1 to proceed anyway.")
     if find_json_array(content) is None:
@@ -189,7 +189,8 @@ def main():
             print(f"llm_preflight: OK - {detail}")
         return 0
     print(f"llm_preflight: NOT READY - {detail}", file=sys.stderr)
-    print("llm_preflight: start the configured LLM server and check its URL/model in Setup.", file=sys.stderr)
+    print("llm_preflight: start one with", file=sys.stderr)
+    print("  LLAMA_MODEL=<path-to.gguf> ./ensure_llama_server.sh", file=sys.stderr)
     return 1
 
 

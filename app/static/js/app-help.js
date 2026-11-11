@@ -15,12 +15,16 @@
             'roster-consent': {what: 'Confirm that you reviewed the proposed identities and exact source locations. Edits invalidate this confirmation.'},
             'setup-settings-category': {what: 'Choose which Setup category to display. Edits in other categories are retained. Save Configuration applies all edited categories.'},
             'setup-settings-search': {what: 'Find available Setup settings by their labels and explanations, then jump to the original control. Does not search field values or save settings.'},
-            'setup-ui-locale': {what: 'Choose English or expanded Pseudo-English for finder text/feedback, preview controls/title, default-count summary and Saved/Would save headings. Preserves counts and configuration values, book, TTS and transcription language. Pseudo-English is a layout test, not a translation.'},
+            'setup-ui-locale': {what: "Choose the language of this Setup pane and the app shell: English, Chinese, Japanese, Spanish or the layout-test Pseudo-English. Help text, task logs, safety warnings and other tabs stay English until their phase ships. Preserves counts, config values and book/TTS/transcription language."},
+            'translated-edition-pair': {what: 'Choose one installed language pair for the translation preview. Only directly installed pairs are listed; nothing is downloaded and no language setting changes.'},
             // Setup: LLM connection
             'llm-mode': {what: 'Which LLM profile is active: Local (this machine) or Remote (a server elsewhere). Each profile keeps its own address, model and limits.'},
             'llm-url': {what: 'Address of the OpenAI-compatible server (LM Studio, llama.cpp, Ollama, a hosted API), ending in /v1.'},
             'llm-key': {what: 'API key sent with each request. Local servers usually accept any value. Use env:NAME to read it from an environment variable instead of saving it.'},
             'llm-model': {what: 'Model name sent with each request. It must match a model the server has loaded or offers.'},
+            'llm-context-length': {what: 'Profile token budget for prompt and reply. A lower detected context still wins. Reducing this caps requests; it does not unload the model or free GPU memory.'},
+            'llm-max-input-tokens': {what: 'Largest prompt this profile may send. Blank inherits the global input ceiling. Lower it for providers with a smaller input limit.'},
+            'llm-max-output-tokens': {what: 'Largest reply this profile may request. Blank means no profile cap; each task still has its own safety ceiling.'},
             'llm-request-timeout': {what: 'How long to wait for a reply before treating the request as failed. Blank uses the app default. Raise it for slow models on long chunks.'},
             'llm-connect-timeout': {what: 'How long to wait to open a connection. Blank uses the request timeout.'},
             'llm-request-interval': {what: 'Minimum seconds between requests. Use it to stay under a provider rate limit; 0 sends as fast as replies arrive.'},
@@ -43,6 +47,7 @@
             'tts-url': {what: 'Address of the external Qwen3-TTS Gradio server.'},
             'tts-external-urls': {what: 'Extra external TTS servers, one per line. Batch rendering spreads lines across them. Empty uses only the address above.'},
             'tts-external-timeout': {what: 'A line that takes longer than this on an external server is marked failed instead of waited on.'},
+            'tts-external-server-number': {what: 'Select the saved external server to inspect, numbered from 1 in saved pool order. The check reads schema only; it does not save settings or generate audio.'},
             'tts-device': {what: 'Where the local TTS model runs. Auto picks the best available GPU, else the CPU.'},
             'tts-language': {what: 'Language the audio is spoken in. It does not change script generation; edit the prompts for that.'},
             'parallel-workers': {what: 'How many TTS requests run at once. More can be faster on a large GPU or server pool, but uses more memory.'},
@@ -60,6 +65,7 @@
             "synthesis-recovery-enabled": {what: "Keep verified windows for interrupted fixed-seed native local stock-voice renders on Linux. Off by default. Save Configuration to apply; unsupported renders continue normally and selected takes are preserved."},
             "synthesis-recovery-budget": {what: "Logical limit for indexed recovery audio across the workspace, in MiB (16–4096). Default 256. Interrupted cache writes remain charged; temporary working files are separate."},
             'speech-verification-enabled': {what: 'Check new English takes with cached CPU ASR and short-line acoustics. Off by default; save to apply. Confirmed missing or extra speech rejects the attempt and keeps the prior take. Unsupported or unavailable checks are labeled. Adds time and RAM; listening review is still needed.'},
+            'speech-retry-enabled': {what: 'Off by default; save with speech checks enabled. Retry confirmed missing/extra speech once with a new seed. Unavailable or review keeps prior audio and never retries; with no prior take the line errors with no audio. Adds time; native batches run one line at a time. Not listening acceptance.'},
             "synthesis-sentence-gap": {what: "Optional target silence at sentence joins within one take. Blank preserves natural silence; trimming is limited by the edge trim setting."},
             "synthesis-clause-gap": {what: "Optional target silence at clause joins within one take. Blank preserves natural silence; trimming is limited by the edge trim setting."},
             "synthesis-paragraph-gap": {what: "Optional target silence at paragraph joins within one take. Blank preserves natural silence; trimming is limited by the edge trim setting."},
@@ -72,8 +78,8 @@
             'design-text-max-chars': {what: 'Longest character line a persona voice is designed from, up to 500. Longer lines are cut at a sentence end.'},
 
             // Setup: LLM generation settings
-            'max-tokens': {what: 'Starting reply size for LLM requests. A verified larger context can raise it up to each task’s safety ceiling.'},
-            'max-input-tokens': {what: 'Largest prompt any LLM request may send. Blank keeps the existing context checks.'},
+            'max-tokens': {what: 'Starting reply size for LLM requests. A verified larger context can raise it up to each task’s safety ceiling; a profile output ceiling caps it.'},
+            'max-input-tokens': {what: 'Largest prompt any profile may send. Blank keeps the existing context checks. A profile’s own input ceiling overrides it.'},
             'temperature': {what: 'Sampling randomness for single-pass generation and review. 0 always picks the most likely token. The three-pass steps have their own temperatures below.'},
             'top-p': {what: 'Nucleus sampling: only tokens within this cumulative probability are considered.'},
             'top-k': {what: 'Only the K most likely tokens are considered. 0 disables it.'},
@@ -150,6 +156,8 @@
             'speaker-review-partial': {what: 'Allow reviewing labels from an attribution checkpoint that has not finished.'},
             'speaker-review-consent': {what: 'Confirms that the shown book and reference excerpts may be sent to this model endpoint. Remote providers may charge for it.'},
             'save-script-name': {what: 'Name to save the current script under in the script library.'},
+            'source-preview-confirm': {what: 'Confirms the loaded source-text excerpt snapshot for the current book in this tab. Reload the preview to check the current source.'},
+            'single-voice-source': {what: 'Speaker whose existing voice to review for book-wide use. Preview lists every affected speaker before anything is applied.'},
 
             // Voices tab
             'voices-state-filter': {what: 'Show all characters, or only those with or without state cards (per-state voices, e.g. a time skip).'},
@@ -177,6 +185,21 @@
             'editor-quality-filter': {what: 'Filter the take review queue by saved findings, historical speech evidence or missing checks. Compare retained candidates without changing audio; restoration requires an explicit action. Unknown evidence is not a clean result.'},
             'chk-drift-only': {what: 'Show only chunks the drift check flagged as sounding unlike their speaker’s reference voice.'},
 
+            // Manual Audiobookshelf delivery
+            'abs-server-url': {what: 'Audiobookshelf server address. Use HTTPS, or HTTP for localhost only. Saving selects the server; it does not upload audio.'},
+            'abs-api-key': {what: 'API key for this Audiobookshelf server. Saved in the OS credential store and never returned to the page. Leave blank to keep the stored key.'},
+            'abs-export-format': {what: 'Choose a completed, current MP3 or M4B export to deliver. The preview checks its saved identity before sending.'},
+            'abs-title': {what: 'Title to send with the audiobook. Changing it clears the delivery preview.'},
+            'abs-library': {what: 'Destination library returned by Load libraries. Loading libraries contacts the selected server without uploading audio.'},
+            'abs-folder': {what: 'Destination folder within the selected library. Preview checks that the folder belongs to that library.'},
+            'abs-author': {what: 'Optional author metadata sent with the audiobook. Leave blank to omit it.'},
+            'abs-series': {what: 'Optional series metadata sent with the audiobook. Leave blank to omit it.'},
+            'abs-right-to-share': {what: 'Confirm that you have permission to share the current export and its voices. Confirmation enables Send only after a current preview.'},
+            // Optional OPDS catalog
+            'calibre-root-url': {what: 'Catalog root URL to browse. It is used only after you save the catalog settings; browsing does not save it.'},
+            'calibre-username': {what: 'Optional catalog username. Saving stores it with the root URL; browsing contacts the saved catalog only.'},
+            'calibre-password': {what: 'Catalog password. Blank keeps the stored password. It is never shown again after saving.'},
+            'calibre-clear-password': {what: 'Clear the stored catalog password when you next save. Use with Load saved settings review before saving again.'},
             // Result tab
             'export-quality-noise': {what: 'Level below which every audio channel counts as silent during the next MP3, M4B or chapter check. Authored pauses are excluded; Audacity checks track structure instead.'},
             'export-quality-gap': {what: 'Minimum unexpected silent interval reported during the next assembled export, in seconds. It warns by default; enable rejection to refuse these gaps before replacing a delivery.'},
@@ -212,6 +235,10 @@
             'chapter-per-chunk': {what: 'Use the same chapter detection as the M4B export (one chapter per chunk).'},
             'chapter-changed-only': {what: 'Export only chapters whose audio changed since their last export. Turn off for a complete set.'},
             'chapter-require-ready': {what: 'Refuse to export until every speaker is marked ready.'},
+            'readalong-include-text': {what: 'Include the script text in the downloadable sidecar. Unchecked sidecars contain timings only.'},
+            'readaloud-timing-mode': {what: 'Choose EPUB timing. Auto uses Qwen3 when its isolated runtime and model are ready; otherwise it uses CPU chunk timing. Qwen estimates sentence times. Chunk uses editor chunk bounds and needs no extra model. See docs/readalong.md for installation.'},
+            'readaloud-timing-device': {what: 'Choose where Qwen alignment runs. Auto uses an eligible GPU or CPU. A GPU build reserves the shared GPU lock; wait for other GPU work to finish. Chunk timing always uses CPU.'},
+            'readaloud-timing-language': {what: 'Speech language for Qwen alignment. EPUB language reads the retained book metadata. Choose an override when metadata is wrong or unavailable; unsupported languages are refused. Chunk timing has no aligner-language limit.'},
 
             // Advanced tabs and shared dialogs
             'manual-llm-reply': {what: 'Paste only the answer to the current manual request. Submit checks it against that request before the waiting task continues.'},
@@ -297,12 +324,38 @@
             'clone-import-source-url': {what: 'Optional source link recorded with this reference clip.'},
             'clone-import-rights-basis': {what: 'Optional record of why you may use this recording, such as your own recording, a licence or permission.'},
             'clone-import-rights-confirmed': {what: 'Confirm that you have permission to use the recording. Import also requires its exact transcript.'},
+            'clone-cleanup-gain': {what: 'Full-length amplitude multiplier from 0.25 to 4.0; 1.0 leaves gain unchanged. It does not trim the reference. A candidate that would clip is refused.'},
+            'clone-cleanup-remove-dc': {what: 'Optionally remove the constant DC offset before applying gain. This changes the full-length waveform; it does not certify speaker identity, words or quality.'},
+            'clone-cleanup-listened-original': {what: 'Confirm that you listened to the labelled Original reference. This is your listening confirmation, not automated transcript, speaker or quality verification.'},
+            'clone-cleanup-listened-candidate': {what: 'Confirm that you listened to the labelled Candidate and compared it with the Original. This is your listening confirmation, not automated transcript, speaker or quality verification.'},
             'manual-copy-text': {what: 'Read-only text for manual copying when the browser refuses automatic clipboard access.'},
             'preset-editor-name': {what: 'Name of the preset to save. An existing name replaces that saved preset.'},
             'preset-editor-description': {what: 'Optional note describing when to use this preset.'},
         };
 
         const ACTION_HELP = {
+            'audiobookshelfApiDocs': 'Open the official Audiobookshelf API documentation. Does not upload audio or send your API key.',
+            'saveAbsConfig': 'Save the selected Audiobookshelf server and its API key in the OS credential store. Does not send the audiobook.',
+            'loadAbsLibraries': 'Contact the selected Audiobookshelf server to list accessible libraries and folders. Does not upload audio.',
+            'previewAbsSend': 'Check the current export and destination, then display their identity before you confirm sending. Contacts the server to check the destination.',
+            'sendAbsExport': 'Upload the previewed export after rights confirmation. Local audio is retained. Verify delivery afterwards to confirm the remote file bytes.',
+            'cancelAbsSend': 'Request cancellation of the active upload. The server may already have received bytes; the outcome remains unconfirmed until verified.',
+            'loadAbsDeliveries': 'Show the current book?s saved delivery outcomes without uploading or retrying. Unconfirmed outcomes block duplicate sends.',
+            'reconcileAbsDelivery': 'Download a candidate remote file and compare its complete size and SHA-256 with the recorded export. Only matching bytes confirm delivery.',
+            'loadCalibreConfig': 'Read the saved catalog root and username from this app only. Does not contact the catalog or change the password.',
+            'saveCalibreConfig': 'Save the catalog root and username, and store, keep, or clear the password as selected. Invalidates prior previews and unconfirmed captures. A successful save can retire a tokenless capture with unknown outcome; it does not claim the capture never ran or was cancelled. Does not start a download.',
+            'browseCalibreRoot': 'Browse the saved catalog root and show one page of categories and books. Does not download a book.',
+            'browseCalibreNextPage': 'Show the next page of the current catalog browse from the server-held token.',
+            'browseCalibreStartPage': 'Return to the first page of the current catalog browse from the server-held token.',
+            'openCalibreNav': 'Open the selected catalog category from the server-held navigation token. The displayed URL is never used as authority.',
+            'approveCalibreReview': 'Approve exactly the cross-origin destination shown, then replay the pending browse or capture step once. Each new destination needs its own approval; approval never trusts the whole origin.',
+            'cancelCalibreReview': 'Retire the pending cross-origin review and request cancellation of its capture job when present. A pending capture start is cancelled when its token arrives; cancellation is confirmed by job status.',
+            'previewCalibreBook': 'Show the pure read-only provider metadata and source identity for the selected catalog book. Does not download or import it.',
+            'startCalibreCapture': 'Explicitly capture the exact previewed source to a staged capture using its preview token. Does not import or select a book; cross-origin destinations need an exact review first.',
+            'checkCalibreCaptureStatus': 'Read the status of this capture job by its job token. Does not start a new capture, retry a failed capture, or import anything.',
+            'cancelCalibreCapture': 'Request cancellation of this capture job by its job token. An accepted cancel (cancelling) is not cancelled until status confirms it.',
+            'discardCalibreCapture': 'Discard the captured staged file using its confirmation token. Does not delete a published book; importing disables discard.',
+            'importCalibreCapture': 'Import the captured source exactly once using its confirmation token and SHA-256. Refreshes existing uploads and, for the current view, shows the extraction report. Does not select a book.',
             'acceptDocxPreview': 'Confirm the exact displayed DOCX extraction, retain its original archive and receipt, then select the derived text. Does not start generation.',
             'cancelDocxPreview': 'Discard this DOCX preview without selecting a new source. An acceptance already sent may retain confirmed files for recovery.',
             'openRetainedDocxDetails': 'Read bounded retained-file metadata, including partial DOCX groups and observed quota bytes. No content verification or deletion. Shows storage location and offline backup/remove guidance.',
@@ -426,6 +479,11 @@
             'loadExportQualityReports': 'Show completed delivery checks and rejected attempts retained for the current book in this app session. File metadata is checked; audio is not rehashed or decoded.',
             'removeM4bCover': 'Remove the selected cover image from this export configuration.',
             'exportM4B': 'Export generated audio as an M4B audiobook with the entered metadata and chapter settings.',
+            'buildReadalongSidecar': 'Build a JSON sidecar bound to the current MP3 export from the existing frame-exact timeline. Fresh-encodes the MP3 so text, timings and audio stay one immutable export. Downloads the sidecar when done.',
+            'cancelReadalongSidecar': 'Request cancellation of the read-along sidecar build. Already published files are unchanged.',
+            'buildReadaloudEpub': 'Build a source-preserving EPUB 3 read-aloud from the retained original EPUB and a fresh MP3 encode. Fails closed with the reason when sync cannot be justified.',
+            'cancelReadaloudEpub': 'Request cancellation of the EPUB read-aloud build. Already published files are unchanged.',
+            'openRetainedEpubDetails': 'Read bounded retained-EPUB metadata, including partial groups and observed quota bytes. No content verification or deletion.',
             'cancelM4B': 'Request cancellation of the current M4B export.',
             'saveChapterTemplatePreset': 'Save the current chapter filename pattern as a reusable preset.',
             'deleteChapterTemplatePreset': 'Delete the selected chapter filename preset.',
@@ -488,6 +546,7 @@
             'renderEditorQualityInbox': 'Filter saved unresolved-speaker, render-failure, missing-file and voice-drift findings. This does not start a quality check.',
             'showMoreEditorFindings': 'Show the next 50 matching saved findings.',
             'focusEditorReviewField': 'Focus the original selected-line field in the Editor table. Edits use its existing save controls.',
+            'analyzeEditorSentenceGaps': 'Inspect quiet gaps between sentences in this saved English take. Shows read-only suggestions and reasons for skipped boundaries; audio and row pauses stay unchanged. Uses installed CPU speech recognition, with no automatic download.',
             'createEditorWordTiming': 'Estimate word/group times for this saved English line using the installed CPU ASR provider. No model download. Timing does not certify pronunciation.',
             'cancelEditorWordTiming': 'Request cancellation of word timing, retaining ownership until the worker exits and preserving existing audio.',
             'playEditorReviewLine': 'Play the selected line with its existing audio player, stopping sequence playback first.',
@@ -537,11 +596,16 @@
             'onDesignedVoiceSelect': 'Assign the selected saved designed voice to this character.',
             'handleCloneVoiceUpload': 'Import the selected recording and its required reference details for voice cloning.',
             'saveVoicesDebounced': 'Save the edited voice assignment settings after a short delay.',
+            'loadSingleVoiceSourcePreview': 'Load a read-only excerpt of this book’s source text for inspection. It starts no generation job and does not change the source.',
+            'previewSingleVoiceBook': 'Preview how one voice would apply to every character, reviewing the affected voices before confirming. It may flush your already-authorized pending edits, but applies nothing until you confirm.',
             'reapplyCastSaveThreshold': 'Recalculate which cast-save matches meet the displayed threshold.',
             'loadDesignLines': 'Load this character’s dialogue lines so one can be used to design a voice.',
         };
 
         const ITEM_HELP = {
+            'translated-edition-refresh': 'Re-check which language pairs are installed on this machine. Does not download anything.',
+            'translated-edition-create': 'Build a reviewable translation proposal for the first 25 saved Script rows. Proposal only: never changes the Script, source, or any language setting, and it refuses rather than download when Argos needs a sentence-splitter model that is not already installed. It belongs to the active book; re-opening the panel with nothing running shows the most recent saved preview for the current book, and another book\'s preview is never shown for this book.',
+            'translated-edition-cancel': 'Request a stop for a running preview after the current row. A preview that has not finished building is saved as cancelled, never complete or approved; one already finished keeps its finished status.',
             'voices-open-casting': 'Open the casting library to browse designed voices from every book and use one for a character here.',
             'casting-refresh': 'Reload the casting library from the designed voices on disk, including review marks.',
             'casting-view-cards': 'Show the matching voices as cards with their description and controls.',
@@ -592,8 +656,14 @@
             'chapter-preview-btn': 'Preview chapter boundaries and filenames for the current export settings.',
             'chapter-export-btn': 'Export the selected chapters into individual audio files.',
             'chapter-cancel-btn': 'Request cancellation of chapter export.',
+            'readalong-include-text': 'Include the script text in the downloadable sidecar. Unchecked sidecars contain timings only.',
+            'readalong-cancel-btn': 'Request cancellation of the read-along sidecar build.',
+            'readaloud-cancel-btn': 'Request cancellation of the EPUB read-aloud build.',
             'btn-cancel-merge': 'Request cancellation of the audio merge.',
             'clone-import-submit': 'Validate the transcript and permission confirmation, then import this reference recording.',
+            'clone-cleanup-prepare': 'Prepare and verify a separate full-length candidate using the selected gain and DC options. This does not import it or change the selected voice.',
+            'clone-cleanup-accept': 'After transcript, rights and both listening confirmations, accept the verified candidate as a new immutable reference. The selected voice does not change automatically.',
+            'clone-cleanup-reject': 'Discard the pending preview if present; already accepted voices remain in the library. The selected voice and source recording are unchanged.',
             'manual-copy-close': 'Close the manual-copy dialog.',
             'preset-editor-cancel': 'Close this preset editor without saving its changes.',
             'preset-editor-submit': 'Save the entered preset name and description.',
@@ -609,6 +679,7 @@
             'blind-pref-a': 'Record that you preferred sample A in this blind comparison.',
             'blind-pref-b': 'Record that you preferred sample B in this blind comparison.',
             'blind-pref-tie': 'Record that you had no preference between the two samples.',
+            'workspace-collection-show': 'Show progress for the selected saved books without opening, loading or changing any book.',
         };
 
         const NAV_HELP = {
@@ -682,11 +753,51 @@
             }
         };
 
+        // Help ids are the stable keys of the maps above, so each catalog key is
+        // derived from its id and field, not from the English sentence: editing a
+        // typo in a `what` must not invalidate three translations (design 3.9).
+        const HELP_CATALOG_KINDS = Object.freeze({
+            FIELD_HELP: 'field',
+            ACTION_HELP: 'action',
+            ITEM_HELP: 'item',
+            NAV_HELP: 'nav',
+            DYNAMIC_FIELD_HELP: 'dynamic',
+            CHANGED_FIELD_HELP: 'changed',
+        });
+
+        function getHelpCatalogKey(kind, id, field = null) {
+            if (!Object.hasOwn(HELP_CATALOG_KINDS, kind)) {
+                throw new Error('Unknown help map: ' + kind);
+            }
+            const slug = String(id).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+            const key = 'help.' + HELP_CATALOG_KINDS[kind] + '.' + slug;
+            return field === null ? key : key + '.' + field;
+        }
+
+        // The English of every map entry is the catalog source (harvested by
+        // tools/i18n/extract_ui_catalog.py); t() only replaces it when the
+        // selected locale has a translation, so an unkeyed entry stays English.
+
+        // Help prose quotes prompt placeholders literally ({chunk}, {roster}).
+        // Feed each one back as its own text so formatting keeps it on screen
+        // instead of treating it as a missing value. Catalog parity still pins
+        // the placeholder set per locale, so a translation cannot drop one.
+        function formatHelpText(key, english, locale) {
+            const values = {};
+            for (const match of english.matchAll(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g)) {
+                values[match[1]] = match[0];
+            }
+            return t(key, english, values, locale);
+        }
+
         /** The tooltip text for one entry: what it does, then any sourced recommendation. */
-        function getFieldHelpText(entry) {
-            let text = entry.what;
+        function getFieldHelpText(entry, id, locale = getUiLocale()) {
+            let text = formatHelpText(getHelpCatalogKey('FIELD_HELP', id, 'what'), entry.what, locale);
             if (entry.recommend) {
-                text += ' Recommended: ' + entry.recommend + ' (source: ' + entry.source + ')';
+                text = joinUiSentences([text, t('help.field.recommended', 'Recommended: {recommend} (source: {source})', {
+                    recommend: formatHelpText(getHelpCatalogKey('FIELD_HELP', id, 'recommend'), entry.recommend, locale),
+                    source: formatHelpText(getHelpCatalogKey('FIELD_HELP', id, 'source'), entry.source, locale),
+                }, locale)], locale);
             }
             return text;
         }
@@ -699,49 +810,49 @@
             return Object.hasOwn(registry, key) ? registry[key] : null;
         }
 
-        function getItemHelpText(control) {
+        function getItemHelpText(control, locale = getUiLocale()) {
             if (control.type === 'hidden') { return ''; }
             if (control.type === 'file' && (control.hidden || control.style.display === 'none')) { return ''; }
-            if (getHelpEntry(FIELD_HELP, control.id)) { return getFieldHelpText(FIELD_HELP[control.id]); }
-            if (getHelpEntry(ITEM_HELP, control.id)) { return ITEM_HELP[control.id]; }
-            if (control.dataset.helpKey && getHelpEntry(ACTION_HELP, control.dataset.helpKey)) { return ACTION_HELP[control.dataset.helpKey]; }
-            if (control.classList.contains('nav-link') && getHelpEntry(NAV_HELP, control.dataset.tab)) { return NAV_HELP[control.dataset.tab]; }
+            if (getHelpEntry(FIELD_HELP, control.id)) { return getFieldHelpText(FIELD_HELP[control.id], control.id, locale); }
+            if (getHelpEntry(ITEM_HELP, control.id)) { return formatHelpText(getHelpCatalogKey('ITEM_HELP', control.id), ITEM_HELP[control.id], locale); }
+            if (control.dataset.helpKey && getHelpEntry(ACTION_HELP, control.dataset.helpKey)) { return formatHelpText(getHelpCatalogKey('ACTION_HELP', control.dataset.helpKey), ACTION_HELP[control.dataset.helpKey], locale); }
+            if (control.classList.contains('nav-link') && getHelpEntry(NAV_HELP, control.dataset.tab)) { return formatHelpText(getHelpCatalogKey('NAV_HELP', control.dataset.tab), NAV_HELP[control.dataset.tab], locale); }
             for (const [selector, text] of Object.entries(DYNAMIC_FIELD_HELP)) {
-                if (control.matches(selector)) { return text; }
+                if (control.matches(selector)) { return formatHelpText(getHelpCatalogKey('DYNAMIC_FIELD_HELP', selector), text, locale); }
             }
             const handler = ['onclick', 'onchange', 'oninput', 'onfocus'].map(name => control.getAttribute(name) || '').join(';');
             for (const [name, fields] of Object.entries(CHANGED_FIELD_HELP)) {
                 const match = new RegExp('\\b' + name + '\\([^,]+,\\s*[\'"]([^\'"]+)[\'"]').exec(handler);
-                if (match && getHelpEntry(fields, match[1])) { return fields[match[1]]; }
+                if (match && getHelpEntry(fields, match[1])) { return formatHelpText(getHelpCatalogKey('CHANGED_FIELD_HELP', name, match[1]), fields[match[1]], locale); }
             }
             for (const match of handler.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
-                if (getHelpEntry(ACTION_HELP, match[1]) && (!control.matches('input,select,textarea') || fieldHelpHandlers.has(match[1]))) { return ACTION_HELP[match[1]]; }
+                if (getHelpEntry(ACTION_HELP, match[1]) && (!control.matches('input,select,textarea') || fieldHelpHandlers.has(match[1]))) { return formatHelpText(getHelpCatalogKey('ACTION_HELP', match[1]), ACTION_HELP[match[1]], locale); }
             }
-            if (handler.includes("closest('.cast-list-row').remove()")) { return 'Remove this cast-list row from the editor. Save the cast list to retain the edit.'; }
-            if (handler.includes("closest('.nick-alias-row').remove()")) { return 'Remove this alias row from the editor. Save the aliases to retain the edit.'; }
-            if (control.classList.contains('navbar-brand')) { return 'Return to the app’s Setup view.'; }
-            if (handler.includes("'auto-config-banner'")) { return 'Dismiss the suggested-settings notice while keeping the values shown in the form.'; }
-            if (handler.includes("'prompt-preview-panel'")) { return 'Close the prompt preview without changing the current prompt settings.'; }
-            if (handler.includes('[data-tab=dataset-builder]')) { return 'Open the Dataset tab to build a new training dataset.'; }
-            if (handler.includes("'chapter-preset-import'")) { return 'Choose a JSON file containing chapter filename presets to import.'; }
-            if (handler.includes("'lora-comparison-panel'")) { return 'Close the adapter comparison or listening-review panel.'; }
-            if (handler.includes("'stale-build-banner'")) { return 'Dismiss the notice about changed app files without reloading the page.'; }
-            if (control.hasAttribute('data-config-save-action')) { return 'Save the current app configuration.'; }
-            if (control.dataset.bsDismiss === 'modal') { return 'Close this dialog without confirming its pending action.'; }
-            if (control.dataset.bsDismiss === 'toast') { return 'Dismiss this notification.'; }
-            if (control.tagName === 'BUTTON' && control.closest('.chunk-actions')) { return 'Generate this script line’s audio using its current text, delivery and assigned voice.'; }
-            if (control.tagName === 'INPUT' && control.id.startsWith('script-batch-narrator-')) { return 'Exact character name to use as narrator for this book in the batch. Leave blank to use the normal narrator assignment.'; }
-            if (control.tagName === 'TEXTAREA' && control.hasAttribute('readonly') && control.closest('#script-recovery-panel')) { return 'Source text or batch entries for the failed chunk. Compare these with the replacement model reply.'; }
-            if (control.tagName === 'TEXTAREA' && control.closest('#manual-llm-retained-replies')) { return 'Read-only copy of an earlier model reply, retained so an unsent response is not lost.'; }
-            if (control.tagName === 'BUTTON' && control.disabled && (control.getAttribute('aria-label') || '').startsWith('Candidate ') && (control.getAttribute('aria-label') || '').endsWith(' is in use')) { return 'This saved voice candidate is already assigned to the character.'; }
-            if (control.tagName === 'A' && control.closest('.toast-body')) { return 'Undo the recently deleted script line while this undo action remains available.'; }
-            if (control.tagName === 'A' && (control.getAttribute('href') || '').startsWith('/api/logs/')) { return 'Download the full task log for troubleshooting.'; }
+            if (handler.includes("closest('.cast-list-row').remove()")) { return t('help.item.cast-row-remove', 'Remove this cast-list row from the editor. Save the cast list to retain the edit.', {}, locale); }
+            if (handler.includes("closest('.nick-alias-row').remove()")) { return t('help.item.alias-row-remove', 'Remove this alias row from the editor. Save the aliases to retain the edit.', {}, locale); }
+            if (control.classList.contains('navbar-brand')) { return t('help.item.brand', 'Return to the app’s Setup view.', {}, locale); }
+            if (handler.includes("'auto-config-banner'")) { return t('help.item.auto-config-banner', 'Dismiss the suggested-settings notice while keeping the values shown in the form.', {}, locale); }
+            if (handler.includes("'prompt-preview-panel'")) { return t('help.item.prompt-preview-close', 'Close the prompt preview without changing the current prompt settings.', {}, locale); }
+            if (handler.includes('[data-tab=dataset-builder]')) { return t('help.item.dataset-builder-link', 'Open the Dataset tab to build a new training dataset.', {}, locale); }
+            if (handler.includes("'chapter-preset-import'")) { return t('help.item.chapter-preset-import', 'Choose a JSON file containing chapter filename presets to import.', {}, locale); }
+            if (handler.includes("'lora-comparison-panel'")) { return t('help.item.lora-comparison-close', 'Close the adapter comparison or listening-review panel.', {}, locale); }
+            if (handler.includes("'stale-build-banner'")) { return t('help.item.stale-build-dismiss', 'Dismiss the notice about changed app files without reloading the page.', {}, locale); }
+            if (control.hasAttribute('data-config-save-action')) { return t('help.item.config-save-action', 'Save the current app configuration.', {}, locale); }
+            if (control.dataset.bsDismiss === 'modal') { return t('help.item.modal-dismiss', 'Close this dialog without confirming its pending action.', {}, locale); }
+            if (control.dataset.bsDismiss === 'toast') { return t('help.item.toast-dismiss', 'Dismiss this notification.', {}, locale); }
+            if (control.tagName === 'BUTTON' && control.closest('.chunk-actions')) { return t('help.item.chunk-generate', 'Generate this script line’s audio using its current text, delivery and assigned voice.', {}, locale); }
+            if (control.tagName === 'INPUT' && control.id.startsWith('script-batch-narrator-')) { return t('help.item.script-batch-narrator', 'Exact character name to use as narrator for this book in the batch. Leave blank to use the normal narrator assignment.', {}, locale); }
+            if (control.tagName === 'TEXTAREA' && control.hasAttribute('readonly') && control.closest('#script-recovery-panel')) { return t('help.item.script-recovery-compare', 'Source text or batch entries for the failed chunk. Compare these with the replacement model reply.', {}, locale); }
+            if (control.tagName === 'TEXTAREA' && control.closest('#manual-llm-retained-replies')) { return t('help.item.manual-retained-reply', 'Read-only copy of an earlier model reply, retained so an unsent response is not lost.', {}, locale); }
+            if (control.tagName === 'BUTTON' && control.disabled && (control.getAttribute('aria-label') || '').startsWith('Candidate ') && (control.getAttribute('aria-label') || '').endsWith(' is in use')) { return t('help.item.candidate-in-use', 'This saved voice candidate is already assigned to the character.', {}, locale); }
+            if (control.tagName === 'A' && control.closest('.toast-body')) { return t('help.item.toast-undo', 'Undo the recently deleted script line while this undo action remains available.', {}, locale); }
+            if (control.tagName === 'A' && (control.getAttribute('href') || '').startsWith('/api/logs/')) { return t('help.item.task-log-download', 'Download the full task log for troubleshooting.', {}, locale); }
             if (control.dataset.bsToggle === 'collapse') {
-                return control.dataset.bsTarget === '#navbarNav' ? 'Show or hide the app navigation menu.' : 'Show or hide this section’s additional settings.';
+                return control.dataset.bsTarget === '#navbarNav' ? t('help.item.navbar-collapse', 'Show or hide the app navigation menu.', {}, locale) : t('help.item.section-collapse', 'Show or hide this section’s additional settings.', {}, locale);
             }
-            if (control.tagName === 'SUMMARY') { return (control.getAttribute('title') ?? helpNativeTitles.get(control) ?? '').trim() || 'Show or hide the details described by this heading.'; }
-            if (control.matches('audio[controls],video[controls]')) { return 'Play, pause or seek through this media preview and adjust its volume. Playback does not regenerate the audio.'; }
-            if (control.hasAttribute('download')) { return 'Download this file to your computer.'; }
+            if (control.tagName === 'SUMMARY') { return (control.getAttribute('title') ?? helpNativeTitles.get(control) ?? '').trim() || t('help.item.summary-toggle', 'Show or hide the details described by this heading.', {}, locale); }
+            if (control.matches('audio[controls],video[controls]')) { return t('help.item.media-preview', 'Play, pause or seek through this media preview and adjust its volume. Playback does not regenerate the audio.', {}, locale); }
+            if (control.hasAttribute('download')) { return t('help.item.download-file', 'Download this file to your computer.', {}, locale); }
             return (control.getAttribute('title') ?? helpNativeTitles.get(control) ?? '').trim();
         }
 
@@ -886,6 +997,13 @@
         function scheduleHelp(trigger, source) {
             cancelHelp();
             if (!trigger) { return; }
+            // The tooltip text is read at display time, so a UI-locale change
+            // applies to the next tooltip without repainting every control.
+            const owner = helpTipOwners.get(trigger) || trigger;
+            const current = getItemHelpText(owner);
+            if (current && trigger.getAttribute('data-bs-title') !== current) {
+                trigger.setAttribute('data-bs-title', current);
+            }
             helpIntent = {trigger, source};
             activeHelp = trigger;
             helpTimer = setTimeout(() => {

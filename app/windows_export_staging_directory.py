@@ -51,11 +51,13 @@ class _Handle:
             raise ValueError('Invalid Windows handle protection mode')
         # A deletion handle permits existing readers, but denies new writers
         # and renames while the object's final version is checked and removed.
-        # A rename guard requests DELETE access but keeps read/write sharing so
-        # the guarded directory's children can still be published normally.
+        # FILE_LIST_DIRECTORY makes the guard participate in sharing checks;
+        # omitting FILE_SHARE_DELETE denies directory rename without requesting
+        # DELETE ourselves. DELETE access conflicts with working-directory and
+        # overlapping guard handles even though neither renames the directory.
         share_mode = 1 if delete else 3
-        delete_access = delete or protect_rename
-        self.handle = api.CreateFileW(str(path), 0x80 | (0x10000 if delete_access else 0),
+        access = 0x80 | (0x10000 if delete else 0) | (0x1 if protect_rename else 0)
+        self.handle = api.CreateFileW(str(path), access,
                                       share_mode, None, 1 if create else 3,
                                       0x02000000 | 0x00200000, None)
         if self.handle == ctypes.c_void_p(-1).value:
@@ -98,19 +100,85 @@ def windows_named_file_identity(path):
         handle.close()
 
 
-def _open_rename_guard(api, directory, *, required):
-    """Request rename authority where the app controls the directory tree.
+def _filetime_ns(value):
+    """FILETIME (100 ns since 1601) -> ns since the Unix epoch, as os.stat reports it."""
+    return (((value.high << 32) | value.low) - 116444736000000000) * 100
 
-    System ancestors can deny DELETE access to an ordinary user precisely
-    because that user cannot rename them.  Retain an identity handle there;
-    never weaken the guard for the admitted root or one of its descendants.
+
+class _RenameInformation(ctypes.Structure):
+    """FILE_RENAME_INFO header; FileName starts at the `name` offset."""
+    _fields_ = [('flags', ctypes.c_uint32), ('root', ctypes.c_void_p),
+                ('length', ctypes.c_uint32), ('name', ctypes.c_wchar * 1)]
+
+
+def _get_rename_request(name):
+    """-> a FILE_RENAME_INFO buffer for `name`: ReplaceIfExists FALSE, no root.
+
+    The name is stored as its exact UTF-16 code units plus a NUL terminator,
+    and FileNameLength counts those bytes without the terminator. Sizing by
+    Python code points is wrong for characters outside the BMP (one code point,
+    two UTF-16 units): the terminator was dropped and the kernel read past the
+    buffer into a garbage name (#1660 review).
+    """
+    if '\0' in name:
+        raise ValueError('Invalid Windows rename destination')   # the kernel would truncate at it
+    # surrogatepass: NTFS allows unpaired surrogates in names, and a path
+    # rename moved them; keep each as its single UTF-16 unit.
+    encoded = name.encode('utf-16-le', 'surrogatepass')
+    offset = _RenameInformation.name.offset
+    request = ctypes.create_string_buffer(
+        max(ctypes.sizeof(_RenameInformation), offset + len(encoded) + 2))
+    header = _RenameInformation.from_buffer(request)
+    header.flags, header.root, header.length = 0, None, len(encoded)
+    ctypes.memmove(ctypes.addressof(request) + offset, encoded + b'\0\0', len(encoded) + 2)
+    return request
+
+
+def windows_rename_verified(source, destination, expected=None):
+    """Rename exactly the object a handle verified, never whatever the name now holds.
+
+    #1660: a path rename re-resolves `source` after any identity check, so a
+    writer that substitutes the name in between gets its object moved. Here
+    one handle is opened (DELETE access, read-only sharing, reparse points
+    not followed), its identity and version are compared with `expected`
+    ([dev, ino] or [dev, ino, size, mtime_ns, mode, nlink] as os.lstat gives
+    them), and the rename is applied to that handle. A substituted name is
+    left untouched, and while the handle is held no other writer or rename
+    can change the object. The destination is a full path and is never
+    replaced (an existing one raises FileExistsError). Any failure raises;
+    there is no fallback to a path rename.
+    """
+    api = _api()
+    handle = _Handle(api, source, delete=True)
+    try:
+        if expected is not None:
+            info = handle.information()
+            observed = [*_identity(info)]
+            if len(expected) == 6:
+                observed += [(info.size_high << 32) | info.size_low, _filetime_ns(info.written),
+                             expected[4], info.links]
+            if observed != list(expected):
+                raise StageDirectoryChanged('Book artifact changed during its move')
+        request = _get_rename_request(str(Path(destination).absolute()))
+        # FileRenameInfo = 3.
+        if not api.SetFileInformationByHandle(handle.handle, 3, request, ctypes.sizeof(request)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        handle.close()
+
+
+def _open_rename_guard(api, directory, *, required):
+    """Deny directory renames through sharing where the app controls the tree.
+
+    System ancestors can deny directory-list access to an ordinary user.
+    Retain an identity handle there; require the sharing guard for the admitted
+    root and its descendants.
     """
     try:
         return _Handle(api, directory, protect_rename=True)
     except OSError as error:
-        # Access denial means this token cannot rename the system ancestor; a
-        # sharing violation means another live handle already denies it.  Both
-        # are acceptable only outside the app-controlled root.
+        # An identity-only fallback is allowed only outside the controlled root;
+        # required directories must retain their rename-denying sharing guard.
         if required or getattr(error, 'winerror', None) not in (5, 32):
             raise
         return _Handle(api, directory)
@@ -209,7 +277,7 @@ def guard_windows_book_move_parents(root, source, destination, *, root_guard=Non
     ordered = sorted(paths.values(), key=lambda path: (len(path.parts), os.path.normcase(str(path))))
     if root_guard is not None:
         # The live root guard already pins the root and every ancestor. Opening
-        # them again with DELETE authority would conflict with that same guard.
+        # them again is unnecessary; reuse that admission and its identity checks.
         ordered = [directory for directory in ordered
                    if directory != root and directory.is_relative_to(root)]
     api = _api()

@@ -1,4 +1,4 @@
-from audio_generation_owner import AUDIO_GENERATION_CANCELLED
+from audio_generation_owner import AUDIO_GENERATION_CANCELLED, AudioGenerationCancelled
 from merge_integrity import get_source_integrity, is_source_integrity_admitted
 from pathlib import Path
 from review_report import get_review_report_info, apply_review_report_explanation
@@ -12,17 +12,18 @@ import logging
 import json
 import os
 import soundfile
+import shutil
 import tempfile
 import time
 import uuid
 import zipfile
 from contextlib import contextmanager
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, Query, Path as PathParameter
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse, Response
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field, StrictInt, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, StrictBool, field_validator
 from publication_preview import get_publication_review, get_publication_preview, get_publication_selection
 from config_settings import load_app_config
 from export_limits import MAX_PAUSE_MS
@@ -30,7 +31,11 @@ from audio_mastering import MasteringOptions, get_audio_sha256
 from export_quality import ExportQualityOptions
 from export_quality_session import ExportQualityAttempt, get_session_evidence
 from project_scope_exports import require_scope_export_current
+from audio_stream_response import AudioStreamResponse
+from export_download import ExportFileResponse, open_export_reader
 
+from book_placeholder import is_book_placeholder, is_book_placeholder_stream
+from export_download import SWITCH_IN_PROGRESS
 from core import (
     AUDIOBOOK_PATH,
     CONFIG_PATH,
@@ -74,13 +79,27 @@ router = APIRouter()
 
 
 def build_zip_download(members, filename):
-    """Build a ZIP on disk and remove it after FileResponse finishes."""
+    """Build a ZIP on disk and remove it after FileResponse finishes.
+
+    Each member is copied from one opened file, so a book switch's
+    placeholder (#1660) is left out by what was opened, not by its name.
+    409 when every member was one."""
     fd, path = tempfile.mkstemp(prefix=".alexandria-export-", suffix=".zip", dir=DATA_DIR)
     os.close(fd)
     try:
+        written = 0
         with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
             for source, name in members:
-                archive.write(source, name)
+                with open(source, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if is_book_placeholder_stream(stream, info.st_size):
+                        continue
+                    entry = zipfile.ZipInfo(name, time.localtime(info.st_mtime)[:6])
+                    with archive.open(entry, "w", force_zip64=True) as out:
+                        shutil.copyfileobj(stream, out, 65536)   # bounded source reads
+                    written += 1
+        if members and not written:
+            raise HTTPException(status_code=409, detail=SWITCH_IN_PROGRESS)
     except BaseException:
         os.unlink(path)
         raise
@@ -88,10 +107,14 @@ def build_zip_download(members, filename):
                         background=BackgroundTask(os.unlink, path))
 
 
-class WordTimingRequest(BaseModel):
+class SelectedTakeRequest(BaseModel):
     expected_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_uid: str = Field(min_length=1, max_length=128)
     expected_audio_revision: Optional[str] = Field(default=None, max_length=128)
+
+
+class WordTimingRequest(SelectedTakeRequest):
+    analyze_sentence_gaps: bool = Field(default=False, strict=True)
 
 
 @router.post("/api/chunks/{index}/word_timing")
@@ -108,13 +131,15 @@ async def create_chunk_word_timing(index: int, request: WordTimingRequest):
     runtime = {**runtime, **{key: str(Path(runtime[key]).resolve()) for key in ('binary', 'model')}}
     def run():
         state = process_state['word_timing']
-        state['logs'] = ['Word timing: one selected chunk, cached English provider, CPU only.']
+        state['logs'] = [('Sentence-gap analysis' if request.analyze_sentence_gaps else 'Word timing')
+                         + ': one selected chunk, cached English provider, CPU only.']
         try:
             for key in ('binary', 'model'):
                 _validate_voicelab_path(runtime[key], 'Word-timing ' + key)
             result = publish_word_timing(project_manager, index, request, runtime,
                 check_chunk_identity, lambda: state.get('cancel', False))
-            state['logs'].append('Timing ready. ASR spans do not certify pronunciation.')
+            state['logs'].append('Sentence-gap report ready. Audio unchanged.' if request.analyze_sentence_gaps
+                                 else 'Timing ready. ASR spans do not certify pronunciation.')
             return result
         except (ValueError, OSError, KeyError, TypeError) as error:
             state['logs'].append('Timing failed: ' + str(error))
@@ -166,7 +191,7 @@ async def change_take_history_policy_endpoint(request: TakeHistoryPolicyRequest)
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
-class TakeSnapshotRequest(WordTimingRequest):
+class TakeSnapshotRequest(SelectedTakeRequest):
     pass
 
 
@@ -179,7 +204,7 @@ class TakeHistoryAction(BaseModel):
     action: str = Field(pattern=r"^(protect|unprotect|delete|undo|purge)$")
 
 
-class TakeRestoreRequest(WordTimingRequest):
+class TakeRestoreRequest(SelectedTakeRequest):
     source_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
     version: str = Field(pattern=r"^[0-9a-f]{32}$")
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -311,8 +336,6 @@ async def cancel_speech_verification():
 
 
 class ChunkUpdate(BaseModel):
-    expected_book_token: Optional[str] = Field(default=None, min_length=64, max_length=64)
-    expected_uid: Optional[str] = None
     text: Optional[str] = None
     instruct: Optional[str] = None
     speaker: Optional[str] = None
@@ -421,13 +444,24 @@ class OutlierCheckRequest(BaseModel):
     expected_book_token: str = Field(pattern=r'^[0-9a-f]{64}$')
 
 
+def _require_export_download(path, missing_detail):
+    """404 for a missing export, 409 while a book switch holds its name.
+
+    Downloads run without the book lock. A switch creating or removing an
+    export briefly leaves a placeholder there (#1660); serving it would hand
+    the user 64 bytes named audiobook.mp3."""
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=missing_detail)
+    if is_book_placeholder(path):   # early answer; the served descriptor is checked again
+        raise HTTPException(status_code=409, detail=SWITCH_IN_PROGRESS)
+
+
 @router.head("/api/audiobook")
 @router.get("/api/audiobook")
 async def get_audiobook():
-    if not os.path.exists(AUDIOBOOK_PATH):
-        raise HTTPException(status_code=404, detail="Audiobook not found")
+    _require_export_download(AUDIOBOOK_PATH, "Audiobook not found")
     require_scope_export_current(DATA_DIR, AUDIOBOOK_PATH)
-    return FileResponse(AUDIOBOOK_PATH, filename="audiobook.mp3", media_type="audio/mpeg")
+    return ExportFileResponse(AUDIOBOOK_PATH, filename="audiobook.mp3", media_type="audio/mpeg")
 
 # --- Chunk Management Endpoints ---
 
@@ -586,9 +620,8 @@ def _ensure_chunk_status_snapshot(revision):
     with ensure_book_state(root):
         chunks = _ensure_editor_chunks()
         identity = get_editor_book_identity(root)
-        chunks = _get_editor_chunk_views(chunks, get_snapshot_digest(identity))
-        return {**_editor_poll_snapshots.ensure_snapshot(chunks, identity, revision),
-                "book_token": get_snapshot_digest(identity)}
+        chunks = _get_editor_chunk_views(chunks,get_snapshot_digest(identity))
+        return _editor_poll_snapshots.ensure_snapshot(chunks, identity, revision)
 
 
 def get_editor_book_identity(root):
@@ -681,6 +714,12 @@ def ensure_audio_generation_requests(indices, expected_book_token=None, expected
             if any(chunks[index].get("uid") != uid for index, uid in zip(indices, expected_uids)):
                 raise HTTPException(status_code=409, detail="Editor row changed; reload before rendering")
         return selected, get_chunk_generation_requests(chunks, selected)
+
+
+def apply_chunk_update(index, updates, expected_book_token, expected_uid):
+    with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
+        check_chunk_identity(index, expected_book_token, expected_uid)
+        return project_manager.update_chunk(index, updates)
 
 
 def apply_editor_gap(index, expected_book_token, expected_uid, expected_revision):
@@ -803,7 +842,8 @@ async def drift_check_endpoint(request: DriftCheckRequest, background_tasks: Bac
             if report["error"]:
                 state["logs"].append(f"NOT MEASURED: {report['error']}")
                 return
-            flagged = voice_drift.apply_drift_results(project_manager, report["results"], threshold)
+            flagged = voice_drift.apply_drift_results(
+                project_manager, report["results"], threshold, expected_chunks=chunks)
             scored = sum(1 for r in report["results"] if r["score"] is not None)
             state["logs"].append(
                 f"Checked {scored} chunk(s) at threshold {threshold}: {flagged} flagged.")
@@ -821,21 +861,6 @@ async def drift_check_endpoint(request: DriftCheckRequest, background_tasks: Bac
     # claim closes the gap between two rapid requests both seeing it as idle.
     schedule_claimed_background_task(background_tasks, "drift_check", task)
     return {"status": "started", "threshold": threshold, "measured": python_bin is not None}
-
-def apply_guarded_chunk_update(index, update):
-    root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root, timeout=0.25):
-        if (update.expected_book_token is not None
-                and update.expected_book_token != get_snapshot_digest(get_editor_book_identity(root))):
-            raise HTTPException(status_code=409, detail="Active book changed; reload the Editor before saving")
-        if update.expected_uid is not None:
-            chunks = project_manager.load_chunks()
-            chunk = next((row for row in chunks if row.get("id") == index), None)
-            if chunk is None or chunk.get("uid") != update.expected_uid:
-                raise HTTPException(status_code=409, detail="Editor row changed; reload before saving")
-        updates = update.model_dump(exclude_unset=True, exclude={"expected_book_token", "expected_uid"})
-        return project_manager.update_chunk(index, updates)
-
 
 @router.post('/api/chunks/outlier_check')
 async def outlier_check_endpoint(request: OutlierCheckRequest, background_tasks: BackgroundTasks):
@@ -913,17 +938,12 @@ async def cancel_outlier_check(request: OutlierCheckRequest):
 
 @router.post("/api/chunks/{index}")
 async def update_chunk(index: int, update: ChunkUpdate,
-                       expected_book_token: Annotated[Optional[str], Query(min_length=64, max_length=64)] = None,
-                       expected_uid: Annotated[Optional[str], Query(max_length=128)] = None):
-    # Editor saves send the guard in the body; row actions send it as a query.
-    guard = {key: value for key, value in (("expected_book_token", expected_book_token),
-                                           ("expected_uid", expected_uid))
-             if value is not None and getattr(update, key) is None}
-    if guard:
-        update = update.model_copy(update=guard)
+                       expected_book_token: Annotated[str, Query(min_length=64, max_length=64)],
+                       expected_uid: Annotated[str, Query(min_length=1, max_length=128)]):
     updates = update.model_dump(exclude_unset=True)
     logger.info(f"Updating chunk {index} with data: {updates}")
-    chunk = await asyncio.to_thread(_apply_chunk_edit, apply_guarded_chunk_update, index, update)
+    chunk = await asyncio.to_thread(_apply_chunk_edit, apply_chunk_update, index, updates,
+                                    expected_book_token, expected_uid)
     if not chunk:
         raise HTTPException(status_code=404, detail="Chunk not found")
     logger.info(f"Chunk {index} updated, instruct is now: '{chunk.get('instruct', '')}'")
@@ -1042,12 +1062,14 @@ async def get_editor_integrity():
 def get_export_quality_attempt(request, state, *, audacity=False):
     # A cancelled queued worker must not start book I/O for evidence capture.
     ensure_audio_export_active(lambda: state.get('cancel', False))
+    options = getattr(request, 'export_quality', None)
     with ensure_book_state(DATA_DIR):
         _ensure_editor_selection()
         token = get_snapshot_digest(get_editor_book_identity(DATA_DIR))
-    options = getattr(request, 'export_quality', None)
-    return ExportQualityAttempt(state, token,
-        options.model_dump() if options is not None else None, audacity=audacity)
+        # Stamp the input revision at admitted start under the book lock.
+        return ExportQualityAttempt(state, token,
+            options.model_dump() if options is not None else None, audacity=audacity,
+            data_dir=DATA_DIR)
 
 
 def record_export_quality_error(attempt, error):
@@ -1126,6 +1148,242 @@ def _get_export_mastering_sync(token):
     with ensure_book_state(DATA_DIR):
         check_chunk_identity(0, token)
     return {'book_token': token, 'reports': reports, 'unavailable': unavailable}
+
+
+class AbsConfigRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    base_url: str = Field(max_length=2048)
+    # Any JSON value at parse time: Pydantic's 422 echoes a non-string
+    # api_key verbatim despite SecretStr, so the type is checked manually in
+    # _save_abs_config_sync with a sanitized 400 (N4). Strings still work.
+    api_key: Optional[Any] = Field(default=None)
+    library_id: Optional[str] = Field(default=None, max_length=200)
+    folder_id: Optional[str] = Field(default=None, max_length=200)
+
+
+class AbsPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    expected_book_token: str = Field(pattern=r'^[0-9a-f]{64}$')
+    export_file: str = Field(pattern=r'^(cloned_audiobook\.mp3|audiobook\.m4b)$')
+    library_id: str = Field(max_length=200)
+    folder_id: str = Field(max_length=200)
+    title: str = Field(max_length=500)
+    author: Optional[str] = Field(default='', max_length=1000)
+    series: Optional[str] = Field(default='', max_length=1000)
+    base_url: str = Field(max_length=2048)
+
+
+class AbsSendRequest(AbsPreviewRequest):
+    preview_id: str = Field(max_length=64)
+    right_to_share: StrictBool = False
+    acknowledge_unknown: StrictBool = False
+
+
+class AbsReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    delivery_id: str = Field(max_length=64)
+
+
+class AbsCancelRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    preview_id: str = Field(max_length=64)
+
+
+def _abs_book_check(token):
+    with ensure_book_state(DATA_DIR):
+        check_chunk_identity(0, token)
+
+
+@router.post('/api/abs/config')
+async def save_abs_config(request: AbsConfigRequest):
+    return await asyncio.to_thread(_save_abs_config_sync, request)
+
+
+def _save_abs_config_sync(request):
+    import audiobookshelf_delivery as delivery
+    stored = None
+    if request.api_key is not None and not isinstance(request.api_key, str):
+        raise HTTPException(status_code=400, detail='API key must be a string.')
+    try:
+        raw_key = request.api_key if isinstance(request.api_key, str) else None
+        if raw_key is not None and raw_key.strip():
+            stored = delivery.save_api_key(request.base_url, raw_key)
+        config = delivery.save_server_config(DATA_DIR, request.base_url,
+                                             request.library_id, request.folder_id)
+        key_present = bool(delivery.get_api_key(config['base_url']))
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    return {'base_url': config['base_url'], 'has_key': key_present,
+            'key_store': stored, 'library_id': config.get('library_id'),
+            'folder_id': config.get('folder_id')}
+
+
+@router.get('/api/abs/config')
+async def get_abs_config():
+    import audiobookshelf_delivery as delivery
+    config = delivery.get_server_config(DATA_DIR)
+    base_url = config.get('base_url')
+    try:
+        key_present = bool(base_url and delivery.get_api_key(base_url))
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    return {'base_url': base_url, 'has_key': key_present,
+            'library_id': config.get('library_id'), 'folder_id': config.get('folder_id')}
+
+
+@router.get('/api/abs/libraries')
+async def list_abs_libraries(base_url: Annotated[Optional[str], Query(max_length=2048)] = None):
+    return await asyncio.to_thread(_list_abs_libraries_sync, base_url)
+
+
+def _list_abs_libraries_sync(base_url):
+    import audiobookshelf_delivery as delivery
+    config = delivery.get_server_config(DATA_DIR)
+    try:
+        server = delivery._validate_base_url(base_url or config.get('base_url'))
+        token = delivery.get_api_key(server)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    if not token:
+        raise HTTPException(status_code=401, detail='No API key stored for this server. Save one first.')
+    try:
+        libraries = delivery.get_libraries(server, token)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    return {'base_url': server, 'libraries': libraries}
+
+
+@router.post('/api/abs/preview')
+async def preview_abs_send(request: AbsPreviewRequest):
+    return await asyncio.to_thread(_preview_abs_send_sync, request)
+
+
+def _preview_abs_send_sync(request):
+    import audiobookshelf_delivery as delivery
+    _abs_book_check(request.expected_book_token)
+    config = delivery.get_server_config(DATA_DIR)
+    saved_base = config.get('base_url')
+    if not saved_base:
+        raise HTTPException(status_code=400, detail='Configure the server first (Save server).')
+    try:
+        requested_base = delivery._validate_base_url(request.base_url)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    if requested_base != saved_base:
+        raise HTTPException(status_code=409, detail='The server URL changed. Save the new server first, then preview again.')
+    try:
+        token = delivery.get_api_key(saved_base)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    if not token:
+        raise HTTPException(status_code=401, detail='No API key stored for this server.')
+    try:
+        preview = delivery.save_preview(DATA_DIR, process_state, request.expected_book_token,
+                                        request.export_file, request.library_id,
+                                        request.folder_id, request.title,
+                                        request.author or '', request.series or '',
+                                        base_url=requested_base, token=token)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    public = dict(preview)
+    public.pop('created_at', None)
+    return public
+
+
+@router.post('/api/abs/send')
+async def send_abs_export(request: AbsSendRequest):
+    if not request.right_to_share:
+        raise HTTPException(status_code=400, detail='Confirm you have the right to share this export before sending.')
+    return await asyncio.to_thread(_send_abs_export_sync, request)
+
+
+def _send_abs_export_sync(request):
+    import audiobookshelf_delivery as delivery
+    _abs_book_check(request.expected_book_token)
+    config = delivery.get_server_config(DATA_DIR)
+    base_url = config.get('base_url')
+    if not base_url:
+        raise HTTPException(status_code=400, detail='Configure the server first.')
+    try:
+        requested_base = delivery._validate_base_url(request.base_url)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    if requested_base != base_url:
+        raise HTTPException(status_code=409, detail='The server URL changed after the preview. Preview again.')
+    try:
+        token = delivery.get_api_key(base_url)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    if not token:
+        raise HTTPException(status_code=401, detail='No API key stored for this server.')
+    confirm = {'book_token': request.expected_book_token, 'export_file': request.export_file,
+               'library_id': request.library_id, 'folder_id': request.folder_id,
+               'title': request.title, 'author': request.author or '', 'series': request.series or '',
+               'base_url': requested_base}
+    try:
+        entry = delivery.send_preview(DATA_DIR, process_state, base_url, token,
+                                      request.preview_id, confirm,
+                                      acknowledge_unknown=request.acknowledge_unknown)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    return entry
+
+
+@router.get('/api/abs/deliveries')
+async def list_abs_deliveries(expected_book_token: Annotated[str, Query(pattern=r'^[0-9a-f]{64}$')]):
+    return await asyncio.to_thread(_list_abs_deliveries_sync, expected_book_token)
+
+
+def _list_abs_deliveries_sync(token):
+    import audiobookshelf_delivery as delivery
+    _abs_book_check(token)
+    entries = [entry for entry in delivery.get_ledger(DATA_DIR)
+               if entry.get('book_token') == token]
+    return {'book_token': token, 'deliveries': entries}
+
+
+@router.post('/api/abs/reconcile')
+async def reconcile_abs_delivery(request: AbsReconcileRequest):
+    return await asyncio.to_thread(_reconcile_abs_delivery_sync, request)
+
+
+def _reconcile_abs_delivery_sync(request):
+    import audiobookshelf_delivery as delivery
+    # Reconcile against the ledger-bound server only; never fall back to the
+    # saved config server or reuse a key from a different saved server.
+    entry = next((item for item in delivery.get_ledger(DATA_DIR)
+                  if item.get('id') == request.delivery_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail='No such delivery record.')
+    entry_server = entry.get('server') or entry.get('base_url')
+    if not entry_server:
+        raise HTTPException(status_code=409, detail='The delivery record names no server; re-export and send again.')
+    server = entry_server
+    try:
+        token = delivery.get_api_key(server)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    if not token:
+        raise HTTPException(status_code=401, detail='No API key stored for this server.')
+    try:
+        updated = delivery.reconcile_delivery(DATA_DIR, request.delivery_id, server, token)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+    return updated
+
+
+@router.get('/api/abs/progress')
+async def get_abs_progress(preview_id: Annotated[str, Query(max_length=64)]):
+    import audiobookshelf_delivery as delivery
+    state = delivery.get_upload_progress(preview_id)
+    return {'preview_id': preview_id, 'progress': state}
+
+
+@router.post('/api/abs/cancel')
+async def cancel_abs_send(request: AbsCancelRequest):
+    import audiobookshelf_delivery as delivery
+    cancelling = delivery.cancel_preview_upload(request.preview_id)
+    return {'preview_id': request.preview_id, 'cancelling': cancelling}
 
 
 @router.post("/api/merge")
@@ -1228,7 +1486,7 @@ async def export_zip():
 def _build_export_zip_response():
     """One zip of whatever exported audio exists (MP3, M4B); 404 when nothing does."""
     members = [(path, name) for path, name in ((AUDIOBOOK_PATH, "audiobook.mp3"), (M4B_PATH, "audiobook.m4b"))
-               if os.path.exists(path)]
+               if os.path.exists(path) and not is_book_placeholder(path)]
     if not members:
         raise HTTPException(status_code=404, detail="No exported audio found. Merge or export first.")
     for path, _name in members:
@@ -1238,10 +1496,9 @@ def _build_export_zip_response():
 @router.get("/api/export_audacity")
 async def get_audacity_export():
     zip_path = os.path.join(DATA_DIR, "audacity_export.zip")
-    if not os.path.exists(zip_path):
-        raise HTTPException(status_code=404, detail="Audacity export not found. Generate it first.")
+    _require_export_download(zip_path, "Audacity export not found. Generate it first.")
     require_scope_export_current(DATA_DIR, zip_path)
-    return FileResponse(zip_path, filename="audacity_export.zip", media_type="application/zip")
+    return ExportFileResponse(zip_path, filename="audacity_export.zip", media_type="application/zip")
 
 def get_unready_export_speakers():
     """Read readiness without treating unusable state as an empty roster."""
@@ -1411,11 +1668,21 @@ async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: Backgr
     process_state["m4b_export"]["result"] = None
     return {"status": "started"}
 
-def _cancel_cpu_export(task_name, missing_message):
+def _cancel_cpu_export(task_name, missing_message, *, expected_claim_id=None,
+                       expected_book_token=None):
+    """Cancel a CPU export. When an expected owner is supplied (read-along
+    start responses), the cancel only applies to that exact owner/book."""
     with _gpu_lock:
         state = process_state[task_name]
         if not state["running"]:
             raise HTTPException(status_code=400, detail=missing_message)
+        if expected_claim_id is not None or expected_book_token is not None:
+            if (expected_claim_id is None or expected_book_token is None
+                    or state.get("task_claim_id") != expected_claim_id
+                    or state.get("readalong_book_token") != expected_book_token):
+                raise HTTPException(
+                    status_code=409,
+                    detail="That build is no longer the active one; no cancel was sent.")
         state["cancel"] = True
     return {"status": "cancelling"}
 
@@ -1436,7 +1703,7 @@ class ChapterExportRequest(BaseModel):
     series_name: str = ""
     volume_number: str = ""
     chapters: Optional[List[StrictInt]] = None     # indices to export; None = all
-    changed_only: bool = False
+    changed_only: bool = False     
     require_ready: bool = False
 
 
@@ -1562,7 +1829,7 @@ def _exported_chapter_path(name):
 async def download_chapter(name: str):
     path, safe = await asyncio.to_thread(_get_listed_chapter_path, name)
     media = "audio/mpeg" if safe.lower().endswith(".mp3") else "audio/wav"
-    return FileResponse(path, filename=safe, media_type=media)
+    return ExportFileResponse(path, filename=safe, media_type=media)
 
 
 def _get_listed_chapter_path(name):
@@ -1596,12 +1863,936 @@ def _build_chapter_zip_response(names: Optional[str] = None):
         "chapters.zip")
 
 
+class ReadalongSidecarRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    include_text: bool = Field(default=False, strict=True)
+    integrity_confirmation: Optional[str] = Field(None, min_length=64, max_length=64,
+                                                  pattern="^[0-9a-f]{64}$")
+
+
+class ReadaloudEpubRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    integrity_confirmation: Optional[str] = Field(None, min_length=64, max_length=64,
+                                                  pattern="^[0-9a-f]{64}$")
+    timing_mode: Optional[str] = Field(None, pattern="^(auto|qwen|chunk)$")
+    timing_device: Optional[str] = Field(None, max_length=32, pattern="^(auto|cpu|cuda:[0-9]+)$")
+    timing_language: Optional[str] = Field(None, max_length=32,
+                                                   pattern="^[A-Za-z][A-Za-z0-9_-]*$|^$")
+
+
+def _get_readaloud_timing_preference():
+    """Persisted timing preference; single source in readalong_export."""
+    from readalong_export import get_readaloud_timing_preference
+    try:
+        return get_readaloud_timing_preference(DATA_DIR)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _save_readaloud_timing_preference(preference):
+    """Persist the user's timing choice; caller holds book state."""
+    from readalong_export import save_readaloud_timing_preference
+    return save_readaloud_timing_preference(preference, DATA_DIR)
+
+
+def _require_readaloud_timing_current(receipt):
+    """Fail closed unless the receipt's timing identity is still current.
+
+    Recomputes from the persisted preference and the provider's current
+    on-disk identity (model files hash + interpreter version read from
+    the qwen-env install metadata). The isolated probe reads device metadata;
+    no model is loaded and no inference runs. Legacy (7-key) receipts keep
+    existing download semantics.
+    """
+    from readalong_export import get_epub_receipt_timing_mode
+    preference = _get_readaloud_timing_preference()
+    receipt_mode = get_epub_receipt_timing_mode(receipt)
+    # Legacy (7-key) receipts resolve to chunk semantics. An
+    # explicit chunk preference with a chunk artifact is
+    # dependency-free: no Qwen probe or heavy import runs. Any
+    # other combination still gets mode-currency checking below —
+    # a switch to qwen, or an auto preference that now resolves to
+    # qwen, invalidates the chunk artifact; auto that still falls
+    # back to chunk remains honest and downloadable.
+    if receipt_mode == "chunk" and preference["timing_mode"] == "chunk":
+        return
+    if preference["timing_mode"] != "auto" and receipt_mode != preference["timing_mode"]:
+        raise HTTPException(status_code=409, detail=(
+            "EPUB read-aloud timing mode is no longer the current choice. Rebuild it."))
+    from qwen_runtime import (get_qwen_capability, get_qwen_device_policy,
+                              get_qwen_model_candidates)
+    # Cheap-first: a chunk receipt under auto only needs the
+    # metadata probe to decide mode currency (no model stream).
+    if receipt_mode == "chunk":
+        capability = get_qwen_capability(ROOT_DIR, status_only=True)
+    else:
+        capability = get_qwen_capability(ROOT_DIR)
+    try:
+        policy = get_qwen_device_policy(preference["timing_mode"],
+                                        preference["timing_device"], capability, require_free_vram=False)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=(
+            "EPUB read-aloud timing runtime is unavailable: %s Rebuild it "
+            "with current timing settings." % error)) from error
+    if receipt_mode != policy["timing_mode"]:
+        raise HTTPException(status_code=409, detail=(
+            "EPUB read-aloud timing mode is no longer the current choice. Rebuild it."))
+    if receipt_mode == "chunk":
+        # Chunk artifact whose current policy is still chunk (explicit
+        # chunk handled above, or auto falling back to chunk): no
+        # provider/language currency applies, so it stays downloadable
+        # without probing the provider digest.
+        return
+    requested_device = preference.get("timing_device")
+    if requested_device not in (None, "", "auto"):
+        if receipt.get("timing_device") != policy["device"]:
+            raise HTTPException(status_code=409, detail=(
+                "EPUB read-aloud timing device is no longer current. Rebuild it."))
+    elif receipt.get("timing_mode") == "qwen" and receipt.get("timing_device") != "cpu":
+        # Auto choice: the receipt device is current if it is still a
+        # real probed device, even when the transient auto pick differs
+        # (VRAM pressure must not flap downloads between 200 and 409).
+        valid_devices = {"cpu"}
+        for entry in capability.get("devices") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("device"), str):
+                valid_devices.add(entry["device"])
+        if receipt.get("timing_device") not in valid_devices:
+            raise HTTPException(status_code=409, detail=(
+                "EPUB read-aloud timing device is no longer current. Rebuild it."))
+    want_language = preference.get("timing_language")
+    if receipt.get("timing_mode") == "qwen":
+        from qwen_align import get_aligner_language_name
+        try:
+            if want_language:
+                want_language = get_aligner_language_name(want_language, capability.get("languages"))
+            else:
+                # Cleared to EPUB language: derive from the current
+                # retained EPUB so a language shift still invalidates.
+                state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {}) or {}
+                input_path = state.get("input_file_path")
+                if not isinstance(input_path, str) or not input_path:
+                    raise HTTPException(status_code=409, detail=(
+                        "EPUB read-aloud source is unavailable. Rebuild it."))
+                from readalong_export import get_retained_epub_candidate_path
+                retained_path = get_retained_epub_candidate_path(input_path)
+                from epub_readaloud import get_epub_language_from_path
+                try:
+                    tag = get_epub_language_from_path(retained_path)
+                    if tag in ("", "und"):
+                        raise ValueError("EPUB has no usable dc:language")
+                    want_language = get_aligner_language_name(tag, capability.get("languages"))
+                except (ValueError, OSError) as error:
+                    raise HTTPException(status_code=409, detail=(
+                        "EPUB read-aloud timing language is unavailable: %s Rebuild it." % error)) from error
+        except HTTPException:
+            raise
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=409, detail=(
+                "EPUB read-aloud timing language is unavailable: %s Rebuild it." % error)) from error
+        if receipt.get("timing_language") != want_language:
+            raise HTTPException(status_code=409, detail=(
+                "EPUB read-aloud timing language is no longer current. Rebuild it."))
+        # AC8 v3 receipts carry human-readable model/version; drift
+        # in either invalidates. v2 receipts bind the version only
+        # via the provider digest below.
+        if "timing_model" in receipt or "timing_qwen_asr_version" in receipt:
+            from qwen_runtime import MODEL_NAME as _QWEN_MODEL_NAME
+            if receipt.get("timing_model") != _QWEN_MODEL_NAME:
+                raise HTTPException(status_code=409, detail=(
+                    "EPUB read-aloud timing model is no longer current. Rebuild it."))
+            if receipt.get("timing_qwen_asr_version") != capability.get("qwen_asr_version"):
+                raise HTTPException(status_code=409, detail=(
+                    "EPUB read-aloud qwen-asr version is no longer current. Rebuild it."))
+    if receipt.get("timing_mode") == "qwen":
+        models = get_qwen_model_candidates(ROOT_DIR)
+        if not models:
+            raise HTTPException(status_code=409, detail=(
+                "Qwen model is unavailable; rebuild the EPUB to validate its timing."))
+        from qwen_runtime import (get_qwen_provider_digest,
+                                  get_qwen_runtime_digest,
+                                  get_qwen_runtime_identity)
+        # Same-phase reuse (raw79/80): the capability call just
+        # captured a fresh runtime identity and streamed exactly one
+        # selected-policy provider digest in this same download
+        # phase. Reuse it only when it binds the receipt's pinned
+        # device/dtype; otherwise capture a fresh one. Distinct
+        # phases (admission/prelaunch/prepublish) still re-capture.
+        if (receipt.get("timing_device") == capability.get("device")
+                and receipt.get("timing_dtype") == capability.get("dtype")
+                and isinstance(capability.get("provider_digest"), str)):
+            current = capability["provider_digest"]
+            if current != receipt.get("timing_provider"):
+                raise HTTPException(status_code=409, detail=(
+                    "Qwen provider changed since the build; rebuild the EPUB "
+                    "to validate its timing."))
+            return
+        try:
+            # The capability call in this same download phase
+            # already captured the interpreter identity; reuse it
+            # (runtime identity does not depend on device/dtype).
+            fresh_runtime = capability.get("runtime_identity") \
+                if isinstance(capability.get("runtime_identity"), dict) else None
+            if fresh_runtime is None:
+                fresh_runtime = get_qwen_runtime_identity(capability["python"])
+            current = get_qwen_provider_digest(
+                models[0], runtime_identity={
+                    "qwen_asr_version": capability.get("qwen_asr_version"),
+                    "torch_version": capability.get("torch_version"),
+                    "device": receipt.get("timing_device"),
+                    "dtype": receipt.get("timing_dtype"),
+                    "identity": fresh_runtime},
+                _model_digest=capability.get("model_digest"))
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if current != receipt.get("timing_provider"):
+            raise HTTPException(status_code=409, detail=(
+                "Qwen provider changed since the build; rebuild the EPUB "
+                "to validate its timing."))
+
+
+@router.get("/api/readaloud_epub/capability")
+async def get_readaloud_epub_capability():
+    """Bounded, non-inference timing capability + effective policy."""
+    def load():
+        from qwen_runtime import get_qwen_capability, get_qwen_device_policy
+        preference = _get_readaloud_timing_preference()
+        capability = get_qwen_capability(ROOT_DIR, status_only=True)
+        try:
+            policy = get_qwen_device_policy(preference["timing_mode"],
+                                            preference["timing_device"], capability)
+        except ValueError as error:
+            # A saved explicit qwen preference with a now-broken
+            # runtime is a useful not-ready status, never a 500.
+            policy = {"timing_mode": preference["timing_mode"],
+                      "device": preference["timing_device"],
+                      "cpu_only": False, "available": False,
+                      "reason": "Qwen not ready: %s" % error}
+        public_capability = {
+            "available": capability.get("available"),
+            "devices": capability.get("devices") or [],
+            "device": capability.get("device"),
+            "dtype": capability.get("dtype"),
+            "languages": capability.get("languages") or [],
+            "qwen_asr_version": capability.get("qwen_asr_version"),
+            "cpu_fallback": capability.get("cpu_fallback"),
+            "reason": capability.get("reason"),
+        }
+        return {"preference": preference, "capability": public_capability,
+                "policy": policy}
+    return await asyncio.to_thread(load)
+
+
+@router.post("/api/readalong/sidecar")
+async def build_readalong_sidecar_endpoint(background_tasks: BackgroundTasks,
+                                           request: Optional[ReadalongSidecarRequest] = None):
+    return await asyncio.to_thread(_start_readalong_sidecar, background_tasks, request)
+
+
+def _get_readalong_book_token():
+    """Current book-operation token; caller holds book state."""
+    return get_snapshot_digest(get_book_operation_identity(DATA_DIR))
+
+
+def _is_current_readalong_generation(task_name, generation):
+    """Refuse stale workers: only the latest start owns process_state writes."""
+    return process_state[task_name].get("readalong_generation") == generation
+
+
+def _readalong_task_error(error):
+    if isinstance(error, (ExportCancelled, AudioGenerationCancelled)):
+        return {'status': 'cancelled', 'message': 'Export cancelled'}
+    return {'status': 'failed', 'message': str(error)}
+
+
+def _start_readalong_sidecar(background_tasks, request):
+    with ensure_book_state(DATA_DIR):
+        report, _chunks = _ensure_editor_integrity_locked()
+        confirmation = request.integrity_confirmation if request is not None else None
+        if not is_source_integrity_admitted(report, confirmation):
+            raise HTTPException(status_code=409, detail=report)
+        admitted_snapshot = report["snapshot"]
+        book_token = _get_readalong_book_token()
+        include_text = bool(request.include_text) if request is not None else False
+        # Reserve the claim first: a duplicate start is refused here without
+        # mutating the live owner's generation/result.
+        claim_id = reserve_background_task("readalong_sidecar", cpu_only=True)
+        state = process_state["readalong_sidecar"]
+        # Initialize BEFORE scheduling: an eager worker that completes
+        # during registration must never have its result erased.
+        state["result"] = None
+        state["logs"] = ["Starting read-along sidecar..."]
+        state["readalong_generation"] = int(state.get("readalong_generation") or 0) + 1
+        state["readalong_book_token"] = book_token
+        state["readalong_snapshot"] = admitted_snapshot
+        generation = state["readalong_generation"]
+
+        def task():
+            state = process_state["readalong_sidecar"]
+            if not _is_current_readalong_generation("readalong_sidecar", generation):
+                return
+            state["start_time"] = time.time()
+            state["logs"] = ["Starting read-along sidecar..."]
+            try:
+                with ensure_book_state(DATA_DIR):
+                    current, chunks = _ensure_editor_integrity_locked()
+                    if current["snapshot"] != admitted_snapshot:
+                        raise ValueError("Source or editor chunks changed after admission; review again.")
+                from readalong_export import build_sidecar_export
+                success, msg = build_sidecar_export(
+                    project_manager,
+                    lambda: state.get("cancel", False),
+                    lambda m: state["logs"].append(m) if _is_current_readalong_generation(
+                        "readalong_sidecar", generation) else None,
+                    includes_text=include_text, chunks=chunks)
+                if not _is_current_readalong_generation("readalong_sidecar", generation):
+                    return
+                state["result"] = get_export_task_result(success, msg)
+                state["logs"].append(f"Read-along sidecar complete: {msg}" if success else f"Read-along sidecar failed: {msg}")
+            except Exception as e:
+                if not _is_current_readalong_generation("readalong_sidecar", generation):
+                    return
+                state["result"] = _readalong_task_error(e)
+                state["logs"].append('Read-along sidecar cancelled' if isinstance(
+                    e, (ExportCancelled, AudioGenerationCancelled))
+                    else f"Read-along sidecar error: {e}")
+            finally:
+                if _is_current_readalong_generation("readalong_sidecar", generation):
+                    state["running"] = False
+                    state["cancel"] = False
+
+    try:
+        register_claimed_background_task(background_tasks, "readalong_sidecar", claim_id, task)
+    except BaseException:
+        release_gpu_task_claim("readalong_sidecar", claim_id, pending_only=True)
+        raise
+    process_state["readalong_sidecar"]["task_claim_id"] = claim_id
+    return {"status": "started", "task_name": "readalong_sidecar",
+            "claim_id": claim_id, "book_token": book_token,
+            "include_text": include_text}
+
+
+class ReadalongCancelRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim_id: Optional[str] = Field(None, pattern=r"^[0-9a-f]{32}$")
+    book_token: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+
+
+@router.post("/api/readalong/sidecar/cancel")
+async def cancel_readalong_sidecar(request: Optional[ReadalongCancelRequest] = None):
+    claim_id = request.claim_id if request is not None else None
+    book_token = request.book_token if request is not None else None
+    return await asyncio.to_thread(
+        _cancel_cpu_export, 'readalong_sidecar', 'No read-along sidecar build is running.',
+        expected_claim_id=claim_id, expected_book_token=book_token)
+
+
+def _get_current_readalong_identity():
+    """Live book/rows/source/settings identity for download currentness.
+
+    Recomputes exactly the values the builder bound into the receipt
+    (book token, saved-rows digest, source-bytes sha, settings digest).
+    Any failure to establish identity is fail-closed (409), never a guess.
+    Caller holds book state.
+    """
+    from export_publication import _get_saved_rows_digest
+    from readalong_export import get_current_settings_digest
+    book_token = _get_readalong_book_token()
+    rows_digest = _get_saved_rows_digest(project_manager)
+    if not isinstance(rows_digest, str) or len(rows_digest) != 64:
+        raise HTTPException(status_code=409, detail="Read-along receipt identity is unavailable.")
+    state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {}) or {}
+    input_path = state.get("input_file_path")
+    if not isinstance(input_path, str) or not input_path:
+        raise HTTPException(status_code=409, detail="Read-along receipt identity is unavailable.")
+    try:
+        from project_scope_files import MAX_SCRIPT_BYTES
+        from readalong_sidecar import get_audio_file_sha256
+        source_sha256, _size = get_audio_file_sha256(
+            input_path, limit=MAX_SCRIPT_BYTES, allow_empty=True)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail="Read-along source is unavailable. Rebuild the sidecar.") from error
+    try:
+        pause_defaults = project_manager._load_pause_defaults()
+        settings_digest = get_current_settings_digest(project_manager, pause_defaults)
+    except OSError as error:
+        raise HTTPException(status_code=409, detail="Read-along settings are unavailable. Restore the settings and rebuild the export.") from error
+    return {"book_token": book_token, "rows_digest": rows_digest,
+            "source_sha256": source_sha256,
+            "settings_digest": settings_digest}
+
+
+def _require_readalong_identity_current(receipt, label):
+    """Fail closed unless every receipt field equals the live identity."""
+    if not isinstance(receipt, dict):
+        raise HTTPException(status_code=409, detail=f"{label} has no source receipt. Rebuild it.")
+    for key in ("book_token", "rows_digest", "source_sha256", "settings_digest"):
+        value = receipt.get(key)
+        if not isinstance(value, str) or len(value) != 64:
+            raise HTTPException(status_code=409, detail=f"{label} has no current source receipt. Rebuild it.")
+    current = _get_current_readalong_identity()
+    for key in ("book_token", "rows_digest", "source_sha256", "settings_digest"):
+        if receipt[key] != current[key]:
+            raise HTTPException(status_code=409, detail=f"{label} does not match the current book or settings. Rebuild it.")
+
+
+def _serve_bound_audio(expected_sha256, filename, label):
+    """Stream the MP3 pinned by an open descriptor, verified by content.
+
+    The descriptor pins the inode, so a replacement after verification can
+    never change the bytes served; the hash is computed from the same
+    descriptor that is then rewound and streamed.
+    """
+    if not os.path.isfile(AUDIOBOOK_PATH):
+        raise HTTPException(status_code=404, detail="Read-along MP3 is unavailable. Build the sidecar first.")
+    try:
+        stream = open_export_reader(AUDIOBOOK_PATH)
+    except OSError as error:
+        raise HTTPException(status_code=404, detail="Read-along MP3 is unavailable. Build the sidecar first.") from error
+    try:
+        size = os.fstat(stream.fileno()).st_size
+        digest = hashlib.sha256()
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        if digest.hexdigest() != expected_sha256:
+            raise HTTPException(status_code=409, detail=f"{label} does not match the current exported audio. Rebuild it.")
+        stream.seek(0)
+    except HTTPException:
+        stream.close()
+        raise
+    except OSError as error:
+        stream.close()
+        raise HTTPException(status_code=409, detail=f"{label} is invalid: {error}") from error
+    return AudioStreamResponse(stream, size, ".mp3", filename=filename)
+
+
+def _validated_sidecar_doc():
+    """Read, scope-fence and receipt-check the sidecar; return (doc, raw)."""
+    from readalong_export import get_sidecar_output_path
+    from readalong_sidecar import get_validated_sidecar, get_audio_file_sha256
+    path = get_sidecar_output_path(DATA_DIR)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Read-along sidecar not found. Build it from the Result tab first.")
+    require_scope_export_current(DATA_DIR, path)
+    try:
+        raw = Path(path).read_bytes()
+        doc = get_validated_sidecar(raw)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=f"Read-along sidecar is invalid: {error}") from error
+    if not os.path.isfile(AUDIOBOOK_PATH):
+        raise HTTPException(status_code=409, detail="Read-along sidecar needs its MP3; rebuild the sidecar.")
+    try:
+        current_sha, _size = get_audio_file_sha256(AUDIOBOOK_PATH)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=f"Read-along sidecar is invalid: {error}") from error
+    if doc["binding"]["audio_sha256"] != current_sha:
+        raise HTTPException(status_code=409, detail="Read-along sidecar does not match the current exported audio. Rebuild the sidecar.")
+    with ensure_book_state(DATA_DIR):
+        _require_readalong_identity_current(doc.get("source"), "Read-along sidecar")
+    return doc, raw
+
+
+@router.get("/api/readalong/sidecar")
+async def download_readalong_sidecar():
+    _doc, raw = await asyncio.to_thread(_validated_sidecar_doc)
+    return Response(raw, media_type="application/json",
+                    headers={'Content-Disposition': 'attachment; filename="readalong.sidecar.json"',
+                             'Cache-Control': 'no-store'})
+
+
+@router.get("/api/readalong/sidecar/audio")
+async def download_readalong_sidecar_audio():
+    def load():
+        doc, _raw = _validated_sidecar_doc()
+        return _serve_bound_audio(doc["binding"]["audio_sha256"], "audiobook.mp3",
+                                  "Read-along sidecar")
+    return await asyncio.to_thread(load)
+
+
+@router.get("/api/readalong/player")
+async def download_readalong_player():
+    path = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "static", "readalong-player.html"))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Read-along player is unavailable.")
+    return FileResponse(path, filename="readalong-player.html", media_type="text/html")
+
+
+@router.post("/api/readaloud_epub")
+async def build_readaloud_epub_endpoint(background_tasks: BackgroundTasks,
+                                        request: Optional[ReadaloudEpubRequest] = None):
+    return await asyncio.to_thread(_start_readaloud_epub, background_tasks, request)
+
+
+def _read_bounded_preference_bytes(path, *, file_description="Timing preference"):
+    """Read preference bytes under the bounded/no-follow contract.
+
+    Returns None for a missing file; raises ValueError for a
+    present file that is not a bounded regular file.
+    """
+    import stat as _stat
+    from audio_take_history import _version
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISREG(info.st_mode) \
+            or info.st_size > 16384:
+        raise ValueError("%s is not a bounded regular file." % file_description)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not _stat.S_ISREG(opened.st_mode) or _version(opened) != _version(info):
+            raise ValueError("%s changed during read." % file_description)
+        chunks = []
+        total = 0
+        while True:
+            block = os.read(descriptor, 8192)
+            if not block:
+                break
+            total += len(block)
+            if total > 16384:
+                raise ValueError("%s exceeds its bound." % file_description)
+            chunks.append(block)
+        if (total != opened.st_size
+                or _version(os.fstat(descriptor)) != _version(opened)
+                or _version(os.lstat(path)) != _version(opened)):
+            raise ValueError("%s changed during read." % file_description)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _restore_readaloud_timing_preference_bytes(path, prior_bytes):
+    """Restore prior preference bytes atomically under the book lock.
+
+    Caller holds book state. A missing prior file removes the newly
+    persisted one; otherwise prior bytes are staged beside the
+    target and atomically replaced into place.
+    """
+    if prior_bytes is None:
+        if os.path.isfile(path):
+            os.unlink(path)
+        return
+    # Reuse the transaction layer's exclusive, fsynced raw-byte writer.
+    # A fixed scratch name could follow or destroy an unrelated file/link.
+    from adapter_publication import save_adapter_publication_bytes
+    save_adapter_publication_bytes(path, prior_bytes)
+
+
+def _start_readaloud_epub(background_tasks, request):
+    # Phase A: admit (under book state).
+    with ensure_book_state(DATA_DIR):
+        report, _chunks = _ensure_editor_integrity_locked()
+        confirmation = request.integrity_confirmation if request is not None else None
+        if not is_source_integrity_admitted(report, confirmation):
+            raise HTTPException(status_code=409, detail=report)
+        admitted_snapshot = report["snapshot"]
+        book_token = _get_readalong_book_token()
+    # Phase B (no book lock): merge preference, validate, probe, resolve
+    # policy. Heavy or failing work here must never mutate anything.
+    from qwen_align import get_aligner_language_name
+    from qwen_runtime import (get_qwen_capability, get_qwen_device_policy,
+                              get_qwen_provider_digest,
+                              get_qwen_runtime_digest,
+                              get_qwen_runtime_identity)
+    preference = _get_readaloud_timing_preference()
+    merged = dict(preference)
+    if request is not None:
+        if request.timing_mode is not None:
+            merged["timing_mode"] = request.timing_mode
+        if request.timing_device is not None:
+            merged["timing_device"] = request.timing_device
+        if request.timing_language is not None:
+            merged["timing_language"] = request.timing_language
+    timing_language = merged["timing_language"]
+    if timing_language == "":
+        timing_language = None
+        merged["timing_language"] = None
+    capability = None
+    policy = {"timing_mode": "chunk", "device": "cpu", "dtype": "float32",
+              "cpu_only": True, "reason": "Chunk timing selected; low-resource CPU path."}
+    # Reject an already-owned instance before probing. GPU conflicts
+    # still depend on the effective policy and are checked atomically
+    # in Phase C; guessing here would block legitimate CPU fallback.
+    from core import is_task_running
+    if is_task_running("readaloud_epub"):
+        raise HTTPException(status_code=400, detail="EPUB read-aloud is already running.")
+    if merged["timing_mode"] != "chunk":
+        # Explicit qwen validates its purely local language string
+        # BEFORE the expensive probe/digest; auto still resolves
+        # the CPU chunk fallback BEFORE any Qwen-only language
+        # validation, so a chunk-persisted unsupported language
+        # cannot block the fallback. Either way refusal happens
+        # before any preference mutation (Phase B never writes).
+        if merged["timing_mode"] == "qwen" and isinstance(timing_language, str) and timing_language:
+            try:
+                timing_language = get_aligner_language_name(timing_language)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            merged["timing_language"] = timing_language
+        capability = get_qwen_capability(ROOT_DIR)
+        try:
+            policy = get_qwen_device_policy(merged["timing_mode"],
+                                            merged["timing_device"], capability)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if policy["timing_mode"] == "qwen":
+            if isinstance(timing_language, str) and timing_language:
+                try:
+                    timing_language = get_aligner_language_name(timing_language, capability.get("languages"))
+                except ValueError as error:
+                    raise HTTPException(status_code=400, detail=str(error)) from error
+                # Canonicalize the persisted representation (en ->
+                # English) so the UI select, receipts and the file
+                # all agree. An explicit "" clear stays None.
+                merged["timing_language"] = timing_language
+    provider_digest = None
+    runtime = None
+    if policy["timing_mode"] == "qwen":
+        # Reuse the capability-phase identity capture (same phase, same
+        # interpreter): a second capture here could straddle a package
+        # replacement and pin a mixed digest. The provider digest is
+        # still computed once with the policy-pinned device/dtype.
+        runtime = capability.get("runtime_identity") if isinstance(capability, dict) else None
+        if not isinstance(runtime, dict):
+            try:
+                runtime = get_qwen_runtime_identity(capability["python"])
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+        # Same-phase reuse (raw79): when the policy-pinned
+        # device/dtype match the capability-phase selection, the
+        # digest just streamed by get_qwen_capability in this same
+        # phase is the selected-policy identity — reuse it instead
+        # of streaming the model a second time. An explicit
+        # cpu/cuda policy that differs still computes its own.
+        if (policy["device"] == capability.get("device")
+                and policy.get("dtype") == capability.get("dtype")
+                and isinstance(capability.get("provider_digest"), str)):
+            provider_digest = capability["provider_digest"]
+        else:
+            try:
+                provider_digest = get_qwen_provider_digest(
+                    capability["model_dir"],
+                    runtime_identity={"qwen_asr_version": capability["qwen_asr_version"],
+                                      "torch_version": capability.get("torch_version"),
+                                      "device": policy["device"],
+                                      "dtype": policy.get("dtype"),
+                                      "identity": runtime},
+                    _model_digest=capability.get("model_digest"))
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+    timing = {"timing_mode": policy["timing_mode"], "device": policy["device"],
+              "dtype": policy.get("dtype"), "language": timing_language,
+              "provider_digest": provider_digest,
+              "qwen_asr_version": (capability or {}).get("qwen_asr_version"),
+              "torch_version": (capability or {}).get("torch_version"),
+              "runtime": runtime,
+              "capability": capability, "preference": dict(merged),
+              "reason": policy["reason"]}
+    # Resolve effective policy before the real shared claim. GPU admission
+    # may release idle models, so no book transaction lock is held here.
+    # Recheck the captured book/settings after reservation before persisting.
+    claim_id = reserve_background_task("readaloud_epub", cpu_only=policy["cpu_only"])
+    try:
+        with ensure_book_state(DATA_DIR):
+            current, _chunks = _ensure_editor_integrity_locked()
+            if current["snapshot"] != admitted_snapshot:
+                raise HTTPException(status_code=409, detail=(
+                    "Source or editor chunks changed during start; retry the build."))
+            if _get_readaloud_timing_preference() != preference:
+                raise HTTPException(status_code=409, detail=(
+                    "Timing settings changed during start; retry the build."))
+            _pref_path = os.path.join(DATA_DIR, "readalong_timing.json")
+            try:
+                _prior_pref_bytes = _read_bounded_preference_bytes(_pref_path)
+                _merged_pref_bytes = _save_readaloud_timing_preference(merged)
+                if not isinstance(_merged_pref_bytes, bytes) or len(_merged_pref_bytes) > 16384:
+                    raise ValueError("Timing writer did not return bounded committed bytes.")
+            except Exception as error:
+                raise HTTPException(status_code=409, detail=(
+                    "Could not persist timing settings (%s: %s); no build started. "
+                    "Verify the timing settings before retrying." % (type(error).__name__, str(error)[:300]))) from error
+            state = process_state["readaloud_epub"]
+            # Initialize BEFORE scheduling (see _start_readalong_sidecar).
+            state["result"] = None
+            state["logs"] = ["Starting EPUB read-aloud export..."]
+            state["readalong_generation"] = int(state.get("readalong_generation") or 0) + 1
+            state["readalong_book_token"] = book_token
+            state["readalong_snapshot"] = admitted_snapshot
+            generation = state["readalong_generation"]
+
+            def task():
+                state = process_state["readaloud_epub"]
+                if not _is_current_readalong_generation("readaloud_epub", generation):
+                    return
+                state["start_time"] = time.time()
+                state["logs"] = ["Starting EPUB read-aloud export..."]
+                try:
+                    with ensure_book_state(DATA_DIR):
+                        current, chunks = _ensure_editor_integrity_locked()
+                        if current["snapshot"] != admitted_snapshot:
+                            raise ValueError("Source or editor chunks changed after admission; review again.")
+                    from core import get_gpu_task_environment, get_task_lease_descriptor
+                    active_timing = dict(timing)
+                    active_timing["task_lease_fd"] = get_task_lease_descriptor(state)
+                    if active_timing.get("timing_mode") == "qwen":
+                        active_timing["worker_env"] = get_gpu_task_environment(state, env={})
+                        # Re-observe the pinned interpreter and model before
+                        # launching the worker: a replaced interpreter or
+                        # model after admission refuses without inference.
+                        from qwen_runtime import (get_qwen_provider_digest,
+                                                   get_qwen_runtime_digest,
+                                                   get_qwen_runtime_identity)
+                        try:
+                            runtime_now = get_qwen_runtime_identity(
+                                active_timing["runtime"]["python"],
+                                cancel_check=lambda: state.get("cancel", False))
+                        except ValueError as error:
+                            if state.get("cancel", False) and "cancelled" in str(error).lower():
+                                raise ExportCancelled("Export cancelled") from error
+                            raise RuntimeError(str(error)) from error
+                        if (get_qwen_runtime_digest(runtime_now)
+                                != active_timing["runtime"].get("runtime_digest")):
+                            raise RuntimeError(
+                                "Qwen runtime changed after admission (interpreter "
+                                "or package replaced); refusing to align.")
+                        try:
+                            current_digest = get_qwen_provider_digest(
+                                active_timing["capability"]["model_dir"],
+                                runtime_identity={
+                                    "qwen_asr_version": active_timing.get("qwen_asr_version"),
+                                    "torch_version": active_timing.get("torch_version"),
+                                    "device": active_timing.get("device"),
+                                    "dtype": active_timing.get("dtype"),
+                                    "identity": runtime_now},
+                                cancel_check=lambda: state.get("cancel", False))
+                        except ValueError as error:
+                            if state.get("cancel", False) and "cancelled" in str(error).lower():
+                                raise ExportCancelled("Export cancelled") from error
+                            raise RuntimeError(str(error)) from error
+                        if current_digest != active_timing.get("provider_digest"):
+                            raise RuntimeError(
+                                "Qwen provider changed after admission (model or "
+                                "interpreter replaced); refusing to align.")
+                    from readalong_export import build_epub_export
+                    success, msg = build_epub_export(
+                        project_manager,
+                        lambda: state.get("cancel", False),
+                        lambda m: state["logs"].append(m) if _is_current_readalong_generation(
+                            "readaloud_epub", generation) else None,
+                        chunks=chunks, timing=active_timing)
+                    if not _is_current_readalong_generation("readaloud_epub", generation):
+                        return
+                    state["result"] = get_export_task_result(success, msg)
+                    if success:
+                        state["logs"].append(f"EPUB read-aloud complete: {msg}")
+                    elif msg == "Export cancelled":
+                        state["logs"].append("EPUB read-aloud cancelled: Export cancelled")
+                    else:
+                        state["logs"].append(f"EPUB read-aloud failed: {msg}")
+                except Exception as e:
+                    if not _is_current_readalong_generation("readaloud_epub", generation):
+                        return
+                    state["result"] = _readalong_task_error(e)
+                    state["logs"].append('EPUB read-aloud cancelled' if isinstance(
+                        e, (ExportCancelled, AudioGenerationCancelled))
+                        else f"EPUB read-aloud error: {e}")
+                finally:
+                    if _is_current_readalong_generation("readaloud_epub", generation):
+                        state["running"] = False
+                        state["cancel"] = False
+
+    except BaseException:
+        release_gpu_task_claim("readaloud_epub", claim_id, pending_only=True)
+        raise
+
+    try:
+        register_claimed_background_task(background_tasks, "readaloud_epub", claim_id, task)
+    except BaseException as registration_error:
+        release_gpu_task_claim("readaloud_epub", claim_id, pending_only=True)
+        # Stale-owner fence: rollback is bound to the original book
+        # token, captured generation, and still-owned merged
+        # preference bytes, under the same book-state lock. If any
+        # of them changed (a successor start or an external write),
+        # restoring would clobber the successor — preserve it and
+        # surface the original error with an honest explanation.
+        stale_reason = None
+        try:
+            with ensure_book_state(DATA_DIR):
+                try:
+                    if _get_readalong_book_token() != book_token:
+                        stale_reason = "the book identity changed"
+                    elif process_state["readaloud_epub"].get("readalong_generation") != generation:
+                        stale_reason = "a newer start owns this book now"
+                    elif _read_bounded_preference_bytes(_pref_path) != _merged_pref_bytes:
+                        stale_reason = "the timing preference changed after this start persisted it"
+                except Exception as verify_error:
+                    stale_reason = "ownership could not be verified (%s)" % verify_error
+                if stale_reason is not None:
+                    raise RuntimeError(
+                        "Start registration failed (%s); timing-preference "
+                        "rollback was skipped because %s. The successor "
+                        "preference was preserved; no stale state was "
+                        "restored." % (registration_error, stale_reason)) from registration_error
+                _restore_readaloud_timing_preference_bytes(
+                    _pref_path, _prior_pref_bytes)
+        except RuntimeError:
+            raise
+        except (OSError, ValueError) as rollback_error:
+            # Explicit, never silent: under failed I/O the merged
+            # preference remains on disk and must not be promised
+            # restored. The original registration failure stays in
+            # the exception chain.
+            raise RuntimeError(
+                "Start registration failed and timing-preference "
+                "rollback also failed (%s). Restoration could not be "
+                "confirmed; verify settings before retrying the build."
+                % rollback_error) from rollback_error
+        raise
+    process_state["readaloud_epub"]["task_claim_id"] = claim_id
+    return {"status": "started", "task_name": "readaloud_epub",
+            "claim_id": claim_id, "book_token": book_token,
+            "preference": dict(merged), "timing_mode": policy["timing_mode"], "timing_device": policy["device"]}
+
+
+@router.post("/api/readaloud_epub/cancel")
+async def cancel_readaloud_epub(request: Optional[ReadalongCancelRequest] = None):
+    claim_id = request.claim_id if request is not None else None
+    book_token = request.book_token if request is not None else None
+    return await asyncio.to_thread(
+        _cancel_cpu_export, 'readaloud_epub', 'No EPUB read-aloud export is running.',
+        expected_claim_id=claim_id, expected_book_token=book_token)
+
+
+def _validated_epub_bytes():
+    """Read, scope-fence and receipt-check the EPUB; return (receipt, raw)."""
+    from readalong_export import (get_epub_output_path, get_epub_receipt_output_path,
+                                  get_validated_epub_receipt)
+    from epub_readaloud import validate_epub_readaloud
+    from readalong_sidecar import get_audio_file_sha256
+    path = get_epub_output_path(DATA_DIR)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="EPUB read-aloud not found. Build it from the Result tab first.")
+    require_scope_export_current(DATA_DIR, path)
+    receipt_path = get_epub_receipt_output_path(DATA_DIR)
+    if not os.path.exists(receipt_path):
+        raise HTTPException(status_code=409, detail="EPUB read-aloud has no receipt. Rebuild the EPUB read-aloud.")
+    require_scope_export_current(DATA_DIR, receipt_path)
+    try:
+        receipt = get_validated_epub_receipt(_read_bounded_preference_bytes(
+            receipt_path, file_description="EPUB read-aloud receipt"))
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=f"EPUB read-aloud receipt is invalid: {error}") from error
+    from export_quality import ensure_export_file
+    from audio_source_io import read_bounded_audio_hash
+    try:
+        with ensure_export_file(path) as (stream, version):
+            digest, size = read_bounded_audio_hash(stream, version[2], lambda: None)
+            if size != version[2] or digest != receipt["epub_sha256"]:
+                raise HTTPException(status_code=409, detail="EPUB read-aloud does not match its receipt. Rebuild the EPUB read-aloud.")
+            stream.seek(0)
+            raw = stream.read(version[2] + 1)
+            if len(raw) != version[2]:
+                raise ValueError("Finished EPUB changed while reading.")
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=f"EPUB read-aloud is invalid: {error}") from error
+    if hashlib.sha256(raw).hexdigest() != receipt["epub_sha256"]:
+        raise HTTPException(status_code=409, detail="EPUB read-aloud does not match its receipt. Rebuild the EPUB read-aloud.")
+    # Structural validation on download: rejects truncated or dangling
+    # overlays rather than serving a broken read-aloud.
+    try:
+        validate_epub_readaloud(raw)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=f"EPUB read-aloud is invalid: {error}") from error
+    if not os.path.isfile(AUDIOBOOK_PATH):
+        raise HTTPException(status_code=409, detail="EPUB read-aloud needs its MP3; rebuild the EPUB read-aloud.")
+    try:
+        current_sha, _size = get_audio_file_sha256(AUDIOBOOK_PATH)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=f"EPUB read-aloud is invalid: {error}") from error
+    if receipt["audio_sha256"] != current_sha:
+        raise HTTPException(status_code=409, detail="EPUB read-aloud does not match the current exported audio. Rebuild the EPUB read-aloud.")
+    # Cheap-first (V50): the book/source/settings identity fence
+    # (small files only) runs BEFORE the heavy timing probe+hash,
+    # so a stale artifact is refused without ever paying for it.
+    # Heavy timing probing stays outside the book lock; the
+    # preference snapshot is re-read under the lock cheaply and any
+    # drift between the reads fails closed.
+    with ensure_book_state(DATA_DIR):
+        _require_readalong_identity_current(receipt, "EPUB read-aloud")
+        state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {}) or {}
+        input_path = state.get("input_file_path")
+        if not isinstance(input_path, str) or not input_path:
+            raise HTTPException(status_code=409, detail="EPUB read-aloud source is unavailable.")
+        from publication_source import get_publication_source_capture
+        try:
+            publication_before = get_publication_source_capture(input_path)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=409, detail="EPUB read-aloud source provenance is unavailable.") from error
+
+    _timing_preference_before = _get_readaloud_timing_preference()
+    _require_readaloud_timing_current(receipt)
+    _timing_preference_after = _get_readaloud_timing_preference()
+    if _timing_preference_before != _timing_preference_after:
+        raise HTTPException(status_code=409, detail=(
+            "EPUB read-aloud timing settings changed during download; rebuild it."))
+    # Resolve/hash outside the book lock; the final identity and provenance
+    # fence below rejects concurrent book or source-publication changes.
+    from readalong_export import get_retained_epub_candidate_path, get_retained_epub_sha256
+    try:
+        retained_path = get_retained_epub_candidate_path(input_path)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail="EPUB read-aloud retained source is unavailable: %s" % error) from error
+    if not os.path.isfile(retained_path):
+        raise HTTPException(status_code=409, detail="EPUB read-aloud retained source is missing. Re-upload the EPUB and rebuild.")
+    try:
+        retained_sha = get_retained_epub_sha256(retained_path)
+    except (ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail="EPUB read-aloud retained source is unavailable.") from error
+    if retained_sha != receipt["retained_epub_sha256"]:
+        raise HTTPException(status_code=409, detail="EPUB read-aloud does not match its retained source. Re-upload the EPUB and rebuild.")
+    with ensure_book_state(DATA_DIR):
+        _require_readalong_identity_current(receipt, "EPUB read-aloud")
+        if _get_readaloud_timing_preference() != _timing_preference_after:
+            raise HTTPException(status_code=409, detail=(
+                "EPUB read-aloud timing settings changed during download; rebuild it."))
+        current_state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {}) or {}
+        try:
+            publication_after = get_publication_source_capture(current_state.get("input_file_path"))
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=409, detail="EPUB read-aloud source provenance changed during download.") from error
+        if publication_after != publication_before:
+            raise HTTPException(status_code=409, detail="EPUB read-aloud source provenance changed during download; rebuild it.")
+    return receipt, raw
+
+
+@router.get("/api/readaloud_epub")
+async def download_readaloud_epub():
+    _receipt, raw = await asyncio.to_thread(_validated_epub_bytes)
+    return Response(raw, media_type="application/epub+zip",
+                    headers={'Content-Disposition': 'attachment; filename="readaloud.epub"',
+                             'Cache-Control': 'no-store'})
+
+
+@router.get("/api/readaloud_epub/audio")
+async def download_readaloud_epub_audio():
+    def load():
+        receipt, _raw = _validated_epub_bytes()
+        return _serve_bound_audio(receipt["audio_sha256"], "audiobook.mp3",
+                                  "EPUB read-aloud")
+    return await asyncio.to_thread(load)
+
+
 @router.get("/api/audiobook_m4b")
 async def get_audiobook_m4b():
-    if not os.path.exists(M4B_PATH):
-        raise HTTPException(status_code=404, detail="M4B audiobook not found. Export it first.")
+    _require_export_download(M4B_PATH, "M4B audiobook not found. Export it first.")
     require_scope_export_current(DATA_DIR, M4B_PATH)
-    return FileResponse(M4B_PATH, filename="audiobook.m4b", media_type="audio/mp4")
+    return ExportFileResponse(M4B_PATH, filename="audiobook.m4b", media_type="audio/mp4")
 
 def _apply_m4b_cover(cover_tmp, cover_path):
     """Validate uploaded image data before publishing an MP4-compatible cover."""
@@ -1711,8 +2902,7 @@ async def generate_batch_endpoint(request: BatchGenerateRequest, background_task
 
 @router.post("/api/generate_batch_fast")
 async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background_tasks: BackgroundTasks):
-    """Generate multiple chunks using batch TTS API with single seed. Faster but less flexible.
-    Requires custom Qwen3-TTS with /generate_batch endpoint."""
+    """Render chunks in batches using saved voice seeds unless a batch seed overrides them."""
     check_global_gpu_lock("audio")
     with ensure_audio_generation_claim() as claim_id:
 

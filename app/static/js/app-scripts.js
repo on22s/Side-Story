@@ -5,16 +5,16 @@
                 const container = document.getElementById('saved-scripts-list');
 
                 if (!scripts.length) {
-                    container.innerHTML = '<p class="text-muted mb-0">No saved scripts yet. Generate a script above, or select Save Current to keep the current script here.</p>';
+                    container.innerHTML = `<p class="text-muted mb-0">${escapeHtml(t('script.saved.list-empty', 'No saved scripts yet. Generate a script above, or select Save Current to keep the current script here.'))}</p>`;
                     return;
                 }
 
                 container.innerHTML = scripts.map(s => {
-                    const date = new Date(s.created * 1000).toLocaleDateString('en-US', {
+                    const date = new Date(s.created * 1000).toLocaleDateString(getIntlUiLocale(), {
                         month: 'short', day: 'numeric', year: 'numeric'
                     });
                     const voiceBadge = s.has_voice_config
-                        ? '<span class="badge bg-info ms-2" title="Includes voice configuration">voices</span>'
+                        ? `<span class="badge bg-info ms-2" title="${escapeHtml(t('script.saved.badge-title', 'Includes voice configuration'))}">${escapeHtml(t('script.saved.voices-badge', 'voices'))}</span>`
                         : '';
                     return `
                         <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 py-2 border-bottom">
@@ -23,9 +23,9 @@
                                 <small class="text-muted ms-2">${date}</small>
                             </div>
                             <div class="flex-shrink-0">
-                                <button class="btn btn-sm btn-outline-info me-1" onclick='auditSavedScript(${getInlineStringArgument(s.name)})'><i class="fas fa-stethoscope me-1"></i>Audit</button>
-                                <button class="btn btn-sm btn-outline-success me-1" onclick='loadScript(${getInlineStringArgument(s.name)})'><i class="fas fa-upload me-1"></i>Load</button>
-                                <button class="btn btn-sm btn-outline-danger" aria-label="${escapeHtml('Delete saved script ' + s.name)}" onclick='deleteScript(${getInlineStringArgument(s.name)})'><i class="fas fa-trash"></i></button>
+                                <button class="btn btn-sm btn-outline-info me-1" onclick='auditSavedScript(${getInlineStringArgument(s.name)})'><i class="fas fa-stethoscope me-1"></i>${escapeHtml(t('script.saved.audit', 'Audit'))}</button>
+                                <button class="btn btn-sm btn-outline-success me-1" onclick='loadScript(${getInlineStringArgument(s.name)})'><i class="fas fa-upload me-1"></i>${escapeHtml(t('script.saved.load', 'Load'))}</button>
+                                <button class="btn btn-sm btn-outline-danger" aria-label="${escapeHtml(t('script.saved.delete-aria', 'Delete saved script {name}', {name: s.name}))}" onclick='deleteScript(${getInlineStringArgument(s.name)})'><i class="fas fa-trash"></i></button>
                             </div>
                         </div>`;
                 }).join('');
@@ -38,7 +38,7 @@
             const panel = document.getElementById('saved-script-preflight');
             panel.style.display = 'block';
             panel.className = 'alert alert-secondary small mt-3 mb-0';
-            panel.textContent = `Auditing ${name}…`;
+            panel.textContent = t('script.audit.running', 'Auditing {name}…', {name});
             try {
                 const report = await API.post(`/api/scripts/${encodeURIComponent(name)}/preflight`, {});
                 if (requestId !== _savedScriptAuditRequest) { return; }
@@ -47,22 +47,26 @@
                 panel.className = `alert ${counts.blocking ? 'alert-danger' : findings.length ? 'alert-warning' : 'alert-success'} small mt-3 mb-0`;
                 const items = findings.map(item => {
                     const entries = (item.entry_numbers || []).join(', ');
-                    const location = entries ? `Entry ${escapeHtml(entries)}: ` : '';
-                    const message = escapeHtml(item.message || item.code || 'Review this finding.');
+                    const location = entries ? escapeHtml(t('script.audit.entry', 'Entry {entries}:', {entries})) + ' ' : '';
+                    const message = escapeHtml(item.message || item.code || t('script.audit.finding-fallback', 'Review this finding.'));
                     let detailsText = '';
                     if (item.code === 'nonprose_speech_risk') {
                         const details = item.details || {};
                         const categories = (details.categories || []).join(', ');
-                        detailsText = ` ${escapeHtml(categories)} — preview: ${escapeHtml(details.normalized_preview || '')}. Audio validation: ${escapeHtml((details.validation || {}).status || 'unknown')}.`;
+                        detailsText = ' ' + t('script.audit.details', '{categories} — preview: {preview}. Audio validation: {status}.', {
+                            categories: escapeHtml(categories),
+                            preview: escapeHtml(details.normalized_preview || ''),
+                            status: escapeHtml((details.validation || {}).status || t('script.audit.status-unknown', 'unknown')),
+                        });
                     }
                     return `<li>${location}${message}${detailsText}</li>`;
                 }).join('');
-                panel.innerHTML = `<strong>${escapeHtml(name)}:</strong> ${counts.blocking || 0} blocking, ${counts.manual_review || 0} manual review.`
-                    + (items ? `<ul class="mt-1 mb-0">${items}</ul>` : ' No findings detected.');
+                panel.innerHTML = `<strong>${escapeHtml(name)}:</strong> ${t('script.audit.counts', '{blocking} blocking, {manual} manual review.', {blocking: counts.blocking || 0, manual: counts.manual_review || 0})}`
+                    + (items ? `<ul class="mt-1 mb-0">${items}</ul>` : ' ' + escapeHtml(t('script.audit.no-findings', 'No findings detected.')));
             } catch (error) {
                 if (requestId !== _savedScriptAuditRequest) { return; }
                 panel.className = 'alert alert-danger small mt-3 mb-0';
-                panel.textContent = getActionErrorMessage('Saved-script audit could not finish', error, 'Check that Alexandria is running, then use Audit again. The failed audit does not establish whether this script is ready.');
+                panel.textContent = getActionErrorMessage(t('script.audit.failed', 'Saved-script audit could not finish'), error, t('script.audit.failed-recovery', 'Check that Alexandria is running, then use Audit again. The failed audit does not establish whether this script is ready.'));
             }
         }
 
@@ -70,7 +74,7 @@
             const nameInput = document.getElementById('save-script-name');
             const name = nameInput.value.trim();
             if (!name) {
-                showToast('Please enter a name for the script.', 'warning');
+                showToast(t('script.saved.name-required', 'Please enter a name for the script.'), 'warning');
                 return;
             }
             try {
@@ -78,37 +82,37 @@
                 let bookToken = _voiceSaveSnapshot?.book_identity_token;
                 const selection = window._selectedUploadIdentity;
                 if (!bookToken && !(selection && selection.filename === book && selection.token)) {
-                    throw new Error('Wait for the current book to finish loading before saving.');
+                    throw new Error(t('script.saved.wait-loading', 'Wait for the current book to finish loading before saving.'));
                 }
                 await flushVoiceSaves();
                 if (selection && selection.filename === book && selection.token !== bookToken) {
                     if (window._selectedUploadIdentity !== selection
                             || currentBookFilename !== book) {
-                        throw new Error('Active book changed; restart Save Current for the current book.');
+                        throw new Error(t('script.saved.book-changed', 'Active book changed; restart Save Current for the current book.'));
                     }
                     await refreshVoiceMetadata({ expectedSelection: selection });
                     if (window._selectedUploadIdentity !== selection
                             || currentBookFilename !== book
                             || _voiceSaveSnapshot?.book_identity_token !== selection.token) {
-                        throw new Error('Active book changed; restart Save Current for the current book.');
+                        throw new Error(t('script.saved.book-changed', 'Active book changed; restart Save Current for the current book.'));
                     }
                     bookToken = selection.token;
                 }
-                if (!bookToken) { throw new Error('Wait for the current book to finish loading before saving.'); }
+                if (!bookToken) { throw new Error(t('script.saved.wait-loading', 'Wait for the current book to finish loading before saving.')); }
                 if (book !== currentBookFilename || bookToken !== _voiceSaveSnapshot?.book_identity_token) {
-                    throw new Error('Active book changed; restart Save Current for the current book.');
+                    throw new Error(t('script.saved.book-changed', 'Active book changed; restart Save Current for the current book.'));
                 }
                 await API.post('/api/scripts/save', { name, expected_book_token: bookToken });
                 nameInput.value = '';
                 loadSavedScripts();
             } catch (e) {
                 console.error('Error saving script:', e);
-                showActionError("Error saving script", e, "Check the saved-script list for this name before saving again. Keep your current book open while checking.");
+                showActionError(t('script.saved.save-failed', 'Error saving script'), e, t('script.saved.save-failed-recovery', 'Check the saved-script list for this name before saving again. Keep your current book open while checking.'));
             }
         }
 
-        async function loadScript(name) {
-            if (!await showConfirm(`Load "${name}"? This will replace your current script and chunks.`, {title: 'Replace active book?', actionLabel: 'Load book', danger: true})) { return; }
+        async function loadScript(name, expectedRevision = null) {
+            if (!await showConfirm(formatUiSafetyText('safety.script.saved.load-confirm', 'Load "{name}"? This will replace your current script and chunks.', {name}), {title: t('safety.script.saved.load-confirm.title', 'Replace active book?'), actionLabel: t('safety.script.saved.load-confirm.action', 'Load book'), danger: true})) { return; }
             let request;
             let loading;
             const isCurrent = () => !request || (loadScript.request === request
@@ -122,14 +126,34 @@
                 window._existingUploadSelectionRequest = request;
                 loading = enqueueBookSelection(request, async () => {
                     if (!isCurrent()) { return; }
-                    const loaded = await API.post('/api/scripts/load', { name });
+                    const body = expectedRevision ? { name, expected_revision: expectedRevision } : { name };
+                    const loaded = await API.post('/api/scripts/load', body);
+                    // The server load committed at this acknowledgment:
+                    // any later local helper/hydration failure must
+                    // report loaded-but-unrefreshed, not a failed load.
+                    request.loadedCommitted = true;
                     if (!isCurrent()) { return; }
                     applyCurrentBookFilename(`${loaded.name}.json`);
+                    // Bind this tab's next unscoped voice read to the
+                    // book just loaded here (DS3074), exactly like an
+                    // upload selection: another tab's book switch must
+                    // not be adopted as this tab's saved-script state.
+                    if (/^[0-9a-f]{64}$/.test(loaded.book_identity_token || '')) {
+                        window._selectedUploadIdentity = { filename: currentBookFilename, token: loaded.book_identity_token, request };
+                    } else {
+                        // Unverifiable identity (DS3074): preserve an
+                        // explicit unavailable local context so the next
+                        // unscoped read fails closed instead of treating
+                        // itself as startup and adopting whatever book
+                        // the server currently holds. An explicit reload
+                        // that obtains a valid token replaces this.
+                        window._selectedUploadIdentity = { filename: currentBookFilename, token: null, unavailable: true, request };
+                    }
                     document.getElementById('cast-list-panel').style.display = 'none';
                     clearCastListEditor();
                     clearCharacterAliases();
                     resetDesignerForm();
-                    showToast(`Script "${name}" loaded.`, 'success');
+                    showToast(t('script.saved.loaded', 'Script "{name}" loaded.', {name}), 'success');
                     clearVoiceSuggestions();
                     await Promise.all([loadCharacterAliases(false), loadCastList(false),
                         refreshVoiceMetadata().then(() => { if (isCurrent()) { return loadChunks(true); } })]);
@@ -144,20 +168,28 @@
             } catch (e) {
                 if (!isCurrent()) { return; }
                 console.error('Error loading script:', e);
-                showActionError("Error loading script", e, "Check the currently loaded book before trying Load again; the load may have completed before its reply was lost.");
+                if (request?.loadedCommitted) {
+                    if (window._selectedUploadIdentity?.unavailable) {
+                        showActionError(t('script.saved.loaded-unrefreshed', 'Script loaded, but Voices could not be refreshed'), e, t('safety.script.saved.loaded-unrefreshed-unavailable', 'The book was loaded, but its identity is unavailable. Reload or reselect this book (load it again from Scripts) before trying Voices again; Reload Voices cannot resolve an unavailable book identity.'));
+                    } else {
+                        showActionError(t('script.saved.loaded-unrefreshed', 'Script loaded, but Voices could not be refreshed'), e, t('script.saved.loaded-unrefreshed-recovery', 'The book was loaded. Reload Voices to see it before trying Load again.'));
+                    }
+                } else {
+                    showActionError(t('script.saved.load-error', 'Error loading script'), e, t('safety.script.saved.load-error-recovery', 'Check the currently loaded book before trying Load again; the load may have completed before its reply was lost.'));
+                }
             } finally {
                 if (loading && loadScript.pending === loading) { loadScript.pending = null; }
             }
         }
 
         async function deleteScript(name) {
-            if (!await showConfirm(`Delete saved script "${name}"? This cannot be undone.`, {title: 'Delete saved script?', actionLabel: 'Delete script', danger: true})) { return; }
+            if (!await showConfirm(formatUiSafetyText('safety.script.saved.delete-confirm', 'Delete saved script "{name}"? This cannot be undone.', {name}), {title: t('safety.script.saved.delete-confirm.title', 'Delete saved script?'), actionLabel: t('safety.script.saved.delete-confirm.action', 'Delete script'), danger: true})) { return; }
             try {
                 await API.del(`/api/scripts/${encodeURIComponent(name)}`);
                 loadSavedScripts();
             } catch (e) {
                 console.error('Error deleting script:', e);
-                showActionError("Error deleting script", e, "Refresh the saved-script list to check whether this script was deleted before trying Delete again.");
+                showActionError(t('script.saved.delete-failed', 'Error deleting script'), e, t('safety.script.saved.delete-failed-recovery', 'Refresh the saved-script list to check whether this script was deleted before trying Delete again.'));
             }
         }
 
@@ -178,22 +210,22 @@
                 const container = document.getElementById('designed-voices-list');
 
                 if (!voices.length) {
-                    container.innerHTML = '<p class="text-muted mb-0">No designed voices yet. Generate and save a preview above.</p>';
+                    container.innerHTML = `<p class="text-muted mb-0">${t('designer.saved.empty', 'No designed voices yet. Generate and save a preview above.')}</p>`;
                     return;
                 }
 
                 container.innerHTML = `
                     <div class="table-responsive"><table class="table table-sm table-hover mb-0">
-                        <thead><tr><th>Name</th><th>Description</th><th style="width:120px">Actions</th></tr></thead>
+                        <thead><tr><th>${escapeHtml(t('designer.saved.column.name', 'Name'))}</th><th>${escapeHtml(t('designer.saved.column.description', 'Description'))}</th><th style="width:120px">${escapeHtml(t('designer.saved.column.actions', 'Actions'))}</th></tr></thead>
                         <tbody>
                             ${voices.map(v => `
                                 <tr>
                                     <td style="overflow-wrap:anywhere;white-space:normal;"><strong>${escapeHtml(v.name)}</strong></td>
                                     <td class="text-muted" style="max-width:400px;overflow-wrap:anywhere;white-space:normal;">${escapeHtml(v.description)}</td>
                                     <td>
-                                        <button class="btn btn-sm btn-outline-primary me-1" onclick='playDesignedVoice(${getInlineStringArgument(v.filename)})' title="Play" aria-label="${escapeHtml('Play designed voice ' + v.name)}"><i class="fas fa-play me-1"></i>Play</button>
-                                        <button class="btn btn-sm btn-outline-secondary me-1" onclick='openDesignedVoiceForEdit(${getInlineStringArgument(v.id)})' title="Edit" aria-label="${escapeHtml('Edit designed voice ' + v.name)}"><i class="fas fa-edit me-1"></i>Edit</button>
-                                        <button class="btn btn-sm btn-outline-danger" onclick='deleteDesignedVoice(${getInlineStringArgument(v.id)}, this)' title="Delete" aria-label="${escapeHtml('Delete designed voice ' + v.name)}"><i class="fas fa-trash me-1"></i>Delete</button>
+                                        <button class="btn btn-sm btn-outline-primary me-1" onclick='playDesignedVoice(${getInlineStringArgument(v.filename)})' title="${escapeHtml(t('designer.saved.play', 'Play'))}" aria-label="${escapeHtml(t('designer.saved.play-aria', 'Play designed voice {name}', {name: v.name}))}"><i class="fas fa-play me-1"></i>${escapeHtml(t('designer.saved.play', 'Play'))}</button>
+                                        <button class="btn btn-sm btn-outline-secondary me-1" onclick='openDesignedVoiceForEdit(${getInlineStringArgument(v.id)})' title="${escapeHtml(t('designer.saved.edit', 'Edit'))}" aria-label="${escapeHtml(t('designer.saved.edit-aria', 'Edit designed voice {name}', {name: v.name}))}"><i class="fas fa-edit me-1"></i>${escapeHtml(t('designer.saved.edit', 'Edit'))}</button>
+                                        <button class="btn btn-sm btn-outline-danger" onclick='deleteDesignedVoice(${getInlineStringArgument(v.id)}, this)' title="${escapeHtml(t('designer.saved.delete', 'Delete'))}" aria-label="${escapeHtml(t('designer.saved.delete-aria', 'Delete designed voice {name}', {name: v.name}))}"><i class="fas fa-trash me-1"></i>${escapeHtml(t('designer.saved.delete', 'Delete'))}</button>
                                     </td>
                                 </tr>
                             `).join('')}
@@ -202,7 +234,7 @@
             } catch (e) {
                 console.error('Failed to load designed voices:', e);
                 if (request !== window._designedVoicesLoadRequest) { return; }
-                const message = 'Designed voices could not be loaded. The displayed list may be out of date. Check that Alexandria is still running, then use Refresh in Saved Voices.';
+                const message = t('designer.saved.load-failed', 'Designed voices could not be loaded. The displayed list may be out of date. Check that Alexandria is still running, then use Refresh in Saved Voices.');
                 document.getElementById('designed-voices-load-status').textContent = message;
                 showToast(message, 'warning');
             }
@@ -230,9 +262,9 @@
             window._designerDiscardPending = true;
             return (async () => {
                 try {
-                    if (!await showConfirm('Discard unsaved Designer edits and open another voice? Save Voice first to keep them, or Cancel to continue editing.', {title: 'Discard Designer edits?', actionLabel: 'Discard edits', danger: true})) { return false; }
+                    if (!await showConfirm(formatUiSafetyText('safety.designer.discard-edits', 'Discard unsaved Designer edits and open another voice? Save Voice first to keep them, or Cancel to continue editing.'), {title: t('safety.designer.discard-edits.title', 'Discard Designer edits?'), actionLabel: t('safety.designer.discard-edits.action', 'Discard edits'), danger: true})) { return false; }
                     if (generation !== (window._designerGeneration || 0) || snapshot !== getDesignerFormSnapshot() || preview !== window._currentPreviewFile) {
-                        showToast('The Designer changed while confirmation was open. Review your edits before switching voices.', 'warning');
+                        showToast(formatUiSafetyText('safety.designer.changed', 'The Designer changed while confirmation was open. Review your edits before switching voices.'), 'warning');
                         return false;
                     }
                     return true;
@@ -280,7 +312,7 @@
             if (sourceField.dataset) { sourceField.dataset.version = ''; }
             document.getElementById('design-description').value = '';
             document.getElementById('design-sample-text').value = '';
-            document.getElementById('design-alias-select').innerHTML = '<option value="">-- None --</option>';
+            document.getElementById('design-alias-select').innerHTML = '<option value="">' + t('designer.alias.none', '-- None --') + '</option>';
             document.getElementById('design-preview-container').style.display = 'none';
             document.getElementById('design-status').innerHTML = '';
             window._editingDesignedVoiceId = null;
@@ -288,7 +320,7 @@
             window._designerPreviewInputs = null;
             const previewButton = document.getElementById('btn-design-preview');
             if (previewButton) {
-                previewButton.innerHTML = '<i class="fas fa-wand-magic-sparkles me-1"></i>Generate Preview';
+                previewButton.innerHTML = '<i class="fas fa-wand-magic-sparkles me-1"></i>' + t('designer.preview.generate', 'Generate Preview');
             }
             markDesignerFormClean();
         }
@@ -307,8 +339,8 @@
             const statusEl = document.getElementById('design-status');
             const previewContainer = document.getElementById('design-preview-container');
 
-            if (!description) { showToast('Please enter a voice description.', 'warning'); return; }
-            if (!sampleText) { showToast('Please enter sample text.', 'warning'); return; }
+            if (!description) { showToast(t('designer.preview.needs-description', 'Please enter a voice description.'), 'warning'); return; }
+            if (!sampleText) { showToast(t('designer.preview.needs-sample', 'Please enter sample text.'), 'warning'); return; }
 
             const generation = window._designerGeneration || 0;
             const request = {};
@@ -318,8 +350,8 @@
             const btn = document.getElementById('btn-design-preview');
             btn.disabled = true;
             statusEl.innerHTML = window._editingDesignedVoiceId
-                ? '<i class="fas fa-spinner fa-spin me-1"></i>Re-designing preview (this may take a moment)...'
-                : '<i class="fas fa-spinner fa-spin me-1"></i>Generating preview (this may take a moment on first run)...';
+                ? '<i class="fas fa-spinner fa-spin me-1"></i>' + t('designer.preview.regenerating', 'Re-designing preview (this may take a moment)...')
+                : '<i class="fas fa-spinner fa-spin me-1"></i>' + t('designer.preview.generating', 'Generating preview (this may take a moment on first run)...');
             stopDesignedVoicePlayback();
             previewContainer.style.display = 'none';
 
@@ -334,15 +366,15 @@
                 audio.src = result.audio_url + '?t=' + Date.now();
                 previewContainer.style.display = 'block';
                 statusEl.innerHTML = window._editingDesignedVoiceId
-                    ? '<span class="text-success"><i class="fas fa-check me-1"></i>New preview ready — click Save Voice to keep it</span>'
-                    : '<span class="text-success"><i class="fas fa-check me-1"></i>Preview ready — click Save Voice to save this voice</span>';
+                    ? '<span class="text-success"><i class="fas fa-check me-1"></i>' + t('designer.preview.ready-edit', 'New preview ready — click Save Voice to keep it') + '</span>'
+                    : '<span class="text-success"><i class="fas fa-check me-1"></i>' + t('designer.preview.ready-new', 'Preview ready — click Save Voice to save this voice') + '</span>';
 
                 // Extract filename from URL for save
                 window._currentPreviewFile = result.audio_url.split('/').pop().split('?')[0];
                 window._designerPreviewInputs = {file: window._currentPreviewFile, ...inputs};
             } catch (e) {
                 if (!isCurrent()) { return; }
-                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage('Voice preview failed', e, 'Your description and sample text are retained. Check that the TTS service and selected model are available, then generate the preview again.'))}</span>`;
+                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage(t('designer.preview.error', 'Voice preview failed'), e, t('designer.preview.error-recovery', 'Your description and sample text are retained. Check that the TTS service and selected model are available, then generate the preview again.')))}</span>`;
             } finally {
                 if (isCurrent()) {
                     btn.disabled = false;
@@ -359,14 +391,14 @@
         window.saveDesignedVoice = async () => {
             if (window._designSavePending) { return; }
             const name = document.getElementById('design-voice-name').value.trim();
-            if (!name) { showToast('Please enter a name for the voice.', 'warning'); return; }
-            if (!window._currentPreviewFile) { showToast('Generate a preview first.', 'warning'); return; }
+            if (!name) { showToast(t('designer.save.needs-name', 'Please enter a name for the voice.'), 'warning'); return; }
+            if (!window._currentPreviewFile) { showToast(t('designer.save.needs-preview', 'Generate a preview first.'), 'warning'); return; }
 
             const inputs = getDesignerSynthesisInputs();
             const previewInputs = window._designerPreviewInputs;
             if (!previewInputs || previewInputs.file !== window._currentPreviewFile
                 || previewInputs.description !== inputs.description || previewInputs.sample_text !== inputs.sample_text) {
-                showToast('The description or sample text changed. Generate a matching preview before saving.', 'warning');
+                showToast(t('designer.save.changed', 'The description or sample text changed. Generate a matching preview before saving.'), 'warning');
                 return;
             }
 
@@ -389,8 +421,8 @@
             const wasDisabled = button?.disabled;
             const status = document.getElementById('design-save-status');
             window._designSavePending = true;
-            if (button) { button.disabled = true; button.innerHTML = 'Saving…'; }
-            if (status) { status.textContent = 'Saving voice…'; }
+            if (button) { button.disabled = true; button.innerHTML = t('designer.save.saving', 'Saving…'); }
+            if (status) { status.textContent = t('designer.save.saving-status', 'Saving voice…'); }
             try {
                 const result = await API.post('/api/voice_design/save', {
                     name,
@@ -414,22 +446,23 @@
                     }
                     if (unchanged) {
                         resetDesignerForm();
-                        if (status) { status.textContent = `Saved "${name}" to the voice library.`; }
+                        if (status) { status.textContent = t('designer.save.saved', 'Saved "{name}" to the voice library.', {name}); }
                     } else {
                         if (window._currentPreviewFile === previewFile) {
                             window._currentPreviewFile = null;
                             window._designerPreviewInputs = null;
                             window._editingDesignedVoiceId = result.voice_id || editingId;
                         }
-                        if (status) { status.textContent = `Saved "${name}". Later form edits were kept.${window._currentPreviewFile ? '' : ' Generate a preview before saving them.'}`; }
+                        const hint = window._currentPreviewFile ? '' : ' ' + t('designer.save.preview-hint', 'Generate a preview before saving them.');
+                        if (status) { status.textContent = t('designer.save.saved-edited', 'Saved "{name}". Later form edits were kept.{hint}', {name, hint}); }
                     }
                 }
-                showToast(`Saved "${name}" to the voice library.`, 'success');
+                showToast(t('designer.save.saved', 'Saved "{name}" to the voice library.', {name}), 'success');
             } catch (e) {
                 if (isDesignerGenerationCurrent(generation) && status) {
-                    status.textContent = getActionErrorMessage('Saving designed voice failed', e, 'Your form is retained. Check the voice library for the saved voice before trying again.');
+                    status.textContent = getActionErrorMessage(t('designer.save.error', 'Saving designed voice failed'), e, t('designer.save.error-recovery', 'Your form is retained. Check the voice library for the saved voice before trying again.'));
                 }
-                showActionError("Saving designed voice failed", e, "Your form is retained. Refresh the voice library and check whether the voice was saved before saving again.");
+                showActionError(t('designer.save.error', 'Saving designed voice failed'), e, t('designer.save.error-recovery-toast', 'Your form is retained. Refresh the voice library and check whether the voice was saved before saving again.'));
             } finally {
                 window._designSavePending = false;
                 if (button) { button.disabled = wasDisabled; button.innerHTML = buttonLabel; }
@@ -449,7 +482,7 @@
                 await audio.play();
             } catch (error) {
                 if (window._designedPlaybackAudio === audio) {
-                    showToast('Could not play the saved voice. Check that Alexandria is running, then try Play again.', 'warning');
+                    showToast(t('designer.play.error', 'Could not play the saved voice. Check that Alexandria is running, then try Play again.'), 'warning');
                 }
             }
         };
@@ -462,9 +495,9 @@
             const wasDisabled = button?.disabled;
             if (button) { button.disabled = true; }
             try {
-                if (!await showConfirm(message, {title: 'Remove library voice?', actionLabel: 'Remove voice', danger: true})) { return; }
+                if (!await showConfirm(message, {title: t('designer.delete.title', 'Remove library voice?'), actionLabel: t('designer.delete.action', 'Remove voice'), danger: true})) { return; }
                 if (!isCurrent()) {
-                    showToast('The selected voice changed. Review the current selection before deleting.', 'warning');
+                    showToast(formatUiSafetyText('safety.designer.selection-changed', 'The selected voice changed. Review the current selection before deleting.'), 'warning');
                     return;
                 }
                 await remove();
@@ -479,20 +512,20 @@
             const name = voice?.name || voiceId;
             try {
                 await applyLibraryVoiceRemoval(`design:${voiceId}`, button,
-                    `Delete designed voice "${name}"? This removes its saved preview from the voice library.`,
+                    formatUiSafetyText('safety.designer.delete', 'Delete designed voice "{name}"? This removes its saved preview from the voice library.', {name}),
                     () => true, async () => {
                         const res = await fetch(`/api/voice_design/${encodeURIComponent(voiceId)}`, {method: 'DELETE'});
-                        if (!res.ok) { const err = await res.json(); showActionError('Designed voice deletion refused', {message: err.detail || 'Failed to delete.', status: res.status}, 'Refresh the voice library and check the selected voice before deleting again.'); return; }
-                        showToast('Designed voice deleted. Characters that used it need a new reference.', 'warning');
+                        if (!res.ok) { const err = await res.json(); showActionError(t('designer.delete.refused', 'Designed voice deletion refused'), {message: err.detail || t('designer.delete.failed', 'Failed to delete.'), status: res.status}, t('designer.delete.refused-recovery', 'Refresh the voice library and check the selected voice before deleting again.')); return; }
+                        showToast(t('designer.delete.deleted', 'Designed voice deleted. Characters that used it need a new reference.'), 'warning');
                         try {
                             await loadDesignedVoices();
                             await loadVoices();
                         } catch (e) {
-                            showActionError('Voice deleted; list refresh failed', e, 'Reload the voice library to refresh the list. The deletion was confirmed; do not delete again.');
+                            showActionError(t('designer.delete.refresh-failed', 'Voice deleted; list refresh failed'), e, t('designer.delete.refresh-failed-recovery', 'Reload the voice library to refresh the list. The deletion was confirmed; do not delete again.'));
                         }
                     });
             } catch (e) {
-                showActionError("Deleting designed voice failed", e, "Refresh the voice library to check whether the voice was deleted before trying again.");
+                showActionError(t('designer.delete.error', 'Deleting designed voice failed'), e, t('designer.delete.error-recovery', 'Refresh the voice library to check whether the voice was deleted before trying again.'));
             }
         };
 
@@ -503,7 +536,7 @@
             try {
                 const voice = (window._designedVoicesCache || []).find(v => v.id === voiceId);
                 if (!voice) {
-                    showToast('Designed voice not found', 'error');
+                    showToast(t('designer.edit.not-found', 'Designed voice not found'), 'error');
                     return;
                 }
 
@@ -518,7 +551,7 @@
 
                 // Populate alias dropdown
                 const aliasSelect = document.getElementById('design-alias-select');
-                aliasSelect.innerHTML = '<option value="">-- None --</option>';
+                aliasSelect.innerHTML = '<option value="">' + t('designer.alias.none', '-- None --') + '</option>';
                 aliasSelect.dataset.aliasLookupFailed = 'false';
                 aliasSelect.onchange = () => { aliasSelect.dataset.aliasLookupFailed = 'false'; };
                 const names = (window._voicesNames || []).filter(n => n !== voice.name);
@@ -538,7 +571,7 @@
                     if (!isDesignerGenerationCurrent(generation)) { return; }
                     formUnchanged = lookupSnapshot === getDesignerFormSnapshot();
                     if (formUnchanged) {
-                        aliasSelect.innerHTML = '<option value="">-- None --</option>';
+                        aliasSelect.innerHTML = '<option value="">' + t('designer.alias.none', '-- None --') + '</option>';
                         voices.filter(v => v.name !== voice.name).forEach(v => {
                             const opt = document.createElement('option');
                             opt.value = v.name;
@@ -546,14 +579,17 @@
                             aliasSelect.appendChild(opt);
                         });
                         const entry = voices.find(v => v.name === voice.name);
-                        if (entry && entry.config && entry.config.alias_of) {
-                            if (!Array.from(aliasSelect.options).some(option => option.value === entry.config.alias_of)) {
+                        // One shared helper (app-core.js loads first):
+                        // never reimplement the effective-alias rule here.
+                        const effectiveAlias = getEffectiveVoiceAlias(entry?.config || {});
+                        if (entry && entry.config && effectiveAlias) {
+                            if (!Array.from(aliasSelect.options).some(option => option.value === effectiveAlias)) {
                                 const opt = document.createElement('option');
-                                opt.value = entry.config.alias_of;
-                                opt.text = entry.config.alias_of;
+                                opt.value = effectiveAlias;
+                                opt.text = effectiveAlias;
                                 aliasSelect.appendChild(opt);
                             }
-                            aliasSelect.value = entry.config.alias_of;
+                            aliasSelect.value = effectiveAlias;
                         } else {
                             aliasSelect.value = '';
                         }
@@ -575,16 +611,16 @@
 
                 const previewButton = document.getElementById('btn-design-preview');
                 if (previewButton) {
-                    previewButton.innerHTML = '<i class="fas fa-wand-magic-sparkles me-1"></i>Re-design Voice';
+                    previewButton.innerHTML = '<i class="fas fa-wand-magic-sparkles me-1"></i>' + t('designer.preview.regenerate', 'Re-design Voice');
                 }
 
                 if (formUnchanged) { markDesignerFormClean(); }
                 // Focus description for quick edits
                 document.getElementById('design-description').focus();
-                showToast('Loaded designed voice for editing', 'info');
+                showToast(t('designer.edit.loaded', 'Loaded designed voice for editing'), 'info');
             } catch (e) {
                 if (!isDesignerGenerationCurrent(generation)) { return; }
-                showActionError("Opening designed voice failed", e, "Refresh the voice library and check that the saved voice is available, then open it again.");
+                showActionError(t('designer.edit.error', 'Opening designed voice failed'), e, t('designer.edit.error-recovery', 'Refresh the voice library and check that the saved voice is available, then open it again.'));
             }
         };
 
@@ -597,7 +633,7 @@
             const description = card ? getVoiceCardDescription(cardRoot || card) : '';
             const cardAlias = card?.querySelector('.alias-select');
             if (cardAlias && !ensureVoiceRosterOptions(cardAlias)) {
-                showToast('The book changed. Reopen the Designer from the current voice card.', 'warning');
+                showToast(formatUiSafetyText('safety.designer.book-changed', 'The book changed. Reopen the Designer from the current voice card.'), 'warning');
                 return;
             }
 
@@ -612,7 +648,7 @@
             document.getElementById('design-description').value = description;
             document.getElementById('design-sample-text').value = card?.querySelector('.ref-text')?.value || '';
             const aliasSelect = document.getElementById('design-alias-select');
-            aliasSelect.innerHTML = cardAlias?.innerHTML || '<option value="">-- None --</option>';
+            aliasSelect.innerHTML = cardAlias?.innerHTML || '<option value="">' + t('designer.alias.none', '-- None --') + '</option>';
             aliasSelect.value = cardAlias?.value || '';
             aliasSelect.dataset.aliasLookupFailed = 'false';
             window._editingDesignedVoiceId = null;
@@ -622,12 +658,12 @@
 
             const previewButton = document.getElementById('btn-design-preview');
             if (previewButton) {
-                previewButton.innerHTML = '<i class="fas fa-wand-magic-sparkles me-1"></i>Re-design Voice';
+                previewButton.innerHTML = '<i class="fas fa-wand-magic-sparkles me-1"></i>' + t('designer.preview.regenerate', 'Re-design Voice');
             }
 
             const statusEl = document.getElementById('design-status');
             if (statusEl) {
-                statusEl.innerHTML = '<span class="text-muted"><i class="fas fa-info me-1"></i>Edit the description, then generate a preview.</span>';
+                statusEl.innerHTML = '<span class="text-muted"><i class="fas fa-info me-1"></i>' + t('designer.preview.intro-edit', 'Edit the description, then generate a preview.') + '</span>';
             }
             markDesignerFormClean();
         };
@@ -665,7 +701,7 @@
                 refAudio.readOnly = !!previous && select.value === previousValue;
                 if (playBtn) { playBtn.style.display = refAudio.value ? 'inline-block' : 'none'; }
                 if (deleteBtn) { deleteBtn.style.display = previous?.type === 'clone' && refAudio.readOnly ? 'inline-block' : 'none'; }
-                showToast('The selected voice reference is no longer available. Previous reference kept; refresh Voices and choose another.', 'warning');
+                showToast(formatUiSafetyText('safety.designer.reference-gone', 'The selected voice reference is no longer available. Previous reference kept; refresh Voices and choose another.'), 'warning');
                 return;
             }
             refAudio.value = `${isClone ? 'clone_voices' : 'designed_voices'}/${voice.filename}`;
@@ -706,7 +742,14 @@
 
         function _refreshCloneImportSubmit() {
             const f = _cloneImportFields();
-            f.submit.disabled = _cloneImportPendingGeneration === _cloneImportGeneration || !(f.refText.value.trim() && f.rightsConfirmed.checked);
+            const importing = _cloneImportPendingGeneration === _cloneImportGeneration;
+            const busy = _cloneCleanupAccepting || _cloneCleanupPreparing || _cloneCleanupDiscarding || importing;
+            f.fields.disabled = _cloneCleanupAccepting || importing;
+            document.getElementById('clone-cleanup-fields').disabled = _cloneCleanupAccepting || importing;
+            document.getElementById('clone-cleanup-prepare').disabled = busy;
+            document.getElementById('clone-cleanup-reject').disabled = busy || !_cloneCleanup;
+            document.getElementById('clone-cleanup-accept').disabled = busy || !_cloneCleanup;
+            f.submit.disabled = busy || !(f.refText.value.trim() && f.rightsConfirmed.checked);
         }
 
         let _cloneChannelPicker = null;
@@ -719,44 +762,57 @@
             const f = _cloneImportFields();
             document.getElementById('clone-import-filename').textContent = file.name;
             f.fields.disabled = false;
-            f.submit.textContent = 'Import';
+            f.submit.textContent = t('clone.import.submit', 'Import');
             document.getElementById('clone-import-status').textContent = '';
             f.refText.value = '';
             f.sourceTitle.value = '';
             f.sourceUrl.value = '';
             f.rightsBasis.value = '';
             f.rightsConfirmed.checked = false;
-            f.refText.oninput = _refreshCloneImportSubmit;
-            f.rightsConfirmed.onchange = _refreshCloneImportSubmit;
+            f.refText.oninput = () => { _invalidateCloneCleanup(); _refreshCloneImportSubmit(); };
+            f.rightsConfirmed.onchange = () => { _invalidateCloneCleanup(); _refreshCloneImportSubmit(); };
+            f.sourceTitle.oninput = () => { _invalidateCloneCleanup(); };
+            f.sourceUrl.oninput = () => { _invalidateCloneCleanup(); };
+            f.rightsBasis.oninput = () => { _invalidateCloneCleanup(); };
+            document.getElementById('clone-cleanup-gain').onchange = () => { _invalidateCloneCleanup(); };
+            document.getElementById('clone-cleanup-remove-dc').onchange = () => { _invalidateCloneCleanup(); };
+            document.getElementById('clone-channel-picker').onchange = () => { _invalidateCloneCleanup(); };
+            _resetCloneCleanup();
             _refreshCloneImportSubmit();
             const modalEl = document.getElementById('cloneImportModal');
             const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
             modalEl.addEventListener('hidden.bs.modal', () => {
-                if (generation !== _cloneImportGeneration) { return; }
-                f.fields.disabled = false;
-                _cloneImportGeneration++;
+                const current = generation === _cloneImportGeneration;
+                _invalidateCloneCleanup();
                 _cloneChannelPicker?.dispose();
                 _cloneChannelPicker = null;
-                f.submit.onclick = null;
+                if (current) {
+                    f.fields.disabled = false;
+                    _cloneImportGeneration++;
+                    f.submit.onclick = null;
+                }
             }, { once: true });
             f.submit.onclick = async () => {
-                if (generation !== _cloneImportGeneration || _cloneImportPendingGeneration === generation) { return; }
+                if (_cloneCleanupAccepting || _cloneCleanupPreparing || _cloneCleanupDiscarding || generation !== _cloneImportGeneration || _cloneImportPendingGeneration === generation) { return; }
                 if (!f.refText.value.trim() || !f.rightsConfirmed.checked) {
                     _refreshCloneImportSubmit();
                     return;
                 }
                 _cloneImportPendingGeneration = generation;
+                _refreshCloneImportSubmit();
                 f.fields.disabled = true;
                 f.submit.disabled = true;
-                f.submit.textContent = 'Importing…';
-                document.getElementById('clone-import-status').textContent = `Uploading and checking "${file.name}"…`;
+                f.submit.textContent = t('clone.import.importing', 'Importing…');
+                document.getElementById('clone-import-status').textContent = t('clone.import.uploading', 'Uploading and checking "{name}"…', {name: file.name});
                 try {
                     const ok = await _submitCloneImport(file, _cloneChannelPicker);
                     if (generation !== _cloneImportGeneration) { return; }
-                    document.getElementById('clone-import-status').textContent = ok ? `Imported "${file.name}".` : 'Import did not complete. Review the error, then retry.';
+                    document.getElementById('clone-import-status').textContent = ok
+                        ? t('clone.import.imported', 'Imported "{name}".', {name: file.name})
+                        : t('clone.import.incomplete', 'Import did not complete. Review the error, then retry.');
                     if (ok) {
                         f.fields.disabled = false;
-                        f.submit.textContent = 'Import';
+                        f.submit.textContent = t('clone.import.submit', 'Import');
                         f.submit.onclick = null;
                         modal.hide();
                     }
@@ -764,7 +820,7 @@
                     if (_cloneImportPendingGeneration === generation) { _cloneImportPendingGeneration = null; }
                     if (generation === _cloneImportGeneration) {
                         f.fields.disabled = false;
-                        f.submit.textContent = 'Import';
+                        f.submit.textContent = t('clone.import.submit', 'Import');
                         _refreshCloneImportSubmit();
                     }
                 }
@@ -790,7 +846,7 @@
                 const res = await fetch('/api/clone_voices/upload', { method: 'POST', body: formData });
                 if (!res.ok) {
                     const err = await res.json();
-                    showActionError('Clone import refused', {message: err.detail || 'Import failed', status: res.status}, 'Keep the selected file and import fields. Correct the transcript, source or rights details identified by the validation error before importing again.');
+                    showActionError(t('safety.clone.import.refused', 'Clone import refused'), {message: err.detail || t('clone.import.failed', 'Import failed'), status: res.status}, t('safety.clone.import.refused-recovery', 'Keep the selected file and import fields. Correct the transcript, source or rights details identified by the validation error before importing again.'));
                     return false;
                 }
                 imported = true;
@@ -798,18 +854,260 @@
                 window._cloneVoicesCache = await API.get('/api/clone_voices/list');
                 await loadVoices();
                 const m = result.measures || {};
-                showToast(`Imported "${file.name}" (${m.duration_s ?? '?'} s, 24 kHz mono)`, 'success');
+                showToast(t('clone.import.imported-measures', 'Imported "{name}" ({duration} s, 24 kHz mono)', {name: file.name, duration: m.duration_s ?? '?'}), 'success');
                 return true;
             } catch (e) {
                 if (imported) {
                     console.error('Imported clone voice refresh failed:', e);
-                    showToast(`Imported "${file.name}", but the voice list could not be refreshed. Do not import again. Check that Alexandria is running, then reopen Voices.`, 'warning');
+                    showToast(formatUiSafetyText('safety.clone.import.refresh-failed', 'Imported "{name}", but the voice list could not be refreshed. Do not import again. Check that Alexandria is running, then reopen Voices.', {name: file.name}), 'warning');
                     return true;
                 }
-                showActionError("Importing clone voice failed", e, "Your selected file and import fields are retained. Check the voice library before retrying; correct any validation details below.");
+                showActionError(t('safety.clone.import.failed', 'Importing clone voice failed'), e, t('safety.clone.import.failed-recovery', 'Your selected file and import fields are retained. Check the voice library before retrying; correct any validation details below.'));
                 return false;
             }
         }
+
+        let _cloneCleanup = null;
+        let _cloneCleanupController = null;
+        let _cloneCleanupEpoch = 0;
+        let _cloneCleanupAccepting = false;
+        let _cloneCleanupPreparing = false;
+        let _cloneCleanupDiscarding = false;
+        function _resetCloneCleanup() {
+            _cloneCleanupController?.abort();
+            _cloneCleanupController = null;
+            _cloneCleanup = null;
+            _cloneCleanupEpoch++;
+            _cloneCleanupAccepting = false;
+            _cloneCleanupPreparing = false;
+            _cloneCleanupDiscarding = false;
+            _refreshCloneImportSubmit();
+            document.getElementById('clone-import-status').textContent = '';
+            const players = document.getElementById('clone-cleanup-players');
+            if (players) { players.hidden = true; }
+            for (const id of ['clone-cleanup-original', 'clone-cleanup-candidate']) {
+                const el = document.getElementById(id);
+                if (el) { el.pause?.(); el.removeAttribute?.('src'); }
+            }
+            document.getElementById('clone-cleanup-listened-original').checked = false;
+            document.getElementById('clone-cleanup-listened-candidate').checked = false;
+            const summary = document.getElementById('clone-cleanup-summary');
+            if (summary) { summary.textContent = ''; }
+        }
+        function _invalidateCloneCleanup() {
+            const token = _cloneCleanup?.cleanup_token;
+            _resetCloneCleanup();
+            if (token) {
+                fetch(`/api/clone_voices/cleanup/${encodeURIComponent(token)}`, {method: 'DELETE'}).catch(() => {});
+            }
+        }
+        function _renderCleanupSummary(data) {
+            const summary = document.getElementById('clone-cleanup-summary');
+            if (!summary) { return; }
+            const gain = data.plan?.operations?.find(op => op.op === 'gain')?.value ?? '?';
+            const dcEnabled = data.plan?.operations?.find(op => op.op === 'dc_offset_removal')?.enabled;
+            const dc = typeof dcEnabled === 'boolean'
+                ? (dcEnabled ? t('clone.cleanup.dc-on', 'on') : t('clone.cleanup.dc-off', 'off'))
+                : t('clone.cleanup.dc-unknown', 'unknown');
+            const candidate = data.candidate_measures || {};
+            const verification = data.verification || {};
+            const channel = data.audio_channel === 'left'
+                ? t('audio.channel.left', 'Left')
+                : data.audio_channel === 'right'
+                    ? t('audio.channel.right', 'Right')
+                    : t('audio.channel.mix', 'Mixed (default)');
+            summary.textContent = t('clone.cleanup.plan', 'Plan: gain {gain}, DC removal {dc}, channel {channel}. Candidate: {duration} s, peak {peak}, samples checked {samples}, max sample difference {difference}. ASR, speaker identity and naturalness are UNMEASURED.', {
+                gain,
+                dc,
+                channel,
+                duration: candidate.duration_s ?? '?',
+                peak: candidate.peak ?? '?',
+                samples: verification.samples_checked ?? '?',
+                difference: verification.max_abs_difference ?? '?',
+            });
+            const original = data.measures || {};
+            summary.textContent = joinUiSentences([summary.textContent, t('clone.cleanup.original', 'Original: {duration} s, peak {peak}, clipping {clipping}, silence {silence}. Candidate clipping {cclipping}, silence {csilence}. Original SHA256: {osha}. Candidate SHA256: {csha}. Plan SHA256: {psha}.', {
+                duration: original.duration_s ?? '?',
+                peak: original.peak ?? '?',
+                clipping: original.clipping_ratio ?? '?',
+                silence: original.silence_ratio ?? '?',
+                cclipping: candidate.clipping_ratio ?? '?',
+                csilence: candidate.silence_ratio ?? '?',
+                osha: data.normalized_original_sha256 ?? '?',
+                csha: data.candidate_sha256 ?? '?',
+                psha: data.plan_digest ?? '?',
+            })]);
+        }
+        document.getElementById('clone-cleanup-prepare').onclick = async () => {
+            if (_cloneCleanupAccepting || _cloneCleanupPreparing || _cloneCleanupDiscarding || _cloneImportPendingGeneration === _cloneImportGeneration) { return; }
+            const generation = _cloneImportGeneration;
+            let epoch = ++_cloneCleanupEpoch;
+            const f = _cloneImportFields();
+            if (!f.refText.value.trim() || !f.rightsConfirmed.checked) {
+                showToast(t('safety.clone.cleanup.rights-required', 'Enter the exact transcript and confirm rights before preparing a cleaned candidate.'), 'warning');
+                return;
+            }
+            const selection = _cloneChannelPicker ? _cloneChannelPicker.getSelection() : {channel: 'mix', token: null};
+            const body = new FormData();
+            body.append('audio_channel', selection.channel);
+            body.append('gain', document.getElementById('clone-cleanup-gain').value || '1');
+            body.append('remove_dc', document.getElementById('clone-cleanup-remove-dc').checked ? 'true' : 'false');
+            body.append('ref_text', f.refText.value.trim());
+            body.append('source_title', f.sourceTitle.value.trim());
+            body.append('source_url', f.sourceUrl.value.trim());
+            body.append('rights_basis', f.rightsBasis.value.trim());
+            body.append('rights_confirmed', f.rightsConfirmed.checked ? 'true' : 'false');
+            _cloneCleanupPreparing = true;
+            _refreshCloneImportSubmit();
+            try {
+                const previous = _cloneCleanup?.cleanup_token;
+                if (previous) {
+                    const discarded = await fetch(
+                        '/api/clone_voices/cleanup/' + encodeURIComponent(previous), {method: 'DELETE'});
+                    if (generation !== _cloneImportGeneration || epoch !== _cloneCleanupEpoch) { return; }
+                    if (!discarded.ok) {
+                        showToast(t('safety.clone.cleanup.previous-kept', 'The previous preview could not be discarded. It is kept; retry before preparing another candidate.'), 'warning');
+                        return;
+                    }
+                    _resetCloneCleanup();
+                    epoch = _cloneCleanupEpoch;
+                    _cloneCleanupPreparing = true;
+                    _refreshCloneImportSubmit();
+                }
+                if (selection.pending) { selection.token = await selection.pending; }
+                if (generation !== _cloneImportGeneration || epoch !== _cloneCleanupEpoch) { return; }
+                if (!selection.token) { showToast(t('clone.cleanup.preview-channel-first', 'Preview the channel first so the cleaned candidate uses the same audio.'), 'warning'); return; }
+                body.append('preview_token', selection.token);
+                _cloneCleanupController?.abort();
+                _cloneCleanupController = new AbortController();
+                const signal = _cloneCleanupController.signal;
+                const res = await fetch('/api/clone_voices/cleanup/prepare', {method: 'POST', body, signal});
+                const data = await res.json();
+                if (generation !== _cloneImportGeneration || epoch !== _cloneCleanupEpoch) {
+                    if (data.cleanup_token) { fetch('/api/clone_voices/cleanup/' + encodeURIComponent(data.cleanup_token), {method: 'DELETE'}).catch(() => {}); }
+                    return;
+                }
+                if (!res.ok) { showActionError(t('safety.clone.cleanup.refused', 'Cleanup refused'), {message: data.detail || t('clone.cleanup.prepare-failed', 'Prepare failed'), status: res.status}, t('safety.clone.cleanup.refused-recovery', 'Your file, transcript and current selection are unchanged.')); return; }
+                _cloneCleanup = data;
+                document.getElementById('clone-cleanup-original').src = '/api/clone_voices/cleanup/' + data.cleanup_token + '/audio?which=original';
+                document.getElementById('clone-cleanup-candidate').src = '/api/clone_voices/cleanup/' + data.cleanup_token + '/audio?which=candidate';
+                document.getElementById('clone-cleanup-players').hidden = false;
+                document.getElementById('clone-cleanup-listened-original').checked = false;
+                document.getElementById('clone-cleanup-listened-candidate').checked = false;
+                _renderCleanupSummary(data);
+                document.getElementById('clone-import-status').textContent = formatUiSafetyText('safety.clone.cleanup.prepared', 'Candidate prepared and verified. Listen to both before accepting; nothing has been imported yet.');
+            } catch (error) {
+                if (error.name !== 'AbortError' && generation === _cloneImportGeneration && epoch === _cloneCleanupEpoch) { showToast(formatUiSafetyText('safety.clone.cleanup.prepare-failed-toast', 'Cleanup preparation failed. Nothing was imported.'), 'warning'); }
+            } finally {
+                if (generation === _cloneImportGeneration && epoch === _cloneCleanupEpoch) {
+                    _cloneCleanupPreparing = false;
+                    _refreshCloneImportSubmit();
+                }
+            }
+        };
+        document.getElementById('clone-cleanup-reject').onclick = async () => {
+            if (!_cloneCleanup || _cloneCleanupAccepting || _cloneCleanupPreparing || _cloneCleanupDiscarding || _cloneImportPendingGeneration === _cloneImportGeneration) { return; }
+            const generation = _cloneImportGeneration;
+            const epoch = _cloneCleanupEpoch;
+            const token = _cloneCleanup.cleanup_token;
+            _cloneCleanupDiscarding = true;
+            _refreshCloneImportSubmit();
+            let response = null;
+            try {
+                response = await fetch('/api/clone_voices/cleanup/' + encodeURIComponent(token), {method: 'DELETE'});
+            } catch (error) {
+                response = null;
+            }
+            if (generation !== _cloneImportGeneration || epoch !== _cloneCleanupEpoch) { return; }
+            _cloneCleanupDiscarding = false;
+            if (response && response.ok) {
+                _resetCloneCleanup();
+                document.getElementById('clone-import-status').textContent = formatUiSafetyText('safety.clone.cleanup.rejected', 'Preview removed if present; already accepted voices remain in the library. Your current selection is unchanged.');
+            } else {
+                _refreshCloneImportSubmit();
+                document.getElementById('clone-import-status').textContent = formatUiSafetyText('safety.clone.cleanup.reject-failed', 'Preview discard failed on the server. The preview is kept so you can retry. Check the voice library if an earlier acceptance was uncertain.');
+            }
+        };
+        document.getElementById('clone-cleanup-accept').onclick = async () => {
+            const generation = _cloneImportGeneration;
+            const epoch = _cloneCleanupEpoch;
+            if (!_cloneCleanup || _cloneCleanupAccepting || _cloneCleanupPreparing || _cloneCleanupDiscarding || _cloneImportPendingGeneration === _cloneImportGeneration) { return; }
+            const f = _cloneImportFields();
+            if (!f.refText.value.trim() || !f.rightsConfirmed.checked || !document.getElementById('clone-cleanup-listened-original').checked || !document.getElementById('clone-cleanup-listened-candidate').checked) {
+                showToast(t('safety.clone.cleanup.listen-first', 'Enter the transcript, confirm rights, and listen to both Original and Candidate first.'), 'warning');
+                return;
+            }
+            _cloneCleanupAccepting = true;
+            _refreshCloneImportSubmit();
+            const body = new FormData();
+            body.append('cleanup_token', _cloneCleanup.cleanup_token);
+            body.append('ref_text', f.refText.value.trim());
+            body.append('source_title', f.sourceTitle.value.trim());
+            body.append('source_url', f.sourceUrl.value.trim());
+            body.append('rights_basis', f.rightsBasis.value.trim());
+            body.append('rights_confirmed', 'true');
+            body.append('listened_original', 'true');
+            body.append('listened_candidate', 'true');
+            body.append('raw_source_sha256', _cloneCleanup.raw_source_sha256);
+            body.append('normalized_original_sha256', _cloneCleanup.normalized_original_sha256);
+            body.append('candidate_sha256', _cloneCleanup.candidate_sha256);
+            body.append('plan_digest_value', _cloneCleanup.plan_digest);
+            body.append('provenance_digest_value', _cloneCleanup.provenance_digest || '');
+            body.append('audio_channel', _cloneCleanup.audio_channel || 'mix');
+            try {
+                const res = await fetch('/api/clone_voices/cleanup/accept', {method: 'POST', body});
+                if (!res.ok) {
+                    if (res.status >= 500 && res.status !== 503) { throw new Error(t('clone.cleanup.accept-outcome-unknown', 'Server did not confirm the publication outcome.')); }
+                    let detail = t('clone.cleanup.accept-failed', 'Accept failed');
+                    try { detail = (await res.json()).detail || detail; } catch (error) { detail = t('clone.cleanup.accept-no-explanation', 'Accept refused without a readable explanation'); }
+                    if (generation === _cloneImportGeneration && epoch === _cloneCleanupEpoch) {
+                        const transient = res.status === 409 || res.status === 503;
+                        if (!transient) {
+                            _resetCloneCleanup();
+                            document.getElementById('clone-import-status').textContent = formatUiSafetyText('safety.clone.cleanup.no-longer-ready', 'Candidate is no longer ready. Review the refusal and prepare a fresh preview.');
+                        }
+                        showActionError(t('safety.clone.cleanup.accept-refused', 'Cleanup acceptance refused'), {message: detail, status: res.status}, transient
+                            ? t('safety.clone.cleanup.accept-refused-retry', 'The preview is kept for retry; your current selection is unchanged.')
+                            : t('safety.clone.cleanup.accept-refused-retired', 'The preview has been retired; your current selection is unchanged.'));
+                    }
+                    return;
+                }
+                let completedEpoch = epoch;
+                if (generation === _cloneImportGeneration && epoch === _cloneCleanupEpoch) {
+                    _resetCloneCleanup();
+                    completedEpoch = _cloneCleanupEpoch;
+                }
+                try {
+                    window._cloneVoicesCache = await API.get('/api/clone_voices/list');
+                    await loadVoices();
+                    showToast(t('clone.cleanup.accepted', 'Cleaned candidate accepted as a new voice. Choose it from the voice list when you are ready.'), 'success');
+                } catch (refreshError) {
+                    console.error('Accepted cleanup refresh failed:', refreshError);
+                    showToast(formatUiSafetyText('safety.clone.cleanup.accepted-unrefreshed', 'Cleaned candidate was accepted as a new voice, but the voice list could not be refreshed. Do not accept or import again. Check that Alexandria is running, then reopen Voices.'), 'warning');
+                }
+                if (generation === _cloneImportGeneration && completedEpoch === _cloneCleanupEpoch) {
+                    const modalEl = document.getElementById('cloneImportModal');
+                    bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+                }
+            } catch (error) {
+                if (generation === _cloneImportGeneration && epoch === _cloneCleanupEpoch) {
+                    _resetCloneCleanup();
+                    document.getElementById('clone-import-status').textContent = formatUiSafetyText('safety.clone.cleanup.accept-maybe', 'Acceptance may have completed. Check the voice library before any new import.');
+                }
+                try {
+                    window._cloneVoicesCache = await API.get('/api/clone_voices/list');
+                    await loadVoices();
+                } catch (refreshError) {
+                    console.error('Uncertain cleanup refresh failed:', refreshError);
+                }
+                showToast(formatUiSafetyText('safety.clone.cleanup.accept-maybe-toast', 'Cleanup acceptance may have completed even though its reply was lost. Do not accept or import again until you check the voice library. Your current selection is unchanged.'), 'warning');
+            } finally {
+                if (generation === _cloneImportGeneration && epoch === _cloneCleanupEpoch) {
+                    _cloneCleanupAccepting = false;
+                    _refreshCloneImportSubmit();
+                }
+            }
+        };
 
         window.playCloneVoice = async (btn) => {
             const card = btn.closest('.card-body');
@@ -819,7 +1117,7 @@
                     const audio = new Audio(getLocalAudioUrl(refAudio, Date.now()));
                     await audio.play();
                 } catch (error) {
-                    showToast('Could not play the clone reference. Check that Alexandria is running, then try Play again.', 'warning');
+                    showToast(t('clone.play.error', 'Could not play the clone reference. Check that Alexandria is running, then try Play again.'), 'warning');
                 }
             }
         };
@@ -834,16 +1132,16 @@
             const name = voice?.name || voiceId;
             try {
                 await applyLibraryVoiceRemoval(val, btn,
-                    `Delete clone voice "${name}"? This removes its saved reference from the voice library.`,
+                    formatUiSafetyText('safety.clone.delete', 'Delete clone voice "{name}"? This removes its saved reference from the voice library.', {name}),
                     () => select.value === val && card.isConnected !== false, async () => {
                         const res = await fetch(`/api/clone_voices/${encodeURIComponent(voiceId)}`, { method: 'DELETE' });
-                        if (!res.ok) { const err = await res.json(); showActionError('Clone voice deletion refused', {message: err.detail || 'Failed to delete', status: res.status}, 'Refresh the voice library and check the selected clone voice before deleting again.'); return; }
+                        if (!res.ok) { const err = await res.json(); showActionError(t('safety.clone.delete.refused', 'Clone voice deletion refused'), {message: err.detail || t('clone.delete.failed', 'Failed to delete'), status: res.status}, t('safety.clone.delete.refused-recovery', 'Refresh the voice library and check the selected clone voice before deleting again.')); return; }
                         window._cloneVoicesCache = await API.get('/api/clone_voices/list');
                         await loadVoices();
-                        showToast('Clone voice deleted', 'success');
+                        showToast(t('clone.delete.deleted', 'Clone voice deleted'), 'success');
                     });
             } catch (e) {
-                showActionError("Deleting clone voice failed", e, "Refresh the voice library to check whether the clone voice was deleted before trying again.");
+                showActionError(t('clone.delete.error', 'Deleting clone voice failed'), e, t('safety.clone.delete.error-recovery', 'Refresh the voice library to check whether the clone voice was deleted before trying again.'));
             }
         };
 
