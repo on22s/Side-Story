@@ -1,6 +1,6 @@
 # Experimental labels-only review
 
-Full-text review can reject useful speaker corrections when the model changes punctuation or moves text (#1174). Experimental labels-only review requests one `{n, speaker, instruct}` object per source entry. Code binds the validated labels back to deep copies of the originals, preserving text, entry order, metadata and literal-source policy.
+Full-text review can reject useful speaker corrections when the model changes punctuation or moves text (#1174). Experimental labels-only review requests one `{n, speaker, instruct}` object per source entry. Code binds the validated labels back to deep copies of the originals, preserving text, entry order, source provenance, pauses and literal-source policy. When a speaker changes, the four speaker annotations (`speaker_gender`, `speaker_age_group`, `speaker_ageless`, `spoken`) follow an unambiguous known target speaker in the original batch. When stale annotations exist, unknown or conflicting target annotations are cleared with a warning, as in classic review.
 
 Run `review_script.py --labels-only`, or set `prompts.review_labels_only` to true in configuration. This mode uses its own labels-only prompt, rather than the custom full-text review templates. It is off by default. The ordinary review remains available for lossless boundary changes; the labels-only model response cannot split or merge source entries. Existing configured post-processing, including consecutive-narrator merging, still runs afterward.
 
@@ -8,4 +8,6 @@ Missing, duplicate or out-of-range indexes, extra fields and invalid labels caus
 
 Repeated paired live PDNC evaluation must establish accuracy and retry tradeoffs before this becomes the default. The pilot uses controlled speaker mistakes on gold quotation spans; that is narrower than review of arbitrary segmented books.
 
-The request schema fixes each batch’s count and allowed indexes using the shared helper from #1178; duplicate-index validation remains required. Explicit `NARRATOR` types, and untyped entries already labelled `NARRATOR`, cannot receive character labels. An explicit `SPOKEN` type permits correcting an erroneous narrator label. The shared schema helper from #1178 is included on the current main base.
+Both modes can also return validated optional annotation corrections (`type`, `spoken`, `speaker_gender`, `speaker_age_group`, `speaker_ageless`). Omission uses the existing source/known-speaker fallback; explicit `null` clears one annotation. Explicit corrections override fallback traits. Source facts remain protected. See [diagnostics and annotations](review-diagnostics-and-annotations.md) for details.
+
+The request schema fixes each batch’s count and allowed indexes using the shared helper from #1178; duplicate-index validation remains required. The shared schema helper from #1178 is included on the current main base.

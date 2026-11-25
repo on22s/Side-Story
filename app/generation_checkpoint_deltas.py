@@ -7,6 +7,7 @@ import uuid
 
 from generation_checkpoint_shards import (
     get_generation_shard_directory, _get_shard_versions)
+from run_spec_receipt import CHECKPOINT_DIGEST
 from utils import atomic_json_write, file_lock
 
 STORAGE = "indexed-checkpoint-deltas-v1"
@@ -100,6 +101,8 @@ def _load_checkpoint(path):
         # escapes until the verified final result. Retain the default detached
         # copy for other callers, but do not clone unchanged state per record.
         current = _apply_changes(current, record["changes"], copy_previous=False)
+        if current.get(CHECKPOINT_DIGEST) != base.get(CHECKPOINT_DIGEST):
+            raise ValueError("Checkpoint delta changes the admitted run spec")
         digest = record["sha256"]
     if versions != _get_shard_versions(directory):
         raise ValueError("Checkpoint deltas changed while reading")
@@ -152,16 +155,20 @@ class GenerationCheckpointDeltas:
                     self.current, self.directory, self.versions, self.digest = None, None, None, None
                 else:
                     self.current, self.directory, self.versions, self.digest = _load_checkpoint(self.path)
+            if self.directory is not None and self.current.get(CHECKPOINT_DIGEST) != data.get(CHECKPOINT_DIGEST):
+                # Never write a new binding into the delta chain of an older
+                # or upgraded seed. The new base must authenticate every delta.
+                self.directory, self.versions, self.digest = None, None, None
             try:
                 if compact:
-                    atomic_json_write(data, str(self.path))
+                    atomic_json_write(data, str(self.path), allow_nonatomic_fallback=False)
                     self.directory, self.versions, self.digest = None, None, None
                 elif self.directory is None:
                     directory = self.path.with_name(self.path.name + ".parts-" + uuid.uuid4().hex)
                     directory.mkdir()
                     digest = _get_digest(data)
                     atomic_json_write({"storage": STORAGE, "base": data,
-                                       "directory": directory.name, "sha256": digest}, str(self.path))
+                                       "directory": directory.name, "sha256": digest}, str(self.path), allow_nonatomic_fallback=False)
                     self.directory, self.digest = directory, digest
                 else:
                     changes = _get_changes(self.current, data)
@@ -169,7 +176,7 @@ class GenerationCheckpointDeltas:
                         record = {"changes": changes, "previous": self.digest}
                         digest = _get_digest(record)
                         atomic_json_write(dict(record, sha256=digest), str(
-                            self.directory / f"{len(self.versions):08d}.json"))
+                            self.directory / f"{len(self.versions):08d}.json"), allow_nonatomic_fallback=False)
                         self.digest = digest
                 self.current = copy.deepcopy(data)
                 self.reset = False

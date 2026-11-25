@@ -35,6 +35,27 @@ def get_unsupported_cyrillic_characters(source_text, output_text):
                   if char.casefold() not in source_folded)
 
 
+def get_introduced_non_ascii_letters(source_text, output_text):
+    """Return non-ASCII letters the response introduces which the source does
+    not support. Cyrillic is excluded here and reported by
+    get_unsupported_cyrillic_characters instead.
+
+    An accented Latin letter whose casefold matches a Latin letter already in
+    the source is a case change, not an introduction (the single-pass allowance
+    since #938). Both gates use this one definition."""
+    source_non_ascii = {char for char in unicodedata.normalize("NFC", source_text)
+                        if ord(char) > 127 and unicodedata.category(char).startswith("L")}
+    source_latin_casefold = {char.casefold() for char in source_non_ascii
+                             if "LATIN" in unicodedata.name(char, "")}
+    return sorted({char for char in unicodedata.normalize("NFC", output_text)
+                   if ord(char) > 127
+                   and unicodedata.category(char).startswith("L")
+                   and char not in source_non_ascii
+                   and not ("LATIN" in unicodedata.name(char, "")
+                            and char.casefold() in source_latin_casefold)
+                   and not _CYRILLIC_RE.match(char)})
+
+
 def get_chunk_schema_findings(entries):
     """Check the entry contract for both fresh responses and stored checkpoints."""
     findings = []
@@ -109,17 +130,7 @@ def validate_chunk_quality(source_text, entries, *, literal_source_preserving=Fa
     if unsupported:
         findings.append({"code": "unsupported_cyrillic", "characters": unsupported,
                          "message": "Response introduced Cyrillic characters absent from the source."})
-    source_non_ascii = {char for char in unicodedata.normalize("NFC", source_text)
-                        if ord(char) > 127 and unicodedata.category(char).startswith("L")}
-    source_latin_casefold = {char.casefold() for char in source_non_ascii
-                            if "LATIN" in unicodedata.name(char, "")}
-    introduced_non_ascii = sorted({char for char in unicodedata.normalize("NFC", output_text)
-                                   if ord(char) > 127
-                                   and unicodedata.category(char).startswith("L")
-                                   and char not in source_non_ascii
-                                   and not ("LATIN" in unicodedata.name(char, "")
-                                            and char.casefold() in source_latin_casefold)
-                                   and not ("\u0400" <= char <= "\u04ff")})
+    introduced_non_ascii = get_introduced_non_ascii_letters(source_text, output_text)
     if introduced_non_ascii:
         findings.append({
             "code": "unsupported_unicode_character",
@@ -152,6 +163,61 @@ def validate_chunk_quality(source_text, entries, *, literal_source_preserving=Fa
     if literal is not None:
         report["literal_source_fidelity"] = literal
     return report
+
+
+# Pass 1 (#1921): a response can keep 90% of a chunk's words yet drop a whole
+# clause. A missing run of at least MIN_MISSING_SPAN_TOKENS words with this many
+# distinct words is reported; a squashed repetition ("hello hello ...") is not.
+MIN_MISSING_RUN_DISTINCT_WORDS = 4
+# recall_core tokenises CJK, kana, Hangul and Thai one character per token, so
+# a run there is measured in characters: roughly a short clause.
+MIN_MISSING_RUN_CHARACTERS = 20
+MIN_MISSING_RUN_DISTINCT_CHARACTERS = 10
+
+
+def get_missing_source_runs(source_tokens, output_tokens):
+    """Missing source spans that are real content, not a squashed repetition.
+
+    Each span gains "unit": "characters" for per-character scripts (whose
+    tokens are single non-ASCII characters), else "words"."""
+    runs = []
+    for span in _missing_source_spans(source_tokens, output_tokens):
+        run = source_tokens[span["start_token"]:span["start_token"] + span["token_count"]]
+        by_character = all(len(token) == 1 and not token.isascii() for token in run)
+        if by_character:
+            if (len(run) < MIN_MISSING_RUN_CHARACTERS
+                    or len(set(run)) < MIN_MISSING_RUN_DISTINCT_CHARACTERS):
+                continue
+        elif len(set(run)) < MIN_MISSING_RUN_DISTINCT_WORDS:
+            continue
+        runs.append({**span, "unit": "characters" if by_character else "words"})
+    return runs
+
+
+def is_segment_near_miss(quality):
+    """A failed pass-1 report that may be accepted once retries are exhausted:
+    a trigram-only near miss, and/or a dropped run of source words (#1921).
+    Accepting the latter keeps today's outcome (the chunk was accepted before
+    this check existed) but only after retries, and the caller warns."""
+    if not quality or quality.get("passed"):
+        return False
+    codes = {finding.get("code") for finding in quality.get("findings") or []}
+    if "missing_source_run" not in codes:
+        return is_trigram_only_near_miss(quality)
+    rest = codes - {"missing_source_run"}
+    if not rest:
+        return True
+    trigram = (quality.get("metrics") or {}).get("ordered_trigram_recall")
+    return (rest == {"low_ordered_trigram_recall"} and trigram is not None
+            and trigram >= ACCEPT_TRIGRAM_NEAR_MISS_FLOOR)
+
+
+def get_near_miss_rank(quality):
+    """Order near misses: a complete answer that only reordered words beats one
+    that dropped a run of source words; then higher trigram recall wins."""
+    dropped = any(finding.get("code") == "missing_source_run"
+                  for finding in quality.get("findings") or [])
+    return (not dropped, quality["metrics"]["ordered_trigram_recall"])
 
 
 def is_trigram_only_near_miss(quality):

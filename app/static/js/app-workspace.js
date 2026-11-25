@@ -14,6 +14,7 @@ let workspaceBookSnapshot = null;
 let workspaceBookPending = null;
 let workspaceMonitorEpoch = 0;
 let workspaceContinuePending = false;
+let workspaceSavedBookPending = false;
 let workspaceMonitorPending = false;
 let workspacePollTimer = null;
 let workspacePreviousRunning = false;
@@ -22,6 +23,29 @@ let workspaceLibrarySignature = null;
 let collectionOverviewRequest = 0;
 let collectionOverviewPending = null;
 let collectionOverviewLimit = 50;
+let collectionOverviewSnapshot = null;
+
+function getWorkspaceGuidance(row, field) {
+    const form = row[field + '_forms']?.[pluralForm(row[field + '_quantity'])];
+    const key = form?.key || row[field + '_key'];
+    const english = form?.template || row[field + '_template'] || row[field];
+    const values = {...row[field + '_values']};
+    for (const name of Object.keys(values)) {
+        if (values[name + '_key']) {
+            values[name] = getWorkspaceGuidance(values, name);
+        }
+    }
+    return key ? t(key, english, values) : row[field];
+}
+
+function renderWorkspaceLocaleChrome() {
+    if (workspaceBookSnapshot) {
+        renderBookWorkspace(workspaceBookSnapshot);
+    }
+    if (collectionOverviewSnapshot) {
+        renderCollectionOverview(collectionOverviewSnapshot);
+    }
+}
 
 function isWorkspaceVisible() {
     return currentTabName === 'home' && document.visibilityState !== 'hidden';
@@ -42,11 +66,16 @@ function renderWorkspaceStage(title, status, explanation) {
 }
 
 function renderBookWorkspace(data) {
-    document.getElementById('workspace-book-name').textContent = data.name;
-    document.getElementById('workspace-next-reason').textContent = data.next.reason;
+    const empty = document.querySelector('#workspace-empty');
+    if (empty) {
+        empty.hidden = data.script.entries !== 0 || data.cast.total !== 0 || !!currentBookFilename || !!window._selectedUploadIdentity;
+        document.querySelector('#workspace-stages').hidden = !empty.hidden;
+    }
+    document.getElementById('workspace-book-name').textContent = getWorkspaceGuidance(data, 'name');
+    document.getElementById('workspace-next-reason').textContent = getWorkspaceGuidance(data.next, 'reason');
     const button = document.getElementById('workspace-continue');
-    button.textContent = data.next.label;
-    button.disabled = workspaceContinuePending;
+    button.textContent = getWorkspaceGuidance(data.next, 'label');
+    button.disabled = workspaceContinuePending || !getWorkspaceContinueTab(data);
     const audio = data.audio;
     const review = audio.review;
     const speech = review?.status === 'observed'
@@ -56,9 +85,12 @@ function renderBookWorkspace(data) {
     const exportNote = exported?.status === 'observed'
         ? t('home.workspace.export.note', '{passed} passed at export; {review} needed review; {unavailable} receipts no longer match output metadata; {failed} failed attempts; {running} running. Checks are from this app session. Current script and voice inputs have not been rechecked; confirm book content before sharing.', {passed: exported.verified_at_export, review: exported.review_at_export, unavailable: exported.unavailable, failed: exported.failed_attempts, running: exported.running})
         : t('safety.home.export.unavailable', 'Saved export checks are unavailable. Check that each output belongs to this book before sharing it.');
-    const outputs = data.outputs.map(row => `${row.format}: ${row.status === 'present_unverified'
-        ? t('home.workspace.output.present-unverified', 'file present; book match unverified') : row.status === 'historical_source_scope'
-            ? t('home.workspace.output.older-scope', 'older scope; rebuild before download') : row.status === 'unavailable' ? t('home.workspace.output.unavailable', 'could not inspect') : t('home.workspace.output.missing', 'no file found')}`).join(' · ');
+    const outputs = data.outputs.map(row => `${row.format}: ${row.status === 'not_found'
+        ? t('home.workspace.output.missing', 'no file found') : row.status === 'present_unverified'
+            ? t('home.workspace.output.present-unverified', 'file present; book match unverified') : row.status === 'historical_source_scope'
+                ? t('home.workspace.output.older-scope', 'older scope; rebuild before download') : row.status === 'historical_previous_book'
+                    ? t('home.workspace.output.previous-book', 'previous book; rebuild before download') : row.status === 'unavailable'
+                        ? t('home.workspace.output.unavailable', 'could not inspect') : t('home.workspace.output.unrecognized', 'status not recognized')}`).join(' · ');
     document.getElementById('workspace-stages').replaceChildren(
         renderWorkspaceStage(t('home.workspace.stage.script', 'Script'), data.script.entries ? t('home.workspace.script.entries', 'Entries saved: {count}', {count: data.script.entries}) : t('home.workspace.not-started', 'Not started'), data.script.recovery?.status === 'candidate'
             ? t('safety.home.script.recovery', 'Interrupted script run has saved recovery evidence. Inspect it in Script; source and settings eligibility must be rechecked before resuming.')
@@ -66,7 +98,7 @@ function renderBookWorkspace(data) {
         renderWorkspaceStage(t('home.workspace.stage.cast', 'Cast'), t('home.workspace.cast.summary', 'Characters: {total} · need preparation: {pending}', {total: data.cast.total, pending: data.cast.pending}), t('home.workspace.cast.help', 'Finish preparing characters in Voices, then listen to their samples.')),
         renderWorkspaceStage(t('home.workspace.stage.audio', 'Audio'), audio.status === 'unavailable' ? t('home.workspace.audio.progress-unavailable', 'Progress unavailable')
             : audio.total ? t('home.workspace.audio.files', 'Files present: {present} / {total}', {present: audio.present, total: audio.total}) : t('home.workspace.not-prepared', 'Not prepared'),
-            `${audio.message}${speech}${audio.failed || audio.missing ? ' ' + t('home.workspace.audio.failures', '{failed} failed; {missing} done rows have missing audio.', {failed: audio.failed, missing: audio.missing}) : ''}`),
+            `${getWorkspaceGuidance(audio, 'message')}${speech}${audio.failed || audio.missing ? ' ' + t('home.workspace.audio.failures', '{failed} failed; {missing} done rows have missing audio.', {failed: audio.failed, missing: audio.missing}) : ''}`),
         renderWorkspaceStage(t('home.workspace.stage.export', 'Export'), outputs || t('home.workspace.not-inspected', 'Not inspected'), exportNote)
     );
 }
@@ -77,8 +109,9 @@ function renderWorkspaceLibrary(books) {
     workspaceLibrarySignature = signature;
     const container = document.getElementById('workspace-library');
     const selected = new Set(collectionSelectedNames());
+    container.removeAttribute('data-i18n');
     container.replaceChildren();
-    if (!books.length) { container.textContent = t('home.workspace.library.empty', 'No saved books yet. Save the current script from Script.'); return; }
+    if (!books.length) { setUiMessage(container, 'home.workspace.library.empty', 'No saved books yet. Save the current script from Script.'); return; }
     for (const book of books) {
         const row = document.createElement('div');
         row.className = 'workspace-library-row';
@@ -86,21 +119,22 @@ function renderWorkspaceLibrary(books) {
         title.textContent = book.name;
         const description = document.createElement('div');
         description.className = 'small text-muted mb-2';
-        description.textContent = t('home.workspace.library.script-saved', 'Script saved · {voices}', {voices: book.has_voice_config ? t('home.workspace.library.voices-saved', 'voice settings file saved') : t('home.workspace.library.voices-missing', 'no saved voice settings file')});
+        setUiMessage(description, 'home.workspace.library.script-saved', 'Script saved · {voices}', () => ({voices: book.has_voice_config ? t('home.workspace.library.voices-saved', 'voice settings file saved') : t('home.workspace.library.voices-missing', 'no saved voice settings file')}));
         const load = document.createElement('button');
         load.type = 'button';
         load.className = 'btn btn-outline-secondary btn-sm';
-        load.textContent = t('home.workspace.library.load', 'Load saved book…');
+        setUiMessage(load, 'home.workspace.library.load', 'Load saved book…');
         load.setAttribute('data-help-key', 'openWorkspaceSavedBook');
         load.addEventListener('click', () => openWorkspaceSavedBook(book.name, load));
         const checkLabel = document.createElement('label');
         checkLabel.className = 'small d-block mt-2';
         const check = document.createElement('input');
         check.type = 'checkbox';
+        check.className = 'me-1';
         check.setAttribute('data-collection-select', book.name);
         check.checked = selected.has(book.name);
         const checkText = document.createElement('span');
-        checkText.textContent = ' ' + t('home.workspace.library.select', 'Select {book} for collection overview', {book: book.name});
+        setUiMessage(checkText, 'home.workspace.library.select', 'Select {book} for collection overview', {book: book.name});
         checkLabel.append(check, checkText);
         row.append(title, description, load, checkLabel);
         container.appendChild(row);
@@ -132,6 +166,7 @@ function isCollectionRowLoadable(row) {
 }
 
 function renderCollectionOverview(rows) {
+    collectionOverviewSnapshot = rows;
     const container = document.getElementById('workspace-collection');
     container.replaceChildren();
     const table = document.createElement('table');
@@ -157,28 +192,31 @@ function renderCollectionOverview(rows) {
         bookId.textContent = t('home.workspace.collection.id', 'ID {id}{active} · revision {revision}', {id: row.book_id, active: row.is_active ? ' · ' + t('home.workspace.collection.active', 'active') : '', revision: isCollectionDigest(row.revision) ? row.revision.slice(0, 12) : t('home.workspace.collection.unknown', 'unknown')});
         bookCell.append(bookTitle, bookId);
         const stageCell = document.createElement('td');
-        stageCell.textContent = row.overall;
+        stageCell.textContent = getWorkspaceGuidance(row, 'overall');
+        stageCell.title = row.overall;
         const evidenceCell = document.createElement('td');
         const evidence = document.createElement('ul');
         evidence.className = 'small mb-0';
         for (const [label, stage] of [[t('home.workspace.stage.script', 'Script'), row.script], [t('home.workspace.stage.review', 'Review'), row.review], [t('home.workspace.stage.voices', 'Voices'), row.voices], [t('home.workspace.stage.render', 'Render/export'), row.render]]) {
             const item = document.createElement('li');
-            item.textContent = `${label}: ${stage.status} — ${stage.evidence}`;
+            item.textContent = `${label}: ${getWorkspaceGuidance(stage, 'status')} — ${getWorkspaceGuidance(stage, 'evidence')}`;
+            item.title = stage.status;
             evidence.appendChild(item);
         }
         evidenceCell.appendChild(evidence);
         const nextCell = document.createElement('td');
         nextCell.className = 'small';
-        nextCell.textContent = `${row.next.label} — ${row.next.reason}`;
+        nextCell.textContent = `${getWorkspaceGuidance(row.next, 'label')} — ${getWorkspaceGuidance(row.next, 'reason')}`;
         const openCell = document.createElement('td');
         const open = document.createElement('button');
         open.type = 'button';
         open.className = 'btn btn-outline-secondary btn-sm';
+        open.disabled = workspaceSavedBookPending;
         open.textContent = t('home.workspace.collection.load', 'Load this book…');
         open.setAttribute('data-help-key', 'openWorkspaceSavedBook');
         if (!isCollectionRowLoadable(row)) {
             open.disabled = true;
-            open.title = row.loadable === false ? row.script.evidence
+            open.title = row.loadable === false ? getWorkspaceGuidance(row.script, 'evidence')
                 : t('home.workspace.collection.no-proof', 'No valid revision proof for this book; show the overview again before loading.');
         }
         open.addEventListener('click', () => openCollectionBook(row, open));
@@ -191,6 +229,7 @@ function renderCollectionOverview(rows) {
 }
 
 async function showCollectionOverview() {
+    collectionOverviewSnapshot = null;
     const selectionEpoch = window._bookSelectionEpoch || 0;
     const names = collectionSelectedNames();
     const signature = JSON.stringify([selectionEpoch, names]);
@@ -245,7 +284,7 @@ async function showCollectionOverview() {
 async function openCollectionBook(row, button) {
     if (!isCollectionRowLoadable(row)) {
         document.getElementById('workspace-collection-feedback').textContent =
-            row.loadable === false ? row.script.evidence
+            row.loadable === false ? getWorkspaceGuidance(row.script, 'evidence')
                 : t('safety.home.collection.no-proof', 'This book has no valid revision proof. Nothing was loaded; show the overview again before loading.');
         return;
     }
@@ -253,30 +292,63 @@ async function openCollectionBook(row, button) {
     await openWorkspaceSavedBook(row.name, button, row.revision);
 }
 
+function getWorkspaceEnums(data) {
+    const fallback = {
+        recoveryStatus: ['candidate', 'not_reported'],
+        recoveryEligibility: ['not_rechecked'],
+        reviewStatus: ['not_prepared', 'unavailable', 'observed'],
+        exportStatus: ['unavailable', 'observed'],
+        exportInputs: ['not_rechecked'],
+        audioStatus: ['not_started', 'files_present', 'needs_attention', 'unavailable'],
+        outputStatus: ['present_unverified', 'historical_source_scope', 'historical_previous_book', 'not_found', 'unavailable'],
+        nextTab: ['script', 'voices', 'editor', 'audio']
+    };
+    const declared = data?.enums;
+    if (!declared || typeof declared !== 'object' || Array.isArray(declared)) { return fallback; }
+    const enums = {...fallback};
+    for (const key of Object.keys(fallback)) {
+        const values = declared[key];
+        if (Array.isArray(values) && values.length && values.every(value => typeof value === 'string' && value.length > 0)) {
+            enums[key] = values;
+        }
+    }
+    return enums;
+}
+
+const WORKSPACE_CONTINUE_TABS = new Set(['script', 'voices', 'editor', 'audio']);
+
+function getWorkspaceContinueTab(data) {
+    const tab = data?.next?.tab;
+    if (!WORKSPACE_CONTINUE_TABS.has(tab)) { return null; }
+    const link = Array.from(document.querySelectorAll('.nav-link')).find(row => row.dataset.tab === tab);
+    return link && document.getElementById(tab + '-tab') ? tab : null;
+}
+
 function isWorkspaceSnapshotValid(data) {
     const count = value => Number.isSafeInteger(value) && value >= 0;
+    const enums = getWorkspaceEnums(data);
+    const allows = (name, value) => typeof value === 'string' && enums[name].includes(value);
     const review = data?.audio?.review;
     const exported = data?.export_review;
     const recovery = data?.script?.recovery;
-    const recoveryValid = !recovery || (['candidate', 'not_reported'].includes(recovery.status)
-        && recovery.eligibility === 'not_rechecked');
-    const reviewValid = !review || ['not_prepared', 'unavailable'].includes(review.status)
-        || (review.status === 'observed' && ['speech_current_metadata', 'speech_not_current',
+    const recoveryValid = !recovery || (allows('recoveryStatus', recovery.status)
+        && allows('recoveryEligibility', recovery.eligibility));
+    const reviewValid = !review || allows('reviewStatus', review.status)
+        && (review.status !== 'observed' || ['speech_current_metadata', 'speech_not_current',
             'speech_not_checked', 'speech_attention', 'drift_flagged', 'unknown_speakers'].every(key => count(review[key])));
-    const exportValid = !exported || exported.status === 'unavailable'
-        || (exported.status === 'observed' && exported.current_inputs === 'not_rechecked'
-            && ['verified_at_export', 'review_at_export', 'unavailable', 'failed_attempts', 'running'].every(key => count(exported[key])));
+    const exportValid = !exported || allows('exportStatus', exported.status)
+        && (exported.status !== 'observed' || (allows('exportInputs', exported.current_inputs)
+            && ['verified_at_export', 'review_at_export', 'unavailable', 'failed_attempts', 'running'].every(key => count(exported[key]))));
     return recoveryValid && reviewValid && exportValid && !!data && typeof data.name === 'string' && /^[a-f0-9]{64}$/.test(data.book_token)
         && count(data.script?.entries) && count(data.cast?.total) && count(data.cast?.pending)
         && data.cast.pending <= data.cast.total
-        && ['not_started', 'files_present', 'needs_attention', 'unavailable'].includes(data.audio?.status)
+        && allows('audioStatus', data.audio?.status)
         && typeof data.audio.message === 'string'
         && ['total', 'present', 'failed', 'missing', 'generating'].every(key => count(data.audio[key]))
         && data.audio.present <= data.audio.total
         && Array.isArray(data.outputs) && data.outputs.every(row => row && typeof row.format === 'string'
-            && ['present_unverified', 'historical_source_scope', 'not_found', 'unavailable'].includes(row.status))
-        && ['script', 'voices', 'editor', 'audio'].includes(data.next?.tab)
-        && typeof data.next.label === 'string' && typeof data.next.reason === 'string';
+            && allows('outputStatus', row.status))
+        && allows('nextTab', data.next?.tab)        && typeof data.next.label === 'string' && typeof data.next.reason === 'string';
 }
 
 async function refreshBookWorkspace() {
@@ -318,7 +390,7 @@ async function refreshBookWorkspace() {
 }
 
 function getBookRecoveryText(summary) {
-    if (!summary || typeof summary !== 'object' || !['pending', 'migration_required', 'unreadable'].includes(summary.status)) { return null; }
+    if (!summary || typeof summary !== 'object' || !['pending', 'migration_required', 'manual_resolution', 'unreadable'].includes(summary.status)) { return null; }
     const commands = Array.isArray(summary.commands) ? summary.commands.filter(item => item
         && typeof item.purpose === 'string' && typeof item.command === 'string') : [];
     const steps = commands.map(item => `${item.purpose}: ${item.command}`).join(' — ');
@@ -336,7 +408,11 @@ async function showBookRecoveryHint(request) {
     const recovery = getBookRecoveryText(summary);
     if (!recovery) { return; }
     const target = document.getElementById('workspace-feedback');
-    if (recovery.status === 'pending' && recovery.steps) {
+    if (recovery.status === 'manual_resolution' && recovery.steps) {
+        renderUiSafety(target, 'safety.home.recovery.manual.steps', 'The Start Over journal could not be verified. Keep the journal and backups for manual recovery. In a terminal in the Alexandria folder — {steps}', {steps: recovery.steps});
+    } else if (recovery.status === 'manual_resolution') {
+        renderUiSafety(target, 'safety.home.recovery.manual', 'The Start Over journal could not be verified. Keep the journal and backups for manual recovery.');
+    } else if (recovery.status === 'pending' && recovery.steps) {
         renderUiSafety(target, 'safety.home.recovery.pending.steps', 'An interrupted book save has not been finished, so the book cannot open yet. Nothing was deleted. In a terminal in the Alexandria folder — {steps}', {steps: recovery.steps});
     } else if (recovery.status === 'pending') {
         renderUiSafety(target, 'safety.home.recovery.pending', 'An interrupted book save has not been finished, so the book cannot open yet. Nothing was deleted.');
@@ -358,18 +434,21 @@ async function continueBookWorkspace() {
     document.getElementById('workspace-continue').disabled = true;
     try {
         const data = await refreshBookWorkspace();
-        if (data && isWorkspaceVisible() && epoch === workspaceMonitorEpoch) { activateTab(data.next.tab); }
+        const tab = getWorkspaceContinueTab(data);
+        if (tab && isWorkspaceVisible() && epoch === workspaceMonitorEpoch) { activateTab(tab); }
     } finally {
         workspaceContinuePending = false;
-        document.getElementById('workspace-continue').disabled = !workspaceBookSnapshot;
+        document.getElementById('workspace-continue').disabled = !getWorkspaceContinueTab(workspaceBookSnapshot);
     }
 }
 
 async function openWorkspaceSavedBook(name, button, expectedRevision = null) {
+    if (workspaceSavedBookPending) { return; }
+    workspaceSavedBookPending = true;
     button.disabled = true;
     try { await loadScript(name, expectedRevision); }
     catch (error) { showActionError(t('home.workspace.load.failed', 'Could not load the saved book'), error, t('home.workspace.load.recovery', 'Review the currently selected book before trying Load again; its reply may have been lost.')); }
-    finally { button.disabled = false; await refreshBookWorkspace(); }
+    finally { workspaceSavedBookPending = false; button.disabled = false; await refreshBookWorkspace(); }
 }
 
 function getWorkspaceTaskTab(name) {
@@ -419,13 +498,14 @@ function renderWorkspaceTask(name, state, stale = false) {
     if (identity != null && identity !== view.identity) { view.identity = identity; view.track = {}; }
     const logs = Array.isArray(state.logs) ? state.logs.filter(line => typeof line === 'string').slice(-40).map(line => line.slice(0, 2000)) : [];
     renderActivity(view.activity, {...state, logs}, view.track);
-    if (!state.running) { view.activity.hidden = false; view.activity.textContent = t('home.workspace.task.finished', 'No longer running; refreshing the task list.'); }
-    if (state.cancel) { view.activity.textContent = t('home.workspace.task.cancelling', 'Cancellation requested; waiting for the worker to stop.'); }
+    if (state.ownership_unconfirmed) { view.card.querySelector('details').open = true; }
+    else if (!state.running) { view.activity.hidden = false; view.activity.textContent = t('home.workspace.task.finished', 'No longer running; refreshing the task list.'); }
+    if (state.cancel && !state.ownership_unconfirmed) { view.activity.textContent = t('home.workspace.task.cancelling', 'Cancellation requested; waiting for the worker to stop.'); }
     const eta = state.eta || {};
     const timing = [];
     if (eta.progress) { timing.push(t('home.workspace.task.progress', 'Progress: {progress}', {progress: eta.progress})); }
     if (eta.elapsed_seconds != null) { timing.push(t('home.workspace.task.elapsed', 'Elapsed {duration}', {duration: formatDuration(eta.elapsed_seconds)})); }
-    timing.push(state.paused || state.manual_request || state.cancel ? t('home.workspace.task.eta-withheld', 'ETA withheld while waiting or stopping.') : eta.eta_seconds != null ? t('home.workspace.task.eta-estimated', 'ETA estimated from current progress.') : t('home.workspace.task.eta-unknown', 'Not enough progress for an ETA yet.'));
+    timing.push(state.ownership_unconfirmed || state.paused || state.manual_request || state.cancel ? t('home.workspace.task.eta-withheld', 'ETA withheld while waiting or stopping.') : eta.eta_seconds != null ? t('home.workspace.task.eta-estimated', 'ETA estimated from current progress.') : t('home.workspace.task.eta-unknown', 'Not enough progress for an ETA yet.'));
     view.timing.textContent = timing.join(' · ');
     const text = logs.join('\n');
     if (view.logs.textContent !== text) { view.logs.textContent = text; }
@@ -439,7 +519,7 @@ async function refreshWorkspaceMonitor() {
         const registry = await API.get('/api/status');
         if (!registry || typeof registry !== 'object' || Array.isArray(registry)
                 || !Object.values(registry).every(state => state && typeof state.running === 'boolean')) { throw new Error('Invalid task registry'); }
-        const names = Object.entries(registry).filter(([, state]) => state?.running).map(([name]) => name);
+        const names = Object.entries(registry).filter(([, state]) => state?.running || state?.ownership_unconfirmed).map(([name]) => name);
         const results = await Promise.allSettled(names.map(name => API.get(`/api/status/${encodeURIComponent(name)}`)));
         if (!isWorkspaceVisible() || epoch !== workspaceMonitorEpoch) { return; }
         for (const [name, view] of workspaceTaskViews) {
@@ -449,7 +529,8 @@ async function refreshWorkspaceMonitor() {
             const state = result.status === 'fulfilled' ? result.value : null;
             renderWorkspaceTask(names[index], state, !state || typeof state.running !== 'boolean');
         });
-        applySystemStatusText('workspace-monitor-feedback', names.length ? (names.length === 1
+        const retained = names.some(name => registry[name].ownership_unconfirmed);
+        applySystemStatusText('workspace-monitor-feedback', retained ? t('home.workspace.task.retained', 'Failed tasks are still holding processes. Read their recovery instructions below; starting conflicting work remains blocked.') : names.length ? (names.length === 1
             ? t('home.workspace.task.running.one', '{count} task reported running. Open a task screen to see its available controls.', {count: names.length})
             : t('home.workspace.task.running.many', '{count} tasks reported running. Open a task screen to see its available controls.', {count: names.length})) : t('home.workspace.task.none', 'No tasks reported running at the last check.'));
         if (workspacePreviousRunning && !names.length) { refreshBookWorkspace(); }
@@ -472,10 +553,13 @@ window.refreshWorkspaceView = function () {
     refreshWorkspaceMonitor();
 };
 window.invalidateBookWorkspace = function () {
+    const hadSnapshot = !!workspaceBookSnapshot && (workspaceBookSnapshot.script?.entries > 0 || workspaceBookSnapshot.cast?.total > 0)
+        || !!document.querySelector('#workspace-collection')?.children.length;
     ++collectionOverviewRequest;
+    collectionOverviewSnapshot = null;
     document.getElementById('workspace-collection')?.replaceChildren();
     const feedback = document.getElementById('workspace-collection-feedback');
-    if (feedback) { feedback.textContent = t('safety.home.collection.active-changed', 'The active book changed. Show the collection overview again.'); }
+    if (feedback) { feedback.textContent = hadSnapshot ? t('safety.home.collection.active-changed', 'The active book changed. Show the collection overview again.') : ''; }
     workspaceBookRequest++;
     workspaceBookSnapshot = null;
     document.getElementById('workspace-continue').disabled = true;

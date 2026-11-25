@@ -1,9 +1,11 @@
 import os
 import copy
+import stat
 from contextlib import contextmanager, ExitStack, nullcontext
 from collections import Counter
 import tempfile
 import hashlib
+import sys
 import json
 import shutil
 import subprocess
@@ -30,8 +32,11 @@ from verbalization import (SET_APART_HINT, classify,
 from utils import (atomic_json_write, safe_load_json, is_oom_failure, is_path_inside,
                    get_app_config_path, is_nonverbal_text, secure_filename, file_lock)
 from chunk_status_journal import (ChunkStatusJournal, get_chunk_status_journal_path,
-                                  get_chunk_audio_key)
+                                   get_chunk_audio_key, capture_chunk_state_file,
+                                   get_chunk_state_file_version, _decode_json,
+                                   _ensure_supported_depth)
 from adapter_publication import sync_adapter_directory
+from pathlib import Path
 from export_file_io import replace_export_output
 from config_settings import load_app_config
 from export_limits import ensure_legacy_pcm_allowed
@@ -41,6 +46,7 @@ from literal_policy import (ensure_literal_narration, bind_literal_chunks,
 from audio_validation import publish_audio_output, remove_stale_audio, validate_generated_audio
 from audio_generation_owner import (AUDIO_GENERATION_CANCELLED, AudioGenerationCancelled,
                                     ensure_audio_generation_active, ensure_audio_generation_publication,
+                                    ensure_audio_generation_commit_active, ensure_audio_generation_claim_current,
                                     ensure_audio_generation_book, ensure_audio_generation_book_work, reuse_audio_generation_book,
                                     get_audio_generation_owner, is_audio_generation_cancelled,
                                     run_with_audio_generation_owner)
@@ -72,11 +78,14 @@ from tts import (
     get_pause_duration_ms,
     sanitize_filename,
     voice_category,
+    VoiceAliasResolutionError,
     DEFAULT_PAUSE_MS,
     SAME_SPEAKER_PAUSE_MS,
                  voice_config_for_chunk, resolve_narrator_voice_config, get_resolved_speaker,
-                 get_chunk_voice_inputs)
+                 get_chunk_render_voice_selection, get_seeded_batch_voice_config, get_chunk_voice_inputs)
 from pydub import AudioSegment
+from timeline_anchors import ambiguous_uids, build_uid_index, full_uid_index_context, resolve_timeline_anchors
+from voice_config_store import read_voice_config
 from audio_assembly import AudioSegmentBuilder
 from audio_pcm_producer import PCMSourceStore, get_audio_duration_ms
 from audio_streaming import (get_track_wav_plan, get_track_pcm_plan, write_track_wav, write_combined_wav,
@@ -114,8 +123,52 @@ CHAPTER_SELECTION_AUDIO_ERROR = (
     "Some chapter audio could not be decoded. Repair the affected clips before exporting selected chapters.")
 
 
+def get_skipped_chapter_lines(chunks, first, last, pairs):
+    """1-based line numbers of admitted rows a chapter's decoder dropped.
+
+    ``_load_chunks_with_audio`` only returns a skipped count; the skipped rows
+    are the chapter's chunks that did not survive into ``pairs``. Comparing the
+    object identities is free (no second decode) and lets a refusal name lines
+    without ever echoing a host path.
+    """
+    loaded = {id(chunk) for chunk, _ in pairs}
+    return [str(position + 1)
+            for position, chunk in enumerate(chunks[first:last + 1], start=first)
+            if id(chunk) not in loaded]
+
+
 class ChunkTargetMissingError(LookupError):
     """A captured publication target disappeared before its locked update."""
+
+
+# 2: a row's "index" is its chapter's position in the whole book (#1921). Version 1
+# rows counted only the chapters that had audio, so their indices mean something else.
+CHAPTER_PLAN_VERSION = 2
+
+
+def get_chapter_selection(chapters, available):
+    """Validate zero-based book chapter numbers against the chapters that have audio.
+
+    Chapters are numbered by the whole book, so a selection can name a chapter that
+    exists but has no generated audio yet; that is refused by number rather than
+    silently skipped."""
+    if not chapters:
+        raise ValueError("Select at least one chapter")
+    if any(type(number) is not int or number < 0 for number in chapters):
+        raise ValueError("Chapter numbers must be zero-based whole numbers (0 is the first chapter)")
+    absent = sorted({number + 1 for number in chapters if number not in available})
+    if absent:
+        shown = ", ".join(str(number) for number in absent[:20]) + (", ..." if len(absent) > 20 else "")
+        raise ValueError(f"No generated audio for chapter(s) {shown}. Generate them in Editor first, "
+                         "or check the chapter numbers.")
+    return sorted(set(chapters))
+
+
+def get_current_chapter_rows(manifest):
+    """{book chapter index: row} for a manifest of the current plan version, else {}."""
+    if not isinstance(manifest, dict) or manifest.get("chapter_plan_version") != CHAPTER_PLAN_VERSION:
+        return {}
+    return {row["index"]: row for row in get_chapter_export_rows(manifest)}
 
 
 def get_index_selection(indices, count):
@@ -153,6 +206,10 @@ def get_chapter_reuse_duration(plan, old, wanted, changed_only, out_dir):
         path = os.path.join(out_dir, filename)
         if not is_path_inside(path, out_dir) or not os.path.isfile(path):
             return None
+        if os.path.basename(out_dir) == CHAPTER_EXPORT_DIR:
+            from project_scope_exports import is_scope_export_historical
+            if is_scope_export_historical(os.path.dirname(out_dir), path):
+                return None
         size = os.path.getsize(path)
     except (KeyError, TypeError, ValueError, OSError):
         return None
@@ -271,6 +328,36 @@ def get_speaker(entry):
     return entry.get("speaker") or entry.get("type") or ""
 
 
+_NUMBER_WORD = (r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+                r"fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|"
+                r"fifty|sixty|seventy|eighty|ninety|hundred)")
+# "Chapter 3: Mana Evaluation (2)", "Chapter Five - The Gate", "Prologue: Ash".
+# Annotation often returns a heading as the first paragraph of the narration
+# that follows it; the splitter only knew bare "Chapter 3", so a titled heading
+# was never split out and the book lost every chapter boundary (#1921).
+TITLED_CHAPTER_HEADING_RE = re.compile(
+    r"^(?:(?:chapter|part|book|volume|act|section)\s+(?:[0-9]+|(?-i:[IVXLCDM]+)|"
+    + _NUMBER_WORD + r"(?:-" + _NUMBER_WORD + r")?)"
+    r"|prologue|epilogue|prelude|interlude|introduction|conclusion|afterword|foreword)"
+    r"\s*[:\-\u2013\u2014]\s*(\S)", re.IGNORECASE)
+
+
+def is_titled_chapter_heading(text):
+    """A keyword-and-number heading followed by a title, short and not a
+    sentence: "Chapter 3: The Gate". The caller requires its own paragraph."""
+    label = text.strip()
+    match = TITLED_CHAPTER_HEADING_RE.match(label)
+    # A title starts with a capital, a digit, a quote or a letter without case
+    # (CJK); prose after "Section 2:" or "Part 2 -" usually starts lowercase.
+    if not match or len(label) > 120 or "\n" in label or match.group(1).islower():
+        return False
+    title = label[match.start(1):]
+    # Not a sentence (the shared rule: . ! ? and CJK stops), not a cut-off line
+    # ("... The Storm -"), and not a number range ("Chapter 3-5").
+    return not (is_sentence_terminated(label) or is_heading_lookalike(label)
+                or re.fullmatch(r"[\d\s,.\-\u2013\u2014]+", title))
+
+
 def is_numbered_heading(text):
     heading = CHAPTER_HEADING_RE.match(text)
     return bool(heading and NUMBERED_HEADING_SUFFIX_RE.fullmatch(text[heading.end():]))
@@ -284,7 +371,8 @@ def get_chapter_heading_offsets(text, unnumbered_labels=UNNUMBERED_CHAPTER_HEADI
         label = line.strip()
         standalone = (index == 0 or not lines[index - 1].strip()) and (
             index + 1 == len(lines) or not lines[index + 1].strip())
-        if is_numbered_heading(label) or (standalone and label.casefold() in unnumbered_labels):
+        if is_numbered_heading(label) or (standalone and (
+                label.casefold() in unnumbered_labels or is_titled_chapter_heading(label))):
             offsets[offset] = label.casefold()
         offset += len(line)
     return offsets
@@ -353,9 +441,58 @@ def _is_structural_text(text, max_length=80):
     return False
 
 
+# A short unterminated line that still is not a heading: a sentence cut off
+# with a dash, ellipsis or comma, or a bracketed system/status-window line.
+CONTINUATION_END_RE = re.compile(r"(?:[,;:\-\u2013\u2014]|\.\.\.|\u2026)$")
+
+
+# 第一章 / 第1話 / 第十二回 ...: the CJK counterpart of the English keyword list.
+# 回 and 部 are also everyday counters, and prose continues with a particle or
+# a counted noun ("第一回目の", "第一部隊が", "第一章は"), so a heading's counter
+# must not be followed by one of those.
+CJK_CHAPTER_HEADING_RE = re.compile(
+    r"^第\s*[0-9\uff10-\uff19一二三四五六七八九十百千零〇两兩]+\s*[章話话節节回卷部幕]"
+    r"(?![のはがをにでともへや目次隊队分門门])")
+HEADING_BRACKETS = {"[": "]", "\u3010": "\u3011", "\u300c": "\u300d", "(": ")", "\uff08": "\uff09"}
+HEADING_RULE_RE = re.compile(r"([-~\u2013\u2014\u301c\u30fb]+)\s*(.+?)\s*([-~\u2013\u2014\u301c\u30fb]+)")
+
+
+def get_heading_core(text):
+    """Text inside a matching bracket pair or between dashes on both ends."""
+    core = text.strip()
+    while len(core) > 2 and core[0] in HEADING_BRACKETS and core[-1] == HEADING_BRACKETS[core[0]]:
+        core = core[1:-1].strip()
+    framed = HEADING_RULE_RE.fullmatch(core)
+    return framed.group(2) if framed else core
+
+
+def is_keyword_chapter_heading(text):
+    """A heading named by a chapter keyword (English or CJK), even when it is
+    framed by a bracket pair or by dashes on both ends ("【第一章】", "- Chapter 1 -")."""
+    core = get_heading_core(text)
+    return bool(CHAPTER_HEADING_RE.match(core) or CJK_CHAPTER_HEADING_RE.match(core)
+                or is_titled_chapter_heading(core))
+
+
+def is_heading_lookalike(text):
+    """Short, unterminated, yet not a chapter title (#1921): an interrupted
+    sentence ("He was about to say -") or a status-window line ("[Status]")."""
+    stripped = text.strip()
+    return bool(CONTINUATION_END_RE.search(stripped) or (
+        stripped[:1] in "[\u3010" and stripped[-1:] in "]\u3011"))
+
+
 def is_smart_chapter_text(text):
-    """Use the existing long keyword-title policy for source and export decisions."""
-    return _is_structural_text(text, max_length=None if CHAPTER_HEADING_RE.match(text.strip()) else 80)
+    """Use the existing long keyword-title policy for source and export decisions.
+
+    A keyword heading ("Chapter 3: ...") is always eligible; any other short
+    unterminated line must not look like an interrupted sentence or a status line."""
+    stripped = text.strip()
+    if CHAPTER_HEADING_RE.match(stripped):
+        return _is_structural_text(text, max_length=None)
+    if is_keyword_chapter_heading(stripped):
+        return _is_structural_text(text, max_length=80)
+    return _is_structural_text(text, max_length=80) and not is_heading_lookalike(stripped)
 
 
 def _make_chunk(speaker, text, instruct, pause_after=None, source_indices=None,
@@ -368,6 +505,24 @@ def _make_chunk(speaker, text, instruct, pause_after=None, source_indices=None,
         chunk["source_entry_indices"] = list(source_indices)
     chunk.update(copy.deepcopy(narrator_context or {}))
     return chunk
+
+
+def get_leading_heading(text):
+    """(heading, rest) when text opens with a TITLED keyword heading paragraph
+    ("Chapter 3: The Gate", then a blank line), else (None, text).
+
+    Titled only: in a spoken entry a bare "Chapter 2" or "Prologue" is a phrase
+    said aloud in the story and stays speech (test_spoken_heading_intent)."""
+    lines = text.split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None:
+        return None, text
+    label = lines[first].strip()
+    standalone = first + 1 == len(lines) or not lines[first + 1].strip()
+    if (standalone and not any(mark in label for mark in "\"\u201c\u201d")
+            and is_titled_chapter_heading(label)):
+        return label, "\n".join(lines[first + 1:])
+    return None, text
 
 
 def split_on_unspeakable(entry, scene_break_pause_ms):
@@ -385,6 +540,23 @@ def split_on_unspeakable(entry, scene_break_pause_ms):
     # classification. Done first because each emoji is category So on its own
     # and would otherwise be reported for review one character at a time.
     original_text = str(entry.get("text") or "")
+    if str(get_speaker(entry)).upper() == "NARRATOR" and entry.get("spoken") is True:
+        # Annotation can return a chapter heading as the first paragraph of a
+        # narrator entry it marked spoken because later paragraphs quote speech
+        # (#1921). Headings are never split out of spoken entries, so the
+        # chapter was lost. The leading heading alone is narration; the rest of
+        # the entry keeps exactly what the annotator said.
+        heading, rest = get_leading_heading(original_text)
+        if heading:
+            whole_entry_facts = ("source_span", "source_speaker", "dialogue_ambiguity")
+            first = {key: value for key, value in entry.items()
+                     if key not in whole_entry_facts and (rest.strip() == "" or key != "pause_after")}
+            first.update(text=heading, spoken=False)
+            head_parts, head_review = split_on_unspeakable(first, scene_break_pause_ms)
+            if not rest.strip():
+                return head_parts, head_review
+            rest_parts, rest_review = split_on_unspeakable(dict(entry, text=rest), scene_break_pause_ms)
+            return head_parts + rest_parts, head_review + rest_review
     split_chapters = (str(get_speaker(entry)).upper() == "NARRATOR"
                       and entry.get("spoken") is not True
                       and is_chapter_line_context_unambiguous(original_text))
@@ -778,6 +950,15 @@ def _export_audio_segment(segment, path, format_name, cancel_check=None, workspa
         segment.export(target, format=format_name, **kwargs)
 
 
+def get_synthesis_added_silence_seconds(chunk, prepared_text_sha256):
+    """Exact silence this chunk's own window join added, or zero for other text."""
+    receipt = chunk.get("_synthesis_receipt") if isinstance(chunk, dict) else None
+    if not isinstance(receipt, dict) or receipt.get("prepared_text_sha256") != prepared_text_sha256:
+        return 0.0
+    from synthesis_audio import get_added_silence_seconds
+    return get_added_silence_seconds(receipt)
+
+
 def _can_register_chunk_encoding(manager, *, exporter=None):
     from audio_export import export_audio_segment, _RAW_EXPORT_AUDIO_SEGMENT
     from audio_validation import publish_audio_output as current_publisher, _RAW_PUBLISH_AUDIO_OUTPUT
@@ -905,7 +1086,7 @@ def build_chapter_filename(template, number, title, ext, padding=2, book_name=""
 
 
 def build_chapter_filenames(groups, template, ext, padding=2, book_name="",
-                            series_name="", volume_number=""):
+                            series_name="", volume_number="", numbers=None):
     """Build one unique filename per chapter group or reject the template.
 
     A custom template may omit ``{chapter_number}``, and chapter titles may
@@ -913,11 +1094,12 @@ def build_chapter_filenames(groups, template, ext, padding=2, book_name="",
     chapter, so uniqueness is an export precondition rather than a best-effort
     cleanup after audio has already been rendered.
     """
+    numbers = list(numbers) if numbers is not None else range(1, len(groups) + 1)
     filenames = [build_chapter_filename(
-        template, index + 1, title, ext, padding=padding,
+        template, number, title, ext, padding=padding,
         book_name=book_name, series_name=series_name,
         volume_number=volume_number)
-        for index, (title, _, _) in enumerate(groups)]
+        for number, (title, _, _) in zip(numbers, groups)]
     seen, duplicates = set(), set()
     for name in filenames:
         key = name.casefold()
@@ -940,7 +1122,7 @@ def _loading_progress(progress_callback):
     return lambda done, total: progress_callback(f"Loading audio {done}/{total}")
 
 class ProjectManager:
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, *, create_audio_dir=True):
         self.root_dir = root_dir
         self.script_path = os.path.join(root_dir, "annotated_script.json")
         self.chunks_path = os.path.join(root_dir, "chunks.json")
@@ -956,13 +1138,15 @@ class ProjectManager:
         self.config_path = get_app_config_path(root_dir, os.path.dirname(_app_dir), _app_dir)
 
         # Ensure voicelines dir exists
-        os.makedirs(self.voicelines_dir, exist_ok=True)
+        if create_audio_dir:
+            os.makedirs(self.voicelines_dir, exist_ok=True)
 
         self.engine = None
         self._engine_lock = threading.Lock()
         self._chunks_lock = threading.Lock()  # Thread-safe chunks.json writes
         self._uids_backfilled = False  # see _read_chunks
         self._uids_file_version = None
+        self._uids_content_sha256 = None
         self._status_journal = None
         self._active_journal_identity = None
         self._config_cache = None
@@ -1054,6 +1238,16 @@ class ProjectManager:
         with self._chunks_lock, file_lock(self.chunks_path):
             return self._get_saved_chunks_locked()
 
+    def read_saved_chunk_rows(self):
+        """Read snapshot/journal rows verbatim; never regenerate, backfill or repair.
+
+        Unlike get_saved_chunks this does not enforce Editor's identity
+        validation, so legacy rows a loader would repair are still readable.
+        Its contract is only to refuse an unreadable or torn saved book.
+        """
+        with self._chunks_lock, file_lock(self.chunks_path):
+            return self._get_saved_chunk_rows_locked()
+
     def _get_saved_chunks_locked(self):
         """Caller holds the existing thread and kernel chunk locks."""
         chunks = self._get_saved_chunk_rows_locked()
@@ -1070,12 +1264,27 @@ class ProjectManager:
         return chunks
 
     def _get_saved_chunk_rows_locked(self):
-        """Read snapshot/journal objects without requiring legacy UID migration."""
-        if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
-            chunks = self._get_status_journal_locked().get_rows()
+        """Read snapshot/journal objects without requiring legacy UID migration.
+
+        Both artifacts go through the shared confined, nonblocking seam, so a
+        FIFO or alias is refused promptly without creating a lock or replacing
+        the file. Only a genuinely absent pair may be initialized; a retained
+        journal without its snapshot is an actionable conflict, not absence.
+        """
+        journal_path = get_chunk_status_journal_path(self.chunks_path)
+        snapshot_bytes = capture_chunk_state_file(self.chunks_path, what="snapshot")
+        journal_bytes = capture_chunk_state_file(journal_path, what="journal")
+        if journal_bytes is not None:
+            if snapshot_bytes is None:
+                raise ValueError(
+                    "Chunk status snapshot is missing while its journal is retained")
+            chunks = self._get_status_journal_locked().get_rows_from_bytes(
+                snapshot_bytes, journal_bytes)
+        elif snapshot_bytes is None:
+            raise FileNotFoundError(self.chunks_path)
         else:
-            with open(self.chunks_path, "r", encoding="utf-8") as source:
-                chunks = json.load(source)
+            chunks = _decode_json(snapshot_bytes, "snapshot")
+            _ensure_supported_depth(chunks, "snapshot")
         if not isinstance(chunks, list) or any(not isinstance(row, dict) for row in chunks):
             raise ValueError("Saved chunks must be an array of objects; open Editor to repair them")
         get_retained_book_bytes(chunks)
@@ -1094,7 +1303,7 @@ class ProjectManager:
     def _apply_pronunciation_settings_invalidation_locked(self, before, after):
         """Fence changed scoped words before publishing settings; retain audio files."""
         chunks = self._get_saved_chunks_locked()
-        voices = self.get_voice_config_for_update()
+        voices = resolve_timeline_anchors(self.get_voice_config_for_update(), chunks)
         updated, changed = list(chunks), []
         with ensure_pronunciation_snapshot():
             for index, chunk in enumerate(chunks):
@@ -1112,43 +1321,65 @@ class ProjectManager:
 
     def _get_chunks_file_version(self):
         """Identify the file whose rows have already received stable UIDs."""
-        try:
-            stat = os.stat(self.chunks_path)
-        except OSError:
-            return None
-        return (stat.st_dev, stat.st_ino, stat.st_size,
-                stat.st_mtime_ns, stat.st_ctime_ns)
+        return get_chunk_state_file_version(self.chunks_path)
 
-    def _save_chunks_locked(self, chunks, uids_backfilled=False, *, retained_update_uid=None):
-        """Publish rows and retain UID validation only for known-valid writes."""
+    def _save_chunks_locked(self, chunks, uids_backfilled=False, *, retained_update_uid=None,
+                            before_replace=None):
+        """Publish rows and retain UID validation only for known-valid writes.
+
+        ``before_replace`` runs at the durable-commit boundary (after staging
+        and fsync, before the snapshot rename) so a caller can refuse a write
+        whose exact claim or cancellation changed while preparing it (R2/R5).
+        """
         if (os.path.lexists(os.path.join(self.root_dir, TAKE_HISTORY_POLICY))
                 or any(row.get(RETAINED_TAKE_KEY) is not None for row in chunks)):
-            previous = self._get_saved_chunk_rows_locked() if os.path.exists(self.chunks_path) else []
+            previous = (self._get_saved_chunk_rows_locked()
+                        if get_chunk_state_file_version(self.chunks_path) is not None else [])
             preserve_retained_takes(self.root_dir, previous, chunks, updated_uid=retained_update_uid)
-        if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
-            self._get_status_journal_locked().save_compacted(
-                chunks, save_snapshot=lambda rows: atomic_json_write(rows, self.chunks_path))
+        written_bytes = None
+        def save_snapshot(rows):
+            nonlocal written_bytes
+            options = {'return_written_bytes': True} if uids_backfilled and sys.platform == 'win32' else {}
+            written_bytes = atomic_json_write(rows, self.chunks_path, **options,
+                allow_nonatomic_fallback=False, before_replace=before_replace)
+        if get_chunk_state_file_version(get_chunk_status_journal_path(self.chunks_path)) is not None:
+            self._get_status_journal_locked().save_compacted(chunks, save_snapshot=save_snapshot,
+                                                            before_replace=before_replace)
             self._status_journal = None
         else:
-            atomic_json_write(chunks, self.chunks_path)
-        self._uids_backfilled = uids_backfilled
-        self._uids_file_version = (self._get_chunks_file_version()
-                                   if uids_backfilled else None)
+            save_snapshot(chunks)
+        try:
+            version = self._get_chunks_file_version() if uids_backfilled else None
+        except ValueError:
+            # Publication succeeded. A failed cache probe only invalidates the cache.
+            version = None
+        self._uids_file_version = version
+        self._uids_backfilled = version is not None
+        # Bind only our validated staged bytes. A destination reread could
+        # attest an external edit that arrived immediately after publication.
+        self._uids_content_sha256 = hashlib.sha256(written_bytes).digest() if written_bytes is not None else None
 
     def _read_chunks_snapshot(self):
         """-> (bytes, (dev, ino)) of chunks.json read through one descriptor,
-        or (None, None) when it is missing or unreadable."""
-        flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+        or (None, None) when it is missing."""
+        flags = (os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+                 | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
         try:
             descriptor = os.open(self.chunks_path, flags)
-        except OSError:
-            return None, None
+        except FileNotFoundError:
+            if get_chunk_state_file_version(self.chunks_path) is None:
+                return None, None
+            raise ValueError("Saved chunks file disappeared while opening; saved progress was preserved")
+        except OSError as error:
+            raise ValueError("Saved chunks file is unreadable; it was preserved") from error
         try:
             info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("Saved chunks file is not a regular file; it was preserved")
             with os.fdopen(os.dup(descriptor), 'rb') as stream:
                 return stream.read(), (info.st_dev, info.st_ino)
         except OSError:
-            return None, None
+            raise ValueError("Saved chunks file is unreadable; it was preserved")
         finally:
             os.close(descriptor)
 
@@ -1159,10 +1390,18 @@ class ProjectManager:
         if raw is None:
             return None
         try:
-            return json.loads(raw.decode('utf-8'))
+            value = json.loads(raw.decode('utf-8'))
+        except RecursionError as error:
+            # Decoder-time overflow is the same controlled conflict as the
+            # post-decode depth guard, not corruption to back up or replace.
+            raise ValueError("Chunk status snapshot is too deeply nested") from error
         except (UnicodeDecodeError, ValueError) as error:
             logger.warning("Corrupted/unreadable JSON at %s, using default: %s", "chunks.json", error)
             return None
+        # A well-formed but over-nested standalone snapshot is a controlled
+        # conflict, not corruption: never back it up or regenerate over it.
+        _ensure_supported_depth(value, "snapshot")
+        return value
 
     def _read_chunks(self):
         """Read chunks.json, regenerating from script if missing or corrupted.
@@ -1172,19 +1411,21 @@ class ProjectManager:
         either name (#1660) is refused rather than parsed, renamed aside as
         corrupt, or regenerated over: the switch owns that name.
         """
-        from book_placeholder import is_book_placeholder, is_book_placeholder_bytes
+        from book_placeholder import (BookSwitchPlaceholderError, is_book_placeholder,
+                                      is_book_placeholder_bytes)
         switching = "A book switch is in progress; chunks are not available yet"
         journal_path = get_chunk_status_journal_path(self.chunks_path)
-        if is_book_placeholder(journal_path):
-            raise ValueError(switching)
-        if os.path.exists(journal_path):
-            # A placeholder landing after the check fails to parse: an error,
-            # never a write.
+        if get_chunk_state_file_version(journal_path) is not None:
+            if is_book_placeholder(journal_path):
+                raise BookSwitchPlaceholderError(switching)
             return self._get_status_journal_locked().get_rows()
         file_version = self._get_chunks_file_version()
         raw, read_identity = self._read_chunks_snapshot()
         if raw is not None and is_book_placeholder_bytes(raw):
-            raise ValueError(switching)
+            raise BookSwitchPlaceholderError(switching)
+        if (raw is None) != (file_version is None):
+            raise ValueError("Saved chunks changed while reading. Retry.")
+        content_sha256 = hashlib.sha256(raw).digest() if raw is not None and sys.platform == 'win32' else None
         chunks = self._parse_chunks_snapshot(raw)
         if not isinstance(chunks, list) or not all(isinstance(c, dict) for c in chunks):
             chunks = None
@@ -1194,6 +1435,7 @@ class ProjectManager:
             # revalidate a replaced saved book or an externally edited file.
             if (not self._uids_backfilled
                     or file_version != self._uids_file_version
+                    or content_sha256 != self._uids_content_sha256
                     or file_version != self._get_chunks_file_version()):
                 changed = False
                 for chunk in chunks:
@@ -1204,30 +1446,30 @@ class ProjectManager:
                     self._save_chunks_locked(chunks, uids_backfilled=True)
                 else:
                     after_version = self._get_chunks_file_version()
-                    self._uids_backfilled = file_version == after_version
+                    self._uids_backfilled = after_version is not None and file_version == after_version
                     self._uids_file_version = (after_version
                                                if self._uids_backfilled else None)
+                    self._uids_content_sha256 = content_sha256 if self._uids_backfilled else None
             return chunks
-        if os.path.exists(self.chunks_path):
+        if raw is not None:
             # Back the corrupted file up rather than deleting it - regenerating
             # resets every chunk to pending/no-audio, so keep a copy in case the
-            # user's generation progress can be salvaged from it.
-            # Only back up the object that was read and found corrupt: a
-            # switch's placeholder appearing since is not ours to rename.
-            try:
-                now = os.lstat(self.chunks_path)
-            except OSError:
-                now = None
+            # user's generation progress can be salvaged from it. Decide from
+            # the bytes actually read, not from a presence probe that would
+            # hide a post-read stat failure as absence and regenerate silently.
             if is_book_placeholder(self.chunks_path):
-                raise ValueError(switching)
-            if now is None or (now.st_dev, now.st_ino) != read_identity:
-                # Identity alone can be fooled by a reused inode number; the
-                # placeholder check above does not depend on it.
+                raise BookSwitchPlaceholderError(switching)
+            current = get_chunk_state_file_version(self.chunks_path)
+            if current is None or current[:2] != read_identity:
                 raise ValueError("chunks.json changed while it was being read; "
                                  "nothing was renamed. Retry.")
             backup = self.chunks_path + ".corrupt"
             suffix = 0
-            while os.path.lexists(backup):
+            while True:
+                try:
+                    os.lstat(backup)
+                except FileNotFoundError:
+                    break
                 suffix += 1
                 backup = self.chunks_path + f".corrupt.{suffix}"
             logger.warning("chunks.json is corrupted; backing it up to %s and regenerating.", backup)
@@ -1240,7 +1482,13 @@ class ProjectManager:
                     "file and resolve the backup failure before retrying."
                 ) from error
 
-        # If no chunks (or corrupted), generate from script
+        chunks = self._build_initial_chunks()
+        if chunks is not None:
+            self._save_chunks_locked(chunks, uids_backfilled=True)
+        return chunks if chunks is not None else []
+
+    def _build_initial_chunks(self):
+        """Prepare initial rows without publishing them."""
         if os.path.exists(self.script_path):
             try:
                 with open(self.script_path, "r", encoding="utf-8") as f:
@@ -1249,7 +1497,7 @@ class ProjectManager:
                     raise ValueError("expected an array of objects")
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(f"annotated_script.json is also corrupted ({e}). Starting with empty chunks.")
-                return []
+                return None
 
             review = []
             chunks = group_into_chunks(script, review_sink=review)
@@ -1262,10 +1510,9 @@ class ProjectManager:
                 chunk["status"] = "pending"  # pending, generating, done, error
                 chunk["audio_path"] = None
 
-            self._save_chunks_locked(chunks, uids_backfilled=True)
             return chunks
 
-        return []
+        return None
 
     def _get_status_journal_locked(self):
         try:
@@ -1290,23 +1537,38 @@ class ProjectManager:
         """Read the effective TTS inputs, including aliases and ensemble members."""
         return get_chunk_voice_inputs(voices, chunk, index, resolve_alias=self._resolve_alias)
 
-    def _apply_voice_timeline_audio_invalidation_locked(self, before, after):
+    def _apply_voice_timeline_audio_invalidation_locked(self, before, after, *,
+                                                        chunks=None, uids_added=False):
         """Caller holds chunk locks through the subsequent voice-config write.
 
         Invalidate before publishing voices: an interrupted save can require
         extra regeneration, but cannot leave changed voices with current audio.
         """
-        if not os.path.exists(self.chunks_path):
-            return []
-        chunks = self._read_chunks()
-        changed = [index for index, chunk in enumerate(chunks)
-                   if self.get_chunk_voice_inputs(before, chunk, index) !=
-                      self.get_chunk_voice_inputs(after, chunk, index)]
+        if chunks is None:
+            if get_chunk_state_file_version(self.chunks_path) is None:
+                return []
+            chunks = self._read_chunks()
+        uid_index = build_uid_index(chunks)
+        before_resolved = resolve_timeline_anchors(before, uid_index=uid_index)
+        after_resolved = resolve_timeline_anchors(after, uid_index=uid_index)
+        changed = []
+        for index, chunk in enumerate(chunks):
+            proposed = self.get_chunk_voice_inputs(after_resolved, chunk, index)
+            try:
+                previous = self.get_chunk_voice_inputs(before_resolved, chunk, index)
+            except VoiceAliasResolutionError:
+                changed.append(index)
+                continue
+            if previous != proposed:
+                changed.append(index)
         updated = copy.deepcopy(chunks)
         for index in changed:
             updated[index].update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                                   voice_revision=uuid.uuid4().hex)
-        if changed:
+        if changed or uids_added:
+            for row in updated:
+                if not row.get("uid"):
+                    row["uid"] = _new_chunk_uid()
             self._save_chunks_locked(updated, uids_backfilled=True)
         return [updated[index]["uid"] for index in changed]
 
@@ -1330,13 +1592,25 @@ class ProjectManager:
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk.get("uid")))
             return chunk
 
-    def insert_chunk(self, after_index):
+    def _get_structure_edit_rows_locked(self, index, expected_uid):
+        try:
+            chunks = self._get_saved_chunk_rows_locked()
+        except FileNotFoundError:
+            chunks = self._build_initial_chunks() if expected_uid is None else None
+        chunks = chunks or []
+        if expected_uid is not None and (
+                not 0 <= index < len(chunks) or chunks[index].get("uid") != expected_uid):
+            raise ValueError("Editor row changed; reload before saving")
+        return chunks
+
+    def insert_chunk(self, after_index, *, expected_uid=None):
         """Insert an empty chunk after the given index. Returns the new chunk list."""
         with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
-            chunks = self._read_chunks()
+            chunks = self._get_structure_edit_rows_locked(after_index, expected_uid)
             if not (0 <= after_index < len(chunks)):
                 return None
-            before = copy.deepcopy(chunks)
+            voices = self.get_voice_config_for_update()
+            before = chunks.copy()
 
             # Copy speaker from the row we're splitting from
             source = chunks[after_index]
@@ -1354,31 +1628,43 @@ class ProjectManager:
             # Re-number all IDs
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
+                if not chunk.get("uid"):
+                    chunk["uid"] = _new_chunk_uid()
 
-            self._invalidate_reindexed_audio_locked(before, chunks)
+            self._invalidate_reindexed_audio_locked(before, chunks, voices)
             self._save_chunks_locked(chunks, uids_backfilled=True)
             return chunks
 
-    def delete_chunk(self, index):
+    def delete_chunk(self, index, *, expected_uid=None, include_before_revision=False):
         """Delete a chunk at the given index. Returns (deleted_chunk, updated_chunks) or None."""
         with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
-            chunks = self._read_chunks()
+            chunks = self._get_structure_edit_rows_locked(index, expected_uid)
             if not (0 <= index < len(chunks)):
                 return None
             if len(chunks) <= 1:
                 return None  # don't allow deleting the last chunk
-            before = copy.deepcopy(chunks)
+            saved_voices = self.get_voice_config_for_update()
+            if include_before_revision:
+                from editor_poll_snapshot import get_snapshot_digest
+                before_revision = get_snapshot_digest(chunks)
+            before = chunks.copy()
 
-            voices = self.get_voice_config_for_update()
+            voices = resolve_timeline_anchors(saved_voices, before)
             deleted = chunks.pop(index)
+            if not deleted.get("uid"):
+                deleted["uid"] = _new_chunk_uid()
             deleted["_deleted_voice_inputs"] = self.get_chunk_voice_inputs(voices, deleted, index)
 
             # Re-number all IDs
             for i, chunk in enumerate(chunks):
                 chunk["id"] = i
+                if not chunk.get("uid"):
+                    chunk["uid"] = _new_chunk_uid()
 
-            self._invalidate_reindexed_audio_locked(before, chunks)
+            self._invalidate_reindexed_audio_locked(before, chunks, saved_voices)
             self._save_chunks_locked(chunks, uids_backfilled=True)
+            if include_before_revision:
+                return deleted, chunks, before_revision
             return deleted, chunks
 
     def restore_chunk(self, at_index, chunk_data):
@@ -1400,7 +1686,8 @@ class ProjectManager:
                 chunk_data.setdefault("uid", _new_chunk_uid())
             chunks.insert(at_index, chunk_data)
             old_voice_inputs = chunk_data.pop("_deleted_voice_inputs", None)
-            voices = self.get_voice_config_for_update()
+            saved_voices = self.get_voice_config_for_update()
+            voices = resolve_timeline_anchors(saved_voices, chunks)
             if chunk_data.get("audio_path") and (
                     old_voice_inputs is None or
                     old_voice_inputs != self.get_chunk_voice_inputs(voices, chunk_data, at_index)):
@@ -1412,28 +1699,28 @@ class ProjectManager:
                 chunk["id"] = i
 
             self._invalidate_reindexed_audio_locked(
-                [row for row in chunks if row is not chunk_data], chunks)
+                [row for row in chunks if row is not chunk_data], chunks, saved_voices)
             self._save_chunks_locked(chunks, uids_backfilled=bool(chunk_data.get("uid")))
             return chunks
 
     def get_voice_config_for_update(self):
         """Read voice inputs without turning damaged state into empty inputs."""
-        try:
-            with open(self.voice_config_path, "r", encoding="utf-8") as handle:
-                voices = json.load(handle)
-        except FileNotFoundError:
-            return {}
-        if not isinstance(voices, dict):
-            raise ValueError("Cannot update chunks with malformed voice configuration")
-        return voices
+        return read_voice_config(self.voice_config_path)
 
-    def _invalidate_reindexed_audio_locked(self, before, after):
+    def _invalidate_reindexed_audio_locked(self, before, after, voices):
         """Keep completed renders only when reindexing preserves their voice."""
-        voices = self.get_voice_config_for_update()
-        previous = {row.get("uid"): (index, row) for index, row in enumerate(before)}
+        before_voices = resolve_timeline_anchors(voices, before)
+        after_voices = resolve_timeline_anchors(voices, after)
+        # Both lists hold the physical row objects from the same locked edit.
+        # A duplicate UID cannot identify which copy survived an insertion/deletion.
+        previous = {id(row): index for index, row in enumerate(before)}
+        ambiguous = ambiguous_uids(before) | ambiguous_uids(after)
         for index, row in enumerate(after):
-            old = previous.get(row.get("uid"))
-            if old is not None and self.get_chunk_voice_inputs(voices, old[1], old[0]) != self.get_chunk_voice_inputs(voices, row, index):
+            old = previous.get(id(row))
+            if old is not None and (
+                    row.get("uid") in ambiguous
+                    or self.get_chunk_voice_inputs(before_voices, row, old)
+                    != self.get_chunk_voice_inputs(after_voices, row, index)):
                 row.update(status="pending", audio_path=None, error=None, drift=None, outlier=None,
                            voice_revision=uuid.uuid4().hex)
 
@@ -1528,6 +1815,7 @@ class ProjectManager:
             if render_changed:
                 chunk["status"] = "pending"
                 chunk["audio_path"] = None
+                chunk["error"] = None
                 if "outlier" in chunk:
                     chunk["outlier"] = None
                 if "drift" in chunk:
@@ -1551,12 +1839,18 @@ class ProjectManager:
     def _update_chunk_fields_by_uid(self, uid, expected_chunk=None, required_status=None,
                                     audio_source=None, expected_fields=None, expected_related_chunks=None,
                                     require_target=False, publication_audio=None, restore_speech_receipt=False,
-                                    audio_source_authority=None, **kwargs):
+                                    audio_source_authority=None, before_update=None, **kwargs):
         """Conditionally publish to the live UID under one lock, preserving other rows.
 
         Generation compares only captured render inputs. An owned converted temp
         file is promoted under this same guard, after conversion outside the lock.
         Existing non-generation callers retain the UID-only update contract.
+
+        ``before_update`` is an optional raise-to-veto command run while both the
+        chunk mutex and the file lock are held, immediately before a metadata
+        write. Cleanup and speech recheck pass an exact-owner/claim validator
+        here instead of checking before the lock is acquired, so a successor
+        that installed its claim while this worker waited cannot be overwritten.
         """
         if not uid:
             return None
@@ -1569,7 +1863,8 @@ class ProjectManager:
                 raise SynthesisWorkspaceUnavailable('Registered publication book changed')
         with self._chunks_lock, file_lock(self.chunks_path):
             use_journal = (self._active_journal_identity is not None
-                           or os.path.exists(get_chunk_status_journal_path(self.chunks_path)))
+                           or get_chunk_state_file_version(
+                               get_chunk_status_journal_path(self.chunks_path)) is not None)
             journal = self._get_status_journal_locked() if use_journal else None
             chunks = None if journal else self._read_chunks()
             chunk = (journal.get_row(uid) if journal
@@ -1622,6 +1917,7 @@ class ProjectManager:
                         break
                 else:
                     raise ValueError("Both chunk audio publication slots are referenced; preserve the shared takes before retrying")
+                ensure_audio_generation_commit_active()
                 kwargs["audio_path"] = candidate
                 if audio_source_authority is not None:
                     published_path = str(audio_source_authority.stage.directory.parent.parent / candidate)
@@ -1629,7 +1925,9 @@ class ProjectManager:
                 else:
                     with open(audio_source, "rb+") as handle:
                         os.fsync(handle.fileno())
-                    publish_audio_output(audio_source, self.get_chunk_audio_path(candidate))
+                    if publish_audio_output(audio_source, self.get_chunk_audio_path(candidate),
+                            cancel_check=ensure_audio_generation_commit_active) is False:
+                        raise AudioGenerationCancelled()
                 sync_adapter_directory(self.voicelines_dir)
                 final_path = (published_path if audio_source_authority is not None
                               else self.get_chunk_audio_path(candidate))
@@ -1664,6 +1962,12 @@ class ProjectManager:
                     kwargs['speech_verification'] = {**receipt,
                         'audio_file_version': list(publication_version[:5])}
             if kwargs:
+                # Under both locks: an obsolete worker whose claim was
+                # replaced while it waited for the chunk mutex must not write.
+                # The same guard is threaded into the durable write below so a
+                # cancellation during staging/serialization is also observed.
+                if before_update is not None:
+                    before_update()
                 if audio_source is not None and publication_retry_budget is not None:
                     publication_retry_budget.check_active()
                 if audio_source_authority is not None:
@@ -1676,11 +1980,12 @@ class ProjectManager:
                         preserve_retained_takes(self.root_dir, [chunk], [changed])
                         if changed.get(RETAINED_TAKE_KEY) != chunk.get(RETAINED_TAKE_KEY):
                             kwargs[RETAINED_TAKE_KEY] = changed.get(RETAINED_TAKE_KEY)
-                    chunk = journal.apply_update(uid, kwargs)
+                    chunk = journal.apply_update(uid, kwargs, before_append=before_update)
                 else:
                     chunk.update(kwargs)
                     self._save_chunks_locked(chunks, uids_backfilled=bool(chunk.get("uid")),
-                        retained_update_uid=uid if RETAINED_TAKE_KEY in kwargs else None)
+                        retained_update_uid=uid if RETAINED_TAKE_KEY in kwargs else None,
+                        before_replace=before_update)
             return chunk
 
     def _publish_generated_chunk_audio(self, chunk, temp_path, speaker, recovery_parent=None, publication_admission=None):
@@ -1693,7 +1998,9 @@ class ProjectManager:
         with ensure_occurrence_pronunciation_context(chunk, chunk.get("_pronunciation_context")):
             preparation = get_speech_normalization(chunk.get("text", ""))
             validator = _RAW_CHUNK_VALIDATE if workspace is not None else validate_generated_audio
-            validator(temp_path, "generated speech", expected_text=preparation["text"])
+            prepared_text_sha256 = get_pronunciation_text_digest(preparation["text"])
+            validator(temp_path, "generated speech", expected_text=preparation["text"],
+                      extra_audio_seconds=get_synthesis_added_silence_seconds(chunk, prepared_text_sha256))
         revision = uuid.uuid4().hex
         evidence = {}
         if preparation.get("pronunciation_decisions"):
@@ -1702,14 +2009,16 @@ class ProjectManager:
                 "text_sha256": get_pronunciation_text_digest(chunk.get("text", "")),
                 "prepared_sha256": preparation["pronunciation_prepared_sha256"],
                 "speech_sha256": get_pronunciation_text_digest(preparation["text"]),
-                "context": chunk.get("_pronunciation_context", {}),
+                "context": {key: value for key, value in
+                            chunk.get("_pronunciation_context", {}).items()
+                            if key != "voice_sha256_legacy"},
                 "decisions": preparation["pronunciation_decisions"]}
         elif "pronunciation_receipt" in chunk:
             evidence["pronunciation_receipt"] = None
         synthesis_receipt = chunk.get("_synthesis_receipt")
         if synthesis_receipt is not None:
             if (not isinstance(synthesis_receipt, dict)
-                    or synthesis_receipt.get("prepared_text_sha256") != get_pronunciation_text_digest(preparation["text"])):
+                    or synthesis_receipt.get("prepared_text_sha256") != prepared_text_sha256):
                 raise ValueError("Internal synthesis receipt does not match the rendered speech")
             evidence["synthesis_receipt"] = {**copy.deepcopy(synthesis_receipt),
                                               "audio_revision": revision, "scope": "pre-encoding PCM"}
@@ -1768,8 +2077,13 @@ class ProjectManager:
                         raise SynthesisWorkspaceUnavailable('Publication writer changed after workspace admission')
                     source_authority.check()
                     authority_options['audio_source_authority'] = source_authority
+                # Selecting the new take is a separate durable decision from
+                # installing the slot. Revalidate the exact owner under both
+                # locks so an acknowledged cancel after the slot rename but
+                # before its directory sync cannot still select it (R2).
                 updated = self._update_chunk_fields_by_uid(
                     chunk["uid"], expected_chunk=chunk, audio_source=staged_path,
+                    before_update=ensure_audio_generation_commit_active,
                     publication_audio=publication['audio'] if publication is not None else None,
                     status="done", audio_revision=revision, error=None, drift=None, outlier=None, **authority_options, **evidence)
             if updated is None:
@@ -1799,7 +2113,8 @@ class ProjectManager:
                 current = self._update_chunk_fields_by_uid(chunk.get('uid'), expected_chunk=chunk)
                 if current is None:
                     raise ValueError(GENERATION_INPUTS_CHANGED)
-                receipt = validate_retained_take(current) or make_retained_take(self.root_dir, current)
+            receipt = validate_retained_take(current) or make_retained_take(
+                self.root_dir, current, cancel_check=ensure_audio_generation_active)
             if receipt is None:
                 yield {}
                 return
@@ -1817,6 +2132,7 @@ class ProjectManager:
             else:
                 saved = history.capture(os.path.join(self.root_dir, receipt['path']), token, current['uid'],
                     receipt['captured'], expected_source_version=receipt['source_version'],
+                    expected_source_sha256=receipt.get('source_sha256'),
                     cancel_check=ensure_audio_generation_active)
                 receipt = {**receipt, 'archive': dict(version=saved['version'], sha256=saved['sha256'],
                     path=f"take_history/{saved['version']}{os.path.splitext(receipt['path'])[1].lower()}")}
@@ -1851,8 +2167,14 @@ class ProjectManager:
         with scope as retained, self._ensure_chunk_generation_publication(chunk) as current_book:
             if not current_book:
                 return None
+            # Ordinary owned status writes (generating/error/done) must carry
+            # the exact-claim guard into the durable write; genuinely unowned
+            # callers keep the UID-only contract, and claim-only validation
+            # still permits the same owner to record its own error (R5).
+            guarded = (ensure_audio_generation_claim_current
+                       if get_audio_generation_owner() is not None else None)
             return self._update_chunk_fields_by_uid(
-                chunk.get("uid"), expected_chunk=chunk, **fields, **retained)
+                chunk.get("uid"), expected_chunk=chunk, before_update=guarded, **fields, **retained)
 
     def _capture_take_publication_admission(self, engine, parent, index, chunk, voice_config, speaker):
         if parent is None or not get_take_history_policy(self.root_dir)['enabled']:
@@ -1873,13 +2195,20 @@ class ProjectManager:
             return capture_take_publication_admission(engine, parent, token, chunk['uid'], index,
                 get_chunk_generation_inputs(chunk), voice_config, speaker)
 
-    def get_chunk_render_voice_config(self, voices, speaker, chunk, index, *, batch_seed=None):
-        """Materialize the same voice selection for rendering and take comparison."""
-        resolved = resolve_narrator_voice_config(speaker, voices, chunk)
+    def get_chunk_render_voice_config(self, voices, speaker, chunk, index, *, batch_seed=None,
+                                      finalize=True):
+        """Materialize the same voice selection for rendering and take comparison.
+
+        ``finalize=False`` reproduces the historical v1/v2 materialization for
+        legacy receipt comparison only; production dispatch is always final.
+        """
+        if finalize:
+            _, resolved, _ = get_chunk_render_voice_selection(voices, speaker, chunk, index)
+        else:
+            resolved = resolve_narrator_voice_config(speaker, voices, chunk)
+            resolved = voice_config_for_chunk(resolved, speaker, index)
         if batch_seed is not None:
-            from tts import get_batch_voice_config
-            return get_batch_voice_config(resolved, speaker, index, batch_seed)
-        resolved = voice_config_for_chunk(resolved, speaker, index)
+            return get_seeded_batch_voice_config(resolved, batch_seed)
         if self._load_tts_config().get('reproducible_takes') is True:
             resolved = get_reproducible_voice_config(resolved,
                 get_chunk_seed(chunk['text'], chunk.get('take', 0)), take=chunk.get('take', 0))
@@ -2024,10 +2353,19 @@ class ProjectManager:
                 current = self._update_chunk_fields_by_uid(chunk.get("uid"), expected_chunk=chunk)
                 if current is not None and current.get("status") == "generating":
                     retry_fields = {} if speech_retry_attempts is None else {"speech_retry_attempts": speech_retry_attempts}
+                    # Revalidate the claim under the chunk mutex, immediately
+                    # before the write: a successor may have installed its
+                    # claim while this obsolete worker waited for that lock.
                     return self._update_chunk_fields_by_uid(
                         chunk.get("uid"), expected_chunk=chunk, required_status="generating",
                         status=(chunk.get("status", "pending") if chunk.get("status") != "generating" else "pending"),
-                        error=chunk.get("error"), **retry_fields)
+                        error=chunk.get("error"), before_update=ensure_audio_generation_claim_current,
+                        **retry_fields)
+                if current is not None:
+                    # A read that finds an already-settled row is only
+                    # countable for the successor's exact claim; otherwise the
+                    # obsolete cleanup must report zero (R5).
+                    ensure_audio_generation_claim_current()
                 return current
         except AudioGenerationCancelled:
             # A replaced/released owner has no authority even for cleanup.
@@ -2072,13 +2410,23 @@ class ProjectManager:
         self.ensure_literal_render_inputs(chunks, [index])
         requests = get_chunk_generation_requests(
             chunks, [index], {index: admitted_chunk} if admitted_chunk is not None else None)
-        return self._generate_captured_chunk_audio(index, requests[index])
+        with full_uid_index_context(build_uid_index(chunks)):
+            return self._generate_captured_chunk_audio(index, requests[index])
 
     def ensure_literal_render_inputs(self, chunks, indices):
         def version():
             try:
                 stat = os.stat(self.script_path)
-                return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                if sys.platform == 'win32':
+                    # Windows ctime is creation time: same-size rewrites can
+                    # retain the entire stat identity after restoring mtime.
+                    with open(self.script_path, 'rb') as source:
+                        digest = hashlib.sha256()
+                        for block in iter(lambda: source.read(1024 * 1024), b''):
+                            digest.update(block)
+                    return identity + (digest.hexdigest(),)
+                return identity
             except FileNotFoundError:
                 return None
         with self._literal_policy_lock:
@@ -2207,6 +2555,7 @@ class ProjectManager:
             # while app.py's voice_library endpoints hold file_lock(voice_config_path)
             # for a read-modify-write — no extra locking needed here.
             voice_config = safe_load_json(self.voice_config_path, default={})
+            voice_config = resolve_timeline_anchors(voice_config)
 
             if chunk.get("pronunciation_rules"):
                 settings = engine.get_model_settings() if callable(getattr(engine, "get_model_settings", None)) else {}
@@ -2214,11 +2563,6 @@ class ProjectManager:
                     voice_config, chunk, index, settings)}
 
             speaker = chunk["speaker"]
-            # Resolve aliases to canonical speaker used for TTS
-            canonical_speaker = self._resolve_alias(speaker, voice_config)
-            if canonical_speaker != speaker:
-                print(f"Resolving alias: '{speaker}' -> '{canonical_speaker}'")
-            speaker_to_use = canonical_speaker
             text = chunk["text"]
             instruct = chunk.get("instruct", "")
 
@@ -2231,7 +2575,10 @@ class ProjectManager:
             render_batch_seed = (batch_seed_value
                                  if type(batch_seed_value) is int and batch_seed_value >= 0 else None)
             chunk_voice_config = self.get_chunk_render_voice_config(
-                voice_config, speaker_to_use, chunk, index, batch_seed=render_batch_seed)
+                voice_config, speaker, chunk, index, batch_seed=render_batch_seed)
+            speaker_to_use = self._resolve_alias(speaker, chunk_voice_config)
+            if speaker_to_use != speaker:
+                print(f"Resolving alias: '{speaker}' -> '{speaker_to_use}'")
             if retry_budget is not None and retry_budget.requested_seed is None:
                 retry_budget.requested_seed = self._speech_retry_requested_seed(
                     chunk, chunk_voice_config, speaker_to_use, text)
@@ -2438,8 +2785,9 @@ class ProjectManager:
             self._restore_and_release(chunk, history)
             return False, AUDIO_GENERATION_CANCELLED
         except Exception as write_error:
-            print(f"Warning: Failed to persist speech-retry failure for "
-                  f"{chunk.get('uid')}: {write_error}")
+            from review_startup import record_failure
+            record_failure('speech_retry_persist_failed', write_error, task='audio', resource=chunk.get('uid'),
+                           rate_limit_seconds=300)
             self._restore_and_release(chunk, history)
             return False, str(error)
 
@@ -2448,8 +2796,9 @@ class ProjectManager:
         try:
             self._restore_cancelled_generation(chunk, speech_retry_attempts=history)
         except Exception as restore_error:
-            print(f"Warning: Failed to restore cancelled generation for "
-                  f"{chunk.get('uid') if isinstance(chunk, dict) else None}: {restore_error}")
+            from review_startup import record_failure
+            record_failure('speech_retry_restore_failed', restore_error, task='audio',
+                           resource=chunk.get('uid') if isinstance(chunk, dict) else None, rate_limit_seconds=300)
 
     def _load_pause_defaults(self):
         """Return (pause_between_speakers_ms, pause_same_speaker_ms) from config."""
@@ -2592,8 +2941,20 @@ class ProjectManager:
             ensure_audio_export_active(cancel_check)
             ensure_export_stage_current(pending_output, quality_report, cancel_check)
             source_snapshot.verify_sources()
-            with source_snapshot.ensure_publication(pending_output, quality_report):
-                replace_export_output(pending_output, output_path)
+            publication_outputs = {pending_output: quality_report}
+            with source_snapshot.ensure_publication_transaction(publication_outputs) as admit:
+                from project_scope_exports import publish_export_with_receipt
+
+                def replace():
+                    if replace_export_output(pending_output, output_path,
+                            cancel_check=ensure_audio_generation_commit_active) is False:
+                        raise AudioGenerationCancelled()
+                    # The publisher verifies the installed file separately.
+                    publication_outputs.pop(pending_output)
+
+                publish_export_with_receipt(self.root_dir, pending_output, output_path,
+                    quality_report.get('sha256'), replace,
+                    expected_version=quality_report.get('file_version'), admit_replace=admit)
             quality_report = {**quality_report, 'skipped_chunks': skipped}
             notify_completed_export(output_path, output_filename, quality_report, export_quality_callback)
             if mastering_report and mastering_callback:
@@ -2687,7 +3048,8 @@ class ProjectManager:
                 # failure mid-write can't leave a truncated zip the download route serves
                 # as valid (or clobber a previous good export with garbage).
                 zip_path = os.path.join(self.root_dir, "audacity_export.zip")
-                tmp_zip = zip_path + f".pending.{uuid.uuid4().hex}"
+                staging = create_export_staging(self.root_dir, 'audacity')
+                tmp_zip = os.fspath(staging.path / "audacity_export.zip")
                 track_shapes = {}
                 try:
                     ensure_audio_export_active(cancel_check)
@@ -2745,16 +3107,19 @@ class ProjectManager:
                     ensure_export_stage_current(tmp_zip, quality_report, cancel_check)
                     source_snapshot.verify_sources()
                     with source_snapshot.ensure_publication(tmp_zip, quality_report):
-                        os.replace(tmp_zip, zip_path)
+                        from project_scope_exports import publish_export_with_receipt
+                        publish_export_with_receipt(self.root_dir, tmp_zip, zip_path,
+                            quality_report.get('sha256'),
+                            lambda: os.replace(tmp_zip, zip_path),
+                            expected_version=quality_report.get('file_version'))
                     notify_completed_export(zip_path, 'audacity_export.zip', quality_report,
                                             export_quality_callback)
-                except BaseException as error:
+                finally:
                     try:
-                        if os.path.exists(tmp_zip):
-                            os.remove(tmp_zip)
-                    except OSError:
-                        pass
-                    raise
+                        staging.finish(remove=True)
+                    except OSError as error:
+                        logging.getLogger('AlexandriaUI').warning(
+                            'Audacity export staging cleanup failed: %s', error)
 
                 if skipped:
                     return True, f"{zip_path} ({skipped} chunk(s) skipped — missing/corrupt audio)"
@@ -2764,7 +3129,7 @@ class ProjectManager:
 
     def merge_m4b(self, per_chunk_chapters=False, metadata=None, cancel_check=None, progress_callback=None,
                   mastering=None, mastering_callback=None, export_quality=None, export_quality_callback=None,
-                  source_cover=None, expected_book_token=None):
+                  source_cover=None, expected_book_token=None, *, expected_editor_revision=None):
         """Merge audio chunks into an M4B audiobook with chapter markers.
 
         Args:
@@ -2795,7 +3160,8 @@ class ProjectManager:
                 source_cover, expected_book_token, cancel_check))
             cover_path = resolved['cover_path']
             source_snapshot = ExportSourceSnapshot(self, cancel_check=cancel_check,
-                additional_sources=([cover_path] if cover_path else []) + list(resolved['expected_sources']))
+                additional_sources=([cover_path] if cover_path else []) + list(resolved['expected_sources']),
+                expected_editor_revision=expected_editor_revision)
             captured_cover = source_snapshot.identities.get(cover_path) if cover_path else None
             if cover_path and captured_cover is None:
                 raise ValueError('Selected M4B cover is missing before source capture')
@@ -2918,7 +3284,14 @@ class ProjectManager:
             ensure_export_stage_current(pending_output, quality_report, cancel_check)
             source_snapshot.verify_sources()
             with source_snapshot.ensure_publication(pending_output, quality_report):
-                replace_export_output(pending_output, output_path)
+                from project_scope_exports import publish_export_with_receipt
+                def replace():
+                    if replace_export_output(pending_output, output_path,
+                            cancel_check=ensure_audio_generation_commit_active) is False:
+                        raise AudioGenerationCancelled()
+                publish_export_with_receipt(self.root_dir, pending_output, output_path,
+                    quality_report.get('sha256'), replace,
+                    expected_version=quality_report.get('file_version'))
             quality_report = {**quality_report, 'skipped_chunks': skipped}
             notify_completed_export(output_path, 'audiobook.m4b', quality_report, export_quality_callback)
             if mastering_report and mastering_callback:
@@ -2985,13 +3358,23 @@ class ProjectManager:
                     and chunk.get("spoken") is not True
                     and source_start is not False
                     and '"' not in text
-                    and (source_start is True or is_smart_chapter_text(text))):
+                    and (source_start is True or is_smart_chapter_text(text))
+                    # A stored source flag can predate the look-alike rule;
+                    # a keyword heading is never a look-alike.
+                    and (is_keyword_chapter_heading(text) or not is_heading_lookalike(text))):
                 heading_indices.append(i)
+        # Adjacent untitled candidates are a status window, a list or a table of
+        # contents, not consecutive chapter starts (#1921). Keyword headings stay.
+        weak = {i for i in heading_indices
+                if not is_keyword_chapter_heading(chunks[i].get("text", ""))}
+        heading_indices = [i for i in heading_indices
+                           if i not in weak or (i - 1 not in weak and i + 1 not in weak)]
 
-        # If no headings detected, fall back to per-chunk
+        # No headings: the whole script is one chapter. One chapter per line is
+        # still available on request through per_chunk_chapters (#1921).
         if not heading_indices:
-            print("  Chapters: no chapter headings detected, falling back to per-chunk chapters")
-            return self._chapter_groups(chunks, per_chunk_chapters=True)
+            print("  Chapters: no chapter headings detected; the whole script is one chapter")
+            return [("Chapter 1", 0, len(chunks) - 1)] if chunks else []
 
         groups = []
         # Pre-heading chunks → "Introduction"
@@ -3031,19 +3414,56 @@ class ProjectManager:
             [chunk.get("pause_after") for chunk, _ in pairs],
             cancel_check=cancel_check)
 
+    def _get_book_chapter_groups(self, book, chunks, per_chunk_chapters):
+        """Chapters numbered by the whole book, mapped onto the rows being exported.
+
+        `chunks` is the in-order subset of `book` that has audio, as the same row
+        objects. Returns (book_index, title, first, last, missing) for each chapter
+        holding at least one of those rows: first/last are positions in `chunks`,
+        and missing counts the chapter's non-empty lines that are not among them.
+        Numbering by the book keeps chapter 500 named 500 while chapters 1-499
+        have no audio yet, and matches the Editor's chapter numbers (#1921).
+
+        Rows are matched by identity: every caller passes rows taken from the one
+        `book` list (ExportSourceSnapshot copies the chunks once; the decoders and
+        iter_timeline pass those same dicts through). A reload or copy in between
+        is refused rather than guessed at.
+        """
+        positions = {id(row): position for position, row in enumerate(book)}
+        located = [positions.get(id(row)) for row in chunks]
+        if None in located or any(b <= a for a, b in zip(located, located[1:])):
+            raise ValueError("Chapter rows changed during export. Retry the export.")
+        present = set(located)
+        groups, cursor = [], 0
+        for book_index, (title, first, last) in enumerate(self._chapter_groups(book, per_chunk_chapters)):
+            start = cursor
+            while cursor < len(located) and located[cursor] <= last:
+                cursor += 1
+            if cursor == start:
+                continue
+            missing = sum(1 for position in range(first, last + 1)
+                          if position not in present and book[position].get("text", "").strip())
+            groups.append((book_index, title, start, cursor - 1, missing))
+        return groups
+
     def _get_chapter_export_plans(self, chunks, options, pause_defaults,
-                                  get_source_fingerprint=None):
-        """Plan shared names, source ranges and fingerprints without publication."""
-        groups = self._chapter_groups(chunks, options["per_chunk_chapters"])
+                                  get_source_fingerprint=None, *, book):
+        """Plan shared names, source ranges and fingerprints without publication.
+
+        A plan's index and number are its chapter's place in `book`; its chunk
+        range is a position range in `chunks`, the rows with audio."""
+        groups = self._get_book_chapter_groups(book, chunks, options["per_chunk_chapters"])
         filenames = build_chapter_filenames(
-            groups, options["template"], options["format"], padding=options["padding"],
+            [(title, first, last) for _, title, first, last, _ in groups],
+            options["template"], options["format"], padding=options["padding"],
             book_name=options["book_name"], series_name=options["series_name"],
-            volume_number=options["volume_number"])
-        plans = [{"index": index, "number": index + 1, "title": title,
-                 "file": filenames[index], "chunks": [first, last],
+            volume_number=options["volume_number"],
+            numbers=[book_index + 1 for book_index, *_ in groups])
+        plans = [{"index": book_index, "number": book_index + 1, "title": title,
+                 "file": filenames[position], "chunks": [first, last],
                  "fingerprint": self._chapter_fingerprint(
                      chunks[first:last + 1], pause_defaults)}
-                for index, (title, first, last) in enumerate(groups)]
+                for position, (book_index, title, first, last, _) in enumerate(groups)]
         if get_source_fingerprint is not None:
             for plan in plans:
                 first, last = plan['chunks']
@@ -3075,7 +3495,7 @@ class ProjectManager:
                             len(rows) != len(manifest["chapters"])):
                         return False, ("Chapter export manifest is invalid; export all chapters "
                                        "without a selection to rebuild it.")
-                    if {row["index"]: row for row in rows} != previous:
+                    if get_current_chapter_rows(manifest) != previous:
                         return False, "Chapter exports changed while preparing this selection. Retry the export."
             staging = create_export_staging(out_dir, 'chapter')
             staging_dir = str(staging.path)
@@ -3088,8 +3508,7 @@ class ProjectManager:
                     cancel_check, staging_dir, publication_outputs, get_current_quality_plan)
                 if not result or not result[0]:
                     return result
-                from export_quality import (get_export_file_identity, get_export_file_version,
-                                            ensure_export_stage_current)
+                from export_quality import get_export_file_identity, ensure_export_stage_current
                 # Final byte proofs precede every publication lock. Retained
                 # chapters participate in the same set admission as new files.
                 for path, report in publication_outputs:
@@ -3109,24 +3528,36 @@ class ProjectManager:
                 names = sorted(os.path.basename(path) for path in outputs
                                if os.path.dirname(path) == staging_dir
                                and path != manifest_path)
-                touched = []
+                sources = [os.path.join(staging_dir, name) for name in names] + [manifest_path]
 
                 def publish(name):
                     source = os.path.join(staging_dir, name)
                     target = os.path.join(out_dir, name)
-                    backup = os.path.join(backup_dir, name)
-                    existed = os.path.lexists(target)
-                    if existed:
-                        os.replace(target, backup)
-                    touched.append((target, backup, existed))
-                    os.replace(source, target)
                     report = outputs.pop(source)
-                    version = get_export_file_version(target)
-                    if version[:4] != report['file_version'][:4]:
-                        raise ValueError('Finished chapter changed during publication. Retry the export.')
-                    outputs[target] = {**report, 'file_version': version}
+                    outputs[target] = publish_export_set_member(self.root_dir, members[name], report)
 
+                from project_scope_exports import (
+                    ExportCommitUncertain, ExportSetChanged, publish_export_set_member,
+                    get_export_set_cleanup_pending_detail,
+                    get_export_set_rollback_pending_detail, recover_failed_export_set,
+                    preflight_export_publication_batch, read_publication_journal,
+                    read_set_journal, record_export_publication,
+                    write_set_journal)
                 with source_snapshot.ensure_publication_transaction(outputs) as admit:
+                    preflight_export_publication_batch(self.root_dir,
+                        [os.path.join(out_dir, name) for name in names]
+                        + [os.path.join(out_dir, 'manifest.json')])
+                    _targets = ([os.path.join(out_dir, name) for name in names]
+                                + [os.path.join(out_dir, 'manifest.json')])
+                    _backups = ([os.path.join(backup_dir, name) for name in names]
+                                + [os.path.join(backup_dir, 'manifest.json')])
+                    if (read_publication_journal(self.root_dir) is not None
+                            or read_set_journal(self.root_dir) is not None):
+                        raise ValueError('An unresolved export set is pending; retry after recovery.')
+                    write_set_journal(self.root_dir, _targets, _backups,
+                        staged=[outputs[source] for source in sources], sources=sources)
+                    members = {Path(member['target']).name: member
+                               for member in read_set_journal(self.root_dir)['members']}
                     try:
                         with admit():
                             for name in names:
@@ -3136,24 +3567,41 @@ class ProjectManager:
                         ensure_audio_export_active(cancel_check)
                         with admit():
                             publish('manifest.json')
-                    except BaseException as error:
-                        failures = []
-                        for target, backup, existed in reversed(touched):
-                            try:
-                                if existed:
-                                    os.replace(backup, target)
-                                elif os.path.lexists(target):
-                                    os.unlink(target)
-                            except OSError as rollback_error:
-                                failures.append(f"{target}: {rollback_error}")
-                        if failures:
-                            retain_backup = True
-                            raise RuntimeError(
-                                f"Chapter export rollback failed; recovery files kept at {staging_dir}: "
-                                + "; ".join(failures)) from error
-                        if isinstance(error, ExportCancelled):
-                            return False, "Export cancelled"
+                        ensure_audio_generation_commit_active()
+                        for target in _targets:
+                            report = outputs.get(target, {})
+                            digest = report.get('sha256')
+                            if isinstance(digest, str):
+                                record_export_publication(self.root_dir, target, digest,
+                                    report.get('file_version'), export_set=True)
+                        # The whole set is reversible until this durable commit;
+                        # a cancel or replaced claim acknowledged during the
+                        # member moves or receipt recording must refuse it.
+                        ensure_audio_generation_commit_active()
+                        retain_backup = not write_set_journal(
+                            self.root_dir, _targets, _backups, committed=True,
+                            commit_check=ensure_audio_generation_commit_active)
+                    except ExportCommitUncertain:
+                        retain_backup = True
                         raise
+                    except BaseException as error:
+                        try:
+                            retain_backup = not recover_failed_export_set(self.root_dir, staging_dir)
+                        except BaseException:
+                            retain_backup = True
+                            raise
+                        if isinstance(error, (ExportCancelled, AudioGenerationCancelled)):
+                            if not retain_backup:
+                                return False, "Export cancelled"
+                            # The undo did not finish; the intent journal and
+                            # backups remain fenced. Report the phase-specific
+                            # pending state, not an ordinary cancellation (F04).
+                            return False, get_export_set_rollback_pending_detail(staging_dir)
+                        if isinstance(error, ExportSetChanged):
+                            return False, str(error)
+                        raise
+                if retain_backup:
+                    return False, get_export_set_cleanup_pending_detail(staging_dir)
                 return result
             except ExportCancelled:
                 return False, "Export cancelled"
@@ -3173,19 +3621,20 @@ class ProjectManager:
         from chapter_export_quality import (get_chapter_pcm_plan, get_chapter_quality_plan,
             ensure_chapter_piece_matches_plan, get_recorded_chapter_quality_plan, get_chapter_plan_duration_ms)
         from export_quality import get_admitted_export_report
+        available = {plan["index"] for plan in plans}
         try:
-            wanted = set(range(len(plans))) if chapters is None else set(get_index_selection(chapters, len(plans)))
+            wanted = available if chapters is None else set(get_chapter_selection(chapters, available))
         except ValueError as exc:
             return False, str(exc)
         out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
         rows, written, reused, cursor = [], 0, 0, 0
-        for plan in plans:
+        for position, plan in enumerate(plans):
             if cancel_check and cancel_check():
                 return False, "Export cancelled"
             index = plan["index"]
             first, last = plan["chunks"]
-            if index:
-                previous_last = plans[index - 1]["chunks"][1]
+            if position:
+                previous_last = plans[position - 1]["chunks"][1]
                 cursor += get_pause_duration_ms(
                     chunks[previous_last], chunks[first], *pause_defaults)
             old = previous.get(index)
@@ -3221,7 +3670,14 @@ class ProjectManager:
             elif index in wanted:
                 pairs, skipped = get_pairs(first, last)
                 if skipped or not pairs:
-                    return None
+                    lines = get_skipped_chapter_lines(chunks, first, last, pairs)
+                    where = ""
+                    if lines:
+                        word = "lines" if len(lines) > 1 else "line"
+                        shown = ", ".join(lines[:5]) + (", ..." if len(lines) > 5 else "")
+                        where = f" ({word} {shown})"
+                    return False, (f"Chapter {plan['number']} has missing or corrupt audio "
+                                   f"that could not be decoded{where}; regenerate it before exporting.")
                 try:
                     # get_chapter_audio always assembles the whole chapter, so
                     # the same finite ceiling applies before any trimmed copy
@@ -3246,7 +3702,7 @@ class ProjectManager:
                     duration = get_chapter_plan_duration_ms(quality_plan)
                     if progress_callback:
                         progress_callback(
-                            f"Writing chapter {index + 1}/{len(plans)}: {plan['title'][:60]}")
+                            f"Writing chapter {plan['number']} ({position + 1}/{len(plans)}): {plan['title'][:60]}")
                     kwargs = {"bitrate": MP3_BITRATE} if options["format"] == "mp3" else {}
                     quality_reports = []
                     mastering_report = _export_audio_segment(
@@ -3268,11 +3724,12 @@ class ProjectManager:
                 written += 1
             else:
                 if old is not None:
-                    return False, (f"Chapter {index + 1} has an invalid or unverified retained output; "
+                    return False, (f"Chapter {plan['number']} has an invalid or unverified retained output; "
                                    "select it for export or export all chapters to rebuild its independent frame proof.")
                 if durations is None:
-                    return None
-                row, duration = None, durations[index]
+                    return False, (f"Chapter {plan['number']} has no retained export and no computed "
+                                   "duration; export all chapters to rebuild the chapter manifest.")
+                row, duration = None, durations[position]
             if row is not None:
                 row["duration_ms"] = duration
                 row["start_ms"], row["end_ms"] = cursor, cursor + duration
@@ -3286,7 +3743,7 @@ class ProjectManager:
         if len(filenames) != len(set(filenames)):
             return False, "Chapter filenames collide with retained exports; export all chapters or choose a different filename template"
         atomic_json_write({**options, "chapters": rows},
-                          os.path.join(staging_dir, "manifest.json"))
+                          os.path.join(staging_dir, "manifest.json"), allow_nonatomic_fallback=False)
         note = f"{written} chapter file(s) written"
         if reused:
             note += f", {reused} unchanged and kept"
@@ -3309,10 +3766,11 @@ class ProjectManager:
         manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
         if manifest.get("chapter_plan_version") != options["chapter_plan_version"]:
             return None
-        previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
+        previous = get_current_chapter_rows(manifest)
         pause_defaults = source_snapshot.pause_defaults
         try:
-            plans = self._get_chapter_export_plans(chunks, options, pause_defaults)
+            plans = self._get_chapter_export_plans(chunks, options, pause_defaults,
+                                                   book=source_snapshot.chunks)
         except ValueError as exc:
             return False, str(exc)
         for plan in plans:
@@ -3360,7 +3818,7 @@ class ProjectManager:
                         book_name="", series_name="", volume_number="",
                         chapters=None, changed_only=False,
                         progress_callback=None, cancel_check=None, mastering=None,
-                        export_quality=None):
+                        export_quality=None, *, expected_editor_revision=None):
         """Write selected chapter files and shared source/timing metadata.
 
         Changed-only exports decode only changed groups when the prior manifest
@@ -3372,26 +3830,40 @@ class ProjectManager:
         options = {"export_quality": get_export_quality_options(export_quality), "format": fmt, "template": template, "padding": padding,
                    "per_chunk_chapters": per_chunk_chapters, "book_name": book_name,
                    "series_name": series_name, "volume_number": volume_number,
-                   "chapter_plan_version": 1}
+                   "chapter_plan_version": CHAPTER_PLAN_VERSION}
         if mastering is not None:
             from audio_mastering import get_mastering_options
             options["mastering"] = get_mastering_options(mastering)
         with PCMSourceStore(self.root_dir, lambda: ensure_audio_export_active(cancel_check)) as sources:
             try:
                 from export_publication import ExportSourceSnapshot
-                source_snapshot = ExportSourceSnapshot(self, cancel_check=cancel_check)
+                source_snapshot = ExportSourceSnapshot(self, cancel_check=cancel_check,
+                                                       expected_editor_revision=expected_editor_revision)
                 captured_chunks = source_snapshot.chunks
                 selected_sources = None
+                # Number chapters by the whole book, as preview does, before a
+                # decoder can remove rows. Keep order and multiplicity.
+                available_rows = []
+                for chunk in captured_chunks:
+                    ensure_audio_export_active(cancel_check)
+                    if self.is_chunk_audio_available(chunk):
+                        available_rows.append(chunk)
+                book_groups = self._get_book_chapter_groups(
+                    captured_chunks, available_rows, per_chunk_chapters)
                 if chapters is not None:
-                    # Match preview numbering before a decoder can remove rows.
-                    # Keep order and multiplicity, including legacy rows without UIDs.
-                    selected_sources = []
-                    for chunk in captured_chunks:
-                        ensure_audio_export_active(cancel_check)
-                        if self.is_chunk_audio_available(chunk):
-                            selected_sources.append(chunk)
-                    get_index_selection(chapters, len(self._chapter_groups(
-                        selected_sources, per_chunk_chapters)))
+                    get_chapter_selection(chapters, {group[0] for group in book_groups})
+                    selected_sources = available_rows
+                incomplete = [group[0] + 1 for group in book_groups
+                              if group[4] and (chapters is None or group[0] in chapters)]
+
+                def finish(result):
+                    """Name exported chapters that still have lines without audio."""
+                    if not result or not result[0] or not incomplete:
+                        return result
+                    shown = ", ".join(str(number) for number in incomplete[:20])
+                    shown += ", ..." if len(incomplete) > 20 else ""
+                    return True, (result[1] + f" Chapter(s) {shown} still have lines with no "
+                                  "generated audio; those lines are not in their files.")
                 from chapter_timing_cache import ensure_chapter_timing_facts
                 indexed = ensure_chapter_timing_facts(
                     self.root_dir, captured_chunks, self.get_chunk_audio_path,
@@ -3401,15 +3873,15 @@ class ProjectManager:
                 if indexed is not None:
                     if selected_sources is not None and [row for row, _ in indexed.pairs] != selected_sources:
                         return False, CHAPTER_SELECTION_AUDIO_ERROR
-                    return self._export_indexed_chapters(
+                    return finish(self._export_indexed_chapters(
                         indexed, sources, options, chapters, changed_only,
-                        progress_callback, cancel_check, source_snapshot=source_snapshot)
+                        progress_callback, cancel_check, source_snapshot=source_snapshot))
                 if changed_only and (selected_sources is None or captured_chunks == selected_sources):
                     incremental = self._export_changed_chapters(
                         captured_chunks, options, chapters, progress_callback, cancel_check,
                         source_snapshot=source_snapshot)
                     if incremental is not None:
-                        return incremental
+                        return finish(incremental)
                 pairs, skipped = self._load_chunks_with_audio(
                     cancel_check=cancel_check, chunks=captured_chunks,
                     progress_callback=_loading_progress(progress_callback),
@@ -3426,7 +3898,8 @@ class ProjectManager:
                     timeline.append((chunk, sources.save_segment(segment), start))
                     del segment
                 chunks = [chunk for chunk, _, _ in timeline]
-                plans = self._get_chapter_export_plans(chunks, options, pause_defaults)
+                plans = self._get_chapter_export_plans(chunks, options, pause_defaults,
+                                                       book=captured_chunks)
                 from chapter_export_quality import get_chapter_durations_ms
                 durations = get_chapter_durations_ms(plans,
                     [(row, segment) for row, segment, _ in timeline], pause_defaults, cancel_check)
@@ -3439,16 +3912,16 @@ class ProjectManager:
             out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
             os.makedirs(out_dir, exist_ok=True)
             manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
-            previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
+            previous = get_current_chapter_rows(manifest)
             result = self._apply_chapter_export_plans(
                 plans, chunks, options, pause_defaults, previous, chapters,
-                changed_only and manifest.get("chapter_plan_version") == 1,
+                changed_only and manifest.get("chapter_plan_version") == CHAPTER_PLAN_VERSION,
                 lambda first, last: ([(chunk, sources.load_segment(segment))
                                       for chunk, segment in pairs[first:last + 1]], 0), durations,
                 progress_callback, cancel_check, source_snapshot=source_snapshot)
             if result and result[0] and skipped:
-                return True, result[1] + f" ({skipped} chunk(s) skipped - missing/corrupt audio)"
-            return result
+                result = True, result[1] + f" ({skipped} chunk(s) skipped - missing/corrupt audio)"
+            return finish(result)
 
     def _export_indexed_chapters(self, indexed, sources, options, chapters,
                                   changed_only, progress_callback, cancel_check, *, source_snapshot):
@@ -3462,10 +3935,11 @@ class ProjectManager:
         chunks = [chunk for chunk, _, _ in timeline]
         plans = self._get_chapter_export_plans(
             chunks, options, pause_defaults,
-            lambda selected: indexed.get_source_fingerprint(selected, self.get_chunk_audio_path))
+            lambda selected: indexed.get_source_fingerprint(selected, self.get_chunk_audio_path),
+            book=source_snapshot.chunks)
         out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
         manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
-        previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
+        previous = get_current_chapter_rows(manifest)
         from chapter_export_quality import get_chapter_durations_ms
         durations = get_chapter_durations_ms(plans, indexed.pairs, pause_defaults, cancel_check)
 
@@ -3488,7 +3962,7 @@ class ProjectManager:
 
         result = self._apply_chapter_export_plans(
             plans, chunks, options, pause_defaults, previous, chapters,
-            changed_only and manifest.get('chapter_plan_version') == 1,
+            changed_only and manifest.get('chapter_plan_version') == CHAPTER_PLAN_VERSION,
             get_pairs, durations, progress_callback, cancel_check,
             source_check=indexed.verify_sources, source_snapshot=source_snapshot,
             get_current_quality_plan=get_current_quality_plan)
@@ -3545,10 +4019,15 @@ class ProjectManager:
     def preview_chapter_filenames(self, fmt="mp3", per_chunk_chapters=False,
                                   template=DEFAULT_CHAPTER_TEMPLATE, padding=2,
                                   book_name="", series_name="", volume_number="",
-                                  chapters=None, changed_only=False, mastering=None):
-        """Preview selected chapter files that export would write, excluding reuse."""
-        chunks = [chunk for chunk in self.load_chunks()
-                  if self.is_chunk_audio_available(chunk)]
+                                  chapters=None, changed_only=False, mastering=None, rows=None):
+        """Preview selected chapter files that export would write, excluding reuse.
+
+        `rows` lets a request reuse the rows it already admitted under a
+        non-recovering book lock, so a source switch between stages cannot make
+        this reader regenerate rows for the new book.
+        """
+        book = rows if rows is not None else self.load_chunks()
+        chunks = [chunk for chunk in book if self.is_chunk_audio_available(chunk)]
         options = {"format": fmt, "per_chunk_chapters": per_chunk_chapters,
                    "template": template, "padding": padding, "book_name": book_name,
                    "series_name": series_name, "volume_number": volume_number}
@@ -3561,12 +4040,14 @@ class ProjectManager:
             get_source_fingerprint = get_chapter_source_fingerprinter(
                 chunks, self.get_chunk_audio_path, None, self._get_chapter_decoder_codes())
         plans = self._get_chapter_export_plans(
-            chunks, options, self._load_pause_defaults(), get_source_fingerprint) if chunks else []
-        wanted = set(range(len(plans))) if chapters is None else set(get_index_selection(chapters, len(plans)))
+            chunks, options, self._load_pause_defaults(), get_source_fingerprint,
+            book=book) if chunks else []
+        available = {plan["index"] for plan in plans}
+        wanted = available if chapters is None else set(get_chapter_selection(chapters, available))
         out_dir = os.path.join(self.root_dir, CHAPTER_EXPORT_DIR)
         manifest = safe_load_json(os.path.join(out_dir, "manifest.json"), {})
-        previous = {row["index"]: row for row in get_chapter_export_rows(manifest)}
-        changed_only = changed_only and manifest.get("chapter_plan_version") == 1
+        previous = get_current_chapter_rows(manifest)
+        changed_only = changed_only and manifest.get("chapter_plan_version") == CHAPTER_PLAN_VERSION
         return [{"number": plan["number"], "title": plan["title"], "file": plan["file"]}
                 for plan in plans if plan["index"] in wanted and
                 get_chapter_reuse_duration(plan, previous.get(plan["index"]),
@@ -3587,7 +4068,8 @@ class ProjectManager:
         finally:
             with admit_take_history_edit(self.root_dir), self._chunks_lock, file_lock(self.chunks_path):
                 try:
-                    if os.path.exists(get_chunk_status_journal_path(self.chunks_path)):
+                    if get_chunk_state_file_version(
+                            get_chunk_status_journal_path(self.chunks_path)) is not None:
                         self._save_chunks_locked(self._read_chunks(), uids_backfilled=True)
                 finally:
                     self._active_journal_identity = None
@@ -3630,9 +4112,14 @@ class ProjectManager:
 
         all_indices = list(indices)
         audio_owner = get_audio_generation_owner()
+        uid_index = build_uid_index(chunks)
         speech_retry_budgets = {}
         if self._is_speech_retry_opted_in():
             speech_retry_budgets = {budget_index: None for budget_index in indices if captured.get(budget_index) is not None}
+
+        def render_captured(index, *args):
+            with full_uid_index_context(uid_index):
+                return self._generate_captured_chunk_audio(index, captured.get(index), *args)
 
         def render_with_retry_budget(index):
             if cancel_check and cancel_check():
@@ -3645,7 +4132,7 @@ class ProjectManager:
                     return False, AUDIO_GENERATION_CANCELLED
                 budget.cancel_check = cancel_check
                 speech_retry_budgets[index] = budget
-            return self._generate_captured_chunk_audio(index, captured[index], budget)
+            return render_captured(index, budget)
 
         def _run_round(round_indices, workers):
             """One pass at `workers` concurrency.
@@ -3664,7 +4151,7 @@ class ProjectManager:
                                                 render_with_retry_budget, idx)] = idx
                     else:
                         futures[executor.submit(run_with_audio_generation_owner, audio_owner,
-                                                self._generate_captured_chunk_audio, idx, captured.get(idx))] = idx
+                                                render_captured, idx)] = idx
                 for future in as_completed(futures):
                     if (is_audio_generation_cancelled() or (cancel_check and cancel_check())) and not was_cancelled:
                         was_cancelled = True
@@ -3767,9 +4254,13 @@ class ProjectManager:
                 groups.setdefault("custom", []).append(idx)
                 continue
             speaker = chunks[idx].get("speaker", "")
-            # Resolve alias before grouping so alias groups collate with their canonical speaker
-            canonical = self._resolve_alias(speaker, voice_config)
-            voice_data = voice_config.get(canonical, {})
+            try:
+                canonical, resolved, _ = get_chunk_render_voice_selection(voice_config, speaker, chunks[idx], idx)
+            except VoiceAliasResolutionError:
+                # Leave refusal and reservation settlement to per-row dispatch.
+                groups.setdefault("invalid", []).append(idx)
+                continue
+            voice_data = resolved.get(canonical, {})
             category = voice_category(voice_data)
 
             if category == "clone":
@@ -3850,13 +4341,17 @@ class ProjectManager:
                           f"lacks MP3 encoder (libmp3lame). Falling back to WAV.")
                     raise RuntimeError("MP3 export produced invalid file")
                 validate_generated_audio(staged_mp3, "MP3 chunk export")
-                publish_audio_output(staged_mp3, mp3_filepath)
+                if publish_audio_output(staged_mp3, mp3_filepath,
+                        cancel_check=ensure_audio_generation_commit_active) is False:
+                    raise AudioGenerationCancelled()
             finally:
                 if os.path.exists(staged_mp3):
                     os.remove(staged_mp3)
             return f"voicelines/{mp3_filename}"
 
         except Exception as e:
+            if isinstance(e, AudioGenerationCancelled):
+                raise
             if "invalid file" not in str(e).lower():
                 print(f"MP3 conversion failed: {e}")
             wav_filename = f"{filename_base}.wav"
@@ -3866,7 +4361,9 @@ class ProjectManager:
             os.close(fd)
             try:
                 shutil.copy2(temp_path, staged_wav)
-                publish_audio_output(staged_wav, wav_filepath)
+                if publish_audio_output(staged_wav, wav_filepath,
+                        cancel_check=ensure_audio_generation_commit_active) is False:
+                    raise AudioGenerationCancelled()
             finally:
                 if os.path.exists(staged_wav):
                     os.remove(staged_wav)
@@ -3991,6 +4488,8 @@ class ProjectManager:
         # while app.py's voice_library endpoints hold file_lock(voice_config_path)
         # for a read-modify-write — no extra locking needed here.
         voice_config = safe_load_json(self.voice_config_path, default={})
+        uid_index = build_uid_index(chunks)
+        voice_config = resolve_timeline_anchors(voice_config, uid_index=uid_index)
 
         if is_audio_generation_cancelled():
             results["cancelled"] = total
@@ -4084,6 +4583,7 @@ class ProjectManager:
                 batch_stack.enter_context(ensure_synthesis_batch_outputs(self.root_dir, {}))
                 # Build batch request data
                 batch_chunks = []
+                batch_selections = {}
                 cleanup_failures = []
                 for idx in batch_indices:
                     chunk = captured.get(idx)
@@ -4107,24 +4607,28 @@ class ProjectManager:
                             message = f"Could not remove stale temp audio: {exc}"
                             cleanup_failures.append((idx, message))
                             continue
-                        # Resolve aliases so batch uses canonical speaker config
                         speaker = chunk.get("speaker", "")
-                        canonical = self._resolve_alias(speaker, voice_config)
-                        if chunk.get("pronunciation_rules"):
-                            settings = engine.get_model_settings() if callable(getattr(engine, "get_model_settings", None)) else {}
-                            chunk = {**chunk, "_pronunciation_context": get_pronunciation_render_context(
-                                voice_config, chunk, idx, settings)}
-                            captured[idx] = chunk
+                        try:
+                            selected, materialized, _ = get_chunk_render_voice_selection(
+                                voice_config, speaker, chunk, idx)
+                            if chunk.get("pronunciation_rules"):
+                                settings = engine.get_model_settings() if callable(getattr(engine, "get_model_settings", None)) else {}
+                                chunk = {**chunk, "_pronunciation_context": get_pronunciation_render_context(
+                                    voice_config, chunk, idx, settings)}
+                                captured[idx] = chunk
+                        except VoiceAliasResolutionError as error:
+                            cleanup_failures.append((idx, str(error)))
+                            continue
+                        batch_selections[idx] = (selected, materialized)
                         batch_chunk = {
                             "index": idx,
                             "uid": chunk.get("uid"),
                             "text": chunk.get("text", ""),
                             "instruct": chunk.get("instruct", ""),
-                            "speaker": canonical
+                            "speaker": speaker
                         }
                         if chunk.get("pronunciation_rules"):
-                            batch_chunk.update(pronunciation_rules=copy.deepcopy(chunk["pronunciation_rules"]),
-                                               _source_speaker=speaker)
+                            batch_chunk.update(pronunciation_rules=copy.deepcopy(chunk["pronunciation_rules"]))
                         # Preserve narrator-selection metadata through the
                         # project boundary; the TTS engine uses these fields to
                         # resolve focus/chapter/gender strategies per chunk.
@@ -4146,21 +4650,21 @@ class ProjectManager:
                         parent = self._capture_synthesis_recovery_parent(engine, row["index"], captured[row["index"]])
                         if parent is not None:
                             recovery_parents[row["uid"]] = parent
-                            materialized = self.get_chunk_render_voice_config(
-                                voice_config, row['speaker'], row, row['index'], batch_seed=batch_seed)
+                            selected_speaker, materialized = batch_selections[row['index']]
+                            materialized = get_seeded_batch_voice_config(materialized, batch_seed)
                             admission = self._capture_take_publication_admission(engine, parent, row['index'],
-                                captured[row['index']], materialized, row['speaker'])
+                                captured[row['index']], materialized, selected_speaker)
                             if admission is not None:
                                 publication_admissions[row['index']] = admission
                             from synthesis_workspace import get_synthesis_workspace_parent, ensure_synthesis_parent_output
-                            category = voice_category(materialized.get(row['speaker'], {}))
+                            category = voice_category(materialized.get(selected_speaker, {}))
                             registered = get_synthesis_workspace_parent(engine, category, parent, batch=True)
                             if registered is not None:
                                 batch_outputs[row['index']] = os.path.abspath(batch_stack.enter_context(
                                     ensure_synthesis_parent_output(registered,
                                         encoding=_can_register_chunk_encoding(self))))
                     batch_stack.enter_context(ensure_synthesis_batch_outputs(self.root_dir, batch_outputs))
-                    with ensure_synthesis_recovery_batch(recovery_parents):
+                    with ensure_synthesis_recovery_batch(recovery_parents), full_uid_index_context(uid_index):
                         batch_results = (engine.generate_batch(
                             batch_chunks, voice_config, self.root_dir, batch_seed,
                             **({'capture_input':True} if publication_admissions else {}))

@@ -3,6 +3,7 @@
 import copy
 import json
 import logging
+import math
 import os
 import shutil
 import uuid
@@ -11,7 +12,8 @@ from datetime import datetime, timezone
 from typing import Annotated, Dict, List, Literal, Optional, Union, get_args, get_origin
 from types import UnionType
 
-from pydantic import AfterValidator, BaseModel, Field, JsonValue, TypeAdapter, ValidationError
+from pydantic import (AfterValidator, BaseModel, Field, JsonValue, TypeAdapter, ValidationError,
+                      field_validator, model_validator)
 from export_limits import MAX_PAUSE_MS
 from lora_evidence import TTS_MODEL_DEFAULTS
 from synthesis_settings import get_synthesis_window_settings, get_synthesis_recovery_settings
@@ -176,6 +178,10 @@ class GenerationConfig(BaseModel):
     three_pass_attribute_target_chars: int = Field(default=0, ge=0, le=1000000)
     three_pass_instruct_target_chars: int = Field(default=0, ge=0, le=1000000)
     three_pass_instruct_context_chars: int = Field(default=0, ge=0, le=1000000)
+    # #2080: how much entry text review sends per request. 0 keeps today's
+    # review_batch_size entry-count batching; a positive value packs whole
+    # entries up to this many characters of entry text (context excluded).
+    review_target_chars: int = Field(default=0, ge=0, le=1000000)
     # Which way the attribution question is asked (attribution_prompt_variants;
     # measured results per variant in RECIPES.md). michel2_full since
     # 2026-09-19, when Muse's cell (90.5 vs michel2 86.6) made it the winner
@@ -203,6 +209,10 @@ class GenerationConfig(BaseModel):
     # (attribution_prompt_variants.GROUP_RULE_7). Off by default: measured on
     # one light-novel chapter and five PDNC novels (#653), see that constant.
     three_pass_group_rule: bool = False
+    # #1931: one opt-in enables sequential discovery and explicit Pass 2 alias evidence.
+    cast_list_incremental: bool = Field(default=False, strict=True)
+    cast_list_source_chars: int = Field(default=30000, ge=1, le=1200000, strict=True)
+    cast_list_max_tokens: int = Field(default=8000, gt=0, strict=True)
     # Pass 2: every answer also gives the speaker's gender, age group (as they
     # look and act) and an ageless flag (speaker_traits.py). Off by default;
     # measured in character_traits.json (+2.6% tokens, who-speaks unchanged).
@@ -218,6 +228,43 @@ class TextPromptPreset(BaseModel):
     user_prompt: str = Field(default="", max_length=100_000)
 
 
+class CompactPromptPreset(TextPromptPreset):
+    system_prompt: str = Field(min_length=1, max_length=100_000, pattern=r"\S")
+    user_prompt: str = Field(min_length=1, max_length=100_000)
+
+    @field_validator("user_prompt")
+    @classmethod
+    def validate_user_prompt(cls, value):
+        from experimental_prompts import validate_experimental_template
+        return validate_experimental_template(value, "units")
+
+
+class DirectedPromptPreset(CompactPromptPreset):
+    @field_validator("user_prompt")
+    @classmethod
+    def validate_user_prompt(cls, value):
+        from experimental_prompts import validate_experimental_template
+        return validate_experimental_template(value, "batch")
+
+
+class ReviewPromptPreset(TextPromptPreset):
+    """Review pass texts; the user template must fill context and batch."""
+
+    @field_validator("user_prompt")
+    @classmethod
+    def validate_user_prompt(cls, value):
+        from review_prompts import validate_review_template
+        return validate_review_template(value)
+
+
+class CastPromptPreset(BaseModel):
+    """Instructions only; the builder appends source and validated roster evidence."""
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=500)
+    whole_book_prompt: str = Field(min_length=1, max_length=100_000, pattern=r"\S")
+    incremental_prompt: str = Field(min_length=1, max_length=100_000, pattern=r"\S")
+
+
 class PromptConfig(BaseModel):
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
@@ -228,15 +275,38 @@ class PromptConfig(BaseModel):
     review_system_prompt: Optional[str] = None
     review_user_prompt: Optional[str] = None
     review_labels_only: bool = False
+    review_preset: str = Field(default="default", min_length=1, max_length=80)
+    review_prompt_presets: List[ReviewPromptPreset] = Field(default_factory=list, max_length=50)
     persona_system_prompt: Optional[str] = None
     persona_user_prompt: Optional[str] = None
     persona_advanced_prompt: Optional[str] = None
     persona_reference_chars: int = Field(default=12000, ge=12000, le=1_000_000)
     persona_allow_unknown_network_context: bool = False
+    cast_preset: str = Field(default="default", min_length=1, max_length=80)
+    cast_prompt_presets: List[CastPromptPreset] = Field(default_factory=list, max_length=50)
     pass1_preset: str = Field(default="default", min_length=1, max_length=80)
     pass1_prompt_presets: List[TextPromptPreset] = Field(default_factory=list, max_length=50)
     pass3_preset: str = Field(default="default", min_length=1, max_length=80)
     pass3_prompt_presets: List[TextPromptPreset] = Field(default_factory=list, max_length=50)
+    pass1_compact_preset: str = Field(default="default", min_length=1, max_length=80)
+    pass1_compact_prompt_presets: List[CompactPromptPreset] = Field(default_factory=list, max_length=50)
+    pass3_gaps_preset: str = Field(default="default", min_length=1, max_length=80)
+    pass3_gaps_prompt_presets: List[DirectedPromptPreset] = Field(default_factory=list, max_length=50)
+    pass3_directed_preset: str = Field(default="default", min_length=1, max_length=80)
+    pass3_directed_prompt_presets: List[DirectedPromptPreset] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_review_user_prompt(self):
+        """Refuse an active review template that lost a payload (#2093).
+
+        Deliberately a model validator, not a field validator: the Save/POST
+        boundary validates the whole PromptConfig, while load_app_config's
+        per-field adapters do not. An existing config.json holding a bad
+        template therefore still loads and Setup still opens.
+        """
+        from review_prompts import validate_active_review_user_prompt
+        validate_active_review_user_prompt(self.review_user_prompt)
+        return self
 
 
 class PromptPreset(BaseModel):
@@ -250,6 +320,27 @@ class PromptPreset(BaseModel):
     user_prompt: str = Field(default="", max_length=100_000)
     example: str = Field(default="", max_length=100_000)
     builtin: bool = False
+
+
+def _reject_json_constant(name):
+    """json.loads accepts NaN/Infinity by default; a config body must not."""
+    raise ValueError(f"Provider request body cannot contain {name}")
+
+
+def _reject_nonfinite(value):
+    """Reject float infinities anywhere in a provider body, with no coercion.
+
+    A finite JSON integer keeps its full size; only values that cannot be
+    written back as readable JSON are refused.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("Provider request body must contain only finite JSON numbers")
+    if isinstance(value, dict):
+        for item in value.values():
+            _reject_nonfinite(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_nonfinite(item)
 
 
 class AppConfig(BaseModel):
@@ -266,6 +357,41 @@ class AppConfig(BaseModel):
     prompts: Optional[PromptConfig] = None
     prompt_presets: List[PromptPreset] = Field(default_factory=list, max_length=50)
     generation: Optional[GenerationConfig] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def restore_exact_provider_body(cls, data):
+        """Resolve the single authoritative provider-body representation.
+
+        The Setup editor explicitly declares raw text authoritative with
+        `provider_extra_body_raw`; only then is its JSON text parsed here with
+        Python's arbitrary-precision integers. Every other caller's structured
+        `provider_extra_body` stays authoritative - stale auxiliary text can
+        never supersede it. Both helper fields are stripped before validation,
+        and a malformed raw text simply leaves the structured value in place.
+        """
+        if not isinstance(data, dict):
+            return data
+        for section in ("llm", "llm_local", "llm_remote"):
+            profile = data.get(section)
+            if not isinstance(profile, dict):
+                continue
+            updated = {key: value for key, value in profile.items()
+                       if key not in ("provider_extra_body_json", "provider_extra_body_raw")}
+            if profile.get("provider_extra_body_raw") is True:
+                raw = profile.get("provider_extra_body_json")
+                if not isinstance(raw, str) or not raw.strip():
+                    raise ValueError("Raw provider request body is required when declared authoritative")
+                try:
+                    parsed = json.loads(raw, parse_constant=_reject_json_constant)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("Raw provider request body is not valid JSON") from error
+                if not isinstance(parsed, dict):
+                    raise ValueError("Raw provider request body must be a JSON object")
+                updated["provider_extra_body"] = parsed
+            _reject_nonfinite(updated.get("provider_extra_body"))
+            data = {**data, section: updated}
+        return data
 
 
 def get_config_section_model(field):

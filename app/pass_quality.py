@@ -16,18 +16,26 @@ from review_script import normalize_text
 # (e.g. the 0.84->0.82 near-miss floor history) instead of drifting.
 from chunk_quality import (MIN_SOURCE_TOKEN_RECALL, MIN_ORDERED_TRIGRAM_RECALL,
                            MIN_OUTPUT_SOURCE_RATIO, MAX_OUTPUT_SOURCE_RATIO,
-                           get_unsupported_cyrillic_characters)
-from script_preflight import find_adjacent_duplicate_blocks
+                           get_introduced_non_ascii_letters,
+                           get_unsupported_cyrillic_characters, get_missing_source_runs)
+from script_preflight import find_adjacent_duplicate_blocks, find_seam_duplicate_narration
 
 _VALID_SEGMENT_TYPES = {"NARRATOR", "SPOKEN"}
-_QUOTE_CHARS = {'"', '“', '”', '「', '」', '『', '』'}
+# Derive every quote-mark set from dialogue_spans' single PAIRED table so the
+# source-map and the generator's segmenter cannot drift apart.
+from dialogue_spans import (PAIRED as _PAIRED, QUOTE_MARKS as _DS_QUOTE_MARKS,
+                            get_guillemet_direction as _get_guillemet_direction)
+
+_QUOTE_CHARS = set(_DS_QUOTE_MARKS) | {'”'}
 # The marks analyze_outer_quote_regions opens a spoken region on; "does this
 # chunk contain any" is the question the quotes-only refusal asks.
-QUOTE_MARKS = ('"', '“', '「', '『')
-_CURLY_AND_JAPANESE_OPEN = {'“', '「', '『'}
+QUOTE_MARKS = tuple(dict.fromkeys(opener for opener, _closer in _PAIRED))
+_CURLY_AND_JAPANESE_OPEN = set(QUOTE_MARKS) - {'"', '＂', '«', '»'}
 # A finished sentence before a second opening quote marks a run-on quote (#624).
 _SENTENCE_END = set('.!?…。！？')
-_CURLY_AND_JAPANESE_CLOSE = {'”', '」', '』'}
+_CURLY_AND_JAPANESE_CLOSE = ({closer for _opener, closer in _PAIRED
+                              if closer not in ('"', '＂', '«', '»')} | {'”'})
+_SELF_PAIRED = {'"', '＂'}
 
 
 _REPORTING_VERBS = (
@@ -73,6 +81,29 @@ def analyze_outer_quote_regions(text, initial_depth=0, allow_open_end=False):
     """
     regions, current, pending_source_label = [], [], None
     depth, saw_quote, repairs = initial_depth, bool(initial_depth), []
+    open_stack = []  # `“` closes „…“ but opens “…”; track which mark is open
+    german_inner = False  # inside an English quote nested in a German speech
+    skip_until = -1  # consumed by a line-dash dialogue region
+
+    # One guillemet direction per text: an opposite-direction closer must not
+    # be parsed as an opener (HIGH in the app-wide review). Decided by the
+    # same function the source map uses, so the two cannot disagree.
+    guillemet_open, guillemet_close = _get_guillemet_direction(text)
+    openers = set(_CURLY_AND_JAPANESE_OPEN)
+    closers = set(_CURLY_AND_JAPANESE_CLOSE)
+    if guillemet_open:
+        openers.add(guillemet_open)
+        closers.add(guillemet_close)
+    # A dash-only book uses line dashes for dialogue; a book with any quote
+    # marks uses those and treats a stray dash as narration punctuation.
+    dash_is_dialogue = not any(mark in text for mark in QUOTE_MARKS)
+    quote_positions = [i for i, c in enumerate(text) if c in _QUOTE_CHARS]
+    quote_at = {i: c for i, c in enumerate(text) if c in _QUOTE_CHARS}
+
+    def next_quote_after(index):
+        from bisect import bisect_right
+        at = bisect_right(quote_positions, index)
+        return quote_at[quote_positions[at]] if at < len(quote_positions) else None
 
     def flush():
         nonlocal pending_source_label
@@ -86,21 +117,59 @@ def analyze_outer_quote_regions(text, initial_depth=0, allow_open_end=False):
         current.clear()
 
     for index, char in enumerate(text):
+        if index < skip_until:
+            continue
+        if dash_is_dialogue and char in "—–" and (index == 0 or text[index - 1] == "\n"):
+            # Continental line-dash dialogue: the rest of this line is speech.
+            flush()
+            line_end = text.find("\n", index)
+            if line_end == -1:
+                line_end = len(text)
+            spoken = text[index + 1:line_end].strip()
+            if spoken:
+                regions.append({"type": "SPOKEN", "text": spoken})
+                saw_quote = True
+            skip_until = line_end
+            continue
         if char == "\n" and text[index:index + 2] == "\n\n" and depth:
             flush()
             current.append(char)
             continue
-        if char in _CURLY_AND_JAPANESE_OPEN or char == '"':
+        if not depth and open_stack:
+            # Nothing is open outside speech. A generic close (`”` ending a
+            # Polish `„…”`) leaves its opener here, and a stale `„` made the
+            # next English “…” read as a nested German quote: its speech went
+            # to NARRATOR, or the narration before it to SPOKEN.
+            open_stack.clear()
+        if char == "“" and open_stack and open_stack[-1] == "„":
+            # `“` closes German, but also opens English. If a `”` follows it
+            # next, this is an English quote nested inside the German speech.
+            if next_quote_after(index) == "”":
+                # An English quote nested in a German speech is decoration:
+                # neither mark changes the region depth.
+                german_inner = True
+                continue
+            if depth == 1:
+                flush()
+            depth -= 1
+            open_stack.pop()
+            continue
+        if char in openers or char in _SELF_PAIRED:
             paragraph_start = text.rfind("\n\n", 0, index)
             paragraph_start = paragraph_start + 2 if paragraph_start >= 0 else 0
-        if char in _CURLY_AND_JAPANESE_OPEN:
+        if char in openers:
             # Source credits sometimes quote a chapter title. It is metadata,
             # not unattributed dialogue, and must remain narrator material.
             if depth == 0 and _is_metadata_paragraph(current):
                 saw_quote = True
                 continue
             if depth == 0:
-                pending_source_label = _pop_source_label(current)
+                # Printed-label attribution is a convention of “ ” / 「 」 /
+                # 『 』 (and straight quotes). For low-high, full-width and
+                # guillemets a preceding capital word is a reporting verb
+                # ("Powiedział", "Nein"), not a speaker name.
+                if char in ('"', '“', '「', '『'):
+                    pending_source_label = _pop_source_label(current)
                 flush()
                 depth = 1
                 saw_quote = True
@@ -127,9 +196,14 @@ def analyze_outer_quote_regions(text, initial_depth=0, allow_open_end=False):
                     depth += 1
             else:
                 depth += 1
+            if char in ("„", "“") or char == guillemet_open:
+                open_stack.append(char)
             continue
-        if char in _CURLY_AND_JAPANESE_CLOSE and depth:
-            if char == '”' and depth == 1:
+        if german_inner and char == '”':
+            german_inner = False
+            continue
+        if char in closers and depth:
+            if char == '”' and depth == 1 and not german_inner:
                 paragraph_tail = text[index + 1:].split("\n\n", 1)[0]
                 next_close = paragraph_tail.find('”')
                 next_open = paragraph_tail.find('“')
@@ -137,6 +211,19 @@ def analyze_outer_quote_regions(text, initial_depth=0, allow_open_end=False):
                     # Stylized cries may use one opening mark and decorative
                     # closers between fragments: “Ha!”Haha!”Hahaha!”
                     continue
+            if char == '”' and open_stack and open_stack[-1] == '“':
+                # Close the nested English pair before continuing.
+                if depth == 1:
+                    flush()
+                depth -= 1
+                open_stack.pop()
+                continue
+            if char == guillemet_close and open_stack and open_stack[-1] == guillemet_open:
+                if depth == 1:
+                    flush()
+                depth -= 1
+                open_stack.pop()
+                continue
             if depth == 1:
                 flush()
             depth -= 1
@@ -161,7 +248,7 @@ def analyze_outer_quote_regions(text, initial_depth=0, allow_open_end=False):
                             "offset": index})
             saw_quote = True
             continue
-        if char == '"':
+        if char in _SELF_PAIRED:
             if depth == 0 and _is_metadata_paragraph(current):
                 saw_quote = True
                 continue
@@ -359,7 +446,9 @@ def _quote_region_findings(source_text, entries, quote_analysis=None,
     return findings, "ran"
 
 
-def _introduced_character_findings(source_text, output_text, entries):
+def _introduced_character_findings(source_text, output_text, entries, quote_analysis=None,
+                                   quoted_must_be_spoken=True,
+                                   unquoted_must_be_narrator=True):
     """Mirror the single-pass gate's introduced-character + adjacent-duplicate
     checks so pass 1 has the same fidelity bar (unsupported_cyrillic,
     unsupported_unicode_character, source_unsupported_duplicate). Text-only, so
@@ -369,12 +458,7 @@ def _introduced_character_findings(source_text, output_text, entries):
     if unsupported:
         findings.append({"code": "unsupported_cyrillic", "characters": unsupported,
                          "message": "Response introduced Cyrillic characters absent from the source."})
-    source_non_ascii = {char for char in unicodedata.normalize("NFC", source_text)
-                        if ord(char) > 127 and unicodedata.category(char).startswith("L")}
-    introduced = sorted({char for char in unicodedata.normalize("NFC", output_text)
-                         if ord(char) > 127 and unicodedata.category(char).startswith("L")
-                         and char not in source_non_ascii
-                         and not ("Ѐ" <= char <= "ӿ")})
+    introduced = get_introduced_non_ascii_letters(source_text, output_text)
     if introduced:
         findings.append({"code": "unsupported_unicode_character",
                          "characters": [{"character": char, "codepoint": f"U+{ord(char):04X}",
@@ -388,6 +472,26 @@ def _introduced_character_findings(source_text, output_text, entries):
             findings.append({"code": "source_unsupported_duplicate",
                              "entry_numbers": duplicate["entry_numbers"],
                              "message": "An adjacent repeated block is not repeated in the source."})
+    # Role-specific accounting is only sound when both quote restrictions
+    # force source and output roles to agree. Under a permissive policy a
+    # quoted source occurrence can be emitted inside a narrator row, so use
+    # compatible whole-source / whole-output counts instead.
+    role_specific = quoted_must_be_spoken and unquoted_must_be_narrator
+    source_narration_text = None
+    if role_specific:
+        quote_regions = (quote_analysis or {}).get("regions")
+        if not quote_regions:
+            quote_regions = analyze_outer_quote_regions(source_text).get("regions", [])
+        source_narration_text = " ".join(region["text"] for region in quote_regions
+                                         if region.get("type") == "NARRATOR") or source_text
+    for duplicate in find_seam_duplicate_narration(
+            source_text, entries, quote_analysis=quote_analysis,
+            role_specific=role_specific, source_narration_text=source_narration_text):
+        if duplicate["severity"] == "blocking":
+            findings.append({"code": "source_unsupported_duplicate",
+                             "entry_numbers": duplicate["entry_numbers"],
+                             "message": duplicate["message"],
+                             "details": duplicate["details"]})
     return findings
 
 
@@ -444,14 +548,26 @@ def validate_segment_quality(source_text, entries, quote_analysis=None, *,
         findings.append({"code": "output_source_ratio", "value": round(ratio, 4),
                          "minimum": MIN_OUTPUT_SOURCE_RATIO, "maximum": MAX_OUTPUT_SOURCE_RATIO,
                          "message": "Output length is implausible for the source chunk."})
+    # 90% recall still lets a whole clause disappear (#1921): report it so the
+    # model is asked again with the missing words named.
+    missing_runs = get_missing_source_runs(source_tokens, output_tokens) if sc else []
+    if missing_runs:
+        findings.append({"code": "missing_source_run",
+                         "value": sum(span["token_count"] for span in missing_runs),
+                         "message": "A run of source words is absent from the response."})
     quote_findings, quote_gate = _quote_region_findings(
         source_text, entries, quote_analysis,
         quoted_must_be_spoken=quoted_must_be_spoken,
         unquoted_must_be_narrator=unquoted_must_be_narrator)
     findings.extend(quote_findings)
-    findings.extend(_introduced_character_findings(source_text, output_text, entries))
-    return _report(sc, oc, recall, trigram, ratio, findings,
-                   quote_gate=quote_gate)
+    findings.extend(_introduced_character_findings(
+        source_text, output_text, entries, quote_analysis=quote_analysis,
+        quoted_must_be_spoken=quoted_must_be_spoken,
+        unquoted_must_be_narrator=unquoted_must_be_narrator))
+    report = _report(sc, oc, recall, trigram, ratio, findings,
+                     quote_gate=quote_gate)
+    report["missing_source_spans"] = missing_runs
+    return report
 
 
 def _report(source_count, output_count, recall, trigram, ratio, findings,

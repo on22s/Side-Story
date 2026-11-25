@@ -2,16 +2,20 @@
 See docs/superpowers/specs/2026-07-21-three-pass-script-generation-design.md."""
 
 import argparse
-from script_recovery_facts import three_pass_manifest_path
+from script_recovery_facts import three_pass_checkpoint_path, three_pass_manifest_path
+from script_recovery_guard import (RECOVERY_CAST_INVALIDATED_DETAIL, SCRIPT_PATH_NAME,
+                                   is_script_recovery_cast_invalidated)
 import hashlib
 import json
 import math
 from generation_checkpoint_deltas import GenerationCheckpointDeltas, load_generation_delta_checkpoint
-from chunk_status_journal import remove_chunk_snapshot
+from run_spec_receipt import CHECKPOINT_DIGEST, get_checkpoint_spec_digest
+from chunk_status_journal import is_active_script_output, remove_chunk_snapshot
 import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from collections import Counter
 from dataclasses import replace
@@ -19,7 +23,8 @@ from types import MappingProxyType
 
 from core import llm_timeout_seconds
 from source_encoding import read_source_text, get_normalized_source_newlines
-from llm_provider import (make_llm_client, make_run_client, get_run_model_binding,
+from llm_provider import (make_llm_client, make_run_client, get_effective_authorization,
+                          get_run_model_binding,
                           get_run_fingerprint_identity, get_provider_extra_body)
 from llm_request_budget import get_prompt_token_estimate
 
@@ -29,6 +34,7 @@ from generate_script import (call_llm_for_entries, split_into_chunks,
                              get_preprocessed_source, LLMGenParams,
                              split_failed_chunk, is_trigram_only_near_miss,
                              ensure_run_request_params, validate_generation_output_path)
+from chunk_quality import is_segment_near_miss
 from dialogue_spans import apply_dialogue_map
 from script_preflight import (audit_unicode_text,
                               replacement_load_is_acceptable,
@@ -56,7 +62,7 @@ from config_settings import load_app_config, get_generation_config
 from lmstudio_settings import (ensure_ideal_settings, get_active_llm_config,
                                get_effective_max_tokens, TokenBudgetError)
 from utils import (get_runtime_data_dir, get_app_config_path,
-                   atomic_json_write, safe_load_json, is_nonverbal_text)
+                   atomic_json_write, safe_load_json, is_nonverbal_text, file_lock)
 
 BATCH_SIZE = 25
 NARRATOR_DEFAULT_INSTRUCT = "Neutral, even narration."
@@ -149,8 +155,9 @@ def resolve_three_pass_generation_settings(config, chunk_size_override=None,
     model_profile = resolve_model_profile(
         model_name, gen.get("three_pass_model_profiles"),
         load_default_model_profiles())
-    return {
+    settings = {
         "model_profile": model_profile,
+        **({"cast_aliases": True} if gen.get("cast_list_incremental") is True else {}),
         "chunk_size": resolve_chunk_size(
             chunk_size_override, gen.get("three_pass_chunk_size", 3000),
             model_profile.get("chunk_size")),
@@ -179,6 +186,17 @@ def resolve_three_pass_generation_settings(config, chunk_size_override=None,
         "attribute_prompt_variant": gen.get("three_pass_attribute_prompt_variant") or "michel2_full",
         "delivery_direction": resolve_delivery_direction(config, delivery_direction_override),
     }
+    from experimental_prompts import resolve_experimental_prompt
+    if settings["pass1_format"] == "compact":
+        system, user = resolve_experimental_prompt(config, "pass1_compact")
+        if system is not None:
+            settings.update(compact_system_prompt=system, compact_user_prompt_template=user)
+    if settings["delivery_direction"] != "off":
+        family = "pass3_gaps" if settings["delivery_direction"] == "gaps" else "pass3_directed"
+        system, user = resolve_experimental_prompt(config, family)
+        if system is not None:
+            settings.update(instruct_system_prompt=system, instruct_user_prompt_template=user)
+    return settings
 
 
 def resolve_delivery_direction(config, cli_value=None):
@@ -226,6 +244,7 @@ def get_three_pass_run_params(config, lm_status, reasoning_effort=None, generati
     from llm_request_budget import get_request_limits
     limits = get_request_limits(llm, lm_status.get("context_length"))
     params = LLMGenParams(
+        cast_aliases=gen.get("cast_list_incremental", False) is True,
         task_max_tokens=gen.get("max_tokens", 10000),
         task_hard_max_tokens=resolve_hard_max_tokens(gen.get("max_tokens", 10000)),
         max_tokens=min(generation_settings["max_tokens"], limits["max_output_tokens"] or generation_settings["max_tokens"]),
@@ -271,6 +290,11 @@ def get_three_pass_run_params(config, lm_status, reasoning_effort=None, generati
         config, "pass1")
     params.instruct_system_prompt, params.instruct_user_prompt_template = resolve_three_pass_prompt(
         config, "pass3")
+    params.compact_system_prompt = generation_settings.get("compact_system_prompt")
+    params.compact_user_prompt_template = generation_settings.get("compact_user_prompt_template")
+    if params.delivery_direction != "off":
+        params.instruct_system_prompt = generation_settings.get("instruct_system_prompt")
+        params.instruct_user_prompt_template = generation_settings.get("instruct_user_prompt_template")
     return params
 
 
@@ -520,12 +544,19 @@ def load_cast(path):
     never admit "the stranger", which is how The Invisible Man's protagonist
     lost 99 lines to UNKNOWN in stage 0 (2026-09-28). A malformed file raises.
     """
-    raw = open(path, "rb").read()
+    with open(path, "rb") as handle:
+        raw = handle.read()
     try:
         cast = get_cast_from_data(json.loads(raw.decode("utf-8")))
     except ValueError as exc:
         raise ValueError(f"cast file {path}: {exc}") from exc
     return {**cast, "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def is_cast_alias_allowed(alias, name):
+    """May ``alias`` be another name for cast member ``name``? Narration,
+    UNKNOWN and group labels never merge into a character (#1913)."""
+    return is_speaker_merge_allowed(alias, name) and alias != "UNKNOWN"
 
 
 def get_cast_from_data(data):
@@ -551,7 +582,7 @@ def get_cast_from_data(data):
         names.append(name)
         groups.append([name] + aliases)
         for alias in aliases:
-            if not is_speaker_merge_allowed(alias, name) or alias == "UNKNOWN":
+            if not is_cast_alias_allowed(alias, name):
                 raise ValueError(f"protected cast alias: {alias} -> {name}")
             if alias in alias_to_name and alias_to_name[alias] != name:
                 raise ValueError(f"duplicate cast alias ownership: {alias}")
@@ -671,6 +702,16 @@ SURROUND_AFTER_HEADER = ("TEXT AFTER THIS WINDOW (evidence only; do not attribut
                          "or return it):")
 
 
+def append_cast_alias_evidence(user_prompt, params, alias_groups=None):
+    """Explicit canonical associations even when a custom preset omits {roster}."""
+    groups = alias_groups if alias_groups is not None else getattr(params, "cast_alias_groups", None)
+    if not getattr(params, "cast_aliases", False) or not groups:
+        return user_prompt
+    rows = [{"name": group[0], "aliases": group[1:]} for group in groups if group]
+    return (user_prompt + "\n\nVALIDATED CAST ALIASES (identity evidence only; "
+            "keep narration, UNKNOWN and groups separate):\n" + json.dumps(rows, ensure_ascii=False))
+
+
 def build_attribute_request(frozen_batch, params, roster,
                             neighbor_contexts=None, surround=None):
     """Build the canonical pass-2 system and user prompts. `surround`
@@ -692,7 +733,7 @@ def build_attribute_request(frozen_batch, params, roster,
         for i, e in enumerate(frozen_batch)], ensure_ascii=False)
     user_prompt = usr_template.format(
         roster=", ".join(roster) or "(none yet)", batch=batch_json)
-    return sys_prompt, wrap_window_surround(user_prompt, surround)
+    return sys_prompt, wrap_window_surround(append_cast_alias_evidence(user_prompt, params), surround)
 
 
 def wrap_window_surround(user_prompt, surround, instruct=False):
@@ -956,6 +997,8 @@ def attribute_batch(client, model_name, frozen_batch, params, roster,
     does not repair labels or change validation, prompts on first attempts,
     schemas or retry budgets."""
     params = ensure_run_request_params(client, params)
+    if getattr(params, "cast_aliases", False) and cast:
+        params = replace(params, cast_alias_groups=cast.get("alias_groups"))
     sys_prompt, user_prompt = build_attribute_request(
         frozen_batch, params, roster, neighbor_contexts, surround)
     from pass_quality import (get_attribution_tag_proofs, get_attribution_snapshot_digest,
@@ -1119,18 +1162,16 @@ def build_instruct_request(prior_batch, params, neighbor_contexts=None, surround
     """Build the canonical pass-3 system and user prompts."""
     direction = getattr(params, "delivery_direction", "off")
     sys_prompt, usr_template = load_instruct_prompts(direction)
-    # A delivery-direction mode always sends its own prompt, which asks for its
-    # fields: get_three_pass_run_params refuses a custom Pass 3 preset with a
-    # mode, and the legacy prompt fallbacks would ask for an instruct alone.
-    if direction == "off":
-        if params.instruct_system_prompt:
-            sys_prompt = params.instruct_system_prompt
-        elif params.system_prompt:
-            sys_prompt = params.system_prompt
-        if params.instruct_user_prompt_template:
-            usr_template = params.instruct_user_prompt_template
-        elif params.user_prompt_template:
-            usr_template = params.user_prompt_template
+    # Explicit fields hold the selected format's preset. Legacy generic
+    # fallbacks apply only to ordinary instructions, never experimental modes.
+    if params.instruct_system_prompt:
+        sys_prompt = params.instruct_system_prompt
+    elif direction == "off" and params.system_prompt:
+        sys_prompt = params.system_prompt
+    if params.instruct_user_prompt_template:
+        usr_template = params.instruct_user_prompt_template
+    elif direction == "off" and params.user_prompt_template:
+        usr_template = params.user_prompt_template
     neighbor_contexts = neighbor_contexts or [{} for _ in prior_batch]
     batch_json = json.dumps([
         {"n": i, "speaker": e["speaker"], "text": e["text"], **neighbor_contexts[i]}
@@ -1353,6 +1394,8 @@ def get_attribute_sizing_request(batch, params, roster, contexts, surround,
             variant or "default", batch, params, roster,
             alias_groups=(cast or {}).get("alias_groups"), neighbor_contexts=contexts,
             surround=surround, texts=texts, roster_traits=roster_traits)
+    if getattr(params, "cast_aliases", False) and cast:
+        params = replace(params, cast_alias_groups=cast.get("alias_groups"))
     return build_attribute_request(batch, params, roster, contexts, surround)
 
 
@@ -1566,12 +1609,31 @@ def segment_chunk(client, model_name, chunk, params, max_retries=4,
     return entries
 
 
+def get_missing_run_warning(quality):
+    """The visible line for a chunk accepted with source text still missing."""
+    spans = quality.get("missing_source_spans") or []
+    unit = "characters" if spans and all(span.get("unit") == "characters" for span in spans) else "words"
+    missing = sum(span["token_count"] for span in spans)
+    return (f"Warning: Step 1 accepted this chunk with about {missing} source {unit} still "
+            "missing after every retry; check this passage in the Editor.")
+
+
+def _has_missing_run(quality):
+    return any(finding.get("code") == "missing_source_run"
+               for finding in (quality or {}).get("findings") or [])
+
+
 def _accept_segment_near_miss(near_miss):
     if not near_miss:
         return []
     entries, quality = near_miss[0]
-    print("  SEGMENT accepted as trigram-only near-miss "
-          f"(ordered_trigram_recall={quality['metrics']['ordered_trigram_recall']})")
+    codes = {finding.get("code") for finding in quality.get("findings") or []}
+    if "missing_source_run" in codes:
+        # Accepted as before this check existed, but never silently (#1921).
+        print(get_missing_run_warning(quality), flush=True)
+    else:
+        print("  SEGMENT accepted as trigram-only near-miss "
+              f"(ordered_trigram_recall={quality['metrics']['ordered_trigram_recall']})")
     return entries
 
 
@@ -1646,8 +1708,11 @@ def quote_regions_decision(mode, chunk, analysis, quoted_must_be_spoken=True,
 STEP_NAMES = {1: "split", 2: "speakers", 3: "delivery"}
 
 
-def announce_step(step, unit, number, total):
-    print(f"Step {step} ({STEP_NAMES[step]}): {unit} {number} of {total} - asking the model",
+def announce_step(step, unit, number, total, part=1):
+    """part > 1: a window too large for one request is sent in pieces, and a
+    Manual LLM user answers each piece, so each says which one it is (#1925)."""
+    piece = f" (part {part})" if part > 1 else ""
+    print(f"Step {step} ({STEP_NAMES[step]}): {unit} {number} of {total}{piece} - asking the model",
           flush=True)
 
 
@@ -1771,6 +1836,12 @@ def segment_chunk_adaptively(client, model_name, chunk, params,
                                                 quote_analysis=recovery_analysis)["passed"]):
             _record_resolution(resolution_sink, "quote_continuation_fallback")
             return regions
+    if near_miss and _has_missing_run(near_miss[0][1]):
+        # The model answered but kept dropping a run of source words, and no
+        # deterministic recovery applies. Before this check that answer was
+        # accepted in one call; splitting it to the 800-character floor could
+        # cost dozens more for the same warning (#1921).
+        return _resolved_near_miss(near_miss, resolution_sink)
     parts = split_failed_chunk(chunk)
     if not parts:
         if failure_sink is not None:
@@ -1808,7 +1879,9 @@ def segment_chunk_adaptively(client, model_name, chunk, params,
         # split-seam artifact, not lost content - accept it if it still clears the
         # trigram-only near-miss floor rather than discarding two good halves.
         # Recall / ratio / cyrillic / duplicate defects are NOT waived (real).
-        if is_trigram_only_near_miss(combined_quality):
+        if is_segment_near_miss(combined_quality):
+            if _has_missing_run(combined_quality):
+                print(get_missing_run_warning(combined_quality), flush=True)
             print(f"  Adaptive split (segment) recombination accepted: both halves "
                   f"passed, trigram-only near-miss at seam "
                   f"(trigram={m['ordered_trigram_recall']} recall={m['source_token_recall']})")
@@ -1878,6 +1951,13 @@ def get_context_rescue_windows(windows=None):
     return tuple(windows)
 
 
+def get_context_rescue_settings(generation):
+    """Resolve configured widths while retaining the legacy default identity."""
+    windows = generation.get("context_rescue_windows")
+    return (get_context_rescue_windows(windows) if windows is not None else None,
+            generation.get("context_rescue_retries"))
+
+
 def validate_attribution_vote_settings(votes, temperature):
     """Reject invalid sampling controls before planning or dispatching calls."""
     if isinstance(votes, bool) or not isinstance(votes, int) or votes < 1:
@@ -1910,6 +1990,11 @@ def get_segment_chunk_records(source_text, chunk_size, params):
         if size <= 500:
             raise TokenBudgetError("Pass-1 source plus prompt/output does not fit; use a capable endpoint or reduce the prompt.")
         size = max(500, size // 2)
+
+
+def get_segment_chunk_digests(records):
+    """Identify the ordered source text dispatched by the segment worker."""
+    return [hashlib.sha256(record['text'].encode('utf-8')).hexdigest() for record in records]
 
 
 def get_three_pass_planning_entries(source_text, settings, params):
@@ -1978,6 +2063,8 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
                                  "max_output_tokens": settings.get("profile_output_ceiling")}, context_length)
     context_length = limits["context_length"]
     params = params or LLMGenParams(
+        cast_aliases=settings.get("cast_aliases", False),
+        cast_alias_groups=(settings.get("cast") or {}).get("alias_groups"),
         literal_source_preserving=settings.get("literal_source_preserving", False),
         max_tokens=settings["max_tokens"], context_length=context_length,
         max_input_tokens=limits["max_input_tokens"],
@@ -1989,7 +2076,11 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
         segment_system_prompt=settings.get("segment_system_prompt"),
         segment_user_prompt_template=settings.get("segment_user_prompt_template"),
         instruct_system_prompt=settings.get("instruct_system_prompt"),
-        instruct_user_prompt_template=settings.get("instruct_user_prompt_template"))
+        instruct_user_prompt_template=settings.get("instruct_user_prompt_template"),
+        pass1_format=settings.get("pass1_format", "ordinary"),
+        delivery_direction=settings.get("delivery_direction", "off"),
+        compact_system_prompt=settings.get("compact_system_prompt"),
+        compact_user_prompt_template=settings.get("compact_user_prompt_template"))
     instruct_context_chars = settings.get("instruct_context_chars", 0)
     validate_instruct_context_chars(instruct_context_chars, params)
     chunks, predicted_entries, unresolved_chunks, chunks_without_quote_marks = (
@@ -2049,6 +2140,12 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
             int(settings["max_tokens"]),
             resolve_completion_ceiling(
                 max(1, len(chunk.split())), params, source_text=chunk))
+        if params.pass1_format == "compact":
+            from compact_pass1 import build_compact_prompt, split_units, COMPACT_MAX_TOKENS
+            compact_system, compact_user = build_compact_prompt(
+                split_units(chunk), params.compact_system_prompt, params.compact_user_prompt_template)
+            add_request("segment_compact", compact_system, compact_user, min(completion, COMPACT_MAX_TOKENS))
+        # The ordinary request remains a possible fallback after rejected labels.
         add_request("segment", segment_system,
                     segment_template.format(chunk=chunk), completion)
         max_window = max(context_windows)
@@ -2064,7 +2161,9 @@ def build_three_pass_request_preflight(source_text, settings, context_length,
 
     roster_chars = min(4096, 32 * sum(
         entry.get("type") == "SPOKEN" for entry in predicted_entries))
-    estimated_roster = ["R" * roster_chars] if roster_chars else []
+    estimated_roster = (["R" * roster_chars] if roster_chars else [])
+    if getattr(params, "cast_aliases", False):
+        estimated_roster = list((settings.get("cast") or {}).get("names") or []) + estimated_roster
     attribute_batch_size = int(settings.get("attribute_batch_size") or BATCH_SIZE)
     context_chars = int(settings.get("attribute_context_chars") or 0)
     attribute_budgeted = bool(settings.get("attribute_target_chars") or context_chars > LARGE_CONTEXT_CHARS)
@@ -2352,10 +2451,6 @@ def get_preflight_sample_info(label, index, output_path, planned_calls,
     return info
 
 
-def three_pass_checkpoint_path(output_path):
-    return output_path + ".threepass_checkpoint.json"
-
-
 def _resolution_counts(resolutions):
     """Roll per-chunk resolution strings up into summary counts."""
     return {
@@ -2374,7 +2469,8 @@ def _resolution_counts(resolutions):
 def _write_manifest(output_path, fingerprint, resolutions, passes, status,
                     failed_pass=None, failed_chunk=None, legacy_resume=False,
                     progress=None, diagnostic_failures=None, telemetry=None,
-                    model_binding=None, delivery_review=None):
+                    model_binding=None, delivery_review=None, run_id=None,
+                    completion=None, run_spec_sha256=None):
     """Persist the run manifest next to the output so results are analyzable from
     structured data instead of log-grepping."""
     if not output_path:
@@ -2393,11 +2489,17 @@ def _write_manifest(output_path, fingerprint, resolutions, passes, status,
         "model_binding": model_binding,
         "delivery_review": delivery_review or {"count": 0, "entries": []},
     }
+    if run_id is not None:
+        manifest["run_id"] = run_id
+    if run_spec_sha256 is not None:
+        manifest["run_spec_sha256"] = run_spec_sha256
+    if completion is not None:
+        manifest["completion"] = completion
     if failed_pass is not None:
         manifest["failed_pass"] = failed_pass
     if failed_chunk is not None:
         manifest["failed_chunk"] = failed_chunk
-    atomic_json_write(manifest, three_pass_manifest_path(output_path))
+    atomic_json_write(manifest, three_pass_manifest_path(output_path), allow_nonatomic_fallback=False)
 
 
 def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
@@ -2408,7 +2510,8 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
                            attribute_prompt_texts=None, cast_sha256=None,
                            attribution_votes=1, vote_temperature=0.3,
                            first_person_narrator=None, speaker_traits=False,
-                           attribute_target_chars=0, instruct_target_chars=0, instruct_context_chars=0):
+                           attribute_target_chars=0, instruct_target_chars=0, instruct_context_chars=0,
+                           keep_scope="line"):
     digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
     settings = {
         "model_name": model_name, "chunk_size": chunk_size,
@@ -2418,6 +2521,11 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
         # anything 'keep' adds is flagged attribution_unchecked in the output.
         "endpoint": endpoint,
         "on_exhaustion": "fail" if on_exhaustion == "keep" else on_exhaustion,
+        # Keep scope changes exhaustion behavior (a whole rejected batch retained
+        # vs subdivided), so every new checkpoint binds it explicitly. Passing
+        # None omits the key and reproduces the pre-knob identity, which legacy
+        # checkpoints are matched against before deciding what may be reused.
+        **({"pass2_keep_scope": keep_scope} if keep_scope in PASS2_KEEP_SCOPES else {}),
         "context_windows": context_windows,
         "context_rescue_retries": context_rescue_retries,
         "collect_all_failures": collect_all_failures,
@@ -2450,6 +2558,8 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
                  list(load_instruct_prompts())), [])).encode("utf-8")).hexdigest(),
     }
     if params is not None:
+        if getattr(params, "cast_aliases", False):
+            settings["cast_aliases"] = {"version": 1, "groups": params.cast_alias_groups}
         if getattr(params, "literal_source_preserving", False):
             settings["literal_source_preserving"] = "literal_words_v1"
             from literal_prompts import CHECKPOINT_PROMPT_POLICY
@@ -2469,6 +2579,9 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
         # keep their identity; switching format restarts instead of mixing.
         if getattr(params, "pass1_format", "ordinary") != "ordinary":
             settings["pass1_format"] = params.pass1_format
+            if getattr(params, "compact_system_prompt", None) is not None:
+                settings["compact_system_prompt"] = params.compact_system_prompt
+                settings["compact_user_prompt_template"] = params.compact_user_prompt_template
         # Only off the default, so existing checkpoints keep their identity; a
         # resumed book cannot mix delivery-direction modes or prompt revisions.
         if getattr(params, "delivery_direction", "off") != "off":
@@ -2502,6 +2615,38 @@ def three_pass_fingerprint(source_text, model_name, chunk_size, params=None,
             "model_name": model_name, "pipeline": "three_pass"}
 
 
+def get_attribution_prompt_params(params, variant, texts, narrator):
+    """Apply the same narrator and preset text when building the native identity."""
+    from attribution_prompt_variants import builtin_texts
+    if narrator:
+        system = add_narrator_prior((texts or {}).get("system") or builtin_texts(variant)["system"],
+                                    narrator)
+        return (copy_run_params(params, attribute_system_prompt=system),
+                dict(texts, system=system) if texts else texts)
+    if texts and variant == "default":
+        return copy_run_params(params, attribute_system_prompt=texts.get("system") or None,
+                               attribute_user_prompt_template=texts.get("user") or None), texts
+    return params, texts
+
+
+def get_native_three_pass_fingerprint(source_text, model_name, chunk_size, params, settings, *,
+                                      keep_scope, **controls):
+    """Build native checkpoint identity from resolved pass sizing and run controls."""
+    return three_pass_fingerprint(
+        source_text, model_name, chunk_size, params, keep_scope=keep_scope,
+        **{name: settings[name] for name in (
+            'attribute_batch_size', 'attribute_context_chars', 'attribute_target_chars',
+            'instruct_target_chars', 'instruct_context_chars')},
+        **controls)
+
+
+def is_valid_three_pass_segment_cursor(stage, chunks_done, chunk_count):
+    """Segmentation can be partial only while the run is still in pass one."""
+    return (type(chunks_done) is int and 0 <= chunks_done <= chunk_count
+            and (stage in ('segment', 'segment_failed', 'segment_incomplete')
+                 or chunks_done == chunk_count))
+
+
 def validate_three_pass_checkpoint(data, chunk_count=None):
     """Validate persisted resume shapes and cursors before consuming state."""
     def require(condition, field):
@@ -2517,6 +2662,9 @@ def validate_three_pass_checkpoint(data, chunk_count=None):
         "attribute_failed", "attribute_incomplete", "attribute_unavailable", "instruct",
         "instruct_failed", "instruct_unavailable", "done"}, "stage")
     require(is_cursor(data.get("chunks_done"), chunk_count), "chunks_done")
+    if chunk_count is not None:
+        require(is_valid_three_pass_segment_cursor(data['stage'], data['chunks_done'], chunk_count),
+                'segmentation cursor for stage')
     segmented, named, annotated = (data.get(key) for key in ("segmented", "named", "annotated"))
     require(isinstance(segmented, list), "segmented")
     for index, entry in enumerate(segmented):
@@ -2563,20 +2711,105 @@ def validate_three_pass_checkpoint(data, chunk_count=None):
                 "diagnostic_segment_resume first failed chunk")
 
 
-def _load_three_pass_checkpoint(output_path, fingerprint, chunk_count=None):
-    path = three_pass_checkpoint_path(output_path)
-    if not os.path.exists(path):
-        return None
+def _refuse_fenced_active_checkpoint(path):
+    """Authoritative refusal for the one active-book checkpoint path.
+
+    The HTTP launcher fences this run before dispatch, but the documented
+    command line can point at the same default active checkpoint directly. The
+    loader is the last boundary every consumer shares, so refuse there under
+    the same book/checkpoint admission. Batch checkpoints and unrelated output
+    paths are untouched, and a Start over (which discards progress and clears
+    the marker) or a fresh baseline has no marker to refuse.
+    """
+    resolved = Path(os.path.abspath(path))
+    if resolved.name != SCRIPT_PATH_NAME:
+        return
+    if is_script_recovery_cast_invalidated(str(resolved.parent)):
+        raise RuntimeError(RECOVERY_CAST_INVALIDATED_DETAIL)
+
+
+_INSPECT_CHECKPOINT = object()
+
+
+def get_three_pass_manifest_snapshot(output_path):
+    """Read identity and exact bytes through the regular-file boundary."""
+    from project_scope_files import capture_scope_file
+
+    path = Path(os.path.abspath(three_pass_manifest_path(output_path)))
+    capture, raw = capture_scope_file(path.parent, path.name, limit=16 * 1024**2,
+                                      include_bytes=True)
+    return capture['sha256'], raw
+
+
+def _load_admitted_manifest(output_path, receipt):
+    from script_selection_binding import _unique_pairs
+    from three_pass_run_spec import spec_digest
+
+    pin = receipt.get('prior_manifest_sha256')
     try:
-        data = load_generation_delta_checkpoint(path)
-        if not isinstance(data, dict):
-            raise ValueError("expected an object")
-        if (get_run_fingerprint_identity(data.get("fingerprint"))
-                != get_run_fingerprint_identity(fingerprint)):
+        digest, raw = get_three_pass_manifest_snapshot(output_path)
+        if 'manifest_at_start' in receipt:
+            expected = receipt['manifest_at_start']
+            if expected == 'marker':
+                _, marker = get_initial_three_pass_artifacts(receipt)
+                if raw != json.dumps(marker, ensure_ascii=False, indent=2,
+                                     allow_nan=False).encode('utf-8'):
+                    raise ValueError('admission marker changed')
+            elif digest != expected:
+                raise ValueError('startup digest changed')
+        if pin is None:
             return None
-        validate_three_pass_checkpoint(data, chunk_count)
-    except (OSError, ValueError, UnicodeError) as exc:
-        raise RuntimeError(f"Invalid three-pass checkpoint {path}: {exc}") from exc
+        manifest = json.loads(raw, object_pairs_hook=_unique_pairs) if raw is not None else None
+        if isinstance(manifest, dict) and spec_digest(manifest) == pin:
+            return manifest
+    except (OSError, ValueError, RecursionError):
+        pass
+    label = 'predecessor manifest' if pin is not None else 'startup manifest'
+    raise RuntimeError(f'The admitted {label} is missing or changed; saved progress was preserved.')
+
+
+def _load_three_pass_checkpoint(output_path, fingerprint, chunk_count=None, *,
+                                keep_scope=None, scope_fingerprints=None,
+                                legacy_fingerprint=None, receipt=_INSPECT_CHECKPOINT):
+    path = three_pass_checkpoint_path(output_path)
+    check_manifest = (receipt is not _INSPECT_CHECKPOINT and receipt is not None
+                      and ('manifest_at_start' in receipt or 'prior_manifest_sha256' in receipt))
+    if not check_manifest and not os.path.exists(path):
+        return None
+    with file_lock(path):
+        _refuse_fenced_active_checkpoint(output_path)
+        manifest = _load_admitted_manifest(output_path, receipt) if check_manifest else None
+        if not os.path.exists(path):
+            return None
+        try:
+            data = load_generation_delta_checkpoint(path, locked=True)
+            if not isinstance(data, dict):
+                raise ValueError("expected an object")
+            if receipt is not _INSPECT_CHECKPOINT:
+                if manifest is None and receipt is not None and CHECKPOINT_DIGEST not in data:
+                    manifest = safe_load_json(three_pass_manifest_path(output_path), {})
+                if not is_checkpoint_bound_to_spec(data, receipt, manifest):
+                    raise RuntimeError(
+                        "Saved progress cannot be verified against the admitted run spec; "
+                        "it was preserved. Use Start over to begin again.")
+            identity = get_run_fingerprint_identity(data.get("fingerprint"))
+            if identity != get_run_fingerprint_identity(fingerprint):
+                if keep_scope is not None and legacy_fingerprint is not None \
+                        and identity == get_run_fingerprint_identity(legacy_fingerprint):
+                    pass  # legacy checkpoint: caller decides what may be reused
+                elif keep_scope is not None and scope_fingerprints and any(
+                        identity == get_run_fingerprint_identity(other)
+                        for scope, other in scope_fingerprints.items() if scope != keep_scope):
+                    # A saved checkpoint from the other keep scope cannot be resumed
+                    # under this one; leave every byte of it untouched.
+                    raise RuntimeError(
+                        "Saved progress was written with a different pass-2 keep scope; "
+                        "it was preserved. Use Start over to begin again.")
+                else:
+                    return None
+            validate_three_pass_checkpoint(data, chunk_count)
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise RuntimeError(f"Invalid three-pass checkpoint {path}: {exc}") from exc
     return data
 
 
@@ -2617,11 +2850,61 @@ def _refuse_checkpoint_replay_over_edited_publication(output_path):
         raise RuntimeError('The published script changed after this checkpoint; saved progress and edits were preserved. Use Start over in Generate to begin again.')
 
 
+def get_receipt_checkpoint_fingerprint(receipt):
+    """Expected native checkpoint identity for the admitted model pair."""
+    fingerprint = dict(receipt['fingerprint'])
+    secondary = receipt['spec'].get('secondary_model')
+    if secondary is not None:
+        fingerprint['model_binding'] = {
+            'primary_model': receipt['spec']['model_name'],
+            'failover_model': secondary.strip(), 'failover_used': False,
+        }
+    return fingerprint
+
+
+def get_initial_three_pass_artifacts(receipt):
+    """Native zero-progress recovery for a durably admitted Start Over."""
+    fingerprint = get_receipt_checkpoint_fingerprint(receipt)
+    checkpoint = {
+        'fingerprint': fingerprint, 'stage': 'segment', 'chunks_done': 0,
+        CHECKPOINT_DIGEST: get_checkpoint_spec_digest(receipt),
+        'segmented': [], 'named': [], 'annotated': [], 'resolutions': [],
+        'pass2_keep_scope': receipt['spec']['keep_scope'],
+    }
+    # The worker can checkpoint its first unit before writing a manifest.
+    # This admission marker makes no claim about the worker's progress.
+    manifest = {
+        'fingerprint': fingerprint, 'run_id': receipt['run_id'], 'status': 'incomplete',
+        'chunks': [],
+    }
+    return checkpoint, manifest
+
+
+def is_checkpoint_bound_to_spec(checkpoint, receipt, manifest=None):
+    """Accept modern progress only with its complete binding or an old empty seed."""
+    if receipt is None:
+        return CHECKPOINT_DIGEST not in checkpoint
+    if CHECKPOINT_DIGEST in checkpoint:
+        return checkpoint[CHECKPOINT_DIGEST] == get_checkpoint_spec_digest(receipt)
+    legacy_checkpoint = receipt.get('legacy_checkpoint_sha256')
+    if legacy_checkpoint is not None:
+        from three_pass_run_spec import spec_digest
+        return (manifest is not None
+                and spec_digest(manifest) == receipt.get('prior_manifest_sha256')
+                and spec_digest(checkpoint) == legacy_checkpoint)
+    seed, marker = get_initial_three_pass_artifacts(receipt)
+    del seed[CHECKPOINT_DIGEST]
+    # Before binding was added, only the exact transactional seed proves no
+    # earlier execution needs to be trusted. Its marker names this attempt.
+    return checkpoint == seed and manifest == marker
+
+
 def _save_three_pass_checkpoint(output_path, fingerprint, stage, segmented,
                                 chunks_done, named, annotated, resolutions=None,
                                 elapsed_s=None, diagnostic_failures=None,
                                 failed=None, model_binding=None,
-                                diagnostic_segment_resume=None, checkpoint_writer=None):
+                                diagnostic_segment_resume=None, checkpoint_writer=None,
+                                pass2_keep_scope=None, checkpoint_spec_digest=None):
     """`failed` (only on a pass-1 fail-fast) carries what the recovery panel
     needs to show and to validate a hand-supplied segmentation: the failed
     chunk's number, its exact source text, how many chunks there are, and the
@@ -2631,13 +2914,16 @@ def _save_three_pass_checkpoint(output_path, fingerprint, stage, segmented,
                        "named": named, "annotated": annotated,
                        "resolutions": resolutions or [],
                        "elapsed_s": elapsed_s or {},
-                       "diagnostic_failures": diagnostic_failures or [],
-                       "failed": failed or None,
-                       "model_binding": model_binding,
-                       "diagnostic_segment_resume": diagnostic_segment_resume}
+                        "diagnostic_failures": diagnostic_failures or [],
+                        "failed": failed or None,
+                        "model_binding": model_binding,
+                        "diagnostic_segment_resume": diagnostic_segment_resume,
+                        "pass2_keep_scope": pass2_keep_scope}
+    if checkpoint_spec_digest is not None:
+        data[CHECKPOINT_DIGEST] = checkpoint_spec_digest
     path = three_pass_checkpoint_path(output_path)
     if checkpoint_writer is None:
-        atomic_json_write(data, path)
+        atomic_json_write(data, path, allow_nonatomic_fallback=False)
     else:
         if checkpoint_writer.path.absolute() != Path(path).absolute():
             raise ValueError("Checkpoint writer belongs to a different output")
@@ -2650,6 +2936,24 @@ def require_nonempty_source(source_text):
         raise ValueError("prepared source contains no text to generate")
 
 
+_LITERAL_PROVENANCE_FIELDS = ('literal_input_sha256', 'literal_strip_front_matter')
+
+
+def copy_run_params(params, **changes):
+    """Copy params for one run while retaining runtime-only literal provenance.
+
+    `literal_input_sha256` and `literal_strip_front_matter` are set on the
+    instance by main() and are not LLMGenParams fields, so a bare replace()
+    loses them and Pass 3 binds a different script than the one staged.
+    """
+    provenance = {name: getattr(params, name) for name in _LITERAL_PROVENANCE_FIELDS
+                  if hasattr(params, name)}
+    copied = replace(params, **changes)
+    for name, value in provenance.items():
+        setattr(copied, name, value)
+    return copied
+
+
 @record_judge_run()
 def run_three_pass(client, model_name, source_text, params, chunk_size,
                    on_exhaustion="fail", output_path=None,
@@ -2660,8 +2964,9 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                    attribute_batch_size=BATCH_SIZE, attribute_context_chars=0,
                    attribute_prompt_variant="default", attribute_prompt_texts=None,
                    planned_calls=None, cast=None, keep_scope="line", speaker_traits=False,
-                   attribute_target_chars=0, instruct_target_chars=0, instruct_context_chars=0,
-                   defer_final_publication=False, require_matching_checkpoint=False):
+                    attribute_target_chars=0, instruct_target_chars=0, instruct_context_chars=0,
+                    defer_final_publication=False, require_matching_checkpoint=False,
+                    run_id=None, run_spec_receipt=None):
     """Full flow. Returns the assembled [{speaker,text,instruct}] list, or raises
     RuntimeError if pass 1 exhausts a chunk. first_person_narrator optionally
     seeds that exact character into the pass-2 roster. When output_path is given, saves a
@@ -2677,6 +2982,18 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
     text is sent through the variant provider for every variant, default
     included, so what Setup shows is what the model gets."""
     require_nonempty_source(source_text)
+    # Rule 17: observed_calls and reasoning_allowance are run-local counters,
+    # not outputs the caller asked us to write into its params. The nested
+    # observers below mutate them, so work on a copy: the caller keeps its
+    # input/default values and each call (e.g. each --preflight sample) starts
+    # its own budget. replace() preserves every field, so unusual flags and
+    # intentionally seeded input values still apply to this run; only the
+    # in-run learning is local.
+    params = copy_run_params(params)
+    if getattr(params, "cast_aliases", False):
+        params = copy_run_params(params, cast_alias_groups=(cast or {}).get("alias_groups"))
+        if not params.cast_alias_groups:
+            print("Experimental Step 2 alias evidence unavailable: no cast aliases loaded.", flush=True)
     validate_instruct_context_chars(instruct_context_chars, params)
     for target in (attribute_target_chars, instruct_target_chars):
         list(iter_entry_windows([], attribute_batch_size, target))
@@ -2701,6 +3018,10 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
     narrator = normalize_narrator_name(first_person_narrator)
     chunk_records = get_segment_chunk_records(source_text, chunk_size, params)
     chunks = [record["text"] for record in chunk_records]
+    if run_spec_receipt is not None and (
+            len(chunks) != run_spec_receipt['chunk_count']
+            or get_segment_chunk_digests(chunk_records) != run_spec_receipt['spec']['chunk_digests']):
+        raise RuntimeError('The loaded chunk plan differs from admission; saved progress was preserved.')
     quote_analyses = []
     quote_depth = 0
     for index, record in enumerate(chunk_records):
@@ -2709,26 +3030,52 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             allow_open_end=index < len(chunk_records) - 1)
         quote_analyses.append(analysis)
         quote_depth = analysis["final_depth"]
-    fingerprint = three_pass_fingerprint(
-        source_text, model_name, chunk_size, params, on_exhaustion,
-        context_windows, context_rescue_retries, endpoint, collect_all_failures,
-        attribute_batch_size=attribute_batch_size,
-        attribute_context_chars=attribute_context_chars,
-        attribute_prompt_variant=attribute_prompt_variant,
-        attribute_prompt_texts=attribute_prompt_texts,
-        cast_sha256=(cast or {}).get("sha256"),
-        attribution_votes=attribution_votes, vote_temperature=vote_temperature,
-        first_person_narrator=narrator, speaker_traits=speaker_traits,
-        attribute_target_chars=attribute_target_chars, instruct_target_chars=instruct_target_chars,
-        instruct_context_chars=instruct_context_chars)
+    def make_fingerprint(scope):
+        return get_native_three_pass_fingerprint(
+            source_text, model_name, chunk_size, params, {
+                'attribute_batch_size': attribute_batch_size,
+                'attribute_context_chars': attribute_context_chars,
+                'attribute_target_chars': attribute_target_chars,
+                'instruct_target_chars': instruct_target_chars,
+                'instruct_context_chars': instruct_context_chars,
+            }, keep_scope=scope, on_exhaustion=on_exhaustion, context_windows=context_windows,
+            context_rescue_retries=context_rescue_retries, endpoint=endpoint,
+            collect_all_failures=collect_all_failures, attribute_prompt_variant=attribute_prompt_variant,
+            attribute_prompt_texts=attribute_prompt_texts, cast_sha256=(cast or {}).get("sha256"),
+            attribution_votes=attribution_votes, vote_temperature=vote_temperature,
+            first_person_narrator=narrator, speaker_traits=speaker_traits)
+
+    if run_spec_receipt is not None:
+        fingerprint = dict(run_spec_receipt['fingerprint'])
+        if run_spec_receipt['spec'].get('legacy_runtime') and make_fingerprint(keep_scope) != fingerprint:
+            raise RuntimeError('The native recovery settings changed; saved progress was preserved.')
+        scope_fingerprints = {scope: dict(fingerprint) for scope in PASS2_KEEP_SCOPES}
+        legacy_fingerprint = dict(fingerprint)
+    else:
+        fingerprint = make_fingerprint(keep_scope)
+        scope_fingerprints = {scope: make_fingerprint(scope) for scope in PASS2_KEEP_SCOPES}
+        legacy_fingerprint = make_fingerprint(None)
     initial_binding = get_run_model_binding(client, model_name)
     if initial_binding["failover_model"] is not None:
         fingerprint["model_binding"] = initial_binding
-    state = _load_three_pass_checkpoint(output_path, fingerprint, len(chunks)) if output_path else None
+        for other in scope_fingerprints.values():
+            other["model_binding"] = initial_binding
+        legacy_fingerprint["model_binding"] = initial_binding
+    checkpoint_spec_digest = (get_checkpoint_spec_digest(run_spec_receipt)
+                              if run_spec_receipt is not None else None)
+    state = (_load_three_pass_checkpoint(
+        output_path, fingerprint, len(chunks), keep_scope=keep_scope,
+        scope_fingerprints=scope_fingerprints, legacy_fingerprint=legacy_fingerprint,
+        receipt=run_spec_receipt)
+        if output_path else None)
     if require_matching_checkpoint and state is None:
         raise RuntimeError('The saved checkpoint does not match this source and settings; it was preserved.')
     if state is not None:
         _refuse_checkpoint_replay_over_edited_publication(output_path)
+        # A durable admission without accepted work still needs fresh-run
+        # preflight and must start at the first chunk.
+        if state['stage'] == 'segment' and state['chunks_done'] == 0:
+            state = None
     if instruct_context_chars and not state and not collect_all_failures:
         from llm_provider import FailoverClient
         # A later pass may switch to a more permissive serving profile. Do not
@@ -2773,9 +3120,20 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
         # A new attempt retries unresolved attribution while keeping accepted rows.
         diagnostic_failures = [failure for failure in diagnostic_failures
                                if failure.get("pass") != "attribute"]
+        # A kept, quality-rejected attribution is flagged, not verified. Leave it
+        # pending so the scheduler retries it instead of skipping a populated row
+        # and trapping the run in an incomplete checkpoint (#2158 follow-up).
+        retry_attribution = {index for index, entry in enumerate(named)
+                             if isinstance(entry, dict)
+                             and entry.get("attribution_unchecked")}
+        for index in retry_attribution:
+            named[index] = None
         retry_instructions = {index for index, entry in enumerate(annotated)
                               if isinstance(entry, dict)
                               and entry.get("instruct_unchecked") is True}
+        # An instruction written for a rejected attribution depends on its
+        # speaker, so redo those too; accepted rows and instructions stay as-is.
+        retry_instructions.update(retry_attribution)
         # Older diagnostic writers recorded the failed index without marking
         # the fallback row. Those rows also remain pending on resume.
         retry_instructions.update(failure["entry"] for failure in diagnostic_failures
@@ -2783,11 +3141,24 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                                   and type(failure.get("entry")) is int
                                   and 0 <= failure["entry"] < len(annotated))
         for index in retry_instructions:
-            annotated[index] = None
+            if index < len(annotated):
+                annotated[index] = None
         diagnostic_failures = [failure for failure in diagnostic_failures
                                if not (failure.get("pass") == "instruct"
                                        and type(failure.get("entry")) is int
                                        and failure.get("entry") in retry_instructions)]
+    if (state is not None and get_run_fingerprint_identity(state.get("fingerprint"))
+            == get_run_fingerprint_identity(legacy_fingerprint)
+            and state.get("pass2_keep_scope") != keep_scope):
+        # A pre-binding checkpoint has no scope identity. Reuse its pass-2/3
+        # output only when evidence bound to that checkpoint proves the same
+        # scope; otherwise keep verified segmentation and redo the later passes.
+        named, annotated = [], []
+        diagnostic_failures = [failure for failure in diagnostic_failures
+                               if failure.get("pass") == "segment"]
+        print("Saved progress cannot prove this pass-2 keep scope; retaining "
+              "verified segmentation and repeating attribution and instructions.",
+              flush=True)
     diagnostic_segment_resume = None
     if any(failure.get("pass") == "segment" for failure in diagnostic_failures):
         resume = state.get("diagnostic_segment_resume")
@@ -2841,8 +3212,10 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                                         failed=failed,
                                         model_binding=get_run_model_binding(
                                             client, model_name, resumed_binding),
-                                        diagnostic_segment_resume=diagnostic_segment_resume,
-                                        checkpoint_writer=checkpoint_writer)
+                                         diagnostic_segment_resume=diagnostic_segment_resume,
+                                         checkpoint_writer=checkpoint_writer,
+                                         pass2_keep_scope=keep_scope,
+                                         checkpoint_spec_digest=checkpoint_spec_digest)
     passes = {}
     narration_resets = None            # set once the dialogue map has run (#1534)
 
@@ -2850,6 +3223,16 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
         failure_counts = Counter(
             code for attempt in attempts
             for code in (attempt.get("failure_codes") or []))
+        completion = None
+        if status in ("publishing", "complete"):
+            # Bind the completion record to the exact staged script bytes, so a
+            # manifest copied from another run or receipt cannot authorize it.
+            staged = [entry for entry in annotated if isinstance(entry, dict)]
+            staged_bytes = json.dumps(staged, ensure_ascii=False, indent=2,
+                                      allow_nan=False).encode('utf-8')
+            completion = {'status': status, 'run_id': run_id,
+                          'script_sha256': hashlib.sha256(staged_bytes).hexdigest(),
+                          'entries': len(staged)}
         _write_manifest(output_path, fingerprint, resolutions, passes, status,
                         delivery_review=get_delivery_review_info(annotated),
                         model_binding=get_run_model_binding(client, model_name, resumed_binding),
@@ -2893,7 +3276,9 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                             "response_fingerprints": len({
                                 a.get("response_fingerprint") for a in attempts
                                 if a.get("response_fingerprint")}),
-                        }, diagnostic_failures=diagnostic_failures)
+                        }, diagnostic_failures=diagnostic_failures, run_id=run_id,
+                        completion=completion,
+                        run_spec_sha256=(run_spec_receipt or {}).get('sha256'))
 
     # Pass 1 — resume from chunks_done.
     seg_start = time.time()
@@ -2910,16 +3295,20 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
         params.quoted_must_be_spoken, params.unquoted_must_be_narrator)
                        for chunk, analysis in zip(chunks, quote_analyses)]
     needs_model = [regions is None for regions, _ in quote_decisions]
+    # "chunk x of n" counts only chunks that ask the model, as the ETA does (#1925).
+    model_total = sum(needs_model)
     if progress:
-        progress.set_total(1, sum(needs_model))
+        progress.set_total(1, model_total)
         progress.restore_done(1, sum(needs_model[:chunks_done]))
+    model_number = sum(needs_model[:chunks_done])
     for i in range(chunks_done, len(chunks)):
         sink = []
         failures = []
         attempts_before = len(attempts)
         by_marks = not needs_model[i]
+        model_number += needs_model[i]
         if not by_marks:
-            announce_step(1, "chunk", i + 1, len(chunks))
+            announce_step(1, "chunk", model_number, model_total)
             if progress:
                 progress.note_call_started()
         seg = []
@@ -2946,8 +3335,10 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                                            # first model chunk gets the thinking room
                                            # the attempt before it showed.
                                            attempt_observer=observe_reasoning)
-        finish_step(1, "chunk", i + 1, len(chunks),
-                    "from quote marks" if by_marks else "from the model")
+        if by_marks:
+            print(f"Step 1 ({STEP_NAMES[1]}): chunk {i + 1} resolved from quote marks", flush=True)
+        else:
+            finish_step(1, "chunk", model_number, model_total, "from the model")
         if progress and not by_marks:
             progress.note_done(1)
             print(progress.eta_line(1), flush=True)
@@ -3052,22 +3443,27 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
     in_flight = {"current": None, "attempt_start": 0}
     attribute_bounds = (get_entry_window_bounds(segmented, attribute_batch_size, attribute_target_chars)
                         if attribute_target_chars else None)
-    window_total = sum(1 for _ in iter_unique_entry_batches(segmented, attribute_batch_size, attribute_target_chars))
-    window_number = 0
-    if progress:
-        model_total, model_done = 0, 0
-        for indexed_batch in iter_unique_entry_batches(segmented, attribute_batch_size, attribute_target_chars):
-            if not any(get_deterministic_named_entry(entry) is None for _, entry in indexed_batch):
-                continue
-            model_total += 1
+    # "window x of n" counts only windows that ask the model - the same windows
+    # the ETA counts - so a narration-only window is neither numbered nor
+    # totalled (#1925). Done windows still count, so a resumed run keeps its place.
+    def needs_attribution_model(indexed_batch):
+        return any(get_deterministic_named_entry(entry, cast) is None for _, entry in indexed_batch)
+
+    window_total, window_number, model_done = 0, 0, 0
+    for indexed_batch in iter_unique_entry_batches(segmented, attribute_batch_size, attribute_target_chars):
+        if not needs_attribution_model(indexed_batch):
+            continue
+        window_total += 1
+        if progress:
             pending = get_attribute_pending_entries(
                 indexed_batch, named, deterministic, diagnostic_failures)
             model_done += not any(index not in deterministic for index, _ in pending)
-        progress.set_total(2, model_total)
+    if progress:
+        progress.set_total(2, window_total)
         progress.restore_done(2, model_done)
     try:
         for indexed_batch in iter_unique_entry_batches(segmented, attribute_batch_size, attribute_target_chars):
-            window_number += 1
+            window_number += needs_attribution_model(indexed_batch)
             pending = get_attribute_pending_entries(
                 indexed_batch, named, deterministic, diagnostic_failures)
             # Narration alone is not work - without a line to attribute there is
@@ -3094,6 +3490,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                     profile_bound=profile_bound)
 
             work = [pending]
+            part = 0
             while work:
                 current = work.pop(0)
                 batch = [entry for _, entry in current]
@@ -3126,7 +3523,8 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                     print(f"  Attribution request exceeds budget; subdividing {len(current)} entries")
                     work[0:0] = [current[:midpoint], current[midpoint:]]
                     continue
-                announce_step(2, "window", window_number, window_total)
+                part += 1
+                announce_step(2, "window", window_number, window_total, part)
                 if progress:
                     progress.note_call_started()
                 try:
@@ -3209,6 +3607,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             "entries": [{"type": entry.get("type"), "text": entry.get("text")}
                         for _, entry in batch],
             "roster": list(roster),
+            "cast_sha256": (cast or {}).get("sha256"),
             "reason": str(exc),
             "attempts": attempts[in_flight["attempt_start"]:][-20:]})
         emit_manifest("failed", failed_pass="attribute")
@@ -3216,13 +3615,13 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             raise RuntimeError(str(exc)) from exc
         raise
     elapsed_s["attribute"] = attr_base + time.time() - attr_start
+    unchecked_entries = sum(
+        1 for entry in named if entry and entry.get("attribution_unchecked"))
     passes["attribute"] = {"elapsed_s": round(elapsed_s["attribute"], 3),
                            "status": ("incomplete" if any(
                                f["pass"] == "attribute" for f in diagnostic_failures)
                                else "complete"),
-                           "unchecked_entries": sum(
-                               1 for entry in named
-                               if entry and entry.get("attribution_unchecked"))}
+                           "unchecked_entries": unchecked_entries}
     # Pass 3 uses the same duplicate-free scheduling so ambiguous heads cannot
     # slip through there either (finding #5).
     annotated.extend([None] * (len(named) - len(annotated)))
@@ -3232,22 +3631,24 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             annotated[index] = {**entry, "instruct": default_instruct(entry)}
     inst_start = time.time()
     inst_base = elapsed_s.get("instruct", 0)
-    window_total = sum(1 for _ in iter_unique_entry_batches(named, target_chars=instruct_target_chars))
-    window_number = 0
+    # As in pass 2, only windows that ask the model are numbered (#1925).
+    def get_instruct_model_indices(indexed_batch):
+        return [index for index, entry in indexed_batch if not is_nonverbal_text(entry.get("text"))]
+
+    window_total, window_number, model_done = 0, 0, 0
     instruction_progress_reported = False
-    if progress:
-        model_total, model_done = 0, 0
-        for indexed_batch in iter_unique_entry_batches(named, target_chars=instruct_target_chars):
-            model_indices = [index for index, entry in indexed_batch
-                             if not is_nonverbal_text(entry.get("text"))]
-            if not model_indices:
-                continue
-            model_total += 1
+    for indexed_batch in iter_unique_entry_batches(named, target_chars=instruct_target_chars):
+        model_indices = get_instruct_model_indices(indexed_batch)
+        if not model_indices:
+            continue
+        window_total += 1
+        if progress:
             model_done += all(annotated[index] is not None for index in model_indices)
-        progress.set_total(3, model_total)
+    if progress:
+        progress.set_total(3, window_total)
         progress.restore_done(3, model_done)
     for indexed_batch in iter_unique_entry_batches(named, target_chars=instruct_target_chars):
-        window_number += 1
+        window_number += bool(get_instruct_model_indices(indexed_batch))
         pending = [(index, entry) for index, entry in indexed_batch
                    if annotated[index] is None]
         if not pending:
@@ -3264,6 +3665,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                 profile_bound=profile_bound)
 
         work = [pending]
+        part = 0
         while work:
             current = work.pop(0)
             batch = [entry for _, entry in current]
@@ -3287,7 +3689,8 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                 raise TokenBudgetError("One instruction entry plus context/output does not fit; use a capable endpoint.")
             exhausted = []
             attempt_start = len(attempts)
-            announce_step(3, "window", window_number, window_total)
+            part += 1
+            announce_step(3, "window", window_number, window_total, part)
             if progress:
                 progress.note_call_started()
             new_annotated = instruct_batch(
@@ -3313,6 +3716,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
                         "entries": [{"speaker": entry.get("speaker"), "text": entry.get("text")}
                                     for _, entry in current],
                         "reason": "instruct LLM unavailable; refusing fallback output",
+                        "delivery_direction": getattr(params, "delivery_direction", "off"),
                         "attempts": batch_attempts[-20:]})
                     emit_manifest("failed", failed_pass="instruct")
                     raise RuntimeError(
@@ -3362,6 +3766,7 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             emit_manifest("failed", failed_pass=failed_pass)
             raise RuntimeError(
                 f"{failed_pass} LLM unavailable; refusing to publish fallback-only output")
+    map_error = None
     try:
         dialogue = apply_dialogue_map(annotated, source_text)
         annotated = dialogue["entries"]
@@ -3380,15 +3785,30 @@ def run_three_pass(client, model_name, source_text, params, chunk_size,
             print("Dialogue map: convention could not be determined; entries "
                   "carry no `spoken` key rather than a guessed one")
     except Exception as exc:                                   # noqa: BLE001
-        print(f"Dialogue map FAILED ({exc}); entries carry no `spoken` key")
+        map_error = exc
+    # The map re-runs unconditionally on every attempt, so its previous verdict
+    # must be replaced by this attempt's once the map has returned: a success
+    # retires the recorded failure (#2295) and a repeated failure replaces it
+    # instead of stacking a duplicate. Only the save() below persists this, so
+    # a run that dies mid-map keeps the old failure on disk.
+    diagnostic_failures = [failure for failure in diagnostic_failures
+                           if failure.get("pass") != "dialogue_map"]
+    if map_error is not None:
+        print(f"Dialogue map FAILED ({map_error}); entries carry no `spoken` key")
         diagnostic_failures.append({
-            "pass": "dialogue_map", "reason": type(exc).__name__,
-            "error": str(exc)[:500]})
+            "pass": "dialogue_map", "reason": type(map_error).__name__,
+            "error": str(map_error)[:500]})
     if getattr(params, "literal_source_preserving", False) and not diagnostic_failures:
         from literal_policy import bind_literal_policy
-        annotated = bind_literal_policy(source_text, annotated)
+        annotated = bind_literal_policy(
+            source_text, annotated,
+            input_sha256=getattr(params, "literal_input_sha256", None),
+            strip_front_matter=getattr(params, "literal_strip_front_matter", None))
     save("done")
-    emit_manifest("incomplete" if diagnostic_failures or unavailable_passes
+    # #2158: a kept, quality-rejected attribution is flagged, not verified.
+    # Keep it out of the published script while preserving the checkpoint,
+    # manifest and diagnostic evidence for review/resume.
+    emit_manifest("incomplete" if diagnostic_failures or unavailable_passes or unchecked_entries
                   else "publishing" if defer_final_publication else "complete")
     return [entry for entry in annotated if isinstance(entry, dict)]
 
@@ -3699,10 +4119,164 @@ def prepare_source_text(book):
 
 def get_output_paths(data_dir, requested_output=None):
     """Resolve output and stale-chunk paths for CLI and application runs."""
+    chunks = os.path.join(data_dir, "chunks.json")
     if requested_output is not None:
-        return requested_output, None
-    return (os.path.join(data_dir, "annotated_script.json"),
-            os.path.join(data_dir, "chunks.json"))
+        return (requested_output, chunks if is_active_script_output(
+            data_dir, requested_output) else None)
+    return (os.path.join(data_dir, "annotated_script.json"), chunks)
+
+
+def _has_explicit_null_pass_status(pass_info):
+    """An explicit null pass status is invalid; an omitted one is legacy.
+
+    Older manifests omit the status field entirely. Using .get() would treat an
+    explicit null the same as that supported legacy shape, so the distinction
+    has one authority shared by publication and the recovery GET.
+    """
+    return 'status' in pass_info and pass_info['status'] is None
+
+
+def get_three_pass_unchecked_count(manifest):
+    """Number of quality-rejected kept attributions recorded in a manifest.
+
+    A malformed pass mapping (including a string count or an explicit null pass
+    status) is refused, not silently counted as zero: every unchecked row must
+    be rejected independently of the other publication checks.
+    """
+    passes = manifest.get("passes") if isinstance(manifest, dict) else None
+    if passes is None:
+        passes = {}
+    if not isinstance(passes, dict):
+        raise ValueError('generation pass mapping is invalid')
+    unchecked = 0
+    for pass_info in passes.values():
+        if not isinstance(pass_info, dict):
+            raise ValueError('generation pass mapping is invalid')
+        if _has_explicit_null_pass_status(pass_info):
+            raise ValueError('generation pass status is null')
+        value = pass_info.get('unchecked_entries', 0)
+        if type(value) is not int or value < 0:
+            raise ValueError('unchecked attribution count is invalid')
+        unchecked += value
+    return unchecked
+
+
+def load_three_pass_completion_manifest(path):
+    """Strictly read the manifest a publication decision is about to trust.
+
+    A missing or corrupt manifest must never be silently treated as an empty
+    object: that would let a run with no completion evidence publish over the
+    last accepted script and delete its chunks.
+    """
+    from script_selection_binding import _unique_pairs
+    try:
+        raw = Path(path).read_bytes()
+        manifest = json.loads(
+            raw, object_pairs_hook=_unique_pairs,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Invalid numeric constant')))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError('Generation manifest is missing or invalid; prior output preserved') from exc
+    if not isinstance(manifest, dict):
+        raise ValueError('Generation manifest is invalid; prior output preserved')
+    return manifest
+
+
+def get_three_pass_publication_blocker(manifest, *, expected_run_id=None,
+                                       staged_script_sha256=None, staged_script_bytes=None,
+                                       require_publishing=False, require_receipt_free=False):
+    """Why a finished three-pass manifest must not be published, or None.
+
+    Publication needs a typed completion record from this exact attempt, bound
+    to the staged script bytes, with no contradictory diagnostic evidence and
+    no unchecked rows. When the bytes are supplied they are decoded again and
+    checked against the declared row count and every row's own unchecked flag:
+    a manifest that merely agrees with its own digest is not sufficient. The
+    locked active boundary additionally requires the publishing state and no
+    prior completion receipt: that boundary writes the receipt itself.
+    """
+    if not isinstance(manifest, dict) or not manifest:
+        return 'generation manifest is missing or invalid'
+    rows = None
+    if staged_script_bytes is not None:
+        from script_selection_binding import _validated_script_entries
+        try:
+            rows = _validated_script_entries(staged_script_bytes)
+        except ValueError as exc:
+            return str(exc)
+        staged_digest = hashlib.sha256(staged_script_bytes).hexdigest()
+        if staged_script_sha256 is not None and staged_script_sha256 != staged_digest:
+            return 'staged script digest does not match its bytes'
+        staged_script_sha256 = staged_digest
+    status = manifest.get("status")
+    if not isinstance(status, str) or status not in ("publishing", "complete"):
+        return f"generation status is {status!r}"
+    if require_publishing and status != 'publishing':
+        return 'generation manifest is already complete'
+    run_id = manifest.get("run_id")
+    if expected_run_id is not None:
+        if (not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id)
+                or run_id != expected_run_id):
+            return 'generation manifest belongs to a different attempt'
+    elif run_id is not None and (not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id)):
+        return 'generation attempt identity is invalid'
+    completion = manifest.get("completion")
+    if not isinstance(completion, dict):
+        return 'generation completion record is missing or invalid'
+    if completion.get('status') != status:
+        return 'generation completion record contradicts the manifest status'
+    if completion.get('run_id') != run_id:
+        return 'generation completion record belongs to a different attempt'
+    script_sha256 = completion.get('script_sha256')
+    if (not isinstance(script_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', script_sha256)):
+        return 'generation completion record is not bound to a script'
+    if staged_script_sha256 is not None and script_sha256 != staged_script_sha256:
+        return 'generation completion record does not match the staged script'
+    if type(completion.get('entries')) is not int or completion['entries'] < 0:
+        return 'generation completion record has an invalid entry count'
+    if rows is not None:
+        if completion['entries'] != len(rows):
+            return 'generation completion record has an invalid entry count'
+        if any(entry.get('attribution_unchecked') for entry in rows):
+            return 'staged script contains unchecked attributions'
+    receipt = manifest.get("publication")
+    if receipt is not None:
+        if require_publishing or require_receipt_free:
+            return 'generation manifest has a prior completion receipt'
+        expected_receipt_run = expected_run_id or run_id
+        if (not isinstance(receipt, dict) or receipt.get('run_id') != expected_receipt_run
+                or not isinstance(receipt.get('script_sha256'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', receipt['script_sha256'])):
+            return 'generation manifest has a conflicting publication receipt'
+        if staged_script_sha256 is not None and receipt['script_sha256'] != staged_script_sha256:
+            return 'generation publication receipt does not match the staged script'
+    if manifest.get("failed_pass") is not None or manifest.get("failed_chunk") is not None:
+        return 'generation did not complete successfully'
+    failures = manifest.get("diagnostic_failures")
+    if failures is None:
+        failures = []
+    if not isinstance(failures, list):
+        return 'generation diagnostic evidence is invalid'
+    if failures:
+        return f"{len(failures)} diagnostic failure(s) remain"
+    passes = manifest.get("passes")
+    if passes is None:
+        passes = {}
+    if not isinstance(passes, dict):
+        return 'generation pass mapping is invalid'
+    for pass_info in passes.values():
+        if not isinstance(pass_info, dict):
+            return 'generation pass mapping is invalid'
+        if _has_explicit_null_pass_status(pass_info):
+            return 'generation pass status is null'
+        if pass_info.get('status') not in (None, 'complete'):
+            return f"generation pass status is {pass_info['status']!r}"
+    try:
+        unchecked = get_three_pass_unchecked_count(manifest)
+    except ValueError as exc:
+        return str(exc)
+    if unchecked:
+        return f"{unchecked} quality-rejected attribution(s) remain unchecked"
+    return None
 
 
 def get_prepared_source(path, strip_front_matter=True, report=lambda message: None,
@@ -3753,7 +4327,7 @@ def get_prepared_source(path, strip_front_matter=True, report=lambda message: No
     return book, unicode_report
 
 
-def main():
+def main(client_factory=None):
     parser = argparse.ArgumentParser(description="Three-pass annotated script generation.")
     parser.add_argument("input_file")
     parser.add_argument("--output", default=None)
@@ -3761,6 +4335,8 @@ def main():
     parser.add_argument("--active-source-sha256", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--active-run-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--require-matching-checkpoint", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--run-spec-receipt", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--run-spec-digest", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--model", default=None, help="Generation model for this run; config.json is unchanged.")
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--attribute-batch-size", type=int, default=None,
@@ -3794,6 +4370,8 @@ def main():
                              "llm (always the model)")
     parser.add_argument("--strip-front-matter", action=argparse.BooleanOptionalAction,
                         default=True)
+    parser.add_argument("--cast-aliases", action=argparse.BooleanOptionalAction, default=None,
+                        help="Explicit Pass 2 cast aliases; saved incremental-cast setting by default")
     parser.add_argument("--cast-file", default=None,
                         help="JSON cast list [{name, aliases}] put on the pass-2 roster "
                              "ahead of attested names (experiments/build_cast_list.py).")
@@ -3833,13 +4411,22 @@ def main():
     parser.add_argument("--literal-source-preserving", action="store_true",
                         help="Preserve ordered source words; keep speech expansion in speech preparation.")
     args = parser.parse_args()
+    admitted_receipt = None
+    if args.run_spec_receipt:
+        import run_spec_receipt as receipt_module
+        try:
+            admitted_receipt = receipt_module.load_receipt_file(args.run_spec_receipt)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if admitted_receipt is None or admitted_receipt.get('sha256') != args.run_spec_digest:
+            parser.error('Run-spec receipt does not match the admitted digest')
     if args.preflight and args.collect_all_failures:
         parser.error("--collect-all-failures cannot be combined with --preflight")
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     app_dir = os.path.dirname(__file__)
     data_dir = get_runtime_data_dir(root)
-    output_path, chunks_path = get_output_paths(data_dir, args.output)
+    output_path, _ = get_output_paths(data_dir, args.output)
     if (len({args.active_book_token is None, args.active_source_sha256 is None, args.active_run_id is None}) != 1
             or (args.active_book_token is not None and (args.output is not None or args.preflight))
             or (args.require_matching_checkpoint and args.active_book_token is None)):
@@ -3861,11 +4448,11 @@ def main():
     # HTTP generation (active-book identity present) runs with the known
     # owning book root; an explicit CLI source keeps its parent authority.
     owning_root = data_dir if args.active_book_token is not None else None
-    input_source_sha256 = None
-    if args.literal_source_preserving:
-        from script_selection_binding import _read_source_snapshot
-        input_source_sha256, _ = _read_source_snapshot(
-            args.input_file, owning_root=owning_root)
+    # Capture the raw source digest for every run: it is the identity checked
+    # again at the publication boundary (not just the literal-mode branch).
+    from script_selection_binding import _read_source_snapshot
+    input_source_sha256, _ = _read_source_snapshot(
+        args.input_file, owning_root=owning_root)
     try:
         expected_source_sha256 = (args.active_source_sha256
                                   if args.active_book_token is not None
@@ -3895,19 +4482,47 @@ def main():
     llm = get_active_llm_config(config)
     gen = config.get("generation") or {}
     model_name = llm.get("model_name")
+    if admitted_receipt is not None:
+        admitted_spec = admitted_receipt['spec']
+        from three_pass_run_spec import get_provider_request_digest, safe_endpoint
+        admitted_llm = admitted_spec.get('llm_profile') or {}
+        if (admitted_llm.get('base_url')
+                and safe_endpoint(llm.get('base_url')) != admitted_llm['base_url']):
+            raise SystemExit(
+                'The active LLM endpoint changed after this run was admitted; '
+                'start a new generation so credentials and limits match the endpoint.')
+        if admitted_spec.get('model_name') and model_name != admitted_spec['model_name']:
+            raise SystemExit('The active LLM model changed after this run was admitted')
+        from lmstudio_settings import get_failover_llm_config
+        failover_profile = get_failover_llm_config(config) or {}
+        configured_secondary = failover_profile.get('model_name')
+        if configured_secondary != admitted_spec.get('secondary_model'):
+            raise SystemExit('The configured failover model changed after this run was admitted')
+        if (admitted_spec.get('secondary_endpoint') is not None
+                and safe_endpoint(failover_profile.get('base_url'))
+                != admitted_spec['secondary_endpoint']):
+            raise SystemExit('The configured failover endpoint changed after this run was admitted')
+        if (get_provider_request_digest(llm, failover_profile)
+                != admitted_spec.get('provider_request_sha256')):
+            raise SystemExit('Provider request settings changed after admission; saved progress was preserved.')
     cast = None
     if args.cast_file:
         try:
             cast = load_cast(args.cast_file)
         except (OSError, ValueError) as exc:
             parser.error(f"--cast-file: {exc}")
+        if admitted_receipt is not None and cast is not None:
+            admitted_cast = admitted_receipt['spec'].get('cast_sha256')
+            if admitted_cast is not None and cast['sha256'] != admitted_cast:
+                parser.error('The admitted cast changed after this run was accepted')
         print(f"Cast list: {len(cast['names'])} characters from {args.cast_file} "
               f"(sha256 {cast['sha256'][:12]})")
     try:
-        generation_settings = resolve_three_pass_generation_settings(
-            config, args.chunk_size, segmentation_override=args.segmentation,
-            pass1_format_override=args.pass1_format,
-            delivery_direction_override=args.delivery_direction)
+        generation_settings = (dict(admitted_spec['settings']) if admitted_receipt is not None
+                               else resolve_three_pass_generation_settings(
+                                   config, args.chunk_size, segmentation_override=args.segmentation,
+                                   pass1_format_override=args.pass1_format,
+                                   delivery_direction_override=args.delivery_direction))
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
@@ -3926,33 +4541,82 @@ def main():
     if attribute_batch_size < 1 or not 0 <= attribute_context_chars <= 1000000:
         raise SystemExit("attribute batch size must be >= 1 and context chars >= 0")
     try:
-        configured_windows = gen.get("context_rescue_windows")
-        validated_windows = get_context_rescue_windows(configured_windows)
-        context_windows = validated_windows if configured_windows is not None else None
+        rescue_settings = admitted_spec.get('context_rescue', {}) if admitted_receipt is not None else gen
+        context_windows, context_rescue_retries = get_context_rescue_settings(rescue_settings)
         validate_attribution_vote_settings(args.attribution_votes, args.vote_temperature)
     except ValueError as exc:
         parser.error(str(exc))
-    context_rescue_retries = gen.get("context_rescue_retries")
     base_url = llm.get("base_url", "http://localhost:1234/v1")
     llm_mode = config.get("llm_mode", "local")
     # Self-heal LM Studio: load model_name at its verified context if nothing is
     # loaded / settings are stale, mirroring generate_script.py. Without this a
     # fresh `lms unload` leaves no model loaded and every call 400s.
     _, lm_status, heal_msg = ensure_ideal_settings(
-        llm_mode, base_url, model_name, ssh_alias=config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
+        llm_mode, base_url, model_name, ssh_alias=config.get("llm_remote_ssh"), api_key=llm.get("api_key"),
+        authorization=get_effective_authorization(llm), llm_config=llm)
     print(heal_msg)
     params = get_three_pass_run_params(config, lm_status, args.reasoning_effort, generation_settings)
     params.literal_source_preserving = args.literal_source_preserving
+    params.literal_input_sha256 = input_source_sha256
+    params.literal_strip_front_matter = args.strip_front_matter
     generation_settings.update({
         "segment_system_prompt": params.segment_system_prompt,
         "segment_user_prompt_template": params.segment_user_prompt_template,
         "instruct_system_prompt": params.instruct_system_prompt,
         "instruct_user_prompt_template": params.instruct_user_prompt_template,
     })
+    if admitted_receipt is not None:
+        if admitted_spec.get('model_name'):
+            llm = dict(llm, model_name=admitted_spec['model_name'])
+        native_params = params
+        params = LLMGenParams(**admitted_spec['params'])
+        if admitted_spec.get('legacy_runtime'):
+            if native_params.context_length != params.context_length:
+                raise SystemExit('The native recovery context changed; saved progress was preserved.')
+            params.provider_extra_body = native_params.provider_extra_body
+        elif native_params.context_length is not None and (
+                params.context_length is None or native_params.context_length < params.context_length):
+            raise SystemExit('The loaded context cannot serve the admitted chunk plan; saved progress was preserved.')
+        params.literal_source_preserving = admitted_spec['options'].get(
+            'literal_source_preserving', False)
+        params.literal_input_sha256 = input_source_sha256
+        params.literal_strip_front_matter = admitted_spec['options'].get('strip_front_matter')
+        model_name = admitted_spec['model_name']
+        chunk_size = admitted_spec['chunk_size']
+        keep_scope = admitted_spec['keep_scope']
+        admitted_attribution = admitted_spec.get('attribution') or {}
+        for name in ('attribute_batch_size', 'attribute_context_chars',
+                     'attribute_target_chars', 'instruct_target_chars',
+                     'instruct_context_chars'):
+            if name in admitted_attribution:
+                if name == 'attribute_batch_size':
+                    attribute_batch_size = admitted_attribution[name]
+                elif name == 'attribute_context_chars':
+                    attribute_context_chars = admitted_attribution[name]
+                elif name == 'attribute_target_chars':
+                    attribute_target_chars = admitted_attribution[name]
+                elif name == 'instruct_target_chars':
+                    instruct_target_chars = admitted_attribution[name]
+                else:
+                    instruct_context_chars = admitted_attribution[name]
+        admitted_prompts = admitted_spec.get('prompts') or {}
+        for field, key in (('segment_system_prompt', 'segment_system'),
+                           ('segment_user_prompt_template', 'segment_user'),
+                           ('instruct_system_prompt', 'instruct_system'),
+                           ('instruct_user_prompt_template', 'instruct_user')):
+            if admitted_prompts.get(key) is not None:
+                setattr(params, field, admitted_prompts[key])
+                generation_settings[field] = admitted_prompts[key]
     attribute_prompt_variant, attribute_prompt_texts = resolve_attribute_prompt(
         config, args.prompt_variant)
-    from attribution_prompt_variants import (GROUP_RULE_7, VARIANTS, builtin_texts,
-                                             validate_preset_texts)
+    if admitted_receipt is not None:
+        attributed = admitted_spec.get('attribution') or {}
+        if 'attribute_prompt_variant' in attributed:
+            attribute_prompt_variant = attributed['attribute_prompt_variant']
+        attribute_prompt_texts = attributed.get('attribute_prompt_texts')
+    if args.cast_aliases is not None:
+        params = copy_run_params(params, cast_aliases=args.cast_aliases)
+    from attribution_prompt_variants import GROUP_RULE_7, VARIANTS, validate_preset_texts
     if (config.get("generation") or {}).get("three_pass_group_rule") is True:
         print("Group rule: on" if GROUP_RULE_7 in ((attribute_prompt_texts or {}).get("system") or "")
               else "Group rule: on, but this prompt has no standard rule 7 to replace; not applied")
@@ -3966,21 +4630,15 @@ def main():
     problem = validate_preset_texts(attribute_prompt_variant, attribute_prompt_texts)
     if problem:
         raise SystemExit(f"attribution preset: {problem}")
-    if narrator:
-        # the first-person narrator prior goes on top of whatever system text
-        # the active preset sends (the file's, or the user's edit of it)
-        system_text = ((attribute_prompt_texts or {}).get("system")
-                       or builtin_texts(attribute_prompt_variant)["system"])
-        params.attribute_system_prompt = add_narrator_prior(system_text, narrator)
-        if attribute_prompt_texts:
-            attribute_prompt_texts = dict(attribute_prompt_texts, system=params.attribute_system_prompt)
-    elif attribute_prompt_texts and attribute_prompt_variant == "default":
-        params.attribute_system_prompt = attribute_prompt_texts.get("system") or None
-        params.attribute_user_prompt_template = attribute_prompt_texts.get("user") or None
-    client = make_run_client(config, llm, llm_timeout_seconds())
+    params, attribute_prompt_texts = get_attribution_prompt_params(
+        params, attribute_prompt_variant, attribute_prompt_texts, narrator)
+    client = (client_factory(config, llm, llm_timeout_seconds())
+              if client_factory is not None
+              else make_run_client(config, llm, llm_timeout_seconds()))
 
     # The CLI flag overrides the Setup switch; neither set means 'line'.
-    keep_scope = args.pass2_keep_scope or generation_settings["keep_scope"]
+    keep_scope = (admitted_spec['keep_scope'] if admitted_receipt is not None
+                  else args.pass2_keep_scope or generation_settings["keep_scope"])
     print(f"Three-pass generation: {len(book)} chars, chunk_size={chunk_size}, "
           f"attribute_batch_size={attribute_batch_size}, "
           f"attribute_context_chars={attribute_context_chars}, "
@@ -4029,7 +4687,7 @@ def main():
                     client, model_name, sample, params, chunk_size,
                     output_path=sample_out,
                     planned_calls=sample_plan, **run_options)
-                atomic_json_write(sample_entries, sample_out)
+                atomic_json_write(sample_entries, sample_out, allow_nonatomic_fallback=False)
                 info = get_preflight_sample_info(label, index, sample_out,
                                                  sample_plan, entries=sample_entries)
             except (RuntimeError, PassExhausted) as exc:
@@ -4039,49 +4697,85 @@ def main():
             if info["status"] != "complete":
                 summary["status"] = "failed"
                 break
-        atomic_json_write(summary, output_path + ".preflight_manifest.json")
+        atomic_json_write(summary, output_path + ".preflight_manifest.json", allow_nonatomic_fallback=False)
         sys.exit(0 if summary["status"] == "complete" else 1)
+    active_run_id = args.active_run_id if args.active_book_token is not None else None
+    if active_run_id is not None:
+        from book_state_transaction import finish_book_worker_handoff
+        finish_book_worker_handoff(data_dir, active_run_id)
+    run_id = active_run_id if active_run_id is not None else uuid.uuid4().hex
     try:
         entries = run_three_pass(client, model_name, book, params, chunk_size,
                                  output_path=output_path,
                                  planned_calls=planned_calls,
+                                 run_id=run_id,
                                  **({'defer_final_publication': True}
-                                    if args.active_book_token is not None else {}),
+                                    if active_run_id is not None else {}),
                                  **({'require_matching_checkpoint': True}
                                     if args.require_matching_checkpoint else {}),
+                                 **({'run_spec_receipt': admitted_receipt}
+                                    if admitted_receipt is not None else {}),
                                  **run_options)
     except (RuntimeError, PassExhausted) as exc:
         print(f"Error: {exc}")
         sys.exit(1)
 
-    manifest = safe_load_json(three_pass_manifest_path(output_path), {})
-    if manifest.get("status") == "incomplete":
+    def refuse(blocker):
         partial_path = output_path + ".partial.json"
-        atomic_json_write(entries, partial_path)
-        print(f"Diagnostic run found {len(manifest.get('diagnostic_failures', []))} "
-              f"failure(s); wrote {len(entries)} successful entries to {partial_path}")
+        atomic_json_write(entries, partial_path, allow_nonatomic_fallback=False)
+        print(f"Refusing publication: {blocker}; "
+              f"wrote {len(entries)} entries to {partial_path}")
         sys.exit(1)
+
+    # Re-verify source identity at the publication boundary. The same guard is
+    # re-run at the final replacement boundary (and on every retry) by the
+    # guarded commit below, so an edit in either window cannot publish stale text.
+    from script_selection_binding import require_unchanged_source
+    publish_source_sha256 = (args.active_source_sha256 if active_run_id is not None
+                             else input_source_sha256)
+
+    def require_source_unchanged():
+        require_unchanged_source(args.input_file, publish_source_sha256,
+                                 owning_root=owning_root)
+
+    require_source_unchanged()
     if args.literal_source_preserving:
         from literal_policy import bind_literal_policy
-        from script_selection_binding import _source_digest
-        if _source_digest(args.input_file) != input_source_sha256:
-            raise ValueError("Source input changed during literal annotation; refusing publication")
         entries = bind_literal_policy(book, entries,
             input_sha256=input_source_sha256,
             strip_front_matter=args.strip_front_matter)
-    # Dialogue mapping already ran inside run_three_pass before the final
-    # checkpoint and manifest were written.
-    if args.active_book_token is not None:
+        require_source_unchanged()
+    # Stage the final bytes only after literal binding. The completion record
+    # must match these bytes, so no manifest can authorize a different script.
+    script_bytes = json.dumps(entries, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+    try:
+        manifest = load_three_pass_completion_manifest(three_pass_manifest_path(output_path))
+    except ValueError as exc:
+        refuse(str(exc))
+    blocker = get_three_pass_publication_blocker(
+        manifest, expected_run_id=run_id, staged_script_bytes=script_bytes,
+        require_publishing=active_run_id is not None,
+        require_receipt_free=active_run_id is None)
+    if blocker:
+        refuse(blocker)
+    if active_run_id is not None:
         from script_selection_binding import publish_generated_script
-        script_bytes = json.dumps(entries, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
         publish_generated_script(data_dir, args.active_book_token, args.input_file,
-                                 args.active_source_sha256, script_bytes, expected_run_id=args.active_run_id,
-                                 complete_manifest=True)
+                                 args.active_source_sha256, script_bytes,
+                                 expected_run_id=args.active_run_id,
+                                 complete_manifest=True,
+                                 before_replace=require_source_unchanged)
     else:
-        atomic_json_write(entries, output_path)
+        # script_bytes above is the exact byte sequence the manifest is bound
+        # to. Pin the text writer's newline so a native-CRLF platform cannot
+        # emit different bytes than the digest that was validated.
+        atomic_json_write(entries, output_path, allow_nonatomic_fallback=False,
+                          newline="\n", before_replace=require_source_unchanged)
     print(f"Wrote {len(entries)} entries to {output_path}")
-    if args.active_book_token is None and chunks_path is not None and remove_chunk_snapshot(chunks_path):
-        print("Cleared old chunks.json")
+    if args.active_book_token is None:
+        _, chunks_path = get_output_paths(data_dir, output_path)
+        if chunks_path is not None and remove_chunk_snapshot(chunks_path):
+            print("Cleared old chunks.json")
 
 
 if __name__ == "__main__":

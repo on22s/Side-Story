@@ -50,7 +50,8 @@ import xml.etree.ElementTree as ET
 
 import utils  # inserts the repo root on sys.path for alexandria_alignment users
 from epub_package import get_epub_package
-from qwen_align import (get_normalized_stream,
+from ruby_text import RUBY_FALLBACK_TAG, RUBY_READING_TAG, RUBY_TAG, RubyCollector
+from qwen_align import (get_normalized_stream, get_stream_chars,
                         get_token_key, get_validated_aligner_tokens,
                         require_exact_coverage, split_sentences,
                         cover_ranges)
@@ -284,10 +285,82 @@ def _visible_pieces(node):
             yield " "
             yield from _visible_pieces(child)
             yield " "
+        elif _local(child.tag) == RUBY_TAG:
+            # Spoken form, by the same rule as script extraction (ruby_text).
+            yield _get_ruby_element_spoken_text(child)
         else:
             yield from _visible_pieces(child)
         if child.tail:
             yield child.tail
+
+
+def get_open_group_carry(mapping):
+    """The span group a spine document left open, for the next document.
+
+    Returns {"group": first_chunk, "matched_words": n} or None.
+    """
+    if mapping and mapping[-1].get("open_group"):
+        last = mapping[-1]
+        return {"group": last["span_group"], "matched_words": last["span_words"][1]}
+    return None
+
+
+def _get_optional_titles(root, segments, toc, path):
+    """Navigation labels that script extraction may speak before a segment.
+
+    Extraction inserts a TOC label at its target (the document start, or
+    the anchor element) when the text there does not already carry it.
+    Returns {segment_index: [label, ...]} for this spine document: the
+    segment at or containing the target, else the first one after it.
+    """
+    targets = [(entry.get("fragment"), entry["label"]) for entry in toc
+               if entry.get("path") == path and entry.get("label")]
+    if not targets or not segments:
+        return {}
+    order = {id(element): position for position, element in enumerate(root.iter())}
+    starts = [order.get(id(segment["element"]), -1) for segment in segments]
+    by_id = {}
+    for element in root.iter():
+        for key in (element.get("id"), element.get("{http://www.w3.org/XML/1998/namespace}id")):
+            if key and key not in by_id:
+                by_id[key] = element
+    titles = {}
+    for fragment, label in targets:
+        index = 0
+        if fragment is not None:
+            anchor = by_id.get(fragment)
+            if anchor is None:
+                continue
+            anchor_at = order[id(anchor)]
+            index = next((i for i, segment in enumerate(segments)
+                          if starts[i] >= anchor_at
+                          or any(node is anchor for node in segment["element"].iter())), None)
+            if index is None:
+                continue
+        titles.setdefault(index, []).append(label)
+    return titles
+
+
+def _get_ruby_element_spoken_text(ruby):
+    collector = RubyCollector()
+
+    def _walk(node):
+        tag = _local(node.tag)
+        if tag in _EXCLUDE or tag == RUBY_FALLBACK_TAG:
+            return
+        if tag == RUBY_READING_TAG:
+            collector.start_reading()
+        if node.text:
+            collector.add(node.text)
+        for child in node:
+            _walk(child)
+            if child.tail:
+                collector.add(child.tail)
+        if tag == RUBY_READING_TAG:
+            collector.end_reading()
+
+    _walk(ruby)
+    return collector.get_spoken_text()
 
 
 def _visible_text(node):
@@ -396,7 +469,60 @@ def get_normalized_words(text):
     """NFKC + casefold tokenization (case/punctuation intentionally ignored)."""
     folded = unicodedata.normalize("NFKC", text or "").casefold()
     folded = folded.replace('\u2019', "'").replace('\u2018', "'")
-    return _WORDS_RE.findall(folded)
+    words = _WORDS_RE.findall(folded)
+    if not any(not word.isascii() for word in words):
+        return words
+    # Han and kana have no spaces, so a whole run would be one "word" and a
+    # chunk cut inside it could never match (#1844). Each Han or kana
+    # character is its own token; the joined text is unchanged, so this
+    # stays exact and keeps qwen_align's stream equal to "".join(words).
+    from project import is_han_or_kana_letter
+    split = []
+    for word in words:
+        if not any(is_han_or_kana_letter(ch) for ch in word):
+            split.append(word)
+            continue
+        run = ""
+        for ch in word:
+            if is_han_or_kana_letter(ch):
+                if run:
+                    split.append(run)
+                    run = ""
+                split.append(ch)
+            else:
+                run += ch
+        if run:
+            split.append(run)
+    return split
+
+
+def get_spoken_text(text):
+    """The text as the TTS was asked to speak it.
+
+    Script chunks are spoken after speech preparation (symbols verbalized,
+    pronunciation respellings applied, #1844), so EPUB text is compared
+    after the same preparation rather than raw. One function for both
+    sides: the renderer and this mapper must never disagree about it.
+    """
+    from speech_text import get_speech_preparation
+    return get_speech_preparation(text or "")["text"]
+
+
+def get_spoken_words(text):
+    """Normalized words of :func:`get_spoken_text` (see get_normalized_words)."""
+    return get_normalized_words(get_spoken_text(text))
+
+
+def _describe_first_difference(source_words, chunk_words):
+    """Name the first word where the EPUB and the spoken script disagree."""
+    for position, (book, spoken) in enumerate(zip(source_words, chunk_words)):
+        if book != spoken:
+            context = " ".join(source_words[max(0, position - 3):position])
+            return (f"first difference after {context!r}: EPUB {book!r}, spoken {spoken!r}"
+                    if context else f"first difference: EPUB {book!r}, spoken {spoken!r}")
+    if len(source_words) > len(chunk_words):
+        return f"the spoken script ends before EPUB word {source_words[len(chunk_words)]!r}"
+    return "the spoken script continues past the EPUB text"
 
 
 def get_word_alignment_score(source_words, script_words):
@@ -407,36 +533,62 @@ def get_word_alignment_score(source_words, script_words):
     return difflib.SequenceMatcher(None, source_words, script_words, autojunk=False).ratio()
 
 
-def _get_span_group(spine_segments, first, script_words, cursor):
-    """Smallest segment run from ``first`` ending on a chunk boundary.
+def _get_span_group(segment_words, first, script_words, cursor, *, carried=None,
+                    allow_open_end=False):
+    """Smallest segment run from ``first`` that ends with a chunk boundary.
 
-    Returns ([(segment_index, word_start, word_end)], end_chunk) or
-    (None, cursor) when the words disagree or no boundary is reached
-    inside this spine document (a span across files stays refused).
+    Segments and chunks are consumed together until their concatenated
+    words are equal and end at the same place, whatever the shape: the
+    first chunk may overrun the first segment, or a later chunk may run
+    on into the next segment (#1844). Returns
+    ([(segment_index, word_start, word_end)], end_chunk, is_open), or
+    (None, cursor, False) when the words disagree or no common boundary
+    is reached.
+
+    ``allow_open_end``: when this document's segments run out while the
+    last chunk still has words, the group stays open (``is_open``) for the
+    next spine document to finish — a chapter split across files.
+    ``carried`` = (group_first_chunk, book_words_already_matched) resumes
+    such a group: word offsets continue from the previous document so
+    one group keeps one word numbering across files.
     """
-    chunk_words = []
-    end = cursor
+    if carried is not None:
+        group_start, matched = carried
+        spoken = [w for words in script_words[group_start:cursor] for w in words]
+        book = spoken[:matched]
+    else:
+        book, spoken = [], []
     members = []
-    offset = 0
-    for index in range(first, len(spine_segments)):
-        words = get_normalized_words(spine_segments[index]["text"])
+    end = cursor
+    checked = len(book)
+    for index in range(first, len(segment_words)):
+        words = segment_words[index]
         if not words:
             continue
-        need = offset + len(words)
-        while len(chunk_words) < need and end < len(script_words):
-            chunk_words.extend(script_words[end])
+        members.append((index, len(book), len(book) + len(words)))
+        book.extend(words)
+        while len(spoken) < len(book) and end < len(script_words):
+            spoken.extend(script_words[end])
             end += 1
-        if chunk_words[offset:need] != words:
-            return None, cursor
-        members.append((index, offset, need))
-        offset = need
-        if offset == len(chunk_words):
-            return (members, end) if len(members) > 1 else (None, cursor)
-    return None, cursor
+        common = min(len(book), len(spoken))
+        if book[checked:common] != spoken[checked:common]:
+            return None, cursor, False
+        checked = common
+        if len(spoken) == len(book):
+            # A lone segment exactly covered by whole chunks is the plain
+            # case, not a group, unless it finishes a carried group.
+            if len(members) > 1 or carried is not None:
+                return members, end, False
+            return None, cursor, False
+        if len(spoken) < len(book):
+            return None, cursor, False  # the script ran out inside this segment
+    if allow_open_end and members and len(spoken) > len(book):
+        return members, end, True
+    return None, cursor, False
 
 
 def map_spine_to_chunks(spine_segments, script_entries, *, start=0, threshold=None, require_full_coverage=False,
-                        allow_span=False):
+                        allow_span=False, optional_titles=None, carry=None, allow_open_end=False):
     """Map each spine segment to a contiguous chunk range or fail closed.
 
     script_entries: [{index, prepared_text, start_frame, end_frame}]
@@ -461,6 +613,21 @@ def map_spine_to_chunks(spine_segments, script_entries, *, start=0, threshold=No
     invented here; callers either time members from aligned tokens or
     highlight the whole group as one block.
 
+    ``optional_titles`` maps a segment index to navigation labels that
+    script extraction may have spoken just before it (a TOC title it
+    inserted because the chapter body has no matching heading). Only when
+    that segment fails to map, and the chunk at the cursor is exactly one
+    of those labels, is the chunk consumed with no highlight and the
+    segment retried; a heading that is really in the text always maps
+    first.
+
+    ``allow_open_end`` lets the last span group stay open when the
+    document ends inside a chunk (a chapter split across files); its rows
+    carry ``crosses_document``. Pass :func:`get_open_group_carry` of that
+    mapping as ``carry`` for the next document, which finishes the group
+    first. Only aligned (Qwen) timing can place such a split; chunk-timed
+    builds refuse it.
+
     Returns (mapping, end_cursor), retaining each row's original segment_index.
     """
     if not spine_segments:
@@ -470,13 +637,52 @@ def map_spine_to_chunks(spine_segments, script_entries, *, start=0, threshold=No
     if not isinstance(start, int) or start < 0 or start > len(script_entries):
         raise ValueError("Spine mapping cursor is invalid.")
     script_words = [get_normalized_words(entry["prepared_text"]) for entry in script_entries]
+    # EPUB text is compared as it would be spoken (#1844), the way every
+    # script chunk was: prepared_text is already speech-prepared.
+    segment_words = [get_spoken_words(segment["text"]) for segment in spine_segments]
     mapping = []
     cursor = start
     segment_index = -1
+
+    def _append_group(members, group_start, group_end, crosses, still_open=False):
+        for member_index, word_start, word_end in members:
+            member = spine_segments[member_index]
+            row = {"fragment": member["fragment"], "text": member["text"],
+                   "segment_index": member_index,
+                   "chunk_indexes": list(range(group_start, group_end)),
+                   "start_frame": script_entries[group_start]["start_frame"],
+                   "end_frame": script_entries[group_end - 1]["end_frame"],
+                   "span_group": group_start,
+                   "span_words": (word_start, word_end)}
+            if crosses:
+                row["crosses_document"] = True
+            if still_open:
+                row["open_group"] = True
+            mapping.append(row)
+
+    if carry is not None:
+        # Finish the span group the previous spine document left open.
+        group_start, matched = carry["group"], carry["matched_words"]
+        if not (0 <= group_start < start <= len(script_entries)):
+            raise ValueError("Spine mapping carry is invalid.")
+        members, group_end, still_open = _get_span_group(
+            segment_words, 0, script_words, start, carried=(group_start, matched),
+            allow_open_end=allow_open_end)
+        if not members:
+            first_text = next((s["text"] for s, w in zip(spine_segments, segment_words) if w), "")
+            raise ValueError(
+                f"A script chunk continues past the end of the previous EPUB file, but the "
+                f"next file does not start with its remaining words (next file starts "
+                f"{first_text[:80]!r}).")
+        _append_group(members, group_start, group_end, True, still_open)
+        segment_index = members[-1][0]
+        cursor = group_end
+        if still_open:
+            return mapping, cursor
     while segment_index + 1 < len(spine_segments):
         segment_index += 1
         segment = spine_segments[segment_index]
-        source_words = get_normalized_words(segment["text"])
+        source_words = segment_words[segment_index]
         if not source_words:
             continue
         if cursor >= len(script_entries):
@@ -493,35 +699,39 @@ def map_spine_to_chunks(spine_segments, script_entries, *, start=0, threshold=No
                 end_candidate = candidate + 1
                 break
         if end_candidate is None:
-            # One chunk spanning multiple segments: the next chunk is
-            # longer than this segment and starts with it exactly.
-            nxt = script_words[cursor] if cursor < len(script_words) else []
-            if len(nxt) > len(source_words) and nxt[:len(source_words)] == source_words:
-                members, group_end = (_get_span_group(spine_segments, segment_index, script_words, cursor)
-                                      if allow_span else (None, cursor))
-                if members:
-                    for member_index, word_start, word_end in members:
-                        member = spine_segments[member_index]
-                        mapping.append({"fragment": member["fragment"], "text": member["text"],
-                                        "segment_index": member_index,
-                                        "chunk_indexes": list(range(cursor, group_end)),
-                                        "start_frame": script_entries[cursor]["start_frame"],
-                                        "end_frame": script_entries[group_end - 1]["end_frame"],
-                                        "span_group": cursor,
-                                        "span_words": (word_start, word_end)})
-                    segment_index = members[-1][0]
-                    cursor = group_end
-                    continue
+            # A chunk runs on past this segment: the first chunk overruns
+            # it, or a later chunk carries on into the next segment.
+            members, group_end, still_open = (
+                _get_span_group(segment_words, segment_index, script_words, cursor,
+                                allow_open_end=allow_open_end)
+                if allow_span else (None, cursor, False))
+            if members:
+                _append_group(members, cursor, group_end, still_open, still_open)
+                segment_index = members[-1][0]
+                cursor = group_end
+                if still_open:
+                    break
+                continue
+            titles = (optional_titles or {}).get(segment_index, ())
+            if any(get_spoken_words(label) == script_words[cursor] for label in titles):
+                # An inserted navigation title was spoken here: its audio
+                # plays without a highlight, then this segment is retried.
+                cursor += 1
+                segment_index -= 1
+                continue
+            probe = [w for words in script_words[cursor:cursor + 3] for w in words]
+            if len(probe) > len(source_words) and probe[:len(source_words)] == source_words:
                 raise ValueError(
                     f"One script chunk spans multiple spine segments "
                     f"(first spine text {segment['text'][:80]!r} continues beyond one segment); "
                     f"supported mapping is one segment per contiguous chunk range "
                     f"— re-split the chunk or re-align the script.")
-            probe = [w for words in script_words[cursor:cursor + 3] for w in words]
             hint = get_word_alignment_score(source_words, probe) if probe else 0.0
             raise ValueError(
                 f"No unambiguous synchronization for spine text: {segment['text'][:80]!r} "
-                f"(no exact contiguous normalized coverage; partial hint {hint:.2f})")
+                f"(no exact contiguous normalized coverage; partial hint {hint:.2f}; "
+                f"{_describe_first_difference(source_words, probe)}, "
+                f"at audio chunk {script_entries[cursor]['index'] + 1} in book order)")
         chunk_indexes = list(range(cursor, end_candidate))
         mapping.append({"fragment": segment["fragment"], "text": segment["text"],
                         "segment_index": segment_index,
@@ -529,7 +739,7 @@ def map_spine_to_chunks(spine_segments, script_entries, *, start=0, threshold=No
                         "start_frame": script_entries[cursor]["start_frame"],
                         "end_frame": script_entries[end_candidate - 1]["end_frame"]})
         cursor = end_candidate
-    if cursor == start:
+    if cursor == start and not mapping:
         raise ValueError("No spine text could be synchronized.")
     if require_full_coverage:
         used = {index for row in mapping for index in row["chunk_indexes"]}
@@ -724,7 +934,7 @@ def _read_archive_member_bounded(archive, name, max_bytes, *, member_index=None)
     if info is None:
         raise ValueError("EPUB archive member is ambiguous: %s" % name)
     path = PurePosixPath(name)
-    if ("\\" in name or "\0" in name or path.is_absolute()
+    if (not path.parts or "\\" in name or "\0" in name or path.is_absolute()
             or PureWindowsPath(name).drive or ".." in path.parts
             or name != path.as_posix()):
         raise ValueError("Unsafe EPUB archive member: %s" % name)
@@ -756,6 +966,13 @@ def get_epub_language_from_path(retained_path):
     import zipfile as _zf
     import os as _os
     from contextlib import nullcontext
+    try:
+        import lzma as _lzma
+        _malformed = (_zf.BadZipFile, ET.ParseError, RecursionError, KeyError,
+                      _lzma.LZMAError)
+    except ImportError:
+        # An absent stdlib codec is an unsupported-read error, not corruption.
+        _malformed = (_zf.BadZipFile, ET.ParseError, RecursionError, KeyError)
     if isinstance(retained_path, (str, _os.PathLike)):
         # Lazy import keeps the in-memory builder API free of an import cycle.
         from readalong_export import _open_retained_epub
@@ -770,7 +987,7 @@ def get_epub_language_from_path(retained_path):
         namespace = package.tag.split('}')[0] + '}' if '}' in package.tag else ''
         metadata = package.find(namespace + 'metadata')
         return _get_validated_epub_language(metadata) or ""
-    except (_zf.BadZipFile, ET.ParseError, RecursionError, KeyError) as error:
+    except _malformed as error:
         raise ValueError("Retained EPUB archive or publication metadata is malformed.") from error
     except RuntimeError as error:  # Includes NotImplementedError from ZIP codecs/features.
         raise ValueError("Retained EPUB ZIP reading is unsupported or unavailable: %s"
@@ -1133,6 +1350,11 @@ def _validated_aligned_row(aligned_rows, index):
 
 _SPAN_WRAP_REFUSED_TAGS = {'li', 'dt', 'dd', 'tr', 'td', 'th', 'caption', 'thead', 'tbody',
                            'tfoot', 'figcaption', 'summary', 'legend', 'option'}
+# Block containers that may be split in two around a chunk's blocks (#1844).
+_SPAN_SPLIT_TAGS = {'div', 'section', 'article', 'main', 'aside', 'blockquote'}
+# Containers whose content model accepts a <div> wrapper.
+_SPAN_WRAP_PARENT_TAGS = {'body', 'div', 'section', 'article', 'main', 'header', 'footer',
+                          'aside', 'blockquote', 'figure', 'nav', 'fieldset'}
 
 
 def _apply_span_group_wrappers(root, segments, mapping, assigned):
@@ -1140,11 +1362,71 @@ def _apply_span_group_wrappers(root, segments, mapping, assigned):
 
     CPU (chunk-timed) mode only (#1844): the group's blocks are
     highlighted together for the group's real chunk frames; nothing
-    inside the group is timed. Mutates ``root`` (wrapper insertion) and
-    reserves the wrapper id in ``assigned``. Blocks that are not
-    consecutive siblings, or that cannot legally sit in a div, refuse.
+    inside the group is timed. Mutates ``root`` (container splits and
+    wrapper insertion) and reserves the wrapper id in ``assigned``. The
+    wrapper goes inside the blocks' nearest common container, around the
+    consecutive children that hold them (so a heading nested in its own
+    div still groups with the next paragraph). When the chunk's blocks
+    open or close a container that also holds other blocks (a heading
+    followed by one div holding the whole chapter), that container is
+    split in two first: the copy keeps its tag and attributes except the
+    id. It refuses, naming the rule and the tag outline (never book
+    text), when a wrapper would still take text from outside the group
+    or the container cannot take a div.
     """
     parents = {child: parent for parent in root.iter() for child in parent}
+    # Only spoken blocks count as another chunk's text. A block with no
+    # spoken words (a "* * *" or "———" divider) never maps to a chunk, has
+    # no audio and no highlight of its own, so it may sit inside a wrapper.
+    segment_elements = (
+        {id(segment["element"]) for segment in segments if get_spoken_words(segment["text"])}
+        if any(row.get("span_group") is not None for row in mapping) else set())
+    xml_id = "{http://www.w3.org/XML/1998/namespace}id"
+
+    def _chain(el):
+        chain = [el]
+        while chain[-1] in parents:
+            chain.append(parents[chain[-1]])
+        return chain[::-1]
+
+    def _segment_ids_under(el):
+        return {id(node) for node in el.iter() if id(node) in segment_elements}
+
+    def _outline(el):
+        classes = (el.get("class") or "").split()
+        return _local(el.tag) + ("." + classes[0] if classes else "")
+
+    def _split_off(container, member_ids, at_start):
+        """Move the group's blocks at one end of ``container`` into a copy."""
+        if _local(container.tag) not in _SPAN_SPLIT_TAGS or container not in parents:
+            return container
+        kids = list(container)
+        held = [i for i, kid in enumerate(kids) if id(kid) in member_ids]
+        if not held:
+            return container
+        cut = held[-1] + 1 if at_start else held[0]
+        moved = kids[:cut] if at_start else kids[cut:]
+        if not moved or len(moved) == len(kids):
+            return container
+        if any(_segment_ids_under(kid) - member_ids for kid in moved):
+            return container
+        copy = ET.Element(container.tag, {key: value for key, value in container.attrib.items()
+                                          if key not in ("id", xml_id)})
+        for kid in moved:
+            container.remove(kid)
+            copy.append(kid)
+            parents[kid] = copy
+        holder = parents[container]
+        position = list(holder).index(container)
+        if at_start:
+            copy.text, container.text = container.text, None
+            holder.insert(position, copy)
+        else:
+            copy.tail, container.tail = container.tail, None
+            holder.insert(position + 1, copy)
+        parents[copy] = holder
+        return copy
+
     out = []
     index = 0
     while index < len(mapping):
@@ -1154,19 +1436,58 @@ def _apply_span_group_wrappers(root, segments, mapping, assigned):
             index += 1
             continue
         group = [row]
-        while index + len(group) < len(mapping) and                 mapping[index + len(group)].get("span_group") == row["span_group"]:
+        while index + len(group) < len(mapping) and \
+                mapping[index + len(group)].get("span_group") == row["span_group"]:
             group.append(mapping[index + len(group)])
         index += len(group)
         elements = [segments[member["segment_index"]]["element"] for member in group]
-        parent = parents.get(elements[0])
+        member_ids = {id(el) for el in elements}
+        chains = [_chain(el) for el in elements]
+        depth = 0
+        while (all(len(chain) > depth + 1 for chain in chains)
+               and len({id(chain[depth]) for chain in chains}) == 1):
+            depth += 1
+        parent = chains[0][depth - 1] if depth else None
+        tops = [chain[depth] for chain in chains]
+        if parent is not None and tops[0] is not tops[-1]:
+            first_top, last_top = tops[0], tops[-1]
+            new_last = _split_off(last_top, member_ids, at_start=True)
+            new_first = _split_off(first_top, member_ids, at_start=False)
+            tops = [new_first if top is first_top else new_last if top is last_top else top
+                    for top in tops]
         children = list(parent) if parent is not None else []
-        positions = [children.index(el) if el in children else -1 for el in elements]
-        if (parent is None or -1 in positions
-                or positions != sorted(positions)
-                or any(_local(el.tag) in _SPAN_WRAP_REFUSED_TAGS for el in elements)):
+        positions = [children.index(top) if top in children else -1 for top in tops]
+        wrapped = set()
+        if parent is not None and -1 not in positions:
+            for child in children[positions[0]:positions[-1] + 1]:
+                wrapped |= _segment_ids_under(child)
+        reason = None
+        if parent is None or -1 in positions or positions != sorted(positions):
+            reason = "the blocks share no container in reading order"
+        elif _local(parent.tag) not in _SPAN_WRAP_PARENT_TAGS:
+            reason = f"their shared container <{_local(parent.tag)}> cannot hold a wrapper"
+        elif any(_local(top.tag) in _SPAN_WRAP_REFUSED_TAGS for top in tops):
+            reason = "a block is a list item or table part"
+        elif wrapped != member_ids:
+            foreign = [node for child in children[positions[0]:positions[-1] + 1]
+                       for node in child.iter() if id(node) in wrapped - member_ids]
+            reason = ("a wrapper would also take text from outside this chunk ("
+                      + ", ".join(_outline(node) for node in foreign[:5]) + ")")
+        if reason is not None:
+            layout = []
+            for top in dict.fromkeys(tops):
+                inside = [el for el in elements if el is top or top in _chain(el)]
+                path = _outline(top) if inside == [top] else \
+                    _outline(top) + " > " + "/".join(dict.fromkeys(_outline(el) for el in inside))
+                blocks = len(_segment_ids_under(top))
+                if blocks > len(inside):
+                    path += f" (holds {blocks} text blocks, {len(inside)} in this chunk)"
+                layout.append(path)
+            where = _outline(parent) if parent is not None else "?"
             raise ValueError(
-                f"One script chunk spans multiple spine segments that are not sibling blocks "
-                f"(first spine text {row['text'][:80]!r}); re-split the chunk or use Qwen mode.")
+                f"One script chunk spans multiple spine segments that cannot be grouped under one wrapper "
+                f"(first spine text {row['text'][:80]!r}): {reason}. Layout inside {where}: "
+                f"{' + '.join(layout)}. Re-split the chunk or use Qwen mode.")
         n = 1
         while f"aa2-g-{n:04d}" in assigned:
             n += 1
@@ -1177,7 +1498,9 @@ def _apply_span_group_wrappers(root, segments, mapping, assigned):
         for child in children[first:last + 1]:
             parent.remove(child)
             wrapper.append(child)
+            parents[child] = wrapper
         parent.insert(first, wrapper)
+        parents[wrapper] = parent
         out.append({"fragment": wrapper_id, "text": " ".join(member["text"] for member in group),
                      "segment_index": row["segment_index"],
                      "chunk_indexes": list(row["chunk_indexes"]),
@@ -1274,8 +1597,8 @@ def _sentence_rows_for_segment(segment, row, script_entries, aligned_rows,
         # #1844: this segment is one member of a chunk span group; keep
         # only the aligned tokens inside its word window. A token that
         # straddles the window edge has no honest owner and refuses.
-        # Stream lengths: qwen_align leaves apostrophes out of the stream.
-        group_words = [w.replace("'", "") for i in row["chunk_indexes"]
+        # Stream lengths: qwen_align leaves apostrophes and underscores out.
+        group_words = [get_stream_chars(w) for i in row["chunk_indexes"]
                        for w in get_normalized_words(script_entries[i]["prepared_text"])]
         word_start, word_end = row["span_words"]
         window_start = sum(len(w) for w in group_words[:word_start])
@@ -1293,6 +1616,25 @@ def _sentence_rows_for_segment(segment, row, script_entries, aligned_rows,
 
     # The segment's source stream must equal the spoken stream exactly.
     spoken = "".join(get_token_key(t.get("text")) for t, _, _, _, _ in stream_spans)
+    if spoken != segment_stream and stream_spans \
+            and spoken == get_normalized_stream(get_spoken_text(segment["text"]))[0]:
+        # #1844: speech preparation changed this segment's words (a
+        # verbalized symbol, a respelled name, a ruby reading spoken in
+        # place of its base: segment["text"] is the ruby-aware visible
+        # text, flat keeps every XHTML character), so its sentences have no
+        # character mapping onto the audio. Highlight the whole segment
+        # from its first to its last aligned token instead of guessing
+        # where a sentence boundary falls inside a rewritten word.
+        frame_start = min(span[3] for span in stream_spans)
+        frame_end = max(span[4] for span in stream_spans)
+        if frame_end <= frame_start:
+            raise ValueError("Aligned segment has no positive duration.")
+        if frame_start < row["start_frame"] or frame_end > row["end_frame"]:
+            raise ValueError("Segment clip escapes its frame bounds.")
+        return [{"fragment": None, "text": segment["text"],
+                 "segment_index": row["segment_index"],
+                 "chunk_indexes": list(row["chunk_indexes"]),
+                 "start_frame": frame_start, "end_frame": frame_end}], 0
     if spoken != segment_stream:
         raise ValueError(
             "Aligned tokens do not correspond to the segment text; the "
@@ -1818,6 +2160,7 @@ def build_epub_readaloud(*, retained_epub_bytes, audio_bytes, audio_filename, sc
     smil_records = []
     modified_xhtml = {}
     cursor = 0
+    carry = None  # a span group the previous spine document left open
     ET.register_namespace('', XHTML_NS)
     ET.register_namespace('epub', OPS_NS)
     for spine_item in spine:
@@ -1859,7 +2202,18 @@ def build_epub_readaloud(*, retained_epub_bytes, audio_bytes, audio_filename, sc
             # Image-only / empty XHTML (cover, title page): no narration
             # required and no chunks consumed; real visible text still maps.
             continue
-        mapping, cursor = map_spine_to_chunks(segments, script_entries, start=cursor, allow_span=True)
+        mapping, cursor = map_spine_to_chunks(
+            segments, script_entries, start=cursor, allow_span=True,
+            optional_titles=_get_optional_titles(root, segments, meta.get("toc") or [],
+                                                 spine_item["path"]),
+            carry=carry, allow_open_end=True)
+        carry = get_open_group_carry(mapping)
+        if aligned_rows is None and any(row.get("crosses_document") for row in mapping):
+            raise ValueError(
+                f"A script chunk continues from one EPUB file into the next (a chapter split "
+                f"across files, at {spine_item['path']!r}). Chunk-timed mode has no timing "
+                f"inside a chunk to split its audio between the files; build in Qwen mode, "
+                f"which times each file from aligned words.")
         xml_local = '{http://www.w3.org/XML/1998/namespace}id'
         existing_ids = set()
         for el in root.iter():
@@ -1937,6 +2291,8 @@ def build_epub_readaloud(*, retained_epub_bytes, audio_bytes, audio_filename, sc
                              "mapping": mapping, "existing_ids": existing_ids})
     if not smil_records:
         raise ValueError("No spine document could be synchronized; refusing to substitute a text-only EPUB.")
+    if carry is not None:
+        raise ValueError("The book ends inside a script chunk that has more words than the EPUB text; failing closed.")
     if cursor != len(script_entries):
         raise ValueError(
             f"Script entries outside spine coverage ([0..{cursor-1}] mapped of {len(script_entries)}); failing closed.")

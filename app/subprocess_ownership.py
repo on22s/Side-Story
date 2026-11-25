@@ -1,5 +1,6 @@
 """Shared descendant ownership and signal dispatch for supervised tasks."""
 import ctypes
+from contextlib import contextmanager
 import errno
 import functools
 import json
@@ -18,6 +19,47 @@ from types import SimpleNamespace
 
 SUBPROCESS_TERMINATE_GRACE_SECONDS = 10.0
 logger = logging.getLogger("AlexandriaUI")
+
+
+@contextmanager
+def mark_unlaunched_exec_errors():
+    """Mark executable rejections at Popen, excluding ambiguous I/O failures."""
+    try:
+        yield
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.ENOEXEC,
+                           getattr(errno, "ETXTBSY", errno.ENOEXEC)):
+            error.worker_not_launched = True
+        raise
+
+
+def get_worker_launch_error_message(error):
+    message = {'error': str(error), 'errno': getattr(error, 'errno', None)}
+    if getattr(error, 'worker_not_launched', False):
+        message['worker_not_launched'] = True
+    return message
+
+
+def get_worker_launch_error(message):
+    error = OSError(message.get('errno'), message['error'])
+    if message.get('worker_not_launched') is True:
+        error.worker_not_launched = True
+    return error
+
+
+def log_subprocess_stop_fallback(error, message):
+    """Explain a taskkill refusal without flattening unexpected cleanup errors."""
+    if sys.platform == 'win32':
+        from windows_subprocess_job import WindowsGracefulTerminationRefused
+        if isinstance(error, WindowsGracefulTerminationRefused):
+            reason = (' '.join(error.stderr.split())[:512]
+                      if isinstance(error.stderr, str) else '')
+            logger.warning('%s (taskkill exit %s for owned process %s): %s',
+                           message, error.returncode, error.pid,
+                           reason or 'no diagnostic returned')
+            logger.debug('Windows graceful-stop refusal details', exc_info=True)
+            return
+    logger.warning(message, exc_info=True)
 
 
 def terminate_windows_process_tree(proc_or_pid, force=False, timeout=SUBPROCESS_TERMINATE_GRACE_SECONDS):
@@ -56,8 +98,15 @@ def send_subprocess_signal(proc_or_pid, sig, termination_grace=SUBPROCESS_TERMIN
 
     Accepts a Popen or a bare pid. Raises ProcessLookupError/OSError like
     proc.send_signal so existing callers' handlers still catch an already-exited
-    process. Windows termination uses taskkill's tree operation; other Windows
-    signals and unresolved POSIX groups retain direct-process dispatch."""
+    process. Windows review workers first receive their private cooperative
+    cancel file; other Windows termination retains the job/taskkill operation.
+    Other signals and unresolved POSIX groups retain direct-process dispatch."""
+    cancel_path = getattr(proc_or_pid, '_alexandria_cancel_path', None)
+    if (sys.platform == 'win32' and sig == signal.SIGTERM
+            and isinstance(cancel_path, str)
+            and getattr(proc_or_pid, '_alexandria_windows_owner', None) is not None):
+        Path(cancel_path).touch(exist_ok=True)
+        return
     control = getattr(proc_or_pid, "_alexandria_control", None)
     if control is not None:
         control.sendall(f"{int(sig)}\n".encode())
@@ -109,12 +158,13 @@ def stop_owned_subprocess(process, interrupt=False, timeout=5, *, force_after_gr
                 send_subprocess_signal(process, graceful_signal, termination_grace=timeout)
             except ProcessLookupError:
                 pass
-            except OSError:
+            except OSError as error:
                 if not force_after_grace and not (
                         sys.platform == 'win32'
                         and getattr(process, '_alexandria_windows_owner', None) is not None):
                     raise
-                logger.warning('Graceful subprocess stop failed; retaining forced cleanup', exc_info=True)
+                log_subprocess_stop_fallback(
+                    error, 'Graceful subprocess stop unavailable; retaining forced cleanup')
         if force_after_grace:
             deadline = time.monotonic() + timeout
         while is_subprocess_tree_running(process) and time.monotonic() < deadline:
@@ -146,10 +196,14 @@ def stop_owned_subprocess(process, interrupt=False, timeout=5, *, force_after_gr
             process.wait(timeout=timeout)
 
 
+class _OwnedCaptureCancelled(ValueError):
+    """The capture callback requested cancellation."""
+
+
 def run_owned_capture(command, *, timeout, cancel_check=None, **kwargs):
     """Capture a bounded command, stopping and reaping its owned descendants."""
     if cancel_check is not None and cancel_check():
-        raise ValueError("Owned capture cancelled")
+        raise _OwnedCaptureCancelled("Owned capture cancelled")
     process = start_owned_subprocess(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=(os.name == 'posix'),
@@ -163,7 +217,7 @@ def run_owned_capture(command, *, timeout, cancel_check=None, **kwargs):
                 deadline = None if timeout is None else time.monotonic() + timeout
                 while True:
                     if cancel_check():
-                        raise ValueError("Owned capture cancelled")
+                        raise _OwnedCaptureCancelled("Owned capture cancelled")
                     remaining = None if deadline is None else deadline - time.monotonic()
                     try:
                         stdout, stderr = process.communicate(
@@ -174,8 +228,13 @@ def run_owned_capture(command, *, timeout, cancel_check=None, **kwargs):
                             raise subprocess.TimeoutExpired(
                                 error.cmd, timeout, output=error.output,
                                 stderr=error.stderr) from error
-        except BaseException:
-            stop_owned_subprocess(process, timeout=1)
+        except BaseException as error:
+            try:
+                stop_owned_subprocess(process, timeout=1)
+            except BaseException as cleanup_error:
+                if isinstance(error, _OwnedCaptureCancelled):
+                    raise error from cleanup_error
+                raise
             raise
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     finally:
@@ -188,7 +247,7 @@ def run_owned_capture(command, *, timeout, cancel_check=None, **kwargs):
 
 def save_owned_exit_notice(path, result):
     from utils import atomic_json_write
-    atomic_json_write({'exit_code': result}, str(path))
+    atomic_json_write({'exit_code': result}, str(path), allow_nonatomic_fallback=False)
 
 
 def get_owned_exit_result(path):
@@ -232,6 +291,16 @@ def start_owned_subprocess(command, *, gpu_lease_fd=None, task_lease_fd=None,
     Windows and macOS apply SUBPROCESS_TERMINATE_GRACE_SECONDS instead.
     """
     if sys.platform == "win32":
+        unsupported = [name for name, value in (
+            ('stop_receipt_path', stop_receipt_path),
+            ('disconnect_signal', disconnect_signal),
+            ('gpu_lease_fd', gpu_lease_fd),
+            ('task_lease_fd', task_lease_fd),
+        ) if value is not None]
+        if unsupported:
+            raise ValueError(
+                'Windows owned subprocesses do not support ' + ', '.join(unsupported) +
+                '; use the native Job Object owner (exit_notice_path, termination_grace, inherited_handles) instead')
         from windows_subprocess_owner import start_windows_owned_subprocess
         return start_windows_owned_subprocess(
             command, exit_notice_path=exit_notice_path, termination_grace=termination_grace, **kwargs)
@@ -242,7 +311,8 @@ def start_owned_subprocess(command, *, gpu_lease_fd=None, task_lease_fd=None,
             stop_receipt_path=stop_receipt_path, disconnect_signal=disconnect_signal,
             exit_notice_path=exit_notice_path, termination_grace=termination_grace, **kwargs)
     if sys.platform != "linux":
-        return subprocess.Popen(command, **kwargs)
+        with mark_unlaunched_exec_errors():
+            return subprocess.Popen(command, **kwargs)
     if disconnect_signal is None:
         disconnect_signal = signal.SIGKILL
     control, child_control = socket.socketpair()
@@ -265,10 +335,11 @@ def start_owned_subprocess(command, *, gpu_lease_fd=None, task_lease_fd=None,
             receipt_args.extend(['--stop-timeout', repr(float(grace))])
         if receipt_args:
             receipt_args.append('--')
-        process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()),
-             str(child_control.fileno()), str(gpu_lease_fd) if gpu_lease_fd is not None else "-", *receipt_args, *command],
-            pass_fds=tuple(set(retained)), **kwargs)
+        with mark_unlaunched_exec_errors():
+            process = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()),
+                 str(child_control.fileno()), str(gpu_lease_fd) if gpu_lease_fd is not None else "-", *receipt_args, *command],
+                pass_fds=tuple(set(retained)), **kwargs)
         child_control.close()
         response = bytearray()
         while not response.endswith(b"\n"):
@@ -278,7 +349,7 @@ def start_owned_subprocess(command, *, gpu_lease_fd=None, task_lease_fd=None,
             response.extend(part)
         admission = json.loads(response)
         if "error" in admission:
-            raise OSError(admission.get("errno"), admission["error"])
+            raise get_worker_launch_error(admission)
         process._alexandria_control = control
         return process
     except BaseException:
@@ -465,7 +536,8 @@ def run_owned_command(control, command, *, disconnect_signal=None, stop_timeout=
     received = []
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda value, frame: received.append(value))
-    process = subprocess.Popen(command, start_new_session=True)
+    with mark_unlaunched_exec_errors():
+        process = subprocess.Popen(command, start_new_session=True)
     buffer = b""
     root_result = None
     stopping = None
@@ -595,6 +667,6 @@ if __name__ == "__main__":
                 # no remaining descendants, including adopted detached children.
                 save_subprocess_stop_receipt(stop_receipt_path)
         except (OSError, RuntimeError) as error:
-            control.sendall(json.dumps({"error": str(error), "errno": getattr(error, "errno", None)}).encode() + b"\n")
+            control.sendall(json.dumps(get_worker_launch_error_message(error)).encode() + b"\n")
             raise
     exit_with_owned_result(result)

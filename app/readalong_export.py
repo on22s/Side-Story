@@ -47,14 +47,14 @@ from pathlib import Path
 from audio_pcm_producer import PCMSourceStore
 from audio_streaming import write_combined_pcm
 from export_publication import ExportSourceSnapshot
-from export_quality import (get_export_file_identity, get_export_file_version,
+from export_quality import (get_export_file_identity,
                             get_export_quality_options, get_pcm_export_encoding_plan,
                             get_admitted_export_report, ensure_export_stage_current)
 from readalong_sidecar import (build_readalong_sidecar, get_audio_file_sha256,
                                map_word_spans_to_frames, get_readalong_timing_report)
 from speech_text import get_speech_preparation
 from tts import ExportCancelled, ensure_audio_export_active, iter_timeline, get_trim_bounds_ms
-from audio_generation_owner import AudioGenerationCancelled
+from audio_generation_owner import AudioGenerationCancelled, ensure_audio_generation_commit_active
 
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 MAX_RETAINED_EPUB_BYTES = 2 * 1024**3
@@ -109,6 +109,54 @@ MP3_BITRATE = "128k"
 
 _PREFERENCE_DEVICE_RE = re.compile(r"^(auto|cpu|cuda:[0-9]+)$")
 _PREFERENCE_LANGUAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+_MAX_METADATA_BYTES = 16384
+
+
+def read_bounded_metadata_bytes(path, *, file_description="Timing preference"):
+    """Read one bounded regular file's exact bytes with identity fencing.
+
+    Single source of the bounded-metadata read contract shared by the
+    production timing preference reader and the Editor's raw-metadata
+    reads. Returns None only for a genuinely missing file. A present
+    file that is a symlink, nonregular, oversized, truncated, grown, or
+    replaced (in place or by atomic rename) during the read is refused
+    before any caller can act on its bytes. The descriptor version, the
+    exact byte count and the named-path version are all revalidated
+    after the final byte is read.
+    """
+    import stat as _stat
+    from audio_take_history import _version
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISREG(info.st_mode) \
+            or info.st_size > _MAX_METADATA_BYTES:
+        raise ValueError("%s is not a bounded regular file." % file_description)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not _stat.S_ISREG(opened.st_mode) or _version(opened) != _version(info):
+            raise ValueError("%s changed during read." % file_description)
+        chunks = []
+        total = 0
+        while True:
+            block = os.read(descriptor, 8192)
+            if not block:
+                break
+            total += len(block)
+            if total > _MAX_METADATA_BYTES:
+                raise ValueError("%s exceeds its bound." % file_description)
+            chunks.append(block)
+        if (total != opened.st_size
+                or _version(os.fstat(descriptor)) != _version(opened)
+                or _version(os.lstat(path)) != _version(opened)):
+            raise ValueError("%s changed during read." % file_description)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def get_readaloud_timing_preference(data_dir):
@@ -123,45 +171,22 @@ def get_readaloud_timing_preference(data_dir):
     always a safe token.
     """
     import json as _json
-    import stat as _stat
     path = os.path.join(data_dir, "readalong_timing.json")
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
+        data = read_bounded_metadata_bytes(path)
+    except (OSError, ValueError) as error:
+        reason = ("not a bounded regular file"
+                  if "not a bounded regular file" in str(error)
+                  else "unreadable JSON")
+        raise ValueError(
+            "Persisted timing preference is corrupt (%s); "
+            "restore a valid preference and rebuild." % reason) from error
+    if data is None:
         return {"timing_mode": "auto", "timing_device": "auto",
                 "timing_language": None}
-    except OSError as error:
-        raise ValueError(
-            "Persisted timing preference is corrupt (unreadable JSON); "
-            "restore a valid preference and rebuild.") from error
-    # Bounded regular-file read: three small scalars only, so a
-    # present file that is a symlink/FIFO/oversized is corrupt state
-    # and is refused explicitly rather than silently defaulted.
-    if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISREG(info.st_mode) \
-            or info.st_size > 16384:
-        raise ValueError(
-            "Persisted timing preference is corrupt (not a bounded "
-            "regular file); restore a valid preference and rebuild.")
     try:
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) \
-            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        descriptor = os.open(path, flags)
-        try:
-            opened = os.fstat(descriptor)
-            if not _stat.S_ISREG(opened.st_mode) or opened.st_size != info.st_size:
-                raise ValueError("changed during read")
-            data = b""
-            while True:
-                block = os.read(descriptor, 8192)
-                if not block:
-                    break
-                data += block
-                if len(data) > 16384:
-                    raise ValueError("oversized")
-        finally:
-            os.close(descriptor)
         raw = _json.loads(data.decode("utf-8"))
-    except (OSError, ValueError, RecursionError) as error:
+    except (ValueError, UnicodeError, RecursionError) as error:
         raise ValueError(
             "Persisted timing preference is corrupt (unreadable JSON); "
             "restore a valid preference and rebuild.") from error
@@ -410,52 +435,65 @@ def _publish_pair_transaction(source_snapshot, pairs, cancel_check, staging_path
     export pattern (``ensure_publication_transaction`` + ``admit()`` per
     mutation); publication keeps the book/owner through rollback.
     """
-    from direct_path_admission import is_plain_path
-
     outputs = {source: report for source, _target, report in pairs}
     backup_dir = Path(staging_path) / "old"
     backup_dir.mkdir(exist_ok=True)
-    touched = []
 
-    def publish(source, target):
-        index = len(touched)
-        backup = str(backup_dir / f"{index}-{Path(target).name}")
-        if not is_plain_path(target):
-            raise ValueError("Read-along publication target must not use file or directory aliases.")
-        existed = os.path.lexists(target)
-        if existed:
-            get_export_file_version(target)
-            os.replace(target, backup)
-        touched.append((target, backup, existed))
-        os.replace(source, target)
-        report = outputs.pop(source)
-        version = get_export_file_version(target)
-        if version[:4] != report["file_version"][:4]:
-            raise ValueError("Finished read-along output changed during publication. Retry the export.")
-        outputs[target] = {**report, "file_version": version}
-
+    from project_scope_exports import (
+        ExportCommitUncertain, ExportRecoveryPending,
+        get_export_set_cleanup_pending_detail, get_export_set_rollback_pending_detail,
+        publish_export_set_member, preflight_export_publication_batch,
+        read_publication_journal, read_set_journal, record_export_publication,
+        recover_failed_export_set, write_set_journal)
     with source_snapshot.ensure_publication_transaction(outputs) as admit:
+        preflight_export_publication_batch(
+            source_snapshot.root, [target for _source, target, _report in pairs])
+        _targets = [target for _source, target, _report in pairs]
+        _backups = [str(backup_dir / f"{index}-{Path(target).name}")
+                    for index, (_source, target, _report) in enumerate(pairs)]
+        if (read_publication_journal(source_snapshot.root) is not None
+                or read_set_journal(source_snapshot.root) is not None):
+            raise ValueError('An unresolved export set is pending; retry after recovery.')
+        write_set_journal(source_snapshot.root, _targets, _backups,
+                          staged=[report for _source, _target, report in pairs],
+                          sources=[source for source, _target, _report in pairs])
+        members = read_set_journal(source_snapshot.root)['members']
         try:
-            for source, target, _report in pairs:
+            for (source, target, _report), member in zip(pairs, members, strict=True):
                 with admit():
-                    publish(source, target)
+                    report = outputs.pop(source)
+                    outputs[target] = publish_export_set_member(source_snapshot.root, member, report)
                 ensure_audio_export_active(cancel_check)
-        except BaseException as error:
-            failures = []
-            for target, backup, existed in reversed(touched):
-                try:
-                    if existed:
-                        os.replace(backup, target)
-                    elif os.path.lexists(target):
-                        os.unlink(target)
-                except OSError as rollback_error:
-                    failures.append(f"{target}: {rollback_error}")
-            if failures:
-                retain[0] = True
-                raise RuntimeError(
-                    "Read-along export rollback failed; recovery files kept at "
-                    f"{staging_path}: " + "; ".join(failures)) from error
+            ensure_audio_generation_commit_active()
+            for target in _targets:
+                report = outputs.get(target, {})
+                digest = report.get('sha256')
+                if isinstance(digest, str):
+                    record_export_publication(source_snapshot.root, target, digest,
+                        report.get('file_version'), export_set=True)
+            # The set stays reversible until this durable commit; a cancel or
+            # replaced claim acknowledged during the moves or receipts refuses.
+            ensure_audio_generation_commit_active()
+            retain[0] = not write_set_journal(source_snapshot.root, _targets, _backups, committed=True,
+                                              commit_check=ensure_audio_generation_commit_active)
+        except ExportCommitUncertain:
+            retain[0] = True
             raise
+        except BaseException as error:
+            try:
+                retain[0] = not recover_failed_export_set(source_snapshot.root, staging_path)
+            except BaseException:
+                retain[0] = True
+                raise
+            if retain[0] and isinstance(error, (ExportCancelled, AudioGenerationCancelled)):
+                # The undo did not finish: the intent journal and backups stay
+                # fenced. Report that phase-specific state instead of an
+                # ordinary cancellation (F04).
+                raise ExportRecoveryPending(
+                    get_export_set_rollback_pending_detail(staging_path)) from error
+            raise
+    if retain[0]:
+        raise RuntimeError(get_export_set_cleanup_pending_detail(staging_path))
 
 
 def _resolve_word_runtime(manager, book_token=None, runtime=None):
@@ -968,13 +1006,10 @@ def build_sidecar_export(manager, cancel_check, progress_callback=None, *,
                                 "text": text, "start_frame": start_frame, "end_frame": end_frame,
                                 "pause_frames_after": pause_frames,
                                 "speaker": chunk.get("speaker")})
-            starts = []
-            for position, row in enumerate(entries):
-                chunk = row["chunk"]
-                start_flag = bool(chunk.get("_chapter_start") or
-                                  (chunk.get("chapter_origin") or {}).get("is_heading"))
-                if position == 0 or start_flag:
-                    starts.append(position)
+            # Sections are the chapters every other export uses (#1921): one
+            # decision, so a status window is not a section here alone.
+            starts = sorted({0} | {first for _, first, _ in manager._chapter_groups(
+                [row["chunk"] for row in entries], False)}) if entries else []
             for position, row in enumerate(entries):
                 row["section"] = f"sec-{len([p for p in starts if p <= position]):04d}"
                 status, words = "missing", None

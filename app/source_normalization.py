@@ -19,6 +19,22 @@ EXTREME_PHRASE_MAX_WORDS = 5
 
 
 
+def iter_source_paragraph_ranges(text):
+    """Yield lossless paragraph spans, attaching separators to their preceding text.
+
+    CRLF is atomic; a single line ending is a wrap, while U+2029 explicitly
+    ends a paragraph. Blank lines may contain any Unicode whitespace.
+    """
+    newline = r"(?:\r\n|\r(?!\n)|[\n\u2028\u2029])"
+    paragraph_break = r"(?:" + newline + r"(?:[^\S\r\n\u2028\u2029]*" + newline + r")+|\u2029)"
+    start = 0
+    for match in re.finditer(paragraph_break, text):
+        yield start, match.end()
+        start = match.end()
+    if start < len(text):
+        yield start, len(text)
+
+
 def get_located_source_changes(text, changes):
     """Return new evidence records using one newline index for this stage."""
     if not changes:
@@ -235,67 +251,7 @@ def strip_known_front_matter(text):
                                  "removed_lines": text.count("\n", 0, match.end())}
 
 
-_YEAR_RE = re.compile(r"\s*(?:1[89]|20)\d{2}\b")
 _REPLACEMENT = "�"
-
-
-def _infer_replacement(chars, index, right_surviving):
-    """Infer one destroyed character from its surroundings, or None."""
-    left = chars[index - 1] if index else "\n"
-    right = chars[index + 1] if index + 1 < len(chars) else "\n"
-    if _YEAR_RE.match("".join(chars[index + 1:index + 7])):
-        return "©"
-    if right == _REPLACEMENT and (left.isalnum() or left in ".,!?"):
-        return "…"
-    if left == _REPLACEMENT and right == _REPLACEMENT:
-        # Interior of a run of three or more, as in "\n���\n" -> "\n“…”\n".
-        return "…"
-    if left == _REPLACEMENT and right in "\n \t":
-        return "”"
-    if left in "\n \t" and (right_surviving.isalnum() or right == _REPLACEMENT):
-        return "“"
-    if left in ".!?,;:…" and right in "\n \t":
-        return "”"
-    if left.isalpha() and right.islower():
-        return "’"
-    if left.isalpha() and right.isupper():
-        return "—"
-    if left.isdigit():
-        return "–"
-    return None
-
-
-def repair_lossy_replacements(text):
-    """Infer characters destroyed into U+FFFD, returning text and evidence.
-
-    Distinct from generate_script.fix_mojibake, which repairs the recoverable
-    byte form (``â€™``). Here the original bytes are gone, so each U+FFFD is
-    inferred from its neighbours. Inference is per character position because
-    a run of U+FFFD is several destroyed characters, not one. Returns the text
-    unchanged when there is nothing to repair, and never mutates the source
-    file. Positions that cannot be inferred are left as U+FFFD for the caller's
-    residual policy to handle.
-    """
-    if _REPLACEMENT not in text:
-        return text, []
-    chars = list(text)
-    repairs = []
-    surviving_index = 0
-    for index, char in enumerate(chars):
-        if char != _REPLACEMENT:
-            continue
-        if index >= surviving_index:
-            surviving_index = index + 1
-            while surviving_index < len(chars) and chars[surviving_index] == _REPLACEMENT:
-                surviving_index += 1
-        right_surviving = chars[surviving_index] if surviving_index < len(chars) else "\n"
-        inferred = _infer_replacement(chars, index, right_surviving)
-        if inferred is not None:
-            repairs.append({"offset": index, "before": _REPLACEMENT,
-                            "after": inferred})
-    for repair in repairs:
-        chars[repair["offset"]] = repair["after"]
-    return "".join(chars), repairs
 
 
 def neutralize_lossy_residue(text, substitute=None):
@@ -418,7 +374,8 @@ def strip_publisher_matter(text):
     Only runs anchored at an end are removed, never a match in the middle, and
     the whole book is never stripped. Returns the text and what was removed.
     """
-    paragraphs = text.split("\n\n")
+    ranges = list(iter_source_paragraph_ranges(text))
+    paragraphs = [text[start:end] for start, end in ranges]
     if len(paragraphs) < 8:
         return text, {"front_paragraphs": 0, "back_paragraphs": 0}
     limit = min(len(paragraphs) // 2,
@@ -431,5 +388,6 @@ def strip_publisher_matter(text):
         # not a book with front matter. Leave it for the caller's gate to
         # reject rather than silently emptying it.
         return text, {"front_paragraphs": 0, "back_paragraphs": 0}
-    kept = paragraphs[front:len(paragraphs) - back] if back else paragraphs[front:]
-    return "\n\n".join(kept), {"front_paragraphs": front, "back_paragraphs": back}
+    start = ranges[front][0]
+    end = ranges[len(ranges) - back - 1][1]
+    return text[start:end], {"front_paragraphs": front, "back_paragraphs": back}

@@ -89,6 +89,80 @@
         }
         // End voice roster dropdowns.
 
+        // Export links the server may refuse (a stale build answers 409 with
+        // its reason). A plain <a download> turns that into the browser
+        // message Failed - Unknown server error and the reason is lost (#1906). A
+        // marked link fetches the response, checks its status, and when the
+        // server accepts, saves that same body, so the server's heavy validation
+        // runs once. Two cases keep the browser's own download instead (the
+        // check request is cancelled and the link clicked again, which validates
+        // a second time): a body too large to hold in memory or of unknown size,
+        // and a page that is not a secure context (plain HTTP on a LAN address), where browsers may
+        // block a download from a blob URL.
+        const CHECKED_DOWNLOAD_MAX_BLOB_BYTES = 256 * 1024 * 1024;
+        // A blob URL must outlive a where-to-save dialog left open a while.
+        const CHECKED_DOWNLOAD_REVOKE_MS = 10 * 60 * 1000;
+        async function onCheckedDownloadClick(event) {
+            const link = event.target.closest?.('[data-checked-download]');
+            if (!link) { return; }
+            if (link.dataset.downloadChecked === 'native') { return; }
+            event.preventDefault();
+            if (link.dataset.downloadChecked === 'pending') { return; }
+            link.dataset.downloadChecked = 'pending';
+            const controller = new AbortController();
+            try {
+                showToast(t('core.download.preparing', 'Preparing download…'), 'info', 30000);
+                let response;
+                try {
+                    response = await fetch(link.href, {signal: controller.signal});
+                } catch (_error) {
+                    showToast(t('core.download.unreachable', 'Download failed: Alexandria did not respond. Check that it is still running, then try again.'), 'error');
+                    return;
+                }
+                if (!response.ok) {
+                    let detail = '';
+                    try {
+                        const body = await response.json();
+                        detail = typeof body?.detail === 'string' ? body.detail : '';
+                    } catch (_error) {
+                        detail = '';
+                    }
+                    showToast(detail
+                        ? t('core.download.refused', 'Download refused: {detail}', {detail})
+                        : t('core.download.refused-status', 'Download refused by the server (status {status}).', {status: String(response.status)}), 'error');
+                    return;
+                }
+                const length = Number(response.headers?.get?.('content-length'));
+                const fitsInMemory = Number.isFinite(length) && length > 0 && length <= CHECKED_DOWNLOAD_MAX_BLOB_BYTES;
+                if (!fitsInMemory || globalThis.isSecureContext === false) {
+                    controller.abort();
+                    link.dataset.downloadChecked = 'native';
+                    link.click();
+                    return;
+                }
+                let blob;
+                try {
+                    blob = await response.blob();
+                } catch (_error) {
+                    showToast(t('core.download.unreachable', 'Download failed: Alexandria did not respond. Check that it is still running, then try again.'), 'error');
+                    return;
+                }
+                const objectUrl = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = objectUrl;
+                anchor.download = link.download || link.href.split('/').pop();
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+                setTimeout(() => URL.revokeObjectURL(objectUrl), CHECKED_DOWNLOAD_REVOKE_MS);
+            } finally {
+                delete link.dataset.downloadChecked;
+            }
+        }
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            document.addEventListener('click', onCheckedDownloadClick);
+        }
+
         // --- Toast & Confirm utilities ---
         let toastSequence = 0;
         let confirmQueue = Promise.resolve();
@@ -113,6 +187,7 @@
             const toast = new bootstrap.Toast(el, { delay: duration });
             toast.show();
             el.addEventListener('hidden.bs.toast', () => el.remove());
+            return el;
         }
 
         function showActionError(action, error, recovery, type = 'error') {
@@ -194,6 +269,32 @@
                 return translated;
             }
             return translated + '\n' + english;
+        }
+
+        function setFieldFeedback(fieldId, message = null) {
+            const field = document.getElementById(fieldId);
+            let error = document.getElementById(fieldId + '-error');
+            if (!message) {
+                field.removeAttribute('aria-invalid');
+                if (error) { error.hidden = true; }
+                return;
+            }
+            if (!error) {
+                error = document.createElement('div');
+                error.id = fieldId + '-error';
+                error.className = 'field-error small mt-1';
+                error.setAttribute('role', 'alert');
+                field.insertAdjacentElement('afterend', error);
+                const described = new Set((field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean));
+                described.add(error.id);
+                field.setAttribute('aria-describedby', [...described].join(' '));
+                field.addEventListener('input', () => setFieldFeedback(fieldId));
+                field.addEventListener('change', () => setFieldFeedback(fieldId));
+            }
+            error.replaceChildren(message);
+            error.hidden = false;
+            field.setAttribute('aria-invalid', 'true');
+            field.focus();
         }
 
         function showConfirm(message, {title = t('core.confirm.title', 'Confirm action'), actionLabel = t('core.confirm.continue', 'Continue'), danger = false} = {}) {
@@ -535,6 +636,7 @@
         function showConfigValidationError(error) {
             const field = error.fieldId ? document.getElementById(error.fieldId) : null;
             if (field) {
+                if (typeof revealExpertSettingsFor === 'function') { revealExpertSettingsFor(field); }
                 openConfigField(field);
             }
             showToast(error.message, 'error');
@@ -600,11 +702,14 @@
                 const line = String(logs[i]).trim();
                 if (/^Task \S+ completed successfully\.$/i.test(line)) { return false; }
                 if (/^Task \S+ (?:cancelled\.|was cancelled\s*\()/i.test(line)) { return false; }
-                if (/^Task \S+ (?:failed with return code|completed, but [1-9]\d* section\(s\))/i.test(line)) { return true; }
+                if (/^Task \S+ (?:was killed by |failed with return code|completed, but [1-9]\d* section\(s\))/i.test(line)) { return true; }
                 if (/^(?:\[ERROR\]|Error:)/i.test(line)) { return true; }
             }
             return logs.some(log => {
-                const line = String(log)
+                const text = String(log).trim();
+                // Collision messages are neutral even if the saved filename contains "Error".
+                if (/^\[\d+\] Skipping — saved script '[^']*' (?:already exists\. Choose version or replace explicitly\.|now exists\.)$/.test(text)) { return false; }
+                const line = text
                     .replace(/\b(?:0|zero|no)\s+(?:(?:batch\(es\)|section\(s\)|batches|sections)\s+)?(?:errors?|failures?|failed)\b(?:\s+or\s+(?:errors?|failures?))?/gi, '')
                     .replace(/\b(?:errors?|failed|failures?)\s*(?:count\s*)?[:=]\s*0(?!\d|\.\d)/gi, '')
                     .replace(/\bwithout (?:any |recorded )?(?:errors?|failures?|failed)(?: or skipped sections)?\b/gi, '');
@@ -676,6 +781,7 @@
         function taskStatusLabel(status) {
             if (status === 'pending') { return t('core.task-status.pending', 'pending'); }
             if (status === 'running') { return t('core.task-status.running', 'running'); }
+            if (status === 'skipped') { return t('core.task-status.skipped', 'skipped'); }
             if (status === 'done') { return t('core.task-status.done', 'done'); }
             if (status === 'finished') { return t('core.task-status.finished', 'finished'); }
             if (status === 'failed') { return t('core.task-status.failed', 'failed'); }
@@ -689,10 +795,21 @@
         // navigated away from the tab (no point popping up a notification for
         // something they're already watching).
         function getTaskCompletionOutcome(status) {
+            const children = status ? (status.tasks || []) : [];
+            if (status && (status.status === 'failed' || children.some(task => task.status === 'failed'))) {
+                return 'failed';
+            }
+            if (status && (status.status === 'cancelled' || children.some(task => task.status === 'cancelled'))) {
+                return 'cancelled';
+            }
+            if (status && (status.status === 'incomplete' || children.some(task => task.status === 'incomplete'))) {
+                return 'incomplete';
+            }
             if (isTaskFailed(status)) { return 'failed'; }
             if (status.status === 'cancelled' || (status.tasks || []).some(task => task.status === 'cancelled')) { return 'cancelled'; }
             for (const line of (status.logs || []).slice().reverse()) {
                 if (/^Task \S+ completed successfully\.$/i.test(String(line).trim())) { return 'finished'; }
+                if (/^Task \S+ was killed by /i.test(String(line).trim())) { return 'failed'; }
                 if (/^Task \S+ (?:cancelled\.|was cancelled\s*\()/i.test(String(line).trim())) { return 'cancelled'; }
             }
             return 'finished';
@@ -702,8 +819,12 @@
             if (!('Notification' in window) || Notification.permission !== 'granted') { return; }
             if (document.visibilityState === 'visible' && document.hasFocus()) { return; }
             const completion = status ? getTaskCompletionOutcome(status) : outcome;
-            const title = `${getTaskLabel(taskName)} ${completion}`;
-            const message = detail || (completion === 'failed' || completion === 'cancelled'
+            const title = completion === 'incomplete'
+                ? t('core.notify.incomplete-title', '{task} review incomplete', {task: getTaskLabel(taskName)})
+                : `${getTaskLabel(taskName)} ${completion}`;
+            const message = detail || (completion === 'incomplete'
+                ? t('core.notify.incomplete-body-stage-neutral', 'Some review work is still unfinished. Re-run the review to finish it.')
+                : completion === 'failed' || completion === 'cancelled'
                 ? t('core.notify.failed-body', 'Open Alexandria to review the activity log and your recovery options.')
                 : t('core.notify.finished-body', 'Switch back to Alexandria to see the results.'));
             try {
@@ -767,6 +888,7 @@
             if (!selectedLink) { return; }
             const target = document.getElementById(name + '-tab');
             if (!target) { return; }
+            if (name !== 'editor') { window.toggleEditorTools?.(false); }
             if (updateHistory && window.location.hash !== '#' + name) {
                 window.history.pushState(null, '', '#' + name);
             }
@@ -780,6 +902,14 @@
             // Add active to clicked
             selectedLink.classList.add('active');
             selectedLink.setAttribute('aria-current', 'page');
+            const advDropdown = document.getElementById('advancedNavDropdown');
+            if (advDropdown?.classList) {
+                if (selectedLink.closest && selectedLink.closest('.dropdown-menu')) {
+                    advDropdown.classList.add('active');
+                } else {
+                    advDropdown.classList.remove('active');
+                }
+            }
 
             // Hide all tabs
             document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
@@ -793,6 +923,7 @@
 
             // Trigger tab specific loads
             window.refreshWorkspaceView?.();
+            if (selectedLink.dataset.tab === 'script') { window.refreshReviewRestart?.(); }
             if (selectedLink.dataset.tab === 'setup') {
                 pollLmStudioStatus();
             } else if (selectedLink.dataset.tab === 'editor') {
@@ -819,7 +950,7 @@
                     // An HTTP-status error stays visible even if a
                     // local-obsolete marker is accidentally present.
                     if (isLocalVoiceLoadObsolete(error)) { return; }
-                    showActionError('Could not load voices', error, 'Retry loading Voices; your voice edits are retained.');
+                    showActionError(t('voice.load.failed', 'Could not load voices'), error, t('voice.load.recovery', 'Retry loading Voices; your voice edits are retained.'));
                 });
             } else if (selectedLink.dataset.tab === 'designer') {
                 loadDesignedVoices();
@@ -842,6 +973,7 @@
                 loadRunHistory();
                 refreshBenchmarkStatus();
             }
+            if (name === 'script') { window.refreshScriptIngestFacts?.(); }
         }
         function restoreTab() {
             let saved = null;
@@ -857,11 +989,24 @@
         document.querySelectorAll('.nav-link').forEach(link => {
             link.addEventListener('click', (e) => {
                 e.preventDefault();
-                activateTab(e.currentTarget.dataset.tab);
+                // A nav-link without a data-tab belongs to something else — the
+                // Advanced dropdown toggle. getTabLink(undefined) would happily
+                // match it, so it must never reach the navigation logic.
+                const tab = e.currentTarget.dataset.tab;
+                if (!tab) { return; }
+                activateTab(tab);
             });
         });
         window.addEventListener('popstate', onTabHistoryChange);
         window.addEventListener('hashchange', onTabHistoryChange);
+        document.getElementById('skip-main-link')?.addEventListener('click', event => {
+            const main = document.getElementById('app-main');
+            if (!main) { return; }
+            event.preventDefault();
+            main.focus({ preventScroll: true });
+            const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            main.scrollIntoView({ behavior: reducedMotion ? 'instant' : 'smooth', block: 'start' });
+        });
 
         // --- LLM model picker: ask the Base URL what it serves ---
         let llmModelRequestSequence = 0;
@@ -877,8 +1022,8 @@
                 try { return !profile || JSON.stringify(profile) === JSON.stringify(getEditedLlmProfile()); }
                 catch (e) { return false; }
             };
-            if (!baseUrl) { hint.textContent = 'Set the Base URL first.'; return; }
-            hint.textContent = 'Fetching model list...';
+            if (!baseUrl) { hint.textContent = t('setup.llm.models.base-url-first', 'Set the Base URL first.'); return; }
+            hint.textContent = t('setup.llm.models.fetching', 'Fetching model list...');
             try {
                 profile = getEditedLlmProfile();
                 const r = await API.post('/api/llm/models', profile);
@@ -890,12 +1035,16 @@
                     list.appendChild(opt);
                 });
                 if (r.error) {
-                    hint.textContent = 'Could not list models: ' + r.error;
+                    hint.textContent = t('setup.llm.models.error', 'Could not list models: {error}', {error: r.error});
+                } else if (pluralForm(r.models.length) === 'one') {
+                    hint.textContent = t('setup.llm.models.available-one', '{count} model available - start typing to pick one.', {count: r.models.length});
+                } else if (r.models.length) {
+                    hint.textContent = t('setup.llm.models.available', '{count} models available - start typing to pick one.', {count: r.models.length});
                 } else {
-                    hint.textContent = r.models.length ? `${r.models.length} model(s) available - start typing to pick one.` : 'Server reports no models loaded.';
+                    hint.textContent = t('setup.llm.models.none', 'Server reports no models loaded.');
                 }
             } catch (e) {
-                if (isCurrent()) { hint.textContent = 'Could not list models: ' + e.message; }
+                if (isCurrent()) { hint.textContent = t('setup.llm.models.error', 'Could not list models: {error}', {error: e.message}); }
             }
         }
         document.getElementById('llm-model-refresh').addEventListener('click', refreshLlmModels);
@@ -907,36 +1056,82 @@
             const button = document.getElementById('llm-key-toggle');
             const visible = input.type === 'password';
             input.type = visible ? 'text' : 'password';
-            button.textContent = visible ? 'Hide key' : 'Show key';
+            button.textContent = visible ? t('setup.llm.key.hide', 'Hide key') : t('setup.llm.llm-key-toggle.button', 'Show key');
             button.setAttribute('aria-pressed', String(visible));
         }
 
         // --- Theme ---
         const THEMES = [
-            { key: 'light',       icon: 'fa-sun',      label: 'Light'      },
-            { key: 'night',       icon: 'fa-moon',     label: 'Night'      },
-            { key: 'super-night', icon: 'fa-circle',   label: 'Super Night'},
-            { key: 'cyberpunk',   icon: 'fa-bolt',     label: 'Cyberpunk'  },
-            { key: 'bread',       icon: 'fa-bread-slice', label: 'Bread'   },
-            { key: 'leek',        icon: 'fa-leaf',     label: 'Leek'       },
+            { key: 'light',       icon: 'fa-sun' },
+            { key: 'night',       icon: 'fa-moon' },
+            { key: 'super-night', icon: 'fa-circle' },
+            { key: 'cyberpunk',   icon: 'fa-bolt' },
+            { key: 'bread',       icon: 'fa-bread-slice' },
+            { key: 'leek',        icon: 'fa-leaf' },
         ];
 
-        function applyTheme(key) {
+        // One resolution policy for the initial theme: an explicit stored choice
+        // wins, otherwise the OS colour scheme picks the theme (dark -> night),
+        // otherwise light. The anti-flash snippet in index.html mirrors this so
+        // first paint and the runtime listener cannot disagree.
+        function isKnownTheme(stored) {
+            return THEMES.some(theme => theme.key === stored);
+        }
+        function resolveThemeKey(stored, osDark) {
+            if (isKnownTheme(stored)) { return stored; }
+            return osDark ? 'night' : 'light';
+        }
+        function prefersDarkNow() {
+            try { return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches); }
+            catch (e) { return false; }
+        }
+        function storedThemeKey() {
+            try { return localStorage.getItem('alex-theme'); } catch (e) { return null; }
+        }
+
+        // persist=false applies a theme derived from the OS without turning it
+        // into an explicit user choice. Only cycleTheme() (the theme button)
+        // persists, so a stored choice stops the OS from overriding it.
+        function applyTheme(key, persist = true) {
             const html = document.documentElement;
             if (key === 'light') {
                 html.removeAttribute('data-theme');
             } else {
                 html.setAttribute('data-theme', key);
             }
-            const t = THEMES.find(t => t.key === key) || THEMES[0];
-            document.getElementById('theme-icon').className = `fas ${t.icon}`;
-            document.getElementById('theme-label').textContent = `Theme: ${t.label}`;
-            const next = THEMES[(THEMES.indexOf(t) + 1) % THEMES.length];
-            const action = `Current theme: ${t.label}. Switch to ${next.label}.`;
+            renderThemeControl();
+            if (typeof CSSTransition !== 'undefined') {
+                for (const transition of document.getAnimations()) {
+                    const property = transition.transitionProperty;
+                    if (transition instanceof CSSTransition && (property === 'color' || property.endsWith('-color') || property === 'box-shadow')) {
+                        transition.finish();
+                    }
+                }
+            }
+            if (persist) {
+                try { localStorage.setItem('alex-theme', key); } catch (e) { /* storage blocked; theme still applies for this page */ }
+            }
+        }
+
+        function getThemeLabel(key) {
+            if (key === 'night') { return t('shell.theme.night', 'Night'); }
+            if (key === 'super-night') { return t('shell.theme.super-night', 'Super Night'); }
+            if (key === 'cyberpunk') { return t('shell.theme.cyberpunk', 'Cyberpunk'); }
+            if (key === 'bread') { return t('shell.theme.bread', 'Bread'); }
+            if (key === 'leek') { return t('shell.theme.leek', 'Leek'); }
+            return t('shell.theme.light', 'Light');
+        }
+
+        function renderThemeControl() {
+            const current = document.documentElement.getAttribute('data-theme') || 'light';
+            const theme = THEMES.find(theme => theme.key === current) || THEMES[0];
+            const next = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+            document.getElementById('theme-icon').className = `fas ${theme.icon}`;
+            document.getElementById('theme-label').textContent = t('shell.theme.current-label', 'Theme: {theme}', {theme: getThemeLabel(theme.key)});
+            const action = t('shell.theme.action', 'Current theme: {current}. Switch to {next}.', {current: getThemeLabel(theme.key), next: getThemeLabel(next.key)});
             const button = document.getElementById('theme-toggle');
             button.title = action;
             button.setAttribute('aria-label', action);
-            try { localStorage.setItem('alex-theme', key); } catch (e) { /* storage blocked; theme still applies for this page */ }
         }
 
         function cycleTheme() {
@@ -946,12 +1141,28 @@
             applyTheme(next.key);
         }
 
-        // Sync button label/icon with whatever the anti-flash snippet already applied
-        (function() {
-            let saved = 'light';
-            try { saved = localStorage.getItem('alex-theme') || 'light'; } catch (e) { /* storage blocked */ }
-            applyTheme(saved);
-        })();
+        // Sync button label/icon with whatever the anti-flash snippet already
+        // applied, and follow the OS until the user makes an explicit choice.
+        // Kept after this marker so slice-based tests can load the pure theme
+        // helpers without triggering DOM-dependent initialisation.
+        function initTheme() {
+            applyTheme(resolveThemeKey(storedThemeKey(), prefersDarkNow()), false);
+            try {
+                const media = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+                if (media && typeof media.addEventListener === 'function') {
+                    media.addEventListener('change', () => {
+                        // Only a VALID stored key counts as an explicit choice.
+                        // Use the same validator as the resolver: a corrupt or
+                        // legacy value must not freeze the theme against the OS.
+                        if (!isKnownTheme(storedThemeKey())) {
+                            applyTheme(resolveThemeKey(null, media.matches), false);
+                        }
+                    });
+                }
+            } catch (e) { /* matchMedia unsupported: the initial resolution still stands */ }
+            restoreVoiceReviewVisibility();
+        }
+        initTheme();
 
         function createSerializedSaveQueue({ write, delay = 500, onDirty = () => {}, onSaved = () => {}, onError = () => {}, guardAmbiguous = false }) {
             let pending = null;
@@ -1030,7 +1241,7 @@
                 pending = { value: JSON.parse(JSON.stringify(value)), revision: ++revision };
                 onDirty();
                 clearTimeout(timer);
-                timer = setTimeout(() => { flush().catch(() => {}); }, delay);
+                timer = setTimeout(() => { flush().catch(error => { reportBrowserFailure('save_flush_timer', error); }); }, delay);
             }
 
             function isDirty() {
@@ -1089,6 +1300,29 @@
             const buttons = taskStartClaims.get(taskName) || [];
             taskStartClaims.delete(taskName);
             buttons.forEach(button => { button.disabled = false; });
+        }
+
+        function reportBrowserFailure(stage, error) {
+            if (!['save_flush_timer', 'save_pagehide'].includes(stage)) { return; }
+            try {
+                const names = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError',
+                    'NetworkError', 'SecurityError', 'QuotaExceededError', 'InvalidStateError', 'UnknownError'];
+                const errorName = error && names.includes(error.name) ? error.name : 'UnknownError';
+                const now = Date.now();
+                let state = reportBrowserFailure.state;
+                if (!state || now - state.started >= 60000) {
+                    state = {started: now, reported: new Set()};
+                    reportBrowserFailure.state = state;
+                }
+                const key = stage + ':' + errorName;
+                if (state.reported.has(key) || state.reported.size >= 5) { return; }
+                state.reported.add(key);
+                fetch('/api/logs/browser-failure', {
+                    method: 'POST', credentials: 'same-origin', redirect: 'error', keepalive: true,
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({stage: stage, error_name: errorName})
+                }).catch(() => {});
+            } catch (_reportError) {}
         }
 
         // --- API Helpers ---
@@ -1223,18 +1457,29 @@
 
         async function autoConfigureSettings() {
             const btn = document.getElementById('btn-auto-configure');
+            // The authored icon and the data-i18n span are never replaced: the
+            // span's key switches to the busy label and back, so applyUiCatalog
+            // can repaint the button in whatever locale is active afterwards
+            // (#2016). Same helper every other keyed node uses (Rule 15).
+            const label = btn.querySelector('[data-i18n]');
+            const icon = btn.querySelector('i');
+            // Capture the authored icon once per button: a request that starts
+            // while an older one is still detecting would otherwise record the
+            // spinner as the class to restore.
+            const iconClass = btn._autoConfigureIconClass ?? (btn._autoConfigureIconClass = icon ? icon.className : '');
             const request = {};
             btn._autoConfigureRequest = request;
             const snapshot = getAutoSettingsSnapshot();
             const isCurrent = () => btn._autoConfigureRequest === request;
             btn.disabled = true;
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Detecting…';
+            if (icon) { icon.className = 'fas fa-spinner fa-spin me-1'; }
+            if (label) { setUiMessage(label, 'setup.auto-config.detecting', 'Detecting…'); }
 
             try {
                 const stats = await API.get('/api/system/stats');
                 if (!isCurrent()) { return; }
                 if (getAutoSettingsSnapshot() !== snapshot) {
-                    showToast('The TTS settings changed during detection. Your edits were kept; review them before running Auto-Configure again.', 'warning');
+                    showToast(t('setup.auto-config.settings-changed', 'The TTS settings changed during detection. Your edits were kept; review them before running Auto-Configure again.'), 'warning');
                     return;
                 }
                 const { settings, summary } = _computeAutoSettings(stats);
@@ -1242,15 +1487,21 @@
 
                 const banner = document.getElementById('auto-config-banner');
                 document.getElementById('auto-config-msg').innerHTML =
-                    `<i class="fas fa-check-circle me-1 text-success"></i><strong>Suggested settings:</strong> ${escapeHtml(summary)}.${settings.ttsMode === 'external' ? ' External TTS selected: start a compatible TTS server and enter its URL below before generating audio.' : ''} Review the TTS settings below, then click Save to apply.`;
+                    '<i class="fas fa-check-circle me-1 text-success"></i>' + (settings.ttsMode === 'external'
+                        ? uiMessageMarkup('setup.auto-config.suggested-external', 'Suggested settings: {summary}. External TTS selected: start a compatible TTS server and enter its URL below before generating audio. Review the TTS settings below, then click Save to apply.', {summary})
+                        : uiMessageMarkup('setup.auto-config.suggested', 'Suggested settings: {summary}. Review the TTS settings below, then click Save to apply.', {summary}));
                 banner.style.display = '';
                 banner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             } catch (e) {
-                if (isCurrent()) { showActionError('Hardware detection failed', e, 'Review the hardware details and TTS settings before trying Auto-Configure again.'); }
+                if (isCurrent()) {
+                    showActionError(t('setup.auto-config.failed', 'Hardware detection failed'), e,
+                        t('setup.auto-config.failed-recovery', 'Review the hardware details and TTS settings before trying Auto-Configure again.'));
+                }
             } finally {
                 if (isCurrent()) {
                     btn.disabled = false;
-                    btn.innerHTML = '<i class="fas fa-magic me-1"></i>Auto-Configure';
+                    if (icon) { icon.className = iconClass; }
+                    if (label) { setUiMessage(label, 'setup.header.auto-configure', 'Auto-Configure'); }
                 }
             }
         }
@@ -1356,7 +1607,7 @@
                             remote: {base_url:'', api_key:'local', model_name:''} };
         let currentLlmMode = 'local';
         let savedLlmMode = 'local';   // last-saved llm_mode; drives the "Active:" badge
-        // Server-computed lmstudio_settings.is_remote_llm(llm_mode, base_url)
+        // Server-computed lmstudio_settings.is_active_llm_remote(config)
         // for the ACTIVE (saved) config - reflects llm_mode/base_url drift
         // that a bare `currentLlmMode === 'remote'` check would miss. Updated
         // from /api/config's response on load and after a successful save.
@@ -1365,11 +1616,16 @@
         let promptPresets = [];
         let activePromptPreset = 'michel2_full';
         let configSavePending = false;
-        const passPromptPresets = {pass1: [], pass3: []};
-        const activePassPromptPreset = {pass1: 'default', pass3: 'default'};
+        const passPromptPresets = {pass1: [], pass3: [], cast: [], pass1_compact: [], pass3_gaps: [], pass3_directed: [], review: []};
+        const activePassPromptPreset = {pass1: 'default', pass3: 'default', cast: 'default', pass1_compact: 'default', pass3_gaps: 'default', pass3_directed: 'default', review: 'default'};
         const passPromptDefaults = {
             pass1: {system_prompt: '', user_prompt: ''},
-            pass3: {system_prompt: '', user_prompt: ''}
+            pass3: {system_prompt: '', user_prompt: ''},
+            cast: {whole_book_prompt: '', incremental_prompt: ''},
+            pass1_compact: {system_prompt: '', user_prompt: ''},
+            pass3_gaps: {system_prompt: '', user_prompt: ''},
+            pass3_directed: {system_prompt: '', user_prompt: ''},
+            review: {system_prompt: '', user_prompt: ''}
         };
 
         function promptBoxes() {
@@ -1381,9 +1637,24 @@
         }
 
         function passPromptFields(pass) {
-            return pass === 'pass1'
-                ? {system: 'pass1-system-prompt', user: 'pass1-user-prompt'}
-                : {system: 'pass3-system-prompt', user: 'pass3-user-prompt'};
+            if (pass === 'cast') { return {system: 'cast-whole-book-prompt', user: 'cast-incremental-prompt'}; }
+            return {system: `${pass}-system-prompt`, user: `${pass}-user-prompt`};
+        }
+
+        function getPromptEditorBoxes(pass) {
+            if (pass === 'attribution') { return promptBoxes(); }
+            const fields = passPromptFields(pass);
+            if (pass === 'cast') { return {whole_book_prompt: document.getElementById(fields.system).value,
+                incremental_prompt: document.getElementById(fields.user).value}; }
+            return {system_prompt: document.getElementById(fields.system).value,
+                user_prompt: document.getElementById(fields.user).value};
+        }
+
+        function setPromptEditorBoxes(pass, boxes) {
+            const fields = pass === 'attribution' ? {system: 'system-prompt', user: 'user-prompt'} : passPromptFields(pass);
+            document.getElementById(fields.system).value = pass === 'cast' ? boxes.whole_book_prompt : boxes.system_prompt;
+            document.getElementById(fields.user).value = pass === 'cast' ? boxes.incremental_prompt : boxes.user_prompt;
+            if (pass === 'attribution') { document.getElementById('prompt-example').value = boxes.example; }
         }
 
         function getPassPromptPresetPayload(pass) {
@@ -1391,11 +1662,8 @@
             const active = activePassPromptPreset[pass];
             const preset = own.find(item => item.name === active);
             const defaults = passPromptDefaults[pass];
-            const fields = passPromptFields(pass);
-            const boxes = {system_prompt: document.getElementById(fields.system).value,
-                user_prompt: document.getElementById(fields.user).value};
-            if (boxes.system_prompt === (preset?.system_prompt || defaults.system_prompt)
-                && boxes.user_prompt === (preset?.user_prompt || defaults.user_prompt)) { return {active, own}; }
+            const boxes = getPromptEditorBoxes(pass);
+            if (Object.entries(boxes).every(([key, value]) => value === (preset?.[key] || defaults[key]))) { return {active, own}; }
             const name = preset?.name || 'default (edited)';
             const edited = {...preset, name, ...boxes};
             const index = own.findIndex(item => item.name === name);
@@ -1414,7 +1682,7 @@
             select.value = String(previousIndex);
             if (pendingPromptPresetSwitches.has(pass)) { return; }
             if (configSavePending) {
-                showToast('Wait for the configuration save before switching prompt presets.', 'warning');
+                showToast(t('setup.prompts.save-pending', 'Wait for the configuration save before switching prompt presets.'), 'warning');
                 return;
             }
             const target = presets[index];
@@ -1431,7 +1699,7 @@
                     if (!await showConfirm(`Switch to prompt preset "${target?.name || 'Default'}"? This replaces the current prompt text. Discard your unsaved prompt edits?`, {title: 'Replace edited prompt?', actionLabel: 'Switch preset', danger: true})) { return; }
                     if (snapshot !== getPromptPresetEditorSnapshot(pass)
                         || defaultSnapshot !== JSON.stringify(attribution ? {} : passPromptDefaults[pass])) {
-                        showToast('The prompt edits or presets changed. Review them before switching.', 'warning');
+                        showToast(t('setup.prompts.switch-changed', 'The prompt edits or presets changed. Review them before switching.'), 'warning');
                         return;
                     }
                 }
@@ -1440,7 +1708,7 @@
                 else { applyPassPromptPreset(pass, index); }
             } catch (error) {
                 console.error('Prompt preset switch failed:', error);
-                showToast('Could not confirm the preset switch. Your prompt edits were kept; try again.', 'error');
+                showToast(t('setup.prompts.switch-unconfirmed', 'Could not confirm the preset switch. Your prompt edits were kept; try again.'), 'error');
             } finally {
                 pendingPromptPresetSwitches.delete(pass);
             }
@@ -1457,7 +1725,7 @@
                 names.add(name);
                 preset.name = name;
                 if (activeName === 'default') { activeName = name; }
-                showToast(`The ${pass} user preset "default" is now "${name}" to keep it separate from the checked-in prompt. Save configuration to retain this name.`, 'warning');
+                showToast(t('setup.prompts.default-renamed', 'The {pass} user preset "default" is now "{name}" to keep it separate from the checked-in prompt. Save configuration to retain this name.', {pass, name}), 'warning');
             }
             passPromptPresets[pass] = own;
             activePassPromptPreset[pass] = activeName || 'default';
@@ -1466,7 +1734,7 @@
             select.replaceChildren();
             const defaultOption = document.createElement('option');
             defaultOption.value = '-1';
-            defaultOption.textContent = 'Default (checked-in prompt)';
+            defaultOption.textContent = t('setup.prompts.default-option', 'Default (checked-in prompt)');
             select.appendChild(defaultOption);
             passPromptPresets[pass].forEach((preset, index) => {
                 const option = document.createElement('option');
@@ -1484,9 +1752,7 @@
             window.invalidateSetupPreview?.();
             const preset = passPromptPresets[pass][index];
             const defaults = passPromptDefaults[pass];
-            const fields = passPromptFields(pass);
-            document.getElementById(fields.system).value = preset?.system_prompt || defaults.system_prompt;
-            document.getElementById(fields.user).value = preset?.user_prompt || defaults.user_prompt;
+            setPromptEditorBoxes(pass, Object.fromEntries(Object.keys(defaults).map(key => [key, preset?.[key] || defaults[key]])));
             activePassPromptPreset[pass] = preset?.name || 'default';
         }
 
@@ -1495,11 +1761,13 @@
         }
 
         window.savePassPromptPreset = async (pass) => {
-            const fields = passPromptFields(pass);
             const snapshot = getPromptPresetEditorSnapshot(pass);
-            const values = await showPresetEditor({title: pass === 'pass1'
+            const values = await showPresetEditor({title: pass === 'cast'
+                    ? t('setup.prompts.save-cast-title', 'Save cast prompt preset') : pass === 'pass1'
                     ? t('setup.prompts.save-pass1-title', 'Save Step 1 prompt preset')
-                    : t('setup.prompts.save-pass3-title', 'Save Step 3 prompt preset'),
+                    : pass === 'pass3' ? t('setup.prompts.save-pass3-title', 'Save Step 3 prompt preset')
+                    : pass === 'review' ? t('setup.prompts.save-review-title', 'Save review prompt preset')
+                    : t('setup.prompts.save-experimental-title', 'Save experimental prompt preset'),
                 name: activePassPromptPreset[pass] === 'default' ? '' : activePassPromptPreset[pass],
                 validateName: getPassPromptPresetNameError});
             if (!values) { return; }
@@ -1510,9 +1778,7 @@
             const {name, description} = values;
             const nameError = getPassPromptPresetNameError(name);
             if (nameError) { showToast(nameError, 'warning'); return; }
-            const preset = {name: name.trim(), description: description.trim(),
-                system_prompt: document.getElementById(fields.system).value,
-                user_prompt: document.getElementById(fields.user).value};
+            const preset = {name: name.trim(), description: description.trim(), ...getPromptEditorBoxes(pass)};
             const presets = passPromptPresets[pass].map(item => ({...item}));
             const index = presets.findIndex(p => p.name === preset.name);
             if (index >= 0) { presets[index] = preset; } else { presets.push(preset); }
@@ -1520,9 +1786,11 @@
             try {
                 await persistPromptPresets({prompts: {[`${pass}_preset`]: preset.name, [`${pass}_prompt_presets`]: presets}},
                     () => applyPromptPresetSave(pass, presets, preset.name, submitted));
-                showToast(pass === 'pass1'
+                showToast(pass === 'cast' ? t('setup.prompts.saved-cast', 'Cast prompt preset saved.') : pass === 'pass1'
                     ? t('setup.prompts.saved-pass1', 'Step 1 prompt preset saved.')
-                    : t('setup.prompts.saved-pass3', 'Step 3 prompt preset saved.'), 'success');
+                    : pass === 'pass3' ? t('setup.prompts.saved-pass3', 'Step 3 prompt preset saved.')
+                    : pass === 'review' ? t('setup.prompts.saved-review', 'Review prompt preset saved.')
+                    : t('setup.prompts.saved-experimental', 'Experimental prompt preset saved.'), 'success');
             } catch (e) { showActionError(t('setup.prompts.save-error', 'Could not save prompt preset'), e, t('setup.prompts.save-error-recovery', 'Review the preset name and saved preset list before trying Save preset again. Your prompt fields remain available.')); }
         };
 
@@ -1544,7 +1812,7 @@
             try {
                 if (!await showConfirm(message, {title: 'Delete prompt preset?', actionLabel: 'Delete preset and save Setup', danger: true})) { return; }
                 if (getPromptPresetEditorSnapshot(pass) !== snapshot) {
-                    showToast('The preset selection or prompt edits changed. Review them before deleting.', 'warning');
+                    showToast(t('setup.prompts.delete-changed', 'The preset selection or prompt edits changed. Review them before deleting.'), 'warning');
                     return;
                 }
                 await remove();
@@ -1556,7 +1824,7 @@
         window.deletePassPromptPreset = async (pass) => {
             const presets = passPromptPresets[pass].map(item => ({...item}));
             const index = presets.findIndex(p => p.name === activePassPromptPreset[pass]);
-            if (index < 0) { showToast('Select a saved preset first.', 'warning'); return; }
+            if (index < 0) { showToast(t('setup.prompts.select-first', 'Select a saved preset first.'), 'warning'); return; }
             try {
                 await applyConfirmedPromptPresetDeletion(pass,
                     `Delete preset "${presets[index].name}" and switch the active ${pass} prompt to the checked-in default? This also saves your current Setup settings.`, async () => {
@@ -1564,10 +1832,10 @@
                         const submitted = getPromptEditorBoxes(pass);
                         await persistPromptPresets({prompts: {[`${pass}_preset`]: 'default', [`${pass}_prompt_presets`]: presets}},
                             () => applyPromptPresetSave(pass, presets, 'default', submitted));
-                        showToast('Prompt preset deleted.', 'success');
+                        showToast(t('setup.prompts.deleted', 'Prompt preset deleted.'), 'success');
                     });
             } catch (e) {
-                showActionError('Could not delete prompt preset', e, 'Review the saved preset list to check whether it was deleted before trying Delete again.');
+                showActionError(t('setup.prompts.delete-failed', 'Could not delete prompt preset'), e, t('setup.prompts.delete-recovery', 'Review the saved preset list to check whether it was deleted before trying Delete again.'));
             }
         };
 
@@ -1625,11 +1893,13 @@
             document.getElementById('prompt-example').value = preset.example || '';
             document.getElementById('prompt-example-block').hidden = variant !== 'michel2_shot';
             document.getElementById('prompt-preset-description').textContent = preset.description || '';
-            document.getElementById('prompt-preset-variant-badge').textContent = 'shape: ' + variant;
-            document.getElementById('user-prompt-hint').textContent = (
-                ['default', 'aliases', 'incremental', 'continuity'].includes(variant)
-                    ? '(a template: the pipeline fills {roster} and {batch})'
-                    : '(the pipeline adds the ROSTER line and the marked PASSAGE around it)');
+            document.getElementById('prompt-preset-variant-badge').textContent = t('setup.prompts.shape', 'shape: {variant}', {variant});
+            const hint = document.getElementById('user-prompt-hint');
+            if (['default', 'aliases', 'incremental', 'continuity'].includes(variant)) {
+                setUiMessage(hint, 'setup.prompts.user-prompt.template-hint', '(a template: the pipeline fills {roster} and {batch})', {roster: '{roster}', batch: '{batch}'});
+            } else {
+                setUiMessage(hint, 'setup.prompts.user-prompt.passage-hint', '(the pipeline adds the ROSTER line and the marked PASSAGE around it)');
+            }
             document.getElementById('prompt-preview-panel').hidden = true;
         }
 
@@ -1666,20 +1936,21 @@
             const saveButtons = ['config-save-button', 'config-save-button-top']
                 .map(id => document.getElementById(id)).filter(Boolean)
                 .map(button => ({button, label: button.innerHTML}));
-            saveButtons.forEach(({button}) => { button.innerHTML = 'Saving…'; });
+            saveButtons.forEach(({button}) => { button.innerHTML = t('designer.save.saving', 'Saving…'); });
             const status = document.getElementById('config-save-status');
-            if (status) { status.textContent = 'Saving configuration…'; }
+            if (status) { status.textContent = t('setup.config.saving-status', 'Saving configuration…'); }
             try {
                 await API.post('/api/config', payload);
-                if (status) { status.textContent = 'Configuration saved.'; }
+                if (status) { status.textContent = t('setup.config.saved', 'Configuration saved.'); }
+                renderReviewLabelsOnlyPointer();
                 try {
                     if (onSaved) { await onSaved(); }
                 } catch (error) {
                     console.debug('Configuration saved, but saved UI feedback failed', error);
-                    if (status) { status.textContent = 'Configuration saved, but the saved status could not be displayed completely. Your form fields are kept. Reload to view the saved settings before making further changes.'; }
+                    if (status) { status.textContent = t('setup.config.saved-status-unavailable', 'Configuration saved, but the saved status could not be displayed completely. Your form fields are kept. Reload to view the saved settings before making further changes.'); }
                 }
             } catch (error) {
-                if (status) { status.textContent = 'Save was not confirmed. Your form fields are kept. Review the error and current saved settings before trying again.'; }
+                if (status) { status.textContent = t('setup.config.save-unconfirmed', 'Save was not confirmed. Your form fields are kept. Review the error and current saved settings before trying again.'); }
                 throw error;
             } finally {
                 configSavePending = false;
@@ -1688,22 +1959,12 @@
             }
         }
 
-        function getPromptEditorBoxes(pass) {
-            if (pass === 'attribution') { return promptBoxes(); }
-            const fields = passPromptFields(pass);
-            return {system_prompt: document.getElementById(fields.system).value,
-                user_prompt: document.getElementById(fields.user).value};
-        }
-
         function applyPromptPresetSave(pass, presets, active, submitted) {
             const current = getPromptEditorBoxes(pass);
             if (pass === 'attribution') { renderPromptPresets(presets, active); }
             else { renderPassPromptPresets(pass, presets, active); }
             if (JSON.stringify(current) !== JSON.stringify(submitted)) {
-                const fields = pass === 'attribution' ? {system: 'system-prompt', user: 'user-prompt'} : passPromptFields(pass);
-                document.getElementById(fields.system).value = current.system_prompt;
-                document.getElementById(fields.user).value = current.user_prompt;
-                if (pass === 'attribution') { document.getElementById('prompt-example').value = current.example; }
+                setPromptEditorBoxes(pass, current);
             }
         }
 
@@ -1737,7 +1998,7 @@
             const retry = document.getElementById('config-refresh-retry');
             savedConfigRefreshPending = true;
             retry.disabled = true;
-            status.textContent = 'Configuration saved. Refreshing saved status…';
+            status.textContent = t('setup.config.refreshing', 'Configuration saved. Refreshing saved status…');
             try {
                 const config = await API.get('/api/config');
                 if (request !== savedConfigRefreshRequest) { return; }
@@ -1750,12 +2011,12 @@
                 const refreshed = await reloadPromptPresets(undefined, config, promptSnapshot);
                 if (request !== savedConfigRefreshRequest) { return; }
                 status.textContent = refreshed ? ''
-                    : 'Configuration saved. Your later prompt edits were kept, so the saved preset list was not reloaded. Review your edits before saving again.';
+                    : t('setup.config.saved-but-edits-kept', 'Configuration saved. Your later prompt edits were kept, so the saved preset list was not reloaded. Review your edits before saving again.');
                 retry.hidden = true;
             } catch (error) {
                 if (request !== savedConfigRefreshRequest) { return; }
                 console.debug('Saved configuration refresh failed', error);
-                status.textContent = 'Configuration saved, but saved profile or preset status could not be refreshed. Your current fields are kept. Check that Alexandria is running, then retry the status refresh; this does not save again.';
+                status.textContent = t('setup.config.refresh-failed', 'Configuration saved, but saved profile or preset status could not be refreshed. Your current fields are kept. Check that Alexandria is running, then retry the status refresh; this does not save again.');
                 retry.hidden = false;
             } finally {
                 if (request === savedConfigRefreshRequest) {
@@ -1795,7 +2056,7 @@
 
         window.deletePromptPreset = async () => {
             const preset = selectedPromptPreset();
-            if (!preset || preset.builtin) { showToast('Built-in prompts cannot be deleted.', 'warning'); return; }
+            if (!preset || preset.builtin) { showToast(t('setup.prompts.builtin-undeletable', 'Built-in prompts cannot be deleted.'), 'warning'); return; }
             try {
                 await applyConfirmedPromptPresetDeletion('attribution',
                     `Delete preset "${preset.name}" and switch the active attribution prompt to "michel2_full"? This also saves your current Setup settings.`, async () => {
@@ -1803,10 +2064,10 @@
                         const submitted = promptBoxes();
                         await persistPromptPresets({prompts: {attribution_preset: 'michel2_full'}, prompt_presets: presets.filter(item => !item.builtin)},
                             () => applyPromptPresetSave('attribution', presets, 'michel2_full', submitted));
-                        showToast('Prompt preset deleted.', 'success');
+                        showToast(t('setup.prompts.deleted', 'Prompt preset deleted.'), 'success');
                     });
             }
-            catch (e) { showActionError('Could not delete prompt preset', e, 'Review the saved preset list to check whether it was deleted before trying Delete again.'); }
+            catch (e) { showActionError(t('setup.prompts.delete-failed', 'Could not delete prompt preset'), e, t('setup.prompts.delete-recovery', 'Review the saved preset list to check whether it was deleted before trying Delete again.')); }
         };
 
         window.previewAttributionPrompt = async () => {
@@ -1814,12 +2075,15 @@
             window._attributionPreviewRequest = request;
             const snapshot = getPromptPresetEditorSnapshot('attribution');
             const contextChars = document.getElementById('tp-attribute-context-chars').value;
+            const castAliases = document.getElementById('cast-list-incremental').checked;
             const isCurrent = () => window._attributionPreviewRequest === request
                 && getPromptPresetEditorSnapshot('attribution') === snapshot
-                && document.getElementById('tp-attribute-context-chars').value === contextChars;
+                && document.getElementById('tp-attribute-context-chars').value === contextChars
+                && document.getElementById('cast-list-incremental').checked === castAliases;
             const preset = selectedPromptPreset();
             const body = {variant: (preset && preset.variant) || 'default', ...promptBoxes(),
-                context_chars: getNumFieldValue('tp-attribute-context-chars', 0, true)};
+                context_chars: getNumFieldValue('tp-attribute-context-chars', 0, true),
+                cast_aliases: castAliases};
             try {
                 const preview = await API.post('/api/prompts/attribution_preview', body);
                 if (!isCurrent()) { return; }
@@ -1828,7 +2092,7 @@
                 document.getElementById('prompt-preview-user').textContent = preview.user_message || '';
                 document.getElementById('prompt-preview-panel').hidden = false;
             } catch (e) {
-                if (isCurrent()) { showActionError('Could not render the prompt', e, 'Check the prompt templates and provider settings, then try What the model will see again.'); }
+                if (isCurrent()) { showActionError(t('setup.prompts.render-failed', 'Could not render the prompt'), e, t('setup.prompts.render-recovery', 'Check the prompt templates and provider settings, then try What the model will see again.')); }
             }
         };
 
@@ -1845,13 +2109,11 @@
             const details = warnings.map((warning) => {
                 const field = warning && warning.field && warning.field !== '$'
                     ? warning.field + ': ' : '';
-                return field + ((warning && warning.message) || 'Invalid saved setting ignored');
+                return field + ((warning && warning.message) || t('setup.config.invalid-setting', 'Invalid saved setting ignored'));
             }).join('; ');
-            const recovery = config.config_needs_backup
-                ? ' Saving will preserve the damaged file as a backup before replacing it.'
-                : '';
-            message.textContent = 'Some saved configuration could not be used; safe defaults are shown.'
-                + recovery + ' ' + details;
+            message.textContent = config.config_needs_backup
+                ? t('setup.config.partial-defaults-backup', 'Some saved configuration could not be used; safe defaults are shown. Saving will preserve the damaged file as a backup before replacing it. {details}', {details})
+                : t('setup.config.partial-defaults', 'Some saved configuration could not be used; safe defaults are shown. {details}', {details});
             banner.style.display = '';
         }
 
@@ -1862,7 +2124,8 @@
             document.getElementById('llm-context-length').value = p.context_length ?? '';
             document.getElementById('llm-max-input-tokens').value = p.max_input_tokens ?? '';
             document.getElementById('llm-max-output-tokens').value = p.max_output_tokens ?? '';
-            document.getElementById('llm-key').value = p.api_key || 'local';
+            // An explicitly saved blank key is a choice, not a missing value.
+            document.getElementById('llm-key').value = p.api_key ?? 'local';
             document.getElementById('llm-model').value = p.model_name || '';
             document.getElementById('llm-request-timeout').value =
                 p.request_timeout_seconds ?? '';
@@ -1880,8 +2143,10 @@
             document.getElementById('llm-retry-jitter').value = p.retry_jitter ?? 0.2;
             document.getElementById('llm-provider-headers').value =
                 JSON.stringify(p.provider_headers || {}, null, 2);
+            // JSON.parse in the browser rounds integers beyond 2^53, so the
+            // server sends the exact JSON text alongside the parsed object.
             document.getElementById('llm-provider-extra-body').value =
-                JSON.stringify(p.provider_extra_body || {}, null, 2);
+                p.provider_extra_body_json ?? JSON.stringify(p.provider_extra_body || {}, null, 2);
             document.getElementById('llm-reasoning-effort').value = p.reasoning_effort || '';
             document.getElementById('llm-on-this-gpu').value = (p.on_this_gpu === true || p.on_this_gpu === false) ? String(p.on_this_gpu) : '';
             document.getElementById('llm-transport').value = p.transport || 'http';
@@ -1908,6 +2173,7 @@
         }
 
         function getEditedLlmProfile() {
+            const bodyText = document.getElementById('llm-provider-extra-body').value;
             return {
                 context_length: getOptionalTokenInput('llm-context-length', 'Total context budget'),
                 max_input_tokens: getOptionalTokenInput('llm-max-input-tokens', 'Input ceiling'),
@@ -1926,6 +2192,10 @@
                 retry_jitter: getOptionalNumberInput('llm-retry-jitter', 'Backoff jitter') ?? 0.2,
                 provider_headers: getJsonObjectInput('llm-provider-headers', 'Custom headers'),
                 provider_extra_body: getJsonObjectInput('llm-provider-extra-body', 'Custom request body'),
+                // The editor's text is the authoritative representation: a
+                // browser number cannot hold integers beyond 2^53 exactly.
+                provider_extra_body_json: bodyText.trim() ? bodyText : '{}',
+                provider_extra_body_raw: true,
                 reasoning_effort: document.getElementById('llm-reasoning-effort').value || null,
                 on_this_gpu: getOnThisGpuInput(),
                 transport: document.getElementById('llm-transport').value || 'http'
@@ -1942,9 +2212,15 @@
         function renderActiveLlmModeBadge() {
             const badge = document.getElementById('llm-active-mode-badge');
             if (!badge) { return; }
-            const labels = { local: 'Local', remote: 'Remote (Thunder / network)' };
-            badge.textContent = 'Active: ' + labels[savedLlmMode] + (currentLlmMode !== savedLlmMode
-                ? ' · Selected: ' + labels[currentLlmMode] + ' — Save to apply' : '');
+            const values = () => ({
+                active: savedLlmMode === 'remote' ? t('setup.llm.active.remote', 'Remote (Thunder / network)') : t('setup.llm.active.local', 'Local'),
+                selected: currentLlmMode === 'remote' ? t('setup.llm.active.remote', 'Remote (Thunder / network)') : t('setup.llm.active.local', 'Local')
+            });
+            if (currentLlmMode !== savedLlmMode) {
+                setUiMessage(badge, 'setup.llm.active.pending', 'Active: {active} · Selected: {selected} — Save to apply', values);
+            } else {
+                setUiMessage(badge, 'setup.llm.active.saved', 'Active: {active}', values);
+            }
         }
 
         function onLlmModeChange(isInit) {
@@ -1970,11 +2246,14 @@
             const btn = document.getElementById('llm-test-btn');
             const out = document.getElementById('llm-test-result');
             const baseUrl = document.getElementById('llm-url').value.trim();
-            if (!baseUrl) {
-                out.className = 'ms-2 small text-danger';
-                out.innerHTML = '<i class="fas fa-times me-1"></i>Enter a Base URL before testing.';
+            try {
+                const url = new URL(baseUrl);
+                if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) { throw new Error(); }
+            } catch (_) {
+                setFieldFeedback('llm-url', createUiMessageNode('span', 'setup.llm.url-invalid', 'Enter an HTTP or HTTPS URL with a host and no embedded credentials.'));
                 return;
             }
+            setFieldFeedback('llm-url');
             const request = {};
             testLlmConnection.request = request;
             const mode = currentLlmMode;
@@ -1984,37 +2263,75 @@
                 try { return !profile || JSON.stringify(getEditedLlmProfile()) === JSON.stringify(profile); }
                 catch (_) { return false; }
             };
-            btn.disabled = true;
-            out.className = 'ms-2 small text-muted';
-            out.textContent = 'Testing…';
+            // Parse before reporting "Testing…": a profile that cannot be read
+            // fails validation, not the request, and nothing is sent. Reporting
+            // it as a request failure would describe work that never happened.
             try {
                 profile = getEditedLlmProfile();
+            } catch (e) {
+                out.className = 'ms-2 small text-danger';
+                out.textContent = (e && e.message) || t('setup.llm.test.no-detail', 'The server did not say why.');
+                // Only the call that owns the button may re-enable it.
+                if (testLlmConnection.request === request) { btn.disabled = false; }
+                return;
+            }
+            btn.disabled = true;
+            btn.setAttribute?.('aria-busy', 'true');
+            const startedAt = Date.now();
+            out.className = 'ms-2 small text-muted';
+            out.innerHTML = `<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>${escapeHtml(t('setup.llm.test.testing', 'Testing…'))}`;
+            try {
                 const res = await API.post('/api/llm/test', profile);
-                if (!isCurrent()) { return; }
+                if (!isCurrent()) {
+                    if (testLlmConnection.request === request && currentLlmMode === mode) { out.textContent = t('setup.llm.test.changed', 'Settings changed; test the edited endpoint again.'); }
+                    return;
+                }
                 if (res.ok) {
-                    out.className = 'ms-2 small text-success';
-                    const note = res.model_present === false
-                        ? ` — warning: model "${escapeHtml(res.model)}" not in server list` : '';
-                    out.innerHTML = `<i class="fas fa-check me-1"></i>Connected. Reply: "${escapeHtml(res.reply || '')}"${note}`;
+                    // Three separate facts stay readable as pills: whether the
+                    // server answered, whether the configured model is actually
+                    // served, and what came back. The sentence form buried the
+                    // model warning in the middle of a line.
+                    out.className = 'ms-2 small d-inline-flex flex-wrap align-items-center gap-2';
+                    const modelPresent = res.model_present !== false;
+                    out.innerHTML = [
+                        `<span class="llm-test-pill is-ok"><i class="fas fa-circle-check me-1"></i>${escapeHtml(t('setup.llm.test.pill-connected', 'Connected · {mode}', {mode: res.is_remote ? t('setup.llm.test.mode-remote', 'Remote') : t('setup.llm.test.mode-local', 'Local')}))}</span>`,
+                        `<span class="llm-test-pill ${modelPresent ? 'is-ok' : 'is-warn'}"><i class="fas fa-microchip me-1"></i>${escapeHtml(modelPresent ? t('setup.llm.test.pill-model-present', 'Model "{model}" present', {model: res.model || ''}) : t('setup.llm.test.pill-model-missing', 'Model "{model}" not in the server list', {model: res.model || ''}))}</span>`,
+                        `<span class="llm-test-pill"><i class="fas fa-comment-dots me-1"></i>${escapeHtml(t('setup.llm.test.pill-reply', 'Reply: "{reply}"', {reply: res.reply || ''}))}</span>`,
+                    ].join('');
 
-                    const modeLabel = res.is_remote ? 'Remote' : 'Local';
+                    const modeLabel = res.is_remote ? t('setup.llm.test.mode-remote', 'Remote') : t('setup.llm.test.mode-local', 'Local');
                     const banner = document.getElementById('auto-config-banner');
                     document.getElementById('auto-config-msg').innerHTML =
-                        `<i class="fas fa-check-circle me-1 text-success"></i><strong>Connection check:</strong> ` +
-                        `${modeLabel} LLM connected (${escapeHtml(res.base_url)}, model "${escapeHtml(res.model)}"). This check does not save or apply settings. Click Save Configuration to apply edits.`;
+                        `<i class="fas fa-check-circle me-1 text-success"></i><strong>${escapeHtml(t('setup.llm.test.connection-check', 'Connection check:'))}</strong> ` +
+                        escapeHtml(t('setup.llm.test.connected', '{mode} LLM connected ({url}, model "{model}"). This check does not save or apply settings. Click Save Configuration to apply edits.', {mode: modeLabel, url: res.base_url, model: res.model || ''}));
                     banner.style.display = '';
                     banner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
                 } else {
-                    out.className = 'ms-2 small text-danger';
-                    const log = res.log_file ? ` (log: ${escapeHtml(res.log_file)})` : '';
-                    out.innerHTML = `<i class="fas fa-times me-1"></i>Failed at ${escapeHtml(res.step)}: ${escapeHtml(res.error || '')}${log}`;
+                    out.className = 'ms-2 small d-inline-flex flex-wrap align-items-center gap-2';
+                    out.innerHTML = [
+                        `<span class="llm-test-pill is-bad"><i class="fas fa-circle-xmark me-1"></i>${escapeHtml(t('setup.llm.test.pill-failed', 'Failed at {step}', {step: res.step || ''}))}</span>`,
+                        `<span class="llm-test-pill is-bad">${escapeHtml(res.error || t('setup.llm.test.no-detail', 'The server did not say why.'))}</span>`,
+                        res.log_file ? `<span class="llm-test-pill">${escapeHtml(t('setup.llm.test.pill-log', 'Log: {log}', {log: res.log_file}))}</span>` : '',
+                        `<button type="button" class="btn btn-sm btn-outline-secondary" onclick="troubleshootLlmConnection()">${escapeHtml(t('setup.llm.test.troubleshoot', 'Troubleshoot'))}</button>`,
+                    ].join('');
                 }
             } catch (e) {
-                if (!isCurrent()) { return; }
-                out.className = 'ms-2 small text-danger';
-                out.textContent = 'Test request failed: ' + (e.message || 'unknown error');
+                const detail = (e && e.message) || t('setup.llm.test.no-detail', 'The server did not say why.');
+                // Do not attach a failure to a different edited endpoint.
+                if (!isCurrent()) {
+                    if (testLlmConnection.request === request && currentLlmMode === mode) { out.textContent = t('setup.llm.test.changed', 'Settings changed; test the edited endpoint again.'); }
+                    return;
+                }
+                out.className = 'ms-2 small d-inline-flex flex-wrap align-items-center gap-2';
+                out.innerHTML = `<span class="llm-test-pill is-bad"><i class="fas fa-circle-xmark me-1"></i>${escapeHtml(t('setup.llm.test.pill-request-failed', 'Test request failed: {detail}', {detail}))}</span> <button type="button" class="btn btn-sm btn-outline-secondary" onclick="troubleshootLlmConnection()">${escapeHtml(t('setup.llm.test.troubleshoot', 'Troubleshoot'))}</button>`;
             } finally {
-                if (testLlmConnection.request === request) { btn.disabled = false; }
+                if (testLlmConnection.request === request) {
+                    btn.disabled = false;
+                    btn.removeAttribute?.('aria-busy');
+                    if (isCurrent()) {
+                        out.innerHTML += ` <span class="llm-test-pill">${escapeHtml(t('setup.llm.test.latency', '{milliseconds} ms round trip', {milliseconds: Date.now() - startedAt}))}</span>`;
+                    }
+                }
             }
         }
 
@@ -2023,7 +2340,10 @@
             'top-k': 'top_k', 'min-p': 'min_p', 'presence-penalty': 'presence_penalty',
             'tp-chunk-size': 'three_pass_chunk_size', 'tp-attribute-batch-size': 'three_pass_attribute_batch_size',
             'tp-attribute-context-chars': 'three_pass_attribute_context_chars',
+            'cast-list-source-chars': 'cast_list_source_chars',
+            'cast-list-max-tokens': 'cast_list_max_tokens',
             'tp-attribute-target-chars': 'three_pass_attribute_target_chars',
+            'review-target-chars': 'review_target_chars',
             'tp-instruct-target-chars': 'three_pass_instruct_target_chars',
             'tp-instruct-context-chars': 'three_pass_instruct_context_chars',
             'tp-segment-output-ratio': 'three_pass_segment_output_ratio',
@@ -2049,6 +2369,7 @@
             document.getElementById('tp-unquoted-must-be-narrator').checked = g.three_pass_unquoted_must_be_narrator !== false;
             document.getElementById('tp-keep-whole-batch').checked = g.three_pass_keep_whole_batch === true;
             document.getElementById('tp-group-rule').checked = g.three_pass_group_rule === true;
+            document.getElementById('cast-list-incremental').checked = g.cast_list_incremental === true;
             document.getElementById('tp-speaker-traits').checked = g.three_pass_speaker_traits === true;
         }
 
@@ -2060,6 +2381,25 @@
             window.retirePlaybackSequence?.();
             window._selectedUploadIdentity = null;
             currentBookFilename = typeof filename === 'string' ? filename : '';
+            window._scriptRecoveryBookEpoch = (window._scriptRecoveryBookEpoch || 0) + 1;
+            window._scriptRecoveryGeneration = (window._scriptRecoveryGeneration || 0) + 1;
+            window._scriptRecoveryPending = false;
+            window._scriptRecoveryConfirmed = null;
+            window._scriptRetryAction = null;
+            window._scriptRecoveryDetail = null;
+            const recoveryRetryBtn = document.getElementById('btn-retry-script');
+            if (recoveryRetryBtn) { recoveryRetryBtn.style.display = 'none'; }
+            const recoveryPanel = document.getElementById('script-recovery-panel');
+            if (recoveryPanel) { recoveryPanel.style.display = 'none'; recoveryPanel.innerHTML = ''; }
+            window.refreshScriptRetryToolbar?.();
+            const acceptedEpoch = window._bookSelectionEpoch;
+            Promise.resolve().then(() => {
+                if (window._bookSelectionEpoch === acceptedEpoch && !window._scriptRecoveryRunActive) {
+                    window.refreshScriptRecovery?.();
+                }
+            });
+            window.resetScriptIngestFacts?.();
+            window.renderPendingCount?.(null);
             window.resetEditorReview?.();
             window.resetPronunciationBook?.();
             // A reloaded script can change even when its filename stays the same.
@@ -2074,6 +2414,7 @@
             window.resetM4bPublicationBook?.();
             window.resetSingleVoiceBook?.();
             window.resetTranslatedEditionBook?.();
+            window.refreshReviewRestart?.();
         }
         function enqueueBookSelection(request, action) {
             const previous = window._existingUploadSelectionPending || Promise.resolve();
@@ -2107,36 +2448,43 @@
                 'pass1-system-prompt': 'pass1_system_prompt',
                 'pass1-user-prompt': 'pass1_user_prompt',
                 'pass3-system-prompt': 'pass3_system_prompt',
-                'pass3-user-prompt': 'pass3_user_prompt'
+                'pass3-user-prompt': 'pass3_user_prompt',
+                'cast-whole-book-prompt': 'cast_whole_book_prompt',
+                'cast-incremental-prompt': 'cast_incremental_prompt'
             };
+            for (const pass of Object.keys(passPromptDefaults).filter(pass => pass !== 'cast')) {
+                fields[`${pass}-system-prompt`] = `${pass}_system_prompt`;
+                fields[`${pass}-user-prompt`] = `${pass}_user_prompt`;
+            }
             const before = Object.fromEntries(Object.keys(fields).map(id => [id, document.getElementById(id).value]));
             const selected = {...activePassPromptPreset};
             promptDefaultsLoadPending = true;
             retry.disabled = true;
-            status.textContent = 'Loading default prompts… Your current edits will be kept.';
+            status.textContent = t('setup.prompts.defaults-loading', 'Loading default prompts… Your current edits will be kept.');
             try {
                 const defaults = await API.get('/api/default_prompts');
                 window.invalidateSetupPreview?.();
-                const required = Object.entries(fields).filter(([id]) => id !== 'persona-advanced-prompt' && (!before[id] || id.startsWith('pass')));
+                const required = Object.entries(fields).filter(([id]) => id !== 'persona-advanced-prompt' && (!before[id] || id.startsWith('pass') || id.startsWith('cast-')));
                 if (!defaults || required.some(([, key]) => typeof defaults[key] !== 'string' || !defaults[key].trim())) {
                     throw new Error('Default prompt response is incomplete');
                 }
-                for (const pass of ['pass1', 'pass3']) {
+                for (const pass of Object.keys(passPromptDefaults).filter(pass => pass !== 'cast')) {
                     passPromptDefaults[pass] = {system_prompt: defaults[`${pass}_system_prompt`], user_prompt: defaults[`${pass}_user_prompt`]};
                 }
+                passPromptDefaults.cast = {whole_book_prompt: defaults.cast_whole_book_prompt, incremental_prompt: defaults.cast_incremental_prompt};
                 for (const [id, key] of Object.entries(fields)) {
                     const field = document.getElementById(id);
-                    const pass = id.startsWith('pass1-') ? 'pass1' : id.startsWith('pass3-') ? 'pass3' : null;
+                    const pass = Object.keys(passPromptDefaults).find(pass => id.startsWith(`${pass}-`));
                     if (!before[id] && field.value === before[id] && typeof defaults[key] === 'string'
                         && (!pass || (selected[pass] === 'default' && activePassPromptPreset[pass] === selected[pass]))) {
                         field.value = defaults[key];
                     }
                 }
-                status.textContent = 'Default prompts loaded. Existing edits and preset choices were kept.';
+                status.textContent = t('setup.prompts.defaults-loaded', 'Default prompts loaded. Existing edits and preset choices were kept.');
                 retry.hidden = true;
             } catch (error) {
                 console.warn('Could not fetch default prompts', error);
-                status.textContent = 'Could not load default prompts. Your current fields are unchanged. Check that Alexandria is running, then retry loading prompts; review the prompts before saving or starting a task.';
+                status.textContent = t('setup.prompts.defaults-failed', 'Could not load default prompts. Your current fields are unchanged. Check that Alexandria is running, then retry loading prompts; review the prompts before saving or starting a task.');
                 retry.hidden = false;
             } finally {
                 promptDefaultsLoadPending = false;
@@ -2153,7 +2501,7 @@
                 .map(field => [field.id, field.value, field.checked]));
             const snapshot = getDraftSnapshot();
             const showKeptDraft = () => {
-                document.getElementById('config-warning-msg').textContent = 'Your settings changed while configuration was loading. Your edits were kept. Retry loading to review replacing them with saved settings.';
+                document.getElementById('config-warning-msg').textContent = t('setup.config.edits-kept', 'Your settings changed while configuration was loading. Your edits were kept. Retry loading to review replacing them with saved settings.');
                 document.getElementById('config-warning-banner').style.display = '';
                 document.getElementById('config-load-retry').style.display = '';
             };
@@ -2248,6 +2596,8 @@
                     if (config.prompts.review_user_prompt) {
                         document.getElementById('review-user-prompt').value = config.prompts.review_user_prompt;
                     }
+                    document.getElementById('review-labels-only').checked = config.prompts.review_labels_only === true;
+                    renderReviewLabelsOnlyPointer();
                     if (config.prompts.persona_system_prompt) {
                         document.getElementById('persona-system-prompt').value = config.prompts.persona_system_prompt;
                     }
@@ -2262,10 +2612,25 @@
                 }
                 activePromptPreset = (config.prompts && config.prompts.attribution_preset) || 'michel2_full';
                 renderPromptPresets(config.prompt_presets || [], activePromptPreset);
-                renderPassPromptPresets('pass1', config.prompts?.pass1_prompt_presets || [],
-                    config.prompts?.pass1_preset || 'default');
-                renderPassPromptPresets('pass3', config.prompts?.pass3_prompt_presets || [],
-                    config.prompts?.pass3_preset || 'default');
+                // Review text is persisted in prompts.review_* (unlike the numbered
+                // passes, which store it only in presets). Applying the Default
+                // review preset on load would replace a saved custom text with the
+                // default, so keep the saved text and restore it after rendering.
+                // passPromptDefaults.review is deliberately left alone: Default must
+                // always restore the checked-in prompt, whether or not the defaults
+                // have been fetched yet (e.g. a later Setup load or after Retry).
+                const savedReviewText = {
+                    system_prompt: document.getElementById('review-system-prompt').value,
+                    user_prompt: document.getElementById('review-user-prompt').value
+                };
+                const reviewDefaultActive = (config.prompts?.review_preset || 'default') === 'default';
+                for (const pass of Object.keys(passPromptDefaults)) {
+                    renderPassPromptPresets(pass, config.prompts?.[`${pass}_prompt_presets`] || [], config.prompts?.[`${pass}_preset`] || 'default');
+                }
+                if (reviewDefaultActive) {
+                    document.getElementById('review-system-prompt').value = savedReviewText.system_prompt;
+                    document.getElementById('review-user-prompt').value = savedReviewText.user_prompt;
+                }
 
                 // Apply saved generation values before yielding to the defaults request.
                 if (config.generation) { applyGenerationSettings(config.generation); }
@@ -2273,7 +2638,7 @@
                 // If review/persona/pass prompts are still empty, fetch defaults.
                 if (!document.getElementById('review-system-prompt').value || !document.getElementById('review-user-prompt').value
                     || !document.getElementById('persona-system-prompt').value || !document.getElementById('persona-user-prompt').value
-                    || !passPromptDefaults.pass1.system_prompt || !passPromptDefaults.pass3.system_prompt) {
+                    || Object.values(passPromptDefaults).some(defaults => Object.values(defaults).some(value => !value))) {
                     await loadMissingPromptDefaults();
                 }
 
@@ -2283,7 +2648,7 @@
                 // Show previously loaded file
                 if (config.current_file) {
                     document.getElementById('upload-status').innerHTML =
-                        `<span class="text-success"><i class="fas fa-check me-1"></i>Loaded: ${escapeHtml(config.current_file)}</span>`;
+                        `<span class="text-success"><i class="fas fa-check me-1"></i>${escapeHtml(t('setup.config.loaded', 'Loaded: {file}', {file: config.current_file}))}</span>`;
                 }
                 loadConfig.draftSnapshot = getDraftSnapshot();
             } catch (e) {
@@ -2291,7 +2656,7 @@
                 if (loadConfig.draftSnapshot === undefined) { loadConfig.draftSnapshot = snapshot; }
                 console.error("Failed to load config", e);
                 document.getElementById('config-warning-msg').textContent =
-                    'Could not load configuration: ' + (e.message || String(e)) + '. Retry before saving settings.';
+                    t('setup.config.load-failed', 'Could not load configuration: {error}. Retry before saving settings.', {error: e.message || String(e)});
                 document.getElementById('config-warning-banner').style.display = '';
                 document.getElementById('config-load-retry').style.display = '';
             }
@@ -2304,19 +2669,29 @@
                 const g = defaults.generation;
                 if (!g || Object.values(generationControlFields).some(key => g[key] == null)
                     || g.chunk_size == null || !Array.isArray(g.banned_tokens) || !Array.isArray(g.context_rescue_windows)
-                    || ['merge_narrators', 'three_pass_quoted_must_be_spoken', 'three_pass_unquoted_must_be_narrator', 'three_pass_keep_whole_batch', 'three_pass_group_rule', 'three_pass_speaker_traits'].some(key => typeof g[key] !== 'boolean')) {
+                    || ['merge_narrators', 'three_pass_quoted_must_be_spoken', 'three_pass_unquoted_must_be_narrator', 'three_pass_keep_whole_batch', 'three_pass_group_rule', 'three_pass_speaker_traits', 'cast_list_incremental'].some(key => typeof g[key] !== 'boolean')) {
                     throw new Error('Generation defaults are unavailable');
                 }
 
+                if (typeof defaults.cast_whole_book_prompt !== 'string' || !defaults.cast_whole_book_prompt.trim()
+                    || typeof defaults.cast_incremental_prompt !== 'string' || !defaults.cast_incremental_prompt.trim()) {
+                    throw new Error(t('setup.prompts.cast-defaults-unavailable', 'Cast prompt defaults are unavailable'));
+                }
+                for (const pass of Object.keys(passPromptDefaults).filter(pass => pass !== 'cast')) {
+                    if (['system_prompt', 'user_prompt'].some(key => typeof defaults[pass + '_' + key] !== 'string' || !defaults[pass + '_' + key].trim())) {
+                        throw new Error(t('setup.prompts.experimental-defaults-unavailable', 'Prompt defaults are incomplete. Retry loading prompts before resetting.'));
+                    }
+                }
                 if (!await showConfirm('Reset prompt and generation settings? Your current form edits will be replaced. Click Save Configuration afterward to keep the defaults.', {title: 'Replace prompt settings?', actionLabel: 'Reset form', danger: true})) { return; }
 
                 renderPromptPresets(promptPresets, 'default');
-                passPromptDefaults.pass1.system_prompt = defaults.pass1_system_prompt || '';
-                passPromptDefaults.pass1.user_prompt = defaults.pass1_user_prompt || '';
-                passPromptDefaults.pass3.system_prompt = defaults.pass3_system_prompt || '';
-                passPromptDefaults.pass3.user_prompt = defaults.pass3_user_prompt || '';
-                renderPassPromptPresets('pass1', passPromptPresets.pass1, 'default');
-                renderPassPromptPresets('pass3', passPromptPresets.pass3, 'default');
+                for (const pass of Object.keys(passPromptDefaults).filter(pass => pass !== 'cast')) {
+                    passPromptDefaults[pass] = {system_prompt: defaults[pass + '_system_prompt'], user_prompt: defaults[pass + '_user_prompt']};
+                }
+                passPromptDefaults.cast = {whole_book_prompt: defaults.cast_whole_book_prompt, incremental_prompt: defaults.cast_incremental_prompt};
+                for (const pass of Object.keys(passPromptDefaults)) {
+                    renderPassPromptPresets(pass, passPromptPresets[pass], 'default');
+                }
                 if (defaults.review_system_prompt) {
                     document.getElementById('review-system-prompt').value = defaults.review_system_prompt;
                 }
@@ -2334,13 +2709,32 @@
                 }
                 document.getElementById('persona-reference-chars').value = defaults.persona_reference_chars ?? 12000;
                 document.getElementById('persona-unknown-network-context').checked = defaults.persona_allow_unknown_network_context ?? false;
+                document.getElementById('review-labels-only').checked = defaults.review_labels_only === true;
+                renderReviewLabelsOnlyPointer();
                 applyGenerationSettings(g);
-                showToast('Default prompts and generation settings are on this form. Click Save Configuration to keep them.', 'success');
+                showToast(t('setup.prompts.defaults-on-form', 'Default prompts and generation settings are on this form. Click Save Configuration to keep them.'), 'success');
             } catch (e) {
                 console.error("Failed to fetch default prompts", e);
-                showToast("Could not load defaults. Check the Alexandria server, then try Reset to Defaults again.", 'error');
+                showToast(t('setup.prompts.defaults-failed-toast', 'Could not load defaults. Check the Alexandria server, then try Reset to Defaults again.'), 'error');
             }
         };
+
+        // The switch is saved Setup config, so it stays in Prompt studio, but the
+        // Script tab is where the other review toggles are looked for (#2045).
+        // This line names the current value and points at the original control;
+        // openSetupSetting() does the navigating, so there is one jump path.
+        function renderReviewLabelsOnlyPointer() {
+            const pointer = document.getElementById('review-labels-only-pointer');
+            const control = document.getElementById('review-labels-only');
+            if (!pointer || !control) { return; }
+            const state = control.checked
+                ? t('script.review.labels-only.state.on', 'on')
+                : t('script.review.labels-only.state.off', 'off');
+            pointer.textContent = t('script.review.labels-only.pointer',
+                'Labels-only review: {state} — change in Setup → Prompt studio', {state});
+        }
+        window.renderReviewLabelsOnlyPointer = renderReviewLabelsOnlyPointer;
+        renderReviewLabelsOnlyPointer();
 
         // The whole payload in one place, so a bad field (a non-numeric rescue
         // window, malformed JSON) throws here and is shown, not swallowed.
@@ -2356,13 +2750,25 @@
 
         function buildConfigPayload(parallelWorkers) {
             const presetPayload = promptPresetPayload();
-            const pass1Payload = getPassPromptPresetPayload('pass1');
-            const pass3Payload = getPassPromptPresetPayload('pass3');
+            const passPayload = {};
+            for (const pass of Object.keys(passPromptDefaults)) {
+                const payload = getPassPromptPresetPayload(pass);
+                passPayload[pass + '_preset'] = payload.active;
+                passPayload[pass + '_prompt_presets'] = payload.own;
+            }
+            // An untouched slot comes straight from the browser-parsed GET
+            // response, whose numbers may already be rounded. Its exact text
+            // travelled alongside it; declare that text authoritative so an
+            // unrelated save cannot rewrite the stored body.
+            const withExactBody = profile => (profile && typeof profile === 'object'
+                && typeof profile.provider_extra_body_json === 'string'
+                && profile.provider_extra_body_raw !== true)
+                ? {...profile, provider_extra_body_raw: true} : profile;
             return {
-                llm: llmProfiles[currentLlmMode],
+                llm: withExactBody(llmProfiles[currentLlmMode]),
                 llm_mode: currentLlmMode,
-                llm_local: llmProfiles.local,
-                llm_remote: llmProfiles.remote,
+                llm_local: withExactBody(llmProfiles.local),
+                llm_remote: withExactBody(llmProfiles.remote),
                 llm_remote_ssh: document.getElementById('llm-ssh').value.trim() || null,
                 llm_failover: document.getElementById('llm-failover').checked,
                 tts: {
@@ -2395,15 +2801,13 @@
                     attribution_preset: presetPayload.active,
                     review_system_prompt: document.getElementById('review-system-prompt').value,
                     review_user_prompt: document.getElementById('review-user-prompt').value,
+                    review_labels_only: document.getElementById('review-labels-only').checked,
                     persona_system_prompt: document.getElementById('persona-system-prompt').value,
                     persona_user_prompt: document.getElementById('persona-user-prompt').value,
                     persona_advanced_prompt: document.getElementById('persona-advanced-prompt').value,
                     persona_reference_chars: Number(document.getElementById('persona-reference-chars').value || 12000),
                     persona_allow_unknown_network_context: document.getElementById('persona-unknown-network-context').checked,
-                    pass1_preset: pass1Payload.active,
-                    pass1_prompt_presets: pass1Payload.own,
-                    pass3_preset: pass3Payload.active,
-                    pass3_prompt_presets: pass3Payload.own
+                    ...passPayload
                 },
                 prompt_presets: presetPayload.own,
                 generation: {
@@ -2422,6 +2826,7 @@
                     three_pass_chunk_size: getNumFieldValue('tp-chunk-size', 3000, true),
                     three_pass_attribute_batch_size: getNumFieldValue('tp-attribute-batch-size', 25, true),
                     three_pass_attribute_target_chars: getNumFieldValue('tp-attribute-target-chars', 0, true),
+                    review_target_chars: getNumFieldValue('review-target-chars', 0, true),
                     three_pass_instruct_target_chars: getNumFieldValue('tp-instruct-target-chars', 0, true),
                     three_pass_instruct_context_chars: getNumFieldValue('tp-instruct-context-chars', 0, true),
                     three_pass_attribute_context_chars: getNumFieldValue('tp-attribute-context-chars', 0, true),
@@ -2437,6 +2842,9 @@
                     three_pass_unquoted_must_be_narrator: document.getElementById('tp-unquoted-must-be-narrator').checked,
                     three_pass_keep_whole_batch: document.getElementById('tp-keep-whole-batch').checked,
                     three_pass_group_rule: document.getElementById('tp-group-rule').checked,
+                    cast_list_incremental: document.getElementById('cast-list-incremental').checked,
+                    cast_list_source_chars: getNumFieldValue('cast-list-source-chars', 30000, true),
+                    cast_list_max_tokens: getNumFieldValue('cast-list-max-tokens', 8000, true),
                     three_pass_speaker_traits: document.getElementById('tp-speaker-traits').checked,
                     context_rescue_windows: getIntListInput('context-rescue-windows', 'Context rescue windows', [2000, 4000, 6000]),
                     context_rescue_retries: getNumFieldValue('context-rescue-retries', 2, true)
@@ -2474,11 +2882,11 @@
                     savedLlmMode = config.llm_mode;
                     savedConfigPromptSnapshot = promptSnapshot;
                     renderActiveLlmModeBadge();
-                    showToast('Configuration Saved!', 'success');
+                    showToast(t('setup.config.saved-toast', 'Configuration Saved!'), 'success');
                     await refreshSavedConfigFeedback(true);
                 });
             } catch (e) {
-                showActionError('Configuration save was not confirmed', e, 'Review the current saved settings and the error details before saving again. Your form fields remain available.');
+                showActionError(t('setup.config.save-failed', 'Configuration save was not confirmed'), e, t('setup.config.save-recovery', 'Review the current saved settings and the error details before saving again. Your form fields remain available.'));
             }
         });
 
@@ -2505,7 +2913,7 @@
                     `<option value="${escapeHtml(item.filename)}">${escapeHtml(item.filename)} (${Math.ceil(item.size / 1024)} KB)</option>`
                 ).join('');
                 document.getElementById('existing-upload-select').innerHTML =
-                    '<option value="">Choose an existing TXT/MD file…</option>' + options;
+                    `<option value="" data-i18n="script.existing-upload.empty" data-i18n-source="Choose an existing TXT/MD file…">${escapeHtml(t('script.existing-upload.empty', 'Choose an existing TXT/MD file…'))}</option>` + options;
                 scriptBatchUploads = uploads;
                 renderScriptBatchUploads();
                 if (status) { status.innerHTML = ''; }
@@ -2513,7 +2921,7 @@
                 if (request !== existingUploadsLoadRequest) { return; }
                 console.debug('Existing upload list unavailable', e);
                 if (status) {
-                    status.innerHTML = '<span class="text-warning">Could not refresh existing uploads. The displayed list may be out of date. Check that Alexandria is running, then retry.</span> <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadExistingScriptUploads()">Retry uploads</button>';
+                    status.innerHTML = `<span class="text-warning">${escapeHtml(t('script.existing-upload.refresh-failed', 'Could not refresh existing uploads. The displayed list may be out of date. Check that Alexandria is running, then retry.'))}</span> <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadExistingScriptUploads()">${escapeHtml(t('script.existing-upload.retry', 'Retry uploads'))}</button>`;
                 }
             }
         }
@@ -2548,14 +2956,14 @@
                     window._selectedUploadIdentity = { filename: book, token: result.book_identity_token, request };
                 }
                 document.getElementById('file-upload').value = '';
-                statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Reusing: ${escapeHtml(result.stored_filename)}</span>`;
+                statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>${escapeHtml(t('script.existing-upload.reusing', 'Reusing: {file}', {file: result.stored_filename}))}</span>`;
                 document.getElementById('cast-list-panel').style.display = 'none';
                 clearCastListEditor();
                 await loadCastList(false);
             });
             try { await selecting; }
             catch (e) {
-                if (isCurrent()) { statusEl.innerHTML = `<span class="text-danger">${escapeHtml(getActionErrorMessage('Book selection was not confirmed', e, 'Check the current loaded book before selecting another upload.'))}</span>`; }
+                if (isCurrent()) { statusEl.innerHTML = `<span class="text-danger">${escapeHtml(getActionErrorMessage(t('script.existing-upload.select-unconfirmed', 'Book selection was not confirmed'), e, t('script.existing-upload.select-recovery', 'Check the current loaded book before selecting another upload.')))}</span>`; }
             } finally {
                 if (window._existingUploadSelectionPending === selecting) { window._existingUploadSelectionPending = null; }
             }
@@ -2564,12 +2972,12 @@
         window.openRetainedDocxDetails = async function() {
             const details = document.getElementById('docx-retained-details');
             details.hidden = false;
-            details.textContent = 'Loading retained DOCX metadata...';
+            details.textContent = t('script.docx.loading-metadata', 'Loading retained DOCX metadata...');
             try {
                 const inventory = await API.get('/api/uploads/docx-retained');
                 details.textContent = JSON.stringify(inventory, null, 2);
             } catch (error) {
-                details.textContent = 'Retained DOCX inventory unavailable. Retry inspection before offline cleanup.';
+                details.textContent = t('script.docx.inventory-unavailable', 'Retained DOCX inventory unavailable. Retry inspection before offline cleanup.');
             }
         };
 
@@ -2617,7 +3025,7 @@
                 document.getElementById('docx-preview-text').textContent = preview.text;
                 document.getElementById('docx-preview-accept').disabled = false;
                 document.getElementById('docx-preview-panel').hidden = false;
-                status.textContent = 'Review the entire extracted text before accepting. The current book is unchanged.';
+                status.textContent = t('script.docx.review-before-accepting', 'Review the entire extracted text before accepting. The current book is unchanged.');
             } catch (error) {
                 if (!isCurrentDocxPreview(candidate)) { return; }
                 window.resetDocxPreview();
@@ -2627,14 +3035,14 @@
         };
         window.cancelDocxPreview = function() {
             if (docxPreviewCandidate?.selecting) {
-                document.getElementById('upload-status').textContent = 'Book selection has already been submitted; wait for its result before selecting another book.';
+                document.getElementById('upload-status').textContent = t('script.docx.selection-submitted', 'Book selection has already been submitted; wait for its result before selecting another book.');
                 return;
             }
             window.resetDocxPreview();
             window._bookSelectionEpoch++;
             window._existingUploadSelectionRequest = {};
             document.getElementById('file-upload').value = '';
-            document.getElementById('upload-status').textContent = 'DOCX preview cancelled. No new source selected.';
+            document.getElementById('upload-status').textContent = t('script.docx.preview-cancelled', 'DOCX preview cancelled. No new source selected.');
         };
         window.acceptDocxPreview = async function() {
             const candidate = docxPreviewCandidate;
@@ -2658,7 +3066,7 @@
                     if (!isCurrentDocxPreview(candidate)) { return; }
                     candidate.selecting = true;
                     document.getElementById('docx-preview-cancel').disabled = true;
-                    status.textContent = 'Selecting the accepted DOCX text...';
+                    status.textContent = t('script.docx.selecting-accepted', 'Selecting the accepted DOCX text...');
                     const selected = await API.post('/api/uploads/select', {filename: uploaded.stored_filename});
                     if (!isCurrentDocxPreview(candidate)) { return; }
                     candidate.selectedBook = selected.stored_filename;
@@ -2667,7 +3075,7 @@
                         window._selectedUploadIdentity = {filename: currentBookFilename, token: selected.book_identity_token, request: candidate.request};
                     }
                     document.getElementById('existing-upload-select').value = '';
-                    status.textContent = 'Accepted DOCX text: ' + selected.stored_filename + '. Exact original and receipt retained.';
+                    status.textContent = t('script.docx.accepted', 'Accepted DOCX text: {file}. Exact original and receipt retained.', {file: selected.stored_filename});
                     document.getElementById('cast-list-panel').style.display = 'none';
                     clearCastListEditor();
                     await loadCastList(false);
@@ -2685,7 +3093,7 @@
                 // Same same-file retry rule as the preview catch above:
                 // clear the input so picking this DOCX again fires 'change'.
                 document.getElementById('file-upload').value = '';
-                status.textContent = 'DOCX acceptance or selection was not confirmed. Check existing uploads and the current book before retrying. ' + error.message;
+                status.textContent = t('script.docx.accept-unconfirmed', 'DOCX acceptance or selection was not confirmed. Check existing uploads and the current book before retrying. {error}', {error: error.message});
             }
         };
 
@@ -2708,7 +3116,7 @@
             window._existingUploadSelectionRequest = request;
             const isCurrent = () => window._existingUploadSelectionRequest === request
                 && fileInput.files[0] === file;
-            statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Loading file...</span>';
+            statusEl.innerHTML = `<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>${escapeHtml(t('script.upload.loading', 'Loading file...'))}</span>`;
             if (/\.docx$/i.test(file.name)) {
                 await window.previewDocxUpload(file, request);
                 return;
@@ -2724,8 +3132,10 @@
                         window._selectedUploadIdentity = { filename: currentBookFilename, token: res.book_identity_token, request };
                     }
                     document.getElementById('existing-upload-select').value = '';
-                    const verb = res.reused ? 'Reused existing copy' : 'Loaded';
-                    statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>${verb}: ${escapeHtml(res.stored_filename)}</span>`;
+                    const fileStatus = res.reused
+                        ? t('script.upload.status-reused', 'Reused existing copy: {file}', {file: res.stored_filename})
+                        : t('script.upload.status-loaded', 'Loaded: {file}', {file: res.stored_filename});
+                    statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>${escapeHtml(fileStatus)}</span>`;
                     document.getElementById('cast-list-panel').style.display = 'none';
                     clearCastListEditor();
                     await loadCastList(false);
@@ -2738,60 +3148,207 @@
                 // again; otherwise the "try again" message cannot be acted on.
                 fileInput.value = '';
                 window.renderEpubExtractionReport?.(null);
-                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage('Book upload was not confirmed', e, 'Check the current loaded book and existing uploads before uploading again.'))}</span>`;
+                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage(t('script.upload.unconfirmed', 'Book upload was not confirmed'), e, t('script.upload.unconfirmed-recovery', 'Check the current loaded book and existing uploads before uploading again.')))}</span>`;
             }
         });
 
         // Generate resumes saved progress for the same text and settings;
         // Start over asks for a fresh run (#597). Same handler, one flag.
         let _scriptStartOver = false;
+        let _scriptStartOverDispatch = 0;
+        let _scriptStartOverInFlight = false;
+        const SCRIPT_RESTART_OWNER_CHANGED = 'The task that was cancelled is no longer the current run.';
         // Start over while a run is active (#613): the server answers 409
         // ("Script generation is running") and the page showed nothing. Now the
         // click means "cancel this run, then start again": confirm, cancel,
         // wait for the task to report not running (bounded), then generate.
-        async function waitForScriptToStop(maxMs = 30000) {
+        function isScriptStopped(status) {
+            return status?.running === false && !status.ownership_unconfirmed;
+        }
+
+        function isExpectedScriptStop(status, claimId, startTime) {
+            if (!isScriptStopped(status)) { return false; }
+            const endedClaim = status.worker_claim_id || status.task_claim_id;
+            return endedClaim
+                ? endedClaim === claimId
+                : Number.isFinite(startTime) && status.start_time === startTime;
+        }
+
+        function reportScriptRestartFailure(error) {
+            showActionError(t('script.start.restart-failed', 'Start over could not be completed'), error,
+                t('script.start.restart-recovery', 'Check the Script task state and start again after it stops.'), 'warning');
+        }
+
+        async function waitForScriptToStop(expectedClaimId, {
+            isCurrent = () => true, maxMs = 30000, checks = Infinity, intervalMs = 500,
+            keepHistoricalStop = () => false, startTime,
+        } = {}) {
             const started = Date.now();
-            while (Date.now() - started < maxMs) {
+            for (let attempt = 0; attempt < checks && Date.now() - started < maxMs && isCurrent(); attempt++) {
                 let status;
                 try { status = await API.get('/api/status/script'); } catch (e) { return false; }
-                if (!status.running) { return true; }
-                await new Promise(r => setTimeout(r, 500));
+                if (status?.worker_pending) {
+                    await new Promise(r => setTimeout(r, intervalMs));
+                    continue;
+                }
+                if (isScriptStopped(status)) {
+                    if (isExpectedScriptStop(status, expectedClaimId, startTime)) {
+                        return isCurrent() || keepHistoricalStop() ? status : false;
+                    }
+                    if (isCurrent()) { throw Error('The terminal status did not identify the run that was cancelled.'); }
+                    return false;
+                }
+                if (!isCurrent() || (status?.task_claim_id && status.task_claim_id !== expectedClaimId)) { return false; }
+                await new Promise(r => setTimeout(r, intervalMs));
             }
             return false;
         }
+
+        function matchesScriptRestartOwner(claimId, originalToken) {
+            const token = window._scriptRecoveryRunToken || 0;
+            const record = window.getScriptAdmissionByToken?.(token);
+            if ((record?.restartInvalidated || record?.restartContended)
+                && record.restartClaimId === claimId) { return false; }
+            // Reattachment can assign the same server owner its first browser token.
+            if (record?.claimId) { return record.claimId === claimId; }
+            return token === originalToken;
+        }
+
+        function bindScriptRestartTarget(scope, record) {
+            if (record.restartClaimId && record.restartClaimId !== scope.claimId) {
+                delete record.restartStop;
+                delete record.restartInvalidated;
+                delete record.restartContended;
+            }
+            record.restartClaimId = scope.claimId;
+            record.restartStartTime = scope.startTime;
+            scope.record = record;
+        }
+
+        async function stopScriptForRestart(claimId, isCurrent, source, waitOptions) {
+            if (!claimId || !isCurrent()) { return false; }
+            const status = await API.get('/api/status/script').catch(() => null);
+            if (!isCurrent() || !status?.running || status.ownership_unconfirmed || status.worker_pending
+                || status.task_claim_id !== claimId) { return false; }
+            const current = window.getScriptAdmissionByToken?.(window._scriptRecoveryRunToken);
+            const pending = current?.source === 'generate' && current.state === 'provisional' ? current : null;
+            const target = pending || (current?.claimId === claimId ? current : null);
+            if (pending?.restartClaimId && pending.restartClaimId !== claimId) { return false; }
+            const scope = {claimId, startTime: status.start_time, record: null};
+            if (target) { bindScriptRestartTarget(scope, target); }
+            window._scriptRestartScope = scope;
+            try {
+                try {
+                    await API.post('/api/generate_script/cancel', {expected_claim_id: claimId});
+                } catch (e) { return false; }
+                if (!isCurrent()) { return false; }
+                _resetPauseBtn('btn-pause-script');
+                const stopped = await waitForScriptToStop(claimId, {
+                    ...waitOptions, isCurrent, keepHistoricalStop: () => !!scope.record, startTime: scope.startTime,
+                });
+                if (!stopped) { return false; }
+                const stoppedRun = scope.record;
+                if (stoppedRun) {
+                    stoppedRun.restartStop = stopped;
+                    if (!isCurrentScriptRecoveryRun(stoppedRun.token) && stoppedRun.claimId === claimId
+                        && (stoppedRun.state === 'accepted' || stoppedRun.state === 'superseded')) {
+                        completeScriptAdmission(stoppedRun, stopped, source);
+                    }
+                }
+                if (!isCurrent()) { return false; }
+                const record = window.getScriptAdmissionByToken?.(window._scriptRecoveryAcceptedRun);
+                if (record?.claimId === claimId) { window.onScriptTaskTerminal?.(stopped, record.token, source); }
+                return stopped;
+            } finally {
+                window._scriptRestartScope = null;
+            }
+        }
+
+        function queueScriptRestart(claimId) {
+            const runToken = window._scriptRecoveryRunToken;
+            window._scriptQueuedRestart = {
+                selection: makeScriptRecoveryStatus(window._scriptRecoveryGeneration || 0, true),
+                epoch: window._bookSelectionEpoch,
+                runToken,
+                claimId,
+            };
+            showToast(t('script.start.restart-queued', 'Start over is queued until the current start finishes.'), 'info');
+        }
         document.getElementById('btn-gen-script-fresh').addEventListener('click', async () => {
+            if (_scriptStartOverInFlight) { return; }
             if (document.getElementById('script-batch-mode')?.checked) {
-                showToast('Start over applies to a single book. Turn off Batch Mode to use it.', 'warning');
+                showToast(t('script.start-over.single-book', 'Start over applies to a single book. Turn off Batch Mode to use it.'), 'warning');
                 return;
             }
             const book = currentBookFilename;
             const batch = !!document.getElementById('script-batch-mode')?.checked;
-            const isCurrent = () => book === currentBookFilename && batch === !!document.getElementById('script-batch-mode')?.checked;
-            let running = false;
-            try { running = !!(await API.get('/api/status/script')).running; }
+            const epoch = window._bookSelectionEpoch;
+            const bookEpoch = window._scriptRecoveryBookEpoch || 0;
+            const dispatch = _scriptStartOverDispatch;
+            const runToken = window._scriptRecoveryRunToken || 0;
+            const isCurrent = () => book === currentBookFilename && batch === !!document.getElementById('script-batch-mode')?.checked
+                && epoch === window._bookSelectionEpoch && bookEpoch === (window._scriptRecoveryBookEpoch || 0);
+            let state;
+            try {
+                state = await API.get('/api/status/script');
+                if (!state) { throw Error('Script status is unavailable'); }
+            }
             catch (e) {
                 console.error('Could not check Script status before starting over:', e);
-                showToast('Script status could not be checked. Check that Alexandria is running, then try Start over again.', 'warning');
+                showToast(t('script.start-over.status-unavailable', 'Script status could not be checked. Check that Alexandria is running, then try Start over again.'), 'warning');
                 return;
             }
+            const running = !!(state.running || state.ownership_unconfirmed);
+            if (state.worker_pending) {
+                showToast(t('script.start.restart-recovery', 'Check the Script task state and start again after it stops.'), 'warning');
+                return;
+            }
+            const claimId = state.ownership_unconfirmed ? null : state.task_claim_id;
+            const ownsConsentRun = () => running
+                ? matchesScriptRestartOwner(claimId, runToken)
+                : runToken === (window._scriptRecoveryRunToken || 0);
             const question = running
                 ? 'Cancel the current run, discard its saved progress, and start again from chunk 1?'
                 : 'Discard the saved progress for this text and start again from chunk 1?';
             if (!await showConfirm(question, {title: 'Discard script progress?', actionLabel: 'Start over', danger: true})) { return; }
-            if (!isCurrent()) { showToast('The book or Batch Mode changed. Review it before starting over.', 'warning'); return; }
-            if (running) {
-                await cancelTask('/api/generate_script/cancel', { onSuccess: () => _resetPauseBtn('btn-pause-script') });
-                if (!(await waitForScriptToStop())) {
-                    showToast('The run has not stopped yet - try Start over again in a moment.', 'warning');
-                    return;
-                }
+            if (!isCurrent()) { showToast(t('script.start-over.changed', 'The book or Batch Mode changed. Review it before starting over.'), 'warning'); return; }
+            if (_scriptStartOverInFlight || dispatch !== _scriptStartOverDispatch) { return; }
+            if (running && (!claimId || !ownsConsentRun())) {
+                showToast(t('script.start.restart-recovery', 'Check the Script task state and start again after it stops.'), 'warning');
+                return;
             }
-            if (!isCurrent()) { showToast('The book or Batch Mode changed. Review it before starting over.', 'warning'); return; }
-            _scriptStartOver = true;
-            // the page's own poller re-enables Generate a tick after the run
-            // stops; a click on a still-disabled button is silently dropped
-            document.getElementById('btn-gen-script').disabled = false;
-            document.getElementById('btn-gen-script').click();
+            if (!ownsConsentRun()) { return; }
+            // Claim the entire handoff before checking the owner or sending Cancel.
+            _scriptStartOverInFlight = true;
+            _scriptStartOverDispatch++;
+            try {
+                if (running) {
+                    const stopped = await stopScriptForRestart(claimId,
+                        () => isCurrent() && ownsConsentRun(), 'start-over');
+                    if (!isCurrent()) { return; }
+                    if (!ownsConsentRun()) { throw Error(SCRIPT_RESTART_OWNER_CHANGED); }
+                    if (!stopped) {
+                        showToast(t('script.start-over.not-stopped', 'The run has not stopped yet - try Start over again in a moment.'), 'warning');
+                        return;
+                    }
+                    if (window._scriptGeneratePending) {
+                        queueScriptRestart(claimId);
+                        return;
+                    }
+                }
+                if (!isCurrent()) { showToast(t('script.start-over.changed', 'The book or Batch Mode changed. Review it before starting over.'), 'warning'); return; }
+                _scriptStartOver = true;
+                window._scriptStartOver = true;
+                window._scriptRestartFromClaimId = running ? claimId : null;
+                // the page's own poller re-enables Generate a tick after the run
+                // stops; a click on a still-disabled button is silently dropped
+                document.getElementById('btn-gen-script').disabled = false;
+                document.getElementById('btn-gen-script').click();
+            } catch (e) {
+                reportScriptRestartFailure(e);
+            } finally {
+                _scriptStartOverInFlight = false;
+            }
         });
         let bookPreflightJob = null;
         let bookPreflightPending = false;
@@ -2808,18 +3365,18 @@
             const panel = document.getElementById('book-preflight-result');
             panel.style.display = '';
             const stale = result.source_is_current === false
-                ? '<div class="text-warning">The selected source has changed. This result belongs to the earlier source.</div>' : '';
+                ? `<div class="text-warning">${escapeHtml(t('script.preflight.source-changed', 'The selected source has changed. This result belongs to the earlier source.'))}</div>` : '';
             const summary = result.summary;
             let details = '';
             if (summary) {
                 const plan = summary.planned_calls || {};
-                details = `<div>Predicted full-book calls: Step 1 ${escapeHtml(plan[1] ?? 0)}, Step 2 ${escapeHtml(plan[2] ?? 0)}, Step 3 ${escapeHtml(plan[3] ?? 0)}. Retries can add calls.</div>`;
+                details = `<div>${escapeHtml(t('script.preflight.planned-calls', 'Predicted full-book calls: Step 1 {step1}, Step 2 {step2}, Step 3 {step3}. Retries can add calls.', {step1: plan[1] ?? 0, step2: plan[2] ?? 0, step3: plan[3] ?? 0}))}</div>`;
                 details += (summary.samples || []).map(sample => {
                     const codes = Object.entries(sample.failure_codes || {}).map(([code, count]) => `${code}: ${count}`).join(', ');
-                    return `<div>${escapeHtml(sample.label)} sample, source chunk ${escapeHtml(sample.chunk_index + 1)}: ${escapeHtml(sample.status)}${codes ? ` — ${escapeHtml(codes)}` : ''}${sample.error ? ` — ${escapeHtml(sample.error)}` : ''}</div>`;
+                    return `<div>${escapeHtml(t('script.preflight.sample-row', '{label} sample, source chunk {chunk}: {status}', {label: sample.label, chunk: sample.chunk_index + 1, status: sample.status}))}${codes ? ` — ${escapeHtml(codes)}` : ''}${sample.error ? ` — ${escapeHtml(sample.error)}` : ''}</div>`;
                 }).join('');
             }
-            panel.innerHTML = `<strong>Book test: ${escapeHtml(result.status)}</strong> · ${escapeHtml(result.source_filename || '')}${stale}${details}${result.error ? `<div class="text-danger">${escapeHtml(result.error)}</div>` : ''}<div class="text-muted">Samples use the configured model and prompts. Passing samples does not establish full-book accuracy. Adjust settings or start generation when ready.</div>`;
+            panel.innerHTML = `<strong>${escapeHtml(t('script.preflight.heading', 'Book test: {status}', {status: result.status}))}</strong> · ${escapeHtml(result.source_filename || '')}${stale}${details}${result.error ? `<div class="text-danger">${escapeHtml(result.error)}</div>` : ''}<div class="text-muted">${escapeHtml(t('script.preflight.guidance', 'Samples use the configured model and prompts. Passing samples does not establish full-book accuracy. Adjust settings or start generation when ready.'))}</div>`;
             document.getElementById('btn-cancel-book-preflight').style.display = result.status === 'running' ? '' : 'none';
             renderBookPreflightVisibility();
         }
@@ -2831,19 +3388,19 @@
         window.startBookPreflight = async () => {
             if (bookPreflightPending || bookPreflightJob) { return; }
             if (document.getElementById('script-batch-mode')?.checked) {
-                showToast('Switch off Batch Mode to test one book with the LLM.', 'warning');
+                showToast(t('script.preflight.batch-mode', 'Switch off Batch Mode to test one book with the LLM.'), 'warning');
                 return;
             }
             const source = getLoadedScriptSourceFilename();
-            if (!source) { showToast('Select or upload a book before running preflight.', 'warning'); return; }
+            if (!source) { showToast(t('script.preflight.no-source', 'Select or upload a book before running preflight.'), 'warning'); return; }
             const button = document.getElementById('btn-book-preflight');
             bookPreflightPending = true;
             button.disabled = true;
             try {
-                if (!(await confirmIfRemote('this book sample test', true))) { return; }
+                if (!(await confirmIfRemote(t('core.remote.task.book-sample-test', 'this book sample test'), true))) { return; }
                 if (document.getElementById('script-batch-mode')?.checked) { return; }
                 if (source !== getLoadedScriptSourceFilename()) {
-                    showToast('The loaded book changed. Review it before running preflight.', 'warning'); return;
+                    showToast(t('script.preflight.book-changed', 'The loaded book changed. Review it before running preflight.'), 'warning'); return;
                 }
                 const result = await API.post('/api/generate_script/preflight', {
                     strip_front_matter: _isStripFrontMatterChecked(),
@@ -2855,18 +3412,23 @@
                 renderBookPreflight(result);
                 _startPolling('book_preflight', () => API.get(`/api/generate_script/preflight/${job}`), {
                     doneCheck: data => data.job_id === job && data.status !== 'running',
-                    onTick: data => {
-                        if (bookPreflightJob === job && data.job_id === job) { renderBookPreflight(data); }
+                    onTick: async data => {
+                        if (bookPreflightJob !== job || data.job_id !== job) { return; }
+                        renderBookPreflight(data);
+                        // A Manual LLM waits for answers here, as Generate does (#1920).
+                        const status = await API.get('/api/status/script');
+                        if (bookPreflightJob === job) { renderManualRequest(status, 'script'); }
                     },
                     onDone: data => {
                         if (bookPreflightJob !== job || data.job_id !== job) { return; }
+                        renderManualRequest({ running: false }, 'script');
                         bookPreflightJob = null;
                         button.disabled = false;
                         renderBookPreflightVisibility();
                     }
                 });
             } catch (error) {
-                showActionError('Book test was not confirmed', error, 'Review the current book-test status and selected source before testing or cancelling again.');
+                showActionError(t('script.preflight.unconfirmed', 'Book test was not confirmed'), error, t('script.preflight.unconfirmed-recovery', 'Review the current book-test status and selected source before testing or cancelling again.'));
             } finally {
                 bookPreflightPending = false;
                 button.disabled = bookPreflightJob !== null;
@@ -2879,17 +3441,21 @@
             if (!job) { return; }
             try {
                 await API.post(`/api/generate_script/preflight/${job}/cancel`, {});
-                showToast('Book-test cancellation queued; waiting for the worker to exit.', 'info');
+                showToast(t('script.preflight.cancel-queued', 'Book-test cancellation queued; waiting for the worker to exit.'), 'info');
             } catch (error) {
-                showActionError('Book test was not confirmed', error, 'Review the current book-test status and selected source before testing or cancelling again.');
+                showActionError(t('script.preflight.unconfirmed', 'Book test was not confirmed'), error, t('script.preflight.unconfirmed-recovery', 'Review the current book-test status and selected source before testing or cancelling again.'));
             }
         };
         // End book-preflight controls.
 
         document.getElementById('btn-gen-script').addEventListener('click', async () => {
             if (document.getElementById('btn-gen-script').disabled) { return; }
-            const startOver = _scriptStartOver;
+            const startOver = window._scriptStartOver === undefined ? _scriptStartOver : window._scriptStartOver;
+            const expectedRestartClaimId = window._scriptRestartFromClaimId;
+            const restartToken = window._scriptRecoveryRunToken || 0;
             _scriptStartOver = false;
+            window._scriptStartOver = false;
+            window._scriptRestartFromClaimId = null;
             if (document.getElementById('script-batch-mode').checked) {
                 return _startBatchScript();
             }
@@ -2899,14 +3465,23 @@
 
             const hasLoadedFile = !!getLoadedScriptSourceFilename();
             if (!hasLoadedFile && fileInput.files.length === 0) {
-                statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Please select a text file first using the file picker above.</span>';
+                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>${escapeHtml(t('script.upload.select-file', 'Please select a text file first using the file picker above.'))}</span>`;
                 return;
             }
 
+            const confirmedSelection = makeScriptRecoveryStatus(
+                window._scriptRecoveryGeneration || 0, true);
+            const confirmedEpoch = window._bookSelectionEpoch;
             // Single-book runs were never gated: a remote ACTIVE profile is a
             // visible choice in Setup. A remote FAILOVER target is not, so the
             // same prompt covers it here.
             if (!(await ensureScriptStartConfirmed('this script generation', true))) { return; }
+            if (!scriptRecoverySelectionMatches(confirmedSelection)
+                || confirmedEpoch !== window._bookSelectionEpoch) { return; }
+            if (expectedRestartClaimId && !matchesScriptRestartOwner(expectedRestartClaimId, restartToken)) {
+                reportScriptRestartFailure(Error(SCRIPT_RESTART_OWNER_CHANGED));
+                return;
+            }
 
             const genBtn = document.getElementById('btn-gen-script');
             const cancelBtn = document.getElementById('btn-cancel-script');
@@ -2916,34 +3491,111 @@
             retryBtn.style.display = 'none';
             cancelBtn.style.display = 'inline-block';
             pauseBtn.style.display = 'inline-block';
-            pauseBtn.innerHTML = '<i class="fas fa-pause me-1"></i>Pause';
+            pauseBtn.innerHTML = `<i class="fas fa-pause me-1"></i>${escapeHtml(t('core.pause.pause', 'Pause'))}`;
             pauseBtn.classList.remove('btn-outline-success');
             pauseBtn.classList.add('btn-outline-warning');
             _resetPauseBtn('btn-pause-script');
 
+            if (window._scriptGeneratePending) {
+                if (startOver) { queueScriptRestart(expectedRestartClaimId); }
+                return;
+            }
+            window._scriptGeneratePending = true;
+            const submittedSelection = makeScriptRecoveryStatus(
+                window._scriptRecoveryGeneration || 0, true);
+            const predecessor = expectedRestartClaimId ? window._scriptRecoveryRunToken : 0;
+            const runToken = window.reserveScriptRecoveryRun('generate');
+            if (predecessor) {
+                const replacement = window.getScriptAdmissionByToken?.(runToken);
+                if (replacement) { replacement.restartPredecessor = predecessor; }
+            }
             try {
-                await API.post('/api/generate_script', {
+                const result = await API.post('/api/generate_script', {
                     strip_front_matter: _isStripFrontMatterChecked(),
                     ...(_isLiteralSourcePreservingChecked() ? {literal_source_preserving: true} : {}),
                     first_person_narrator:
                         document.getElementById('script-first-person-narrator').value.trim() || null,
                     start_over: startOver,
+                    ...(expectedRestartClaimId ? {expected_restart_claim_id: expectedRestartClaimId} : {}),
                 });
-                pollScriptLogs('script', () => {
-                    if (!scriptBatchPoller) { genBtn.disabled = false; }
+                const record = window.getScriptAdmissionByToken?.(runToken);
+                const restartClaimId = record?.restartClaimId;
+                const stop = record?.restartStop;
+                if (restartClaimId && !isCurrentScriptRecoveryRun(runToken)) {
+                    // A newer owner can finish before this acknowledgement.
+                    // Record the old admission without changing the active run.
+                    if (restartClaimId === result?.task_claim_id) {
+                        const acknowledged = acknowledgeScriptAdmission(record.id, restartClaimId);
+                        if (acknowledged && stop) { completeScriptAdmission(acknowledged, stop, 'start-over'); }
+                    }
+                } else if (window.confirmScriptRecoveryRun(runToken, 'generate',
+                    !scriptRecoverySelectionMatches(submittedSelection), result?.task_claim_id)) {
+                    if (stop && restartClaimId === result?.task_claim_id) {
+                        window.onScriptTaskTerminal?.(stop, runToken, 'start-over');
+                    } else {
+                        pollScriptLogs('script', null, runToken);
+                    }
+                }
+            } catch (e) {
+                window.cancelScriptRecoveryRun(runToken);
+                const detail = e.message || 'Unknown error';
+                if (!window._scriptRecoveryRunActive) {
+                    genBtn.disabled = false;
                     cancelBtn.style.display = 'none';
                     pauseBtn.style.display = 'none';
-                    refreshScriptRecovery();
-                });
-            } catch (e) {
-                genBtn.disabled = false;
-                cancelBtn.style.display = 'none';
-                pauseBtn.style.display = 'none';
-                const detail = e.message || 'Unknown error';
-                if (detail.includes('No input file')) {
-                    statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>No file loaded. Please select a text file first.</span>';
-                } else {
-                    statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage('Script generation start was not confirmed', e, 'Check the Script task state, selected book and Test Connection in Setup before starting again.'))}</span>`;
+                }
+                if (detail.includes('No input file') && scriptRecoverySelectionMatches(submittedSelection)) {
+                    statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>${escapeHtml(t('script.upload.no-file', 'No file loaded. Please select a text file first.'))}</span>`;
+                } else if (scriptRecoverySelectionMatches(submittedSelection)) {
+                    statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage(t('script.start.unconfirmed', 'Script generation start was not confirmed'), e, t('script.start.unconfirmed-recovery', 'Check the Script task state, selected book and Test Connection in Setup before starting again.')))}</span>`;
+                }
+            } finally {
+                window._scriptGeneratePending = false;
+                const queued = window._scriptQueuedRestart;
+                window._scriptQueuedRestart = null;
+                if (queued && !_scriptStartOverInFlight && scriptRecoverySelectionMatches(queued.selection)
+                    && queued.epoch === window._bookSelectionEpoch) {
+                    _scriptStartOverInFlight = true;
+                    _scriptStartOverDispatch++;
+                    window._scriptGeneratePending = true;
+                    try {
+                        const target = window.getScriptAdmissionByToken?.(queued.runToken);
+                        const isCurrent = () => scriptRecoverySelectionMatches(queued.selection)
+                            && queued.epoch === window._bookSelectionEpoch;
+                        let stopped = false;
+                        if ((queued.claimId && queued.claimId !== target?.claimId)
+                            || (target?.restartClaimId && (target.restartInvalidated || target.claimId !== target.restartClaimId))) {
+                            throw Error(SCRIPT_RESTART_OWNER_CHANGED);
+                        }
+                        if (target?.state === 'accepted') {
+                            stopped = await stopScriptForRestart(target.claimId,
+                                () => isCurrent() && matchesScriptRestartOwner(target.claimId, target.token),
+                                'queued-restart', {checks: 8, intervalMs: 60});
+                        } else if (target?.state === 'delivered') {
+                            const status = await API.get('/api/status/script');
+                            stopped = matchesScriptRestartOwner(target.claimId, target.token)
+                                && isExpectedScriptStop(status, target.claimId, target.restartStartTime);
+                        }
+                        if (!isCurrent()) { return; }
+                        if (!stopped || !matchesScriptRestartOwner(target.claimId, target.token)) {
+                            throw Error('previous run still active');
+                        }
+                        window._scriptStartOver = true;
+                        _scriptStartOver = true;
+                        window._scriptRestartFromClaimId = target.claimId;
+                        const launch = document.getElementById('btn-gen-script');
+                        if (launch) { launch.disabled = false; launch.click(); }
+                    } catch (e) {
+                        reportScriptRestartFailure(e);
+                        if (!window._scriptRecoveryRunActive) {
+                            genBtn.disabled = false;
+                            cancelBtn.style.display = 'none';
+                            pauseBtn.style.display = 'none';
+                        }
+                    } finally {
+                        window._scriptGeneratePending = false;
+                        _scriptStartOverInFlight = false;
+                    }
                 }
             }
         });
@@ -2976,7 +3628,7 @@
         function _resetPauseBtn(btnId) {
             const btn = document.getElementById(btnId);
             if (!btn) { return; }
-            btn.innerHTML = '<i class="fas fa-pause me-1"></i>Pause';
+            btn.innerHTML = `<i class="fas fa-pause me-1"></i>${escapeHtml(t('core.pause.pause', 'Pause'))}`;
             btn.classList.remove('btn-outline-success');
             btn.classList.add('btn-outline-warning');
         }
@@ -3125,12 +3777,446 @@
             'btn-cancel-script', 'btn-pause-script', t('script.cancel.task-script', 'script generation'));
         window.pauseResumeScript      = _scriptPauseResume;
 
+        function scriptRecoveryContextMatches(context) {
+            return (window._scriptRecoveryGeneration || 0) === context.generation
+                && context.book === currentBookFilename
+                && context.bookEpoch === (window._scriptRecoveryBookEpoch || 0)
+                && context.selection === (window._selectedUploadIdentity || null);
+        }
+
+        function makeScriptRecoveryStatus(generation, recoverable) {
+            return {generation, recoverable, book: currentBookFilename,
+                bookEpoch: window._scriptRecoveryBookEpoch || 0,
+                selection: window._selectedUploadIdentity || null};
+        }
+
+        function scriptRecoverySelectionMatches(selection) {
+            return !!selection && selection.book === currentBookFilename
+                && selection.bookEpoch === (window._scriptRecoveryBookEpoch || 0)
+                && selection.selection === (window._selectedUploadIdentity || null);
+        }
+
+        function isScriptRecoveryDetailCurrent(detail, book, generation) {
+            return !!detail && window._scriptRecoveryDetail === detail
+                && book === currentBookFilename
+                && (window._scriptRecoveryGeneration || 0) === generation
+                && !window._scriptRecoveryPending
+                && !window._scriptRecoveryRunActive;
+        }
+
+        function isScriptRetryBusy() {
+            const settled = window._scriptRecoveryConfirmed;
+            const action = window._scriptRetryAction;
+            return !settled || settled.recoverable !== true
+                || !!window._scriptRecoveryPending || !!window._scriptRecoveryRunActive
+                || !scriptRecoverySelectionMatches(settled)
+                || (!!action && action.inFlight && scriptRecoverySelectionMatches(action));
+        }
+
+        function refreshScriptRetryToolbar() {
+            const disabled = isScriptRetryBusy();
+            const toolbar = document.getElementById('btn-retry-script');
+            if (toolbar) { toolbar.disabled = disabled; }
+            const inPanel = document.getElementById('script-recovery-retry');
+            if (inPanel) { inPanel.disabled = disabled; }
+        }
+        window.refreshScriptRetryToolbar = refreshScriptRetryToolbar;
+
+        window._scriptAdmissionSeq = window._scriptAdmissionSeq || 0;
+        window._scriptAdmissions = window._scriptAdmissions || {};
+        window._scriptAdmissionsByToken = window._scriptAdmissionsByToken || {};
+
+        function createScriptAdmission(source, claimId) {
+            const id = ++window._scriptAdmissionSeq;
+            // The active run can roll back to an older admission.
+            const token = id;
+            const record = {
+                id, token, source, claimId, state: 'provisional', requestSeq: 0,
+                selection: makeScriptRecoveryStatus(window._scriptRecoveryGeneration || 0, true),
+                epoch: window._bookSelectionEpoch,
+                effects: {log: false, notify: false, release: false, read: false}
+            };
+            window._scriptAdmissions[id] = record;
+            window._scriptAdmissionsByToken[token] = id;
+            const scope = window._scriptRestartScope;
+            if (scope && !scope.record && claimId === scope.claimId) { bindScriptRestartTarget(scope, record); }
+            return record;
+        }
+        function getScriptAdmissionByToken(token) {
+            const id = window._scriptAdmissionsByToken?.[token];
+            return id ? (window._scriptAdmissions[id] || null) : null;
+        }
+        function getScriptAdmission(idOrToken) {
+            if (typeof idOrToken === 'number') {
+                return window._scriptAdmissions[idOrToken]
+                    || window._scriptAdmissions[window._scriptAdmissionsByToken[idOrToken]] || null;
+            }
+            return null;
+        }
+        function acknowledgeScriptAdmission(id, claimId) {
+            const record = window._scriptAdmissions[id];
+            if (!record || !['provisional', 'accepted'].includes(record.state)) { return null; }
+            if (claimId && record.claimId && claimId !== record.claimId) { return null; }
+            if (claimId) { record.claimId = claimId; }
+            const scope = window._scriptRestartScope;
+            if (scope && !scope.record && record.claimId === scope.claimId) { bindScriptRestartTarget(scope, record); }
+            record.state = 'accepted';
+            record.acceptedSeq = ++record.requestSeq;
+            return record;
+        }
+        function acceptScriptAdmission(id, claimId) {
+            const record = acknowledgeScriptAdmission(id, claimId);
+            if (record) { window._scriptRecoveryAcceptedRun = record.token; }
+            return record;
+        }
+        function fenceScriptAdmission(record, capturedSeq) {
+            return !!record && record.state !== 'terminal'
+                && record.requestSeq === capturedSeq
+                && record.epoch === window._bookSelectionEpoch
+                && scriptRecoverySelectionMatches(record.selection);
+        }
+        window.createScriptAdmission = createScriptAdmission;
+        window.getScriptAdmission = getScriptAdmission;
+        window.getScriptAdmissionByToken = getScriptAdmissionByToken;
+        window._scriptNotifiedTokens = {};
+        window.isScriptRunDelivered = token => {
+            const record = getScriptAdmissionByToken(token || 0);
+            return !!record && record.state === 'delivered';
+        };
+        window.markScriptNotified = token => {
+            const key = token || 0;
+            if (window._scriptNotifiedTokens[key]) { return false; }
+            window._scriptNotifiedTokens[key] = true;
+            return true;
+        };
+        window.acceptScriptAdmission = acceptScriptAdmission;
+        window.fenceScriptAdmission = fenceScriptAdmission;
+
+        function activateScriptRecoveryRun(record) {
+            window._scriptRecoveryRunToken = record.token;
+            window._scriptRecoveryRunActive = true;
+            window._scriptRecoveryRunSelection = record.selection;
+            window._scriptRecoveryDetail = null;
+            window._scriptRecoveryTerminalToken = 0;
+            window._scriptRecoveryTerminalDelivered = false;
+        }
+        function beginScriptRecoveryRun(source, silent, claimId) {
+            const record = createScriptAdmission(source, claimId);
+            const token = record.token;
+            activateScriptRecoveryRun(record);
+            window._scriptRuns = window._scriptRuns || {};
+            window._scriptRuns[token] = {source, state: 'provisional', selection: record.selection};
+            window._scriptRecoveryRunSource = source;
+            if (!silent) {
+                const panel = document.getElementById('script-recovery-panel');
+                if (panel) { panel.style.display = 'none'; panel.innerHTML = ''; }
+                const retryBtn = document.getElementById('btn-retry-script');
+                if (retryBtn) { retryBtn.style.display = 'none'; }
+                window.refreshScriptRetryToolbar?.();
+            }
+            return token;
+        }
+        function confirmScriptRecoveryRun(token, source, silent, claimId) {
+            const record = getScriptAdmissionByToken(token);
+            const acceptedNow = window._scriptRecoveryAcceptedRun || 0;
+            if (!isCurrentScriptRecoveryRun(token)) {
+                if (acceptedNow && acceptedNow !== token
+                    && !window.isScriptRunDelivered(acceptedNow)) { return false; }
+            }
+            if (!record || !acceptScriptAdmission(record.id, claimId)) { return false; }
+            if (!isCurrentScriptRecoveryRun(token)) { activateScriptRecoveryRun(record); }
+            const cleanup = window._scriptTerminalCleanup;
+            if (cleanup && cleanup.token !== token) {
+                const observation = getScriptAdmissionByToken(cleanup.token);
+                if (observation?.state === 'provisional') { observation.state = 'superseded'; }
+                window._scriptTerminalCleanup = null;
+                cleanup.onReplace?.();
+            }
+            window._scriptRuns[token] = {source, state: 'accepted', selection: window._scriptRecoveryRunSelection};
+            window._scriptRecoveryRunSource = source;
+            if (silent) { return true; }
+            const genBtn = document.getElementById('btn-gen-script');
+            const cancelBtn = document.getElementById('btn-cancel-script');
+            const pauseBtn = document.getElementById('btn-pause-script');
+            if (genBtn) { genBtn.disabled = true; }
+            if (cancelBtn) { cancelBtn.style.display = 'inline-block'; }
+            if (pauseBtn) { pauseBtn.style.display = 'inline-block'; }
+            _resetPauseBtn('btn-pause-script');
+            window.refreshScriptRetryToolbar?.();
+            return true;
+        }
+        function cancelScriptRecoveryRun(token) {
+            if ((window._scriptRecoveryRunToken || 0) !== token) { return; }
+            const rejected = getScriptAdmissionByToken(token);
+            if (rejected?.state === 'provisional') { rejected.state = 'rejected'; }
+            const accepted = window._scriptRecoveryAcceptedRun || 0;
+            const acceptedRecord = getScriptAdmissionByToken(accepted);
+            const observed = getScriptAdmissionByToken(rejected?.observationToken);
+            const previous = acceptedRecord?.state === 'accepted' ? acceptedRecord : observed;
+            if (previous && previous.token !== token && confirmScriptRecoveryRun(previous.token, previous.source)) {
+                window._scriptRecoveryRestoring = false;
+                window.refreshScriptRetryToolbar?.();
+                return;
+            } else {
+                window._scriptRecoveryRunActive = false;
+                window._scriptRecoveryAcceptedRun = 0;
+                if (window._scriptGenerationClaim === window._scriptRecoveryRunClaim) {
+                    window._scriptGenerationClaim = Math.max(0, (window._scriptGenerationClaim || 0) - 1);
+                }
+            }
+            window.refreshScriptRetryToolbar?.();
+            window._scriptRecoveryRestoring = true;
+            window._scriptRecoveryRestorationSettled = false;
+            window._scriptRecoveryGeneration = (window._scriptRecoveryGeneration || 0) + 1;
+            window.refreshScriptRecovery?.();
+            window._scriptRecoveryRestorationGeneration = window._scriptRecoveryGeneration || 0;
+            window._scriptRecoveryRestorationSelection = window._scriptRecoveryRunSelection;
+        }
+        function isCurrentScriptRecoveryRun(token) {
+            return !!token && window._scriptRecoveryRunActive
+                && (window._scriptRecoveryRunToken || 0) === token;
+        }
+        window.isCurrentScriptRecoveryRun = isCurrentScriptRecoveryRun;
+        window.armScriptRecoveryRunForReattach = () => window._scriptRecoveryRunActive
+            ? (window._scriptRecoveryRunToken || 0) : beginScriptRecoveryRun('reattach');
+        window.reserveScriptRecoveryRun = (source, silent) => {
+            window._scriptGenerationClaim = (window._scriptGenerationClaim || 0) + 1;
+            window._scriptRecoveryRunClaim = window._scriptGenerationClaim;
+            return beginScriptRecoveryRun(source, silent);
+        };
+        window.confirmScriptRecoveryRun = confirmScriptRecoveryRun;
+        window.cancelScriptRecoveryRun = cancelScriptRecoveryRun;
+
+        function replaceObservedScriptRun(previous, claimId) {
+            if (previous.restartClaimId) { previous.restartInvalidated = true; }
+            if (window._scriptQueuedRestart?.runToken === previous.token) {
+                window._scriptQueuedRestart = null;
+            }
+            const token = beginScriptRecoveryRun('observe', false, claimId);
+            confirmScriptRecoveryRun(token, 'observe');
+            deliverSavedScriptStop(previous);
+            return token;
+        }
+        window.observeScriptRecoveryRun = (claimId, confirmedLive) => {
+            const accepted = window._scriptRecoveryAcceptedRun || 0;
+            const record = getScriptAdmissionByToken(accepted);
+            if (record?.state === 'accepted') {
+                if (!claimId || !record.claimId || record.claimId === claimId) { return record.token; }
+                // The server replaced the accepted job. Any late status or
+                // acknowledgement for the old claim now belongs to an old run.
+                record.state = scriptTerminalDeliveries[record.id] ? 'delivered' : 'superseded';
+                return replaceObservedScriptRun(record, claimId);
+            }
+            if (!window._scriptRecoveryRunActive) { return beginScriptRecoveryRun('observe', false, claimId); }
+            const pending = getScriptAdmissionByToken(window._scriptRecoveryRunToken);
+            if (pending?.state !== 'provisional') { return null; }
+            if (confirmedLive && pending.restartClaimId && claimId && pending.restartClaimId !== claimId) {
+                return replaceObservedScriptRun(pending, claimId);
+            }
+            // A status request issued before Generate acknowledges may be
+            // observing a different server task.
+            if (!pending.observationToken) { pending.observationToken = createScriptAdmission('observe', claimId).token; }
+            return pending.observationToken;
+        };
+        window.adoptScriptRecoveryRun = token => {
+            if (window._scriptRecoveryAcceptedRun !== token || window._scriptRecoveryRunActive) { return null; }
+            return beginScriptRecoveryRun('adopt');
+        };
+
+        const scriptTerminalDeliveries = {};
+        const scriptNotifiedClaims = new Set();
+        function notifyScriptCompletion(data, claimId, runToken) {
+            if (claimId && scriptNotifiedClaims.has(claimId)) { return; }
+            if (runToken && !window.markScriptNotified(runToken)) { return; }
+            if (claimId) { scriptNotifiedClaims.add(claimId); }
+            notifyJobDone('script', '', 'finished', data);
+        }
+
+        function deliverSavedScriptStop(record) {
+            if (record.state === 'superseded' && record.restartStop && record.claimId === record.restartClaimId) {
+                completeScriptAdmission(record, record.restartStop, 'start-over');
+            }
+        }
+
+        function deliverScriptTaskTerminal(data, runToken, source) {
+            if (typeof runToken !== 'number' || runToken <= 0) { return; }
+            if (data?.running || data?.ownership_unconfirmed) { return; }
+            const record = getScriptAdmissionByToken(runToken);
+            if (!record || record.state !== 'accepted') { return; }
+            if (!isCurrentScriptRecoveryRun(runToken)
+                && (window._scriptRecoveryAcceptedRun || 0) !== runToken) { return; }
+            completeScriptAdmission(record, data, source);
+        }
+        function completeScriptAdmission(record, data, source) {
+            if (scriptTerminalDeliveries[record.id]) { return; }
+            scriptTerminalDeliveries[record.id] = true;
+            record.state = 'delivered';
+            const runToken = record.token;
+            const cleanup = window._scriptTerminalCleanup;
+            try {
+                if (cleanup && cleanup.token === runToken) {
+                    window._scriptTerminalCleanup = null;
+                    try { cleanup.fn(data, runToken, source); }
+                    catch (e) { console.error('Script terminal cleanup failed', e); }
+                }
+            } finally {
+                try {
+                    if (Array.isArray(data?.logs) && data.logs.length
+                        && (source === 'start-over' || source === 'queued-restart')
+                        && window._scriptRecoveryRunToken === runToken
+                        && record.epoch === window._bookSelectionEpoch
+                        && scriptRecoverySelectionMatches(record.selection)) {
+                        const renderLogs = createTaskLogRenderer(document.getElementById('script-logs'));
+                        renderLogs(data);
+                    }
+                    finishScriptRecoveryRun(runToken);
+                    if (data) {
+                        const confirmedClaim = data.worker_claim_id === record.claimId ? record.claimId : null;
+                        notifyScriptCompletion(data, confirmedClaim, runToken);
+                    }
+                }
+                catch (e) { console.error('Script terminal recovery failed', e); }
+            }
+        }
+        function retireUnverifiedScriptStop(record) {
+            if (!isCurrentScriptRecoveryRun(record.token) || record.state !== 'accepted') { return; }
+            // A held response can still complete this admission, but cannot restore permission to restart.
+            record.restartInvalidated = true;
+            record.state = scriptTerminalDeliveries[record.id] ? 'delivered' : 'superseded';
+            const cleanup = window._scriptTerminalCleanup;
+            if (cleanup?.token === record.token) {
+                window._scriptTerminalCleanup = null;
+                cleanup.onReplace?.();
+            }
+            finishScriptRecoveryRun(record.token);
+            deliverSavedScriptStop(record);
+        }
+        window.onScriptTaskTerminal = deliverScriptTaskTerminal;
+        window.registerScriptTerminalCleanup = (token, fn, onReplace) => {
+            window._scriptTerminalCleanup = {token, fn, onReplace};
+        };
+
+        function finishScriptRecoveryRun(runToken) {
+            if (!window._scriptRecoveryRunActive) { return; }
+            if (typeof runToken === 'number'
+                && (window._scriptRecoveryRunToken || 0) !== runToken) { return; }
+            const ownsSelection = scriptRecoverySelectionMatches(window._scriptRecoveryRunSelection);
+            window._scriptRecoveryTerminalToken = runToken || (window._scriptRecoveryRunToken || 0);
+            window._scriptRecoveryTerminalDelivered = true;
+            window._scriptRecoveryRunActive = false;
+            const action = window._scriptRetryAction;
+            if (action) { action.inFlight = false; }
+            const cancelBtn = document.getElementById('btn-cancel-script');
+            const pauseBtn = document.getElementById('btn-pause-script');
+            const genBtn = document.getElementById('btn-gen-script');
+            if (cancelBtn) { cancelBtn.style.display = 'none'; }
+            if (pauseBtn) { pauseBtn.style.display = 'none'; }
+            window.syncSnapshotButton?.({ running: false });
+            if (genBtn && !scriptBatchPoller) { genBtn.disabled = false; }
+            if (ownsSelection) {
+                const panel = document.getElementById('script-recovery-panel');
+                if (panel) { panel.style.display = 'none'; panel.innerHTML = ''; }
+            }
+            window._scriptRecoveryDetail = null;
+            window._scriptRecoveryGeneration = (window._scriptRecoveryGeneration || 0) + 1;
+            window._scriptRecoveryPending = false;
+            window.refreshScriptRetryToolbar?.();
+            refreshScriptRecovery();
+        }
+
+        function captureScriptRecoveryOwnership() {
+            const generation = (window._scriptRecoveryGeneration || 0) + 1;
+            window._scriptRecoveryGeneration = generation;
+            window._scriptRecoveryPending = true;
+            const context = makeScriptRecoveryStatus(generation, false);
+            return {
+                generation,
+                current: () => scriptRecoveryContextMatches(context) && window._scriptRecoveryGeneration === generation,
+                settle: () => { if (window._scriptRecoveryGeneration === generation) { window._scriptRecoveryPending = false; } }
+            };
+        }
+
+        function captureScriptRetryAdmission() {
+            const context = makeScriptRecoveryStatus(window._scriptRecoveryGeneration || 0, false);
+            const retryGeneration = (window._scriptRetryGeneration || 0) + 1;
+            let action = null;
+            let statusAtClaim = null;
+            let generationAtClaim = 0;
+            let generationClaimAtClaim = 0;
+            let submissionToken = window._scriptRecoveryRunToken || 0;
+            let submitted = false;
+            const current = () => scriptRecoveryContextMatches(context) && !window._scriptRecoveryPending;
+            const confirmed = () => {
+                const settled = window._scriptRecoveryConfirmed;
+                return !!settled && settled.recoverable === true && scriptRecoverySelectionMatches(settled);
+            };
+            return {
+                current,
+                confirmed,
+                claim: () => {
+                    if (!current() || !confirmed() || window._scriptRecoveryRunActive
+                        || window._scriptRecoveryRestoring) { return false; }
+                    const restoration = window._scriptRecoveryRestorationSelection;
+                    if (restoration && !scriptRecoverySelectionMatches(restoration)) { return false; }
+                    const active = window._scriptRetryAction;
+                    if (active && active.inFlight && scriptRecoverySelectionMatches(active)) { return false; }
+                    statusAtClaim = window._scriptRecoveryConfirmed;
+                    generationAtClaim = window._scriptRecoveryGeneration || 0;
+                    generationClaimAtClaim = window._scriptGenerationClaim || 0;
+                    action = makeScriptRecoveryStatus(context.generation, true);
+                    action.inFlight = true;
+                    window._scriptRetryAction = action;
+                    window._scriptRetryGeneration = retryGeneration;
+                    window.refreshScriptRetryToolbar?.();
+                    return true;
+                },
+                isLatestRetry: () => (window._scriptRetryGeneration || 0) === retryGeneration,
+                selectionCurrent: () => !!action && scriptRecoverySelectionMatches(action),
+                statusSuperseded: () => !!statusAtClaim && window._scriptRecoveryConfirmed !== statusAtClaim,
+                readSuperseded: () => (window._scriptRecoveryGeneration || 0) !== generationAtClaim,
+                claimCurrent: () => (window._scriptGenerationClaim || 0) === generationClaimAtClaim,
+                submissionToken: () => submissionToken,
+                restored: () => !!window._scriptRecoveryRestorationSettled
+                    && (window._scriptRecoveryRestorationGeneration || 0) > generationAtClaim
+                    && (window._scriptRecoveryRestorationGeneration || 0) === (window._scriptRecoveryGeneration || 0),
+                reclaim: () => !!action && window._scriptRetryAction === action && action.inFlight
+                    && scriptRecoverySelectionMatches(action) && !window._scriptRecoveryRunActive
+                    && (window._scriptGenerationClaim || 0) === generationClaimAtClaim,
+                markSubmitted: () => { submitted = true; },
+                wasSubmitted: () => submitted,
+                release: () => {
+                    if (action) { action.inFlight = false; }
+                    window.refreshScriptRetryToolbar?.();
+                }
+            };
+        }
+
         async function refreshScriptRecovery() {
+            const owner = captureScriptRecoveryOwnership();
             const retryBtn = document.getElementById('btn-retry-script');
             const panel = document.getElementById('script-recovery-panel');
+            window._scriptRecoveryDetail = null;
+            if (retryBtn) { retryBtn.style.display = 'none'; }
+            window.refreshScriptRetryToolbar?.();
+            if (panel) {
+                panel.style.display = '';
+                panel.innerHTML = `<div class="card-body small text-muted" role="status" aria-live="polite">${escapeHtml(t('script.recovery.status-checking', 'Checking recovery status…'))}</div>`;
+            }
             try {
                 const recovery = await API.get('/api/generate_script/recovery?include_detail=true');
+                if (!owner.current()) { return; }
+                owner.settle();
+                window._scriptRecoveryRestoring = false;
+                window._scriptRecoveryRestorationSettled = true;
+                window._scriptRecoveryRestorationSelection = null;
+                if (window._scriptRecoveryRunActive) { return; }
+                window._scriptRecoveryConfirmed = makeScriptRecoveryStatus(owner.generation, recovery.recoverable === true);
+                window.refreshScriptRetryToolbar?.();
                 retryBtn.style.display = recovery.recoverable ? 'inline-block' : 'none';
+                if (recovery.start_over_required) {
+                    renderCastChangedRecovery(recovery.detail);
+                    return;
+                }
                 if (recovery.recoverable) {
                     const resumeAtPass = recovery.failed_pass
                         ? t('script.recovery.can-resume-at', 'Generation can resume from its checkpoint at {pass}.', {pass: recovery.failed_pass})
@@ -3141,12 +4227,44 @@
                     renderScriptRecovery(null);
                 }
             } catch (e) {
-                retryBtn.style.display = 'none';
+                if (!owner.current()) { return; }
+                owner.settle();
+                window._scriptRecoveryRestorationSettled = true;
+                window._scriptRecoveryRestorationSelection = null;
+                if (window._scriptRecoveryRunActive) { return; }
+                window._scriptRecoveryConfirmed = makeScriptRecoveryStatus(owner.generation, false);
+                window.refreshScriptRetryToolbar?.();
                 if (panel) {
-                    panel.style.display = 'none';
+                    panel.style.display = '';
+                    panel.innerHTML = `<div class="card-body small text-danger" role="status" aria-live="polite">${escapeHtml(getActionErrorMessage(
+                        t('script.recovery.status-unreadable', 'Recovery status could not be read'), e,
+                        t('script.recovery.status-unreadable-detail', 'This does not mean the run is unrecoverable. Use Check recovery status to read the checkpoint state before starting generation again.')))}</div>
+                        <div class="card-body border-top"><button type="button" class="btn btn-sm btn-outline-secondary" onclick="refreshScriptRecovery()">${escapeHtml(t('script.recovery.status-unreadable-check', 'Check recovery status'))}</button></div>`;
                 }
-                console.debug('Script recovery status unavailable', e);
+                showActionError(t('script.recovery.status-unreadable', 'Recovery status could not be read'), e,
+                    t('script.recovery.status-unreadable-recovery', 'Retry stays unavailable until the status is confirmed. Use Check recovery status in the recovery panel before starting generation again.'), 'warning');
             }
+        }
+
+        // A fenced run cannot resume: its checkpoint was built for the old cast.
+        // Surface the server's own explanation and point at the existing Start
+        // over control; checkpoint, manifest and cast are left intact for review.
+        function renderCastChangedRecovery(detail) {
+            const panel = document.getElementById('script-recovery-panel');
+            if (!panel) { return; }
+            window._scriptRecoveryDetail = null;
+            const explanation = detail || t('script.recovery.cast-changed-detail', 'The approved cast changed since this run started, so it cannot resume; start a new run. The saved checkpoint was preserved.');
+            showToast(explanation, 'warning', 12000);
+            panel.style.display = '';
+            panel.innerHTML = `
+                <div role="status" aria-live="polite" aria-atomic="true">
+                    <div class="card-header"><strong>${escapeHtml(t('script.recovery.cast-changed-title', 'Approved cast changed'))}</strong></div>
+                    <div class="card-body">
+                        <p>${escapeHtml(explanation)}</p>
+                        <p class="small text-muted">${escapeHtml(t('script.recovery.cast-changed-guidance', 'Your checkpoint, manifest and cast were preserved. Use Start over to generate again with the approved cast.'))}</p>
+                        <button type="button" class="btn btn-outline-warning" onclick="document.getElementById('btn-gen-script-fresh').click()"><i class="fas fa-undo me-1" aria-hidden="true"></i>${escapeHtml(t('script.recovery.cast-changed-start-over', 'Start over'))}</button>
+                    </div>
+                </div>`;
         }
 
         // Failed-request recovery panel (issue #522 s23): where it failed, every
@@ -3159,6 +4277,7 @@
                 return;
             }
             if (!detail) {
+                window._scriptRecoveryDetail = null;
                 panel.style.display = 'none';
                 panel.innerHTML = '';
                 return;
@@ -3213,7 +4332,7 @@
                     </div>
                     <div id="script-recovery-findings" class="small text-danger mt-2"></div>
                     <div class="d-flex flex-wrap gap-2 mt-2">
-                        <button class="btn btn-sm btn-primary" onclick="retryScriptGeneration()"><i class="fas fa-rotate-right me-1"></i>${t('script.recovery.retry', 'Retry this chunk')}</button>
+                        <button id="script-recovery-retry" class="btn btn-sm btn-primary" onclick="retryScriptGeneration()"${isScriptRetryBusy() ? ' disabled' : ''}><i class="fas fa-rotate-right me-1"></i>${t('script.recovery.retry', 'Retry this chunk')}</button>
                         <button class="btn btn-sm btn-outline-secondary" onclick="onCopyRecoveryPrompt()"><i class="fas fa-copy me-1"></i>${t('script.recovery.copy-prompt', 'Copy prompt')}</button>
                         <button class="btn btn-sm btn-outline-success" onclick="onInjectRecoverySegmentation()"><i class="fas fa-file-import me-1"></i>${t('script.recovery.apply-segmentation', 'Validate & apply segmentation')}</button>
                         <button class="btn btn-sm btn-outline-warning" onclick="onSkipRecoveryChunk()"><i class="fas fa-forward me-1"></i>${skipLabel}</button>
@@ -3223,7 +4342,7 @@
 
         async function onCopyRecoveryPrompt() {
             const detail = window._scriptRecoveryDetail;
-            if (!detail || !detail.prompt) {
+            if (!detail || !detail.prompt || window._scriptRecoveryPending || window._scriptRecoveryRunActive) {
                 return;
             }
             const text = `SYSTEM:\n${detail.prompt.system}\n\nUSER:\n${detail.prompt.user}`;
@@ -3245,8 +4364,10 @@
 
         async function onInjectRecoverySegmentation() {
             const detail = window._scriptRecoveryDetail;
+            const book = currentBookFilename;
+            const generation = window._scriptRecoveryGeneration || 0;
             const box = document.getElementById('script-recovery-inject');
-            if (!detail || !box) {
+            if (!box || !isScriptRecoveryDetailCurrent(detail, book, generation)) {
                 return;
             }
             let entries;
@@ -3262,73 +4383,93 @@
             }
             try {
                 const result = await API.post('/api/generate_script/inject', { chunk: detail.failed_chunk, entries });
+                if (!isScriptRecoveryDetailCurrent(detail, book, generation)) { return; }
                 renderRecoveryFindings(null);
                 showToast(t('script.recovery.accepted', 'Accepted ({resolution}). Resume to continue.', {resolution: result.resolution}), 'success');
                 await refreshScriptRecovery();
             } catch (e) {
+                if (!isScriptRecoveryDetailCurrent(detail, book, generation)) { return; }
                 renderRecoveryFindings(e.detail && typeof e.detail === 'object' ? e.detail : { message: e.message });
             }
         }
 
         async function onSkipRecoveryChunk() {
             const detail = window._scriptRecoveryDetail;
-            if (!detail) {
+            const book = currentBookFilename;
+            const generation = window._scriptRecoveryGeneration || 0;
+            if (!isScriptRecoveryDetailCurrent(detail, book, generation)) {
                 return;
             }
             const question = detail.failed_pass === 'attribute'
                 ? t('script.recovery.skip-question-attribute', 'Label every spoken line in this batch UNKNOWN and continue? You can fix speakers in the Editor afterwards.')
                 : t('script.recovery.skip-question-segment', 'Put chunk {chunk} into the script split only at its quote marks (no speaker attribution beyond NARRATOR/SPOKEN)? Nothing is dropped.', {chunk: detail.failed_chunk});
-            const book = currentBookFilename;
             const chunk = detail.failed_chunk;
             const pass = detail.failed_pass;
             if (!await showConfirm(question, {title: t('script.recovery.fallback-title', 'Continue with fallback script?'), actionLabel: t('script.recovery.fallback-action', 'Use fallback'), danger: false})) { return; }
-            if (book !== currentBookFilename || window._scriptRecoveryDetail !== detail
+            if (!isScriptRecoveryDetailCurrent(detail, book, generation)
                 || detail.failed_chunk !== chunk || detail.failed_pass !== pass) {
                 showToast(t('safety.script.recovery_changed_review', 'The book or recovery section changed. Review the latest recovery details before continuing.'), 'warning'); return;
             }
             try {
                 const result = await API.post('/api/generate_script/skip', { chunk });
+                if (!isScriptRecoveryDetailCurrent(detail, book, generation)) { return; }
                 showToast(t('script.recovery.accepted', 'Accepted ({resolution}). Resume to continue.', {resolution: result.resolution}), 'success');
                 await refreshScriptRecovery();
             } catch (e) {
+                if (!isScriptRecoveryDetailCurrent(detail, book, generation)) { return; }
                 renderRecoveryFindings(e.detail && typeof e.detail === 'object' ? e.detail : { message: e.message });
             }
         }
 
         window.retryScriptGeneration = async () => {
-            const genBtn = document.getElementById('btn-gen-script');
+            const admission = captureScriptRetryAdmission();
+            if (!admission.current() || !admission.claim()) { return; }
             const retryBtn = document.getElementById('btn-retry-script');
-            const cancelBtn = document.getElementById('btn-cancel-script');
-            const pauseBtn = document.getElementById('btn-pause-script');
             retryBtn.disabled = true;
             try {
                 const recovery = await API.get('/api/generate_script/recovery');
+                if ((!admission.current() && !admission.restored()) || !admission.confirmed()
+                    || !admission.isLatestRetry() || !admission.reclaim()
+                    || !admission.claimCurrent()) { return; }
+                if (recovery.recoverable !== true) {
+                    showToast(t('script.recovery.retry-withheld', 'Recovery is no longer confirmed. Check recovery status before resuming.'), 'warning');
+                    refreshScriptRecovery();
+                    return;
+                }
                 const payload = {};
                 if (recovery.legacy_confirmation) {
                     const confirmed = await showConfirm(
                         formatUiSafetyText('safety.script.legacy_checkpoint', 'This older checkpoint does not record which book it belongs to. Resume only if you recognize it as progress for the currently selected book. The source and generation settings must still match.'),
                         {title: t('safety.script.legacy_checkpoint.title', 'Confirm older checkpoint'), actionLabel: t('script.recovery.resume-checkpoint', 'Resume this checkpoint')});
                     if (!confirmed) { return; }
+                    if ((!admission.current() && !admission.restored()) || !admission.confirmed()
+                    || !admission.isLatestRetry() || !admission.reclaim()
+                    || !admission.claimCurrent()) { return; }
                     payload.legacy_checkpoint_token = recovery.legacy_confirmation.checkpoint_token;
                     payload.legacy_book_token = recovery.legacy_confirmation.book_token;
                 }
-                await API.post('/api/generate_script/retry', payload);
-                retryBtn.style.display = 'none';
-                genBtn.disabled = true;
-                cancelBtn.style.display = 'inline-block';
-                pauseBtn.style.display = 'inline-block';
-                _resetPauseBtn('btn-pause-script');
-                pollScriptLogs('script', () => {
-                    if (!scriptBatchPoller) { genBtn.disabled = false; }
-                    cancelBtn.style.display = 'none';
-                    pauseBtn.style.display = 'none';
-                    refreshScriptRecovery();
-                });
+                if ((!admission.current() && !admission.restored()) || !admission.confirmed()
+                    || !admission.isLatestRetry() || !admission.reclaim()
+                    || !admission.claimCurrent()) { return; }
+                admission.markSubmitted();
+                const result = await API.post('/api/generate_script/retry', payload);
+                const acceptedNow = window._scriptRecoveryAcceptedRun || 0;
+                if (acceptedNow && acceptedNow !== admission.submissionToken()
+                    && !window.isScriptRunDelivered(acceptedNow)) { return; }
+                const runToken = window.reserveScriptRecoveryRun('retry', !admission.selectionCurrent());
+                const selectionCurrent = admission.selectionCurrent();
+                if (window.confirmScriptRecoveryRun(runToken, 'retry', !selectionCurrent, result?.task_claim_id)) {
+                    if (selectionCurrent) { retryBtn.style.display = 'none'; }
+                    pollScriptLogs('script', null, runToken);
+                }
             } catch (e) {
+                if (!admission.selectionCurrent() || !admission.isLatestRetry() || !admission.claimCurrent()) { return; }
+                if (!admission.wasSubmitted()
+                    && (admission.statusSuperseded() || admission.readSuperseded())) { return; }
                 showActionError(t('script.recovery.resume-failed', 'Script resume was not confirmed'), e, t('script.recovery.resume-recovery', 'Check the Script task state, recovery panel and Test Connection in Setup before resuming again.'), 'warning');
                 refreshScriptRecovery();
             } finally {
-                retryBtn.disabled = false;
+                admission.release();
             }
         };
 
@@ -3603,7 +4744,7 @@
                         state.tasks.forEach((taskStatus, i) => {
                             const el = document.getElementById(`script-batch-status-${i}`);
                             if (!el) { return; }
-                            const colours = { pending: 'secondary', running: 'primary', done: 'success', failed: 'danger', cancelled: 'warning' };
+                            const colours = { pending: 'secondary', running: 'primary', done: 'success', skipped: 'secondary', failed: 'danger', cancelled: 'warning' };
                             el.innerHTML = `<span class="badge bg-${colours[taskStatus.status] || 'secondary'}">${escapeHtml(taskStatusLabel(taskStatus.status))}</span>`;
                         });
                     }
@@ -3613,7 +4754,7 @@
                     clearScriptCancellation('batch_script');
                     renderManualRequest({ running: false }, 'batch_script');
                     _showTaskRecoveryPanel('script-batch-recovery-panel', 'batch_script', state,
-                        t('script.batch.recovery-hint', 'Inspect the log and resume failed books from their validated checkpoints.'));
+                        t('script.batch.recovery-hint', 'Inspect the log. If a failed book has a validated checkpoint, resume it from there.'));
                     notifyJobDone('batch_script', '', 'finished', state);
                     document.getElementById('btn-gen-script').disabled = false;
                     document.getElementById('btn-pause-batch-script').style.display = 'none';
@@ -3622,9 +4763,14 @@
                     const done = tasks.filter(task => task.status === 'done').length;
                     const failed = tasks.filter(task => task.status === 'failed').length;
                     const cancelled = tasks.filter(task => task.status === 'cancelled').length;
+                    // A collision skip never attempted the book, so count it separately.
+                    const skipped = tasks.filter(task => task.status === 'skipped').length;
                     const tone = failed ? 'text-warning' : 'text-muted';
+                    const summary = failed
+                        ? t('script.batch.finished', 'Batch finished — {done} completed, {skipped} skipped, {failed} failed, {cancelled} cancelled. Failed books may have validated checkpoints.', {done, skipped, failed, cancelled})
+                        : t('script.batch.finished-clean', 'Batch finished — {done} completed, {skipped} skipped, {failed} failed, {cancelled} cancelled.', {done, skipped, failed, cancelled});
                     document.getElementById('script-batch-status-msg').innerHTML =
-                        `<span class="${tone}">${escapeHtml(t('script.batch.finished', 'Batch finished — {done} completed, {failed} failed, {cancelled} cancelled. Failed books keep validated checkpoints.', {done, failed, cancelled}))}</span>`;
+                        `<span class="${tone}">${escapeHtml(summary)}</span>`;
                     loadSavedScripts();
                 }
             });
@@ -3635,6 +4781,17 @@
             const cb = document.getElementById('review-dedupe-speakers');
             return cb ? cb.checked : true;
         }
+        window.syncBatchReviewOptions = (changed) => {
+            if (!document.getElementById('review-batch-mode')?.checked) { return; }
+            const merge = document.getElementById('review-dedupe-speakers');
+            const discover = document.getElementById('review-batch-find-nicknames');
+            const twoPass = document.getElementById('review-batch-bidirectional');
+            if (!merge || !discover || !twoPass) { return; }
+            if (changed === twoPass && twoPass.checked) { discover.checked = true; }
+            if ((changed === discover || changed === twoPass) && discover.checked) { merge.checked = true; }
+            if (!merge.checked) { discover.checked = false; }
+            if (!discover.checked) { twoPass.checked = false; }
+        };
         function _isReviewForceChecked() {
             const cb = document.getElementById('review-force-rerun');
             return cb ? cb.checked : false;
@@ -3647,6 +4804,65 @@
             const cb = document.getElementById('script-strip-front-matter');
             return cb ? cb.checked : true;
         }
+        let reviewRestartSnapshot = null;
+        let reviewRestartRequest = 0;
+
+        function getReviewRestartNames() {
+            return document.getElementById('review-batch-mode').checked
+                ? Array.from(document.querySelectorAll('.review-batch-check:checked')).map(field => field.dataset.name)
+                : ['(active script)'];
+        }
+
+        function syncReviewRestartButtons() {
+            const batch = document.getElementById('review-batch-mode').checked;
+            const names = getReviewRestartNames();
+            const available = (reviewRestartSnapshot?.checkpoints || []).some(row => names.includes(row.book));
+            for (const [id, batchButton, startId] of [
+                ['btn-review-fresh', false, 'btn-review-script'],
+                ['btn-review-contextual-fresh', false, 'btn-review-script-contextual'],
+                ['btn-review-batch-fresh', true, 'btn-review-batch-start']
+            ]) {
+                const button = document.getElementById(id);
+                button.disabled = document.getElementById(startId).disabled;
+                button.style.display = available && batch === batchButton && !button.disabled ? '' : 'none';
+            }
+        }
+
+        async function refreshReviewRestart() {
+            const request = ++reviewRestartRequest;
+            const book = currentBookFilename;
+            reviewRestartSnapshot = null;
+            syncReviewRestartButtons();
+            try {
+                const snapshot = await API.get('/api/review/checkpoints');
+                if (request !== reviewRestartRequest || book !== currentBookFilename) { return; }
+                reviewRestartSnapshot = snapshot;
+                syncReviewRestartButtons();
+            } catch (error) {
+                if (request !== reviewRestartRequest || book !== currentBookFilename) { return; }
+                showActionError(t('script.review.progress-failed', 'Could not check saved review progress'), error,
+                    t('script.review.progress-recovery', 'Reopen the Script tab after checking the app connection.'));
+            }
+        }
+
+        async function confirmReviewRestart() {
+            const book = currentBookFilename;
+            const batch = document.getElementById('review-batch-mode').checked;
+            const names = JSON.stringify(getReviewRestartNames());
+            const isCurrent = () => book === currentBookFilename
+                && batch === document.getElementById('review-batch-mode').checked
+                && names === JSON.stringify(getReviewRestartNames());
+            await refreshReviewRestart();
+            if (!isCurrent()) { throw new Error(t('script.review.restart-changed', 'The book or selection changed. Review it before starting over.')); }
+            const snapshot = reviewRestartSnapshot;
+            if (!snapshot?.book_token || !snapshot.checkpoints.some(row => getReviewRestartNames().includes(row.book))) { return null; }
+            const question = t('script.review.restart-confirm', 'Discard the saved review progress for the selected script(s) and start again from batch 1? The current script, source and all accepted corrections and user edits are kept.');
+            if (!await showConfirm(question, {title: t('script.review.restart-title', 'Discard review progress?'),
+                actionLabel: t('script.review.start-over', 'Start over'), danger: true})) { return null; }
+            if (!isCurrent()) { throw new Error(t('script.review.restart-changed', 'The book or selection changed. Review it before starting over.')); }
+            return {start_over: true, book_token: snapshot.book_token};
+        }
+
         function _showReviewControls(show) {
             document.getElementById('btn-pause-review').style.display = show ? 'inline-block' : 'none';
             document.getElementById('btn-cancel-review').style.display = show ? 'inline-block' : 'none';
@@ -3655,17 +4871,26 @@
         function _disableReviewButtons(disabled) {
             document.getElementById('btn-review-script').disabled = disabled;
             document.getElementById('btn-review-script-contextual').disabled = disabled;
+            syncReviewRestartButtons();
         }
         function _onReviewDone(status) {
             _showReviewControls(false);
             _disableReviewButtons(false);
+            refreshReviewRestart();
             const panel = document.getElementById('review-recovery-panel');
             const logs = status?.logs || [];
             const failed = isTaskFailed(status);
+            const failureMessage = (typeof status?.failure_message === 'string' ? status.failure_message : '').trim();
+            if (failed && status?.failure_kind === 'resume_misaligned') {
+                for (const id of ['btn-review-fresh', 'btn-review-contextual-fresh']) {
+                    const fresh = document.getElementById(id);
+                    if (fresh) { fresh.style.display = ''; }
+                }
+            }
             if (panel) {
                 panel.style.display = failed ? '' : 'none';
                 if (failed) {
-                    const last = logs.filter(Boolean).slice(-1)[0] || t('script.review.unknown-error', 'Unknown review error');
+                    const last = failureMessage || logs.filter(Boolean).slice(-1)[0] || t('script.review.unknown-error', 'Unknown review error');
                     panel.innerHTML = `${escapeHtml(t('script.review.stopped', 'Review stopped with an error: {log}.', {log: last}))} ` +
                         `<a href="/api/logs/review?download=true" target="_blank" rel="noopener">${t('script.review.download-log', 'Download full log.')}</a> ` +
                         t('script.review.inspect-log', 'Inspect the log, correct the source or profile, and retry.');
@@ -3673,35 +4898,123 @@
             }
         }
 
-        document.getElementById('btn-review-script').addEventListener('click', async () => {
-            if (!(await confirmIfRemote(t('core.remote.task.review', 'this review'), true))) { return; }
+        async function startReview(startOver = false) {
             try {
+                const restart = startOver ? await confirmReviewRestart() : {};
+                if (!restart || !(await confirmIfRemote(t('core.remote.task.review', 'this review'), true))) { return; }
                 _disableReviewButtons(true);
                 _showReviewControls(true);
-                await API.post('/api/review_script', { dedupe_speakers: _isReviewDedupeChecked(), force_review: _isReviewForceChecked() });
+                await API.post('/api/review_script', { dedupe_speakers: _isReviewDedupeChecked(), force_review: _isReviewForceChecked(), ...restart });
                 pollScriptLogs('review', _onReviewDone);
             } catch (e) {
-                _onReviewDone();
+                _onReviewDone({status: 'failed', logs: [describeApiError(e)]});
                 showActionError(t('script.review.start-failed', 'Failed to start review'), e, t('script.review.start-recovery', 'Check the current review task state and Test Connection in Setup before starting another review.'));
             }
-        });
+        }
+        document.getElementById('btn-review-script').addEventListener('click', () => startReview());
+        document.getElementById('btn-review-fresh').addEventListener('click', () => startReview(true));
 
-        function applyReviewContextWindow(field, minimum, defaultValue) {
+        // The toggle and the per-mode values persist the way this SPA remembers
+        // other review controls: in localStorage, behind try so a storage-blocked
+        // browser still gets a working toggle (test_ui_review_fixes enforces this).
+        const REVIEW_CONTEXT_STORAGE_KEY = 'alexandria.review-context';
+        // One authority for each mode's limit/default; the single-book field,
+        // the correction toast and the Python routes must all agree on these.
+        const REVIEW_CONTEXT_MODES = {
+            entries: {limit: 100, default: 4},
+            chars: {limit: 1000000, default: 2000}
+        };
+        function getReviewContextPreference() {
+            let stored = null;
+            try { stored = JSON.parse(localStorage.getItem(REVIEW_CONTEXT_STORAGE_KEY) || '{}'); } catch (error) { /* storage blocked or corrupt */ }
+            if (stored && typeof stored === 'object') { return stored; }
+            return {};
+        }
+        function saveReviewContextPreference(preference) {
+            try { localStorage.setItem(REVIEW_CONTEXT_STORAGE_KEY, JSON.stringify(preference)); } catch (error) { /* storage blocked */ }
+        }
+        function getReviewContextMode() {
+            const mode = getReviewContextPreference().mode;
+            return mode === 'chars' ? 'chars' : 'entries';
+        }
+        function getReviewContextValue(mode) {
+            const stored = getReviewContextPreference();
+            const fallback = REVIEW_CONTEXT_MODES[mode].default;
+            const raw = mode === 'chars' ? stored.chars : stored.entries;
+            const parsed = parseInt(raw, 10);
+            return Number.isFinite(parsed) ? parsed : fallback;
+        }
+        function renderReviewContextModeButton() {
+            const button = document.getElementById('btn-review-context-mode');
+            const field = document.getElementById('review-context-window');
+            const mode = getReviewContextMode();
+            const limit = REVIEW_CONTEXT_MODES[mode].limit;
+            if (field) {
+                field.max = String(limit);
+                field.value = String(getReviewContextValue(mode));
+            }
+            const label = document.getElementById('review-contextual-label');
+            if (label) {
+                if (mode === 'chars') {
+                    label.textContent = t('script.review.contextual.chars', 'Contextual Review (+/- N characters)');
+                } else {
+                    label.textContent = t('script.review.contextual.entries', 'Contextual Review (+/- N entries)');
+                }
+            }
+            if (!button) { return; }
+            button.setAttribute('aria-pressed', mode === 'chars' ? 'true' : 'false');
+            if (mode === 'chars') {
+                button.textContent = t('script.review.context-mode.chars', 'Characters');
+                button.setAttribute('aria-label', t('script.review.context-mode.aria.chars',
+                    'Context measured in characters. Activate to switch to entries.'));
+            } else {
+                button.textContent = t('script.review.context-mode.entries', 'Entries');
+                button.setAttribute('aria-label', t('script.review.context-mode.aria.entries',
+                    'Context measured in entries. Activate to switch to characters.'));
+            }
+        }
+        function toggleReviewContextMode() {
+            const mode = getReviewContextMode();
+            const next = mode === 'chars' ? 'entries' : 'chars';
+            const preference = getReviewContextPreference();
+            const field = document.getElementById('review-context-window');
+            if (field) {
+                const parsed = parseInt(field.value, 10);
+                if (Number.isFinite(parsed)) { preference[mode] = parsed; }
+            }
+            preference.mode = next;
+            saveReviewContextPreference(preference);
+            renderReviewContextModeButton();
+        }
+
+        function applyReviewContextWindow(field, minimum, defaultValue, mode) {
+            const singleBook = mode === undefined;
+            const contextMode = mode || getReviewContextMode();
+            const limit = REVIEW_CONTEXT_MODES[contextMode].limit;
             const rawWindow = parseInt(field.value, 10);
-            const windowSize = Number.isFinite(rawWindow) ? Math.max(minimum, Math.min(rawWindow, 12)) : defaultValue;
+            const windowSize = Number.isFinite(rawWindow) ? Math.max(minimum, Math.min(rawWindow, limit)) : defaultValue;
             const corrected = !Number.isFinite(rawWindow) || Number(field.value) !== windowSize;
             field.value = String(windowSize);
-            if (corrected) { showToast(t('script.review.context-corrected', 'Context Window must be {minimum}–12; using {size}', {minimum, size: windowSize}), 'warning'); }
+            if (singleBook) {
+                const preference = getReviewContextPreference();
+                if (contextMode === 'chars') { preference.chars = windowSize; } else { preference.entries = windowSize; }
+                saveReviewContextPreference(preference);
+            }
+            if (corrected) { showToast(t('script.review.context-corrected', 'Context Window must be {minimum}–{maximum}; using {size}', {minimum, maximum: limit, size: windowSize}), 'warning'); }
             return windowSize;
         }
 
-        document.getElementById('btn-review-script-contextual').addEventListener('click', async () => {
+        async function startContextualReview(startOver = false) {
             try {
+                const restart = startOver ? await confirmReviewRestart() : {};
+                if (!restart) { return; }
                 if (!(await confirmIfRemote(t('core.remote.task.contextual-review', 'this contextual review'), true))) { return; }
-                const windowSize = applyReviewContextWindow(document.getElementById('review-context-window'), 1, 4);
+                const contextField = document.getElementById('review-context-window');
+                const windowSize = applyReviewContextWindow(contextField, 1, getReviewContextValue(getReviewContextMode()));
+                const contextMode = getReviewContextMode();
                 _disableReviewButtons(true);
                 _showReviewControls(true);
-                const result = await API.post('/api/review_script_contextual', { window_size: windowSize, dedupe_speakers: _isReviewDedupeChecked(), force_review: _isReviewForceChecked() });
+                const result = await API.post('/api/review_script_contextual', { window_size: windowSize, context_mode: contextMode, dedupe_speakers: _isReviewDedupeChecked(), force_review: _isReviewForceChecked(), ...restart });
                 const estimateEl = document.getElementById('review-context-estimate');
                 if (estimateEl) {
                     estimateEl.innerText = result.estimated_calls
@@ -3710,10 +5023,14 @@
                 }
                 pollScriptLogs('review', _onReviewDone);
             } catch (e) {
-                _onReviewDone();
+                _onReviewDone({status: 'failed', logs: [describeApiError(e)]});
                 showActionError(t('script.review.contextual-failed', 'Failed to start contextual review'), e, t('script.review.contextual-recovery', 'Check the review task state, context window and Test Connection in Setup before starting another review.'));
             }
-        });
+        }
+        document.getElementById('btn-review-script-contextual').addEventListener('click', () => startContextualReview());
+        document.getElementById('btn-review-contextual-fresh').addEventListener('click', () => startContextualReview(true));
+        document.getElementById('btn-review-context-mode').addEventListener('click', toggleReviewContextMode);
+        renderReviewContextModeButton();
 
         const _reviewPauseResume = _makePauseResumeHandler(
             '/api/review_script/pause', '/api/review_script/resume', 'btn-pause-review');
@@ -3737,7 +5054,8 @@
             document.getElementById('review-single-area').style.display = isBatch ? 'none' : 'block';
             document.getElementById('review-batch-area').style.display = isBatch ? 'block' : 'none';
             document.getElementById('btn-review-batch-start').style.display = isBatch ? 'inline-block' : 'none';
-            if (isBatch) { loadReviewBatchScripts(); }
+            if (isBatch) { syncBatchReviewOptions(); loadReviewBatchScripts(); }
+            refreshReviewRestart();
         };
 
         // --- Shared helpers for saved-script checkbox pickers (Batch Review,
@@ -3829,6 +5147,7 @@
             await _loadScriptList('review-batch-list', (scripts) => {
                 reviewBatchScripts = scripts;
                 renderReviewBatchList();
+                window.refreshReviewRestart?.();
             });
         }
 
@@ -3837,6 +5156,7 @@
                 containerId: 'review-batch-list',
                 checkClass: 'review-batch-check',
                 idPrefix: 'rb-check-',
+                onchange: 'syncReviewRestartButtons()',
                 extra: (i) => `<span class="small" id="rb-status-${i}"></span>`,
             });
         }
@@ -3846,20 +5166,33 @@
             renderReviewBatchList();
         };
 
-        window.reviewBatchSelectAll = (on) => _selectAllCheckboxes('review-batch-check', on);
+        window.reviewBatchSelectAll = (on) => {
+            _selectAllCheckboxes('review-batch-check', on);
+            window.syncReviewRestartButtons?.();
+        };
 
-        async function startBatchReview() {
+        async function startBatchReview(startOver = false) {
             const names = Array.from(document.querySelectorAll('.review-batch-check:checked')).map(cb => cb.dataset.name);
             if (!names.length) { showToast(t('script.review.batch.select-one', 'Select at least one script to review.'), 'warning'); return; }
+            let restart = {};
+            try {
+                if (startOver) { restart = await confirmReviewRestart(); }
+                if (!restart) { return; }
+            } catch (error) {
+                showActionError(t('script.review.start-failed', 'Failed to start review'), error,
+                    t('script.review.start-recovery', 'Check the current review task state and Test Connection in Setup before starting another review.'));
+                return;
+            }
             if (!(await confirmIfRemote(t('core.remote.task.batch-review', 'this batch review')))) { return; }
             reviewBatchSelected = names;
-            const contextWindow = applyReviewContextWindow(document.getElementById('review-batch-context-window'), 0, 0);
+            const contextWindow = applyReviewContextWindow(document.getElementById('review-batch-context-window'), 0, 0, 'entries');
 
             const startBtn = document.getElementById('btn-review-batch-start');
             const pauseBtn = document.getElementById('btn-pause-batch-review');
             const cancelBtn = document.getElementById('btn-cancel-batch-review');
             const statusMsg = document.getElementById('review-batch-status-msg');
             startBtn.disabled = true;
+            syncReviewRestartButtons();
             pauseBtn.style.display = 'inline-block';
             cancelBtn.style.display = 'inline-block';
             _resetPauseBtn('btn-pause-batch-review');
@@ -3874,10 +5207,12 @@
                     force_review: _isReviewForceChecked(),
                     find_nicknames: document.getElementById('review-batch-find-nicknames').checked,
                     bidirectional: document.getElementById('review-batch-bidirectional').checked,
+                    ...restart,
                 });
                 pollReviewBatch();
             } catch (e) {
                 startBtn.disabled = false;
+                refreshReviewRestart();
                 pauseBtn.style.display = 'none';
                 cancelBtn.style.display = 'none';
                 statusMsg.innerHTML = `<span class="text-danger">${escapeHtml(getActionErrorMessage(t('script.review.batch.start-unconfirmed', 'Batch review start was not confirmed'), e, t('script.review.batch.start-recovery', 'Check the batch review task state, selected books and Test Connection in Setup before starting again.')))}</span>`;
@@ -3968,7 +5303,7 @@
         async function buildCastList() {
             const source = getLoadedScriptSourceFilename();
             if (!source) { showToast(t('script.cast_list.no-book', 'Select or upload a book before building its cast list.'), 'warning'); return; }
-            if (!(await confirmIfRemote(t('core.remote.task.cast-list', 'this cast list (the whole book in one request)')))) { return; }
+            if (!(await confirmIfRemote(t('core.remote.task.cast-list', 'this cast list (the complete book; experimental mode uses sequential requests with the accumulated roster and aliases)')))) { return; }
             if (source !== getLoadedScriptSourceFilename()) {
                 showToast(t('safety.script.cast_list.book_changed_build', 'The loaded book changed. Review it before building its cast list.'), 'warning'); return;
             }
@@ -4020,6 +5355,7 @@
         }
 
         async function loadCastList(show) {
+            document.getElementById('cast-list-status').removeAttribute('data-i18n');
             const panel = document.getElementById('cast-list-panel');
             const editorSnapshot = getCastListEditorSnapshot();
             if (show && (castListMutationPending || (castListEditorSnapshot !== null && panel.style.display !== 'none' && editorSnapshot !== castListEditorSnapshot))) {
@@ -4034,6 +5370,11 @@
                 result = await API.get('/api/cast_list');
             } catch (e) {
                 if (request !== castListRequest || book !== currentBookFilename) { return; }
+                if (!book && !window._selectedUploadIdentity && editorSnapshot === '[]'
+                        && e.status === 400 && e.messageKey === 'error.generation.no_input') {
+                    setUiMessage(document.getElementById('cast-list-status'), 'script.cast_list.empty', 'No book selected. Choose a source above to begin.');
+                    return;
+                }
                 document.getElementById('cast-list-status').textContent = getActionErrorMessage(
                     t('script.cast_list.refresh-unconfirmed', 'Cast-list refresh was not confirmed'), e,
                     t('script.cast_list.refresh-recovery', 'Existing editor rows were kept. Retry loading this book’s cast list before relying on it for generation.'));
@@ -4043,6 +5384,7 @@
             if (request !== castListRequest || book !== currentBookFilename) { return; }
             castListLoaded = true;
             renderCastListStatus(result);
+            if (typeof refreshScriptIngestFacts === 'function' && currentTabName === 'script') { void refreshScriptIngestFacts(); }
             if (!show) { return; }
             if (castListMutationPending || editorSnapshot !== getCastListEditorSnapshot()) {
                 showToast(t('safety.script.cast_list.edits_changed', 'Your cast-list edits changed while loading. They have been kept.'), 'warning');
@@ -4221,6 +5563,7 @@
         function _formatBookStats(stats) {
             const changes = t('script.review.stats.changes', '{changes} changes: {text} text, {speaker} speaker, {instruct} instruct, +{added}/-{removed} entries', {changes: stats.total_changes, text: stats.text_changed, speaker: stats.speaker_changed, instruct: stats.instruct_changed, added: stats.entries_added, removed: stats.entries_removed});
             let txt = stats.partial ? joinUiSentences([t('script.review.stats.partial', '(partial — not every pass completed)'), changes]) : changes;
+            if (stats.annotations_changed) { txt += t('script.review.stats.annotations', ', {count} annotation correction(s)', {count: stats.annotations_changed}); }
             if (stats.narrators_merged) { txt += t('script.review.stats.narrators-merged', ', {count} narrators merged', {count: stats.narrators_merged}); }
             if (stats.speakers_merged) { txt += t('script.review.stats.speakers-merged', ', {count} speakers merged', {count: stats.speakers_merged}); }
             if (stats.batches_failed) { txt += t('script.review.stats.batches-failed', ', {count} batch(es) failed', {count: stats.batches_failed}); }
@@ -4232,6 +5575,7 @@
         function _formatTotalsLine(label, totals) {
             if (!totals || !totals.books_done) { return t('script.review.totals.none', '{label}: no books finished yet', {label}); }
             let txt = t('script.review.totals.line', '{label}: {books} book(s), {changes} total change(s) ({text} text, {speaker} speaker, {instruct} instruct, +{added}/-{removed} entries)', {label, books: totals.books_done, changes: totals.total_changes, text: totals.text_changed, speaker: totals.speaker_changed, instruct: totals.instruct_changed, added: totals.entries_added, removed: totals.entries_removed});
+            if (totals.annotations_changed) { txt += t('script.review.stats.annotations', ', {count} annotation correction(s)', {count: totals.annotations_changed}); }
             if (totals.batches_failed) { txt = joinUiSentences([txt, t('script.review.totals.batches-failed', '— {count} batch(es) failed', {count: totals.batches_failed})]); }
             if (totals.accounting_warning) { txt += ` — ${totals.accounting_warning}`; }
             return txt;
@@ -4302,6 +5646,10 @@
                         if (el) {
                             el.innerHTML = `<span class="badge bg-${colours[taskStatus.status] || 'secondary'}">${escapeHtml(taskStatusLabel(taskStatus.status))}</span>`;
                             el.title = taskStatus.stats ? _formatBookStats(taskStatus.stats) : '';
+                            if (taskStatus.failure_message && typeof el.insertAdjacentText === 'function') {
+                                el.title = (el.title ? el.title + ' — ' : '') + taskStatus.failure_message;
+                                el.insertAdjacentText('beforeend', ' ' + taskStatus.failure_message);
+                            }
                         }
                     });
                     _updateReviewBatchTotals(state);
@@ -4311,6 +5659,7 @@
                         t('script.review.batch.recovery-hint', 'Inspect the failed books and retry the batch.'));
                     notifyJobDone('batch_review', '', 'finished', state);
                     document.getElementById('btn-review-batch-start').disabled = false;
+                    refreshReviewRestart();
                     document.getElementById('btn-pause-batch-review').style.display = 'none';
                     document.getElementById('btn-cancel-batch-review').style.display = 'none';
                     const outcome = getBatchOutcome(state.tasks || []);
@@ -4365,8 +5714,8 @@
             const select = document.getElementById('voices-scope');
             if (!select) { return; }
             const { pending, have, total } = _voicesScopeState();
-            select.options[0].textContent = `Only characters without a voice yet (${pending.length})`;
-            select.options[1].textContent = `All characters (regenerate ${total})`;
+            select.options[0].textContent = t('voice.scope.pending', 'Only characters without a voice yet ({count})', {count: pending.length});
+            select.options[1].textContent = t('voice.scope.all', 'All characters (regenerate {count})', {count: total});
             if (!select.dataset.userSet) {
                 select.value = (pending.length >= 1 && have.length >= 1) ? 'new' : 'all';
             }
@@ -4405,11 +5754,11 @@
             try {
                 try { await API.post('/api/voice_library/casts', { name: cast }); } catch (e) { if (e.status !== 409) { throw e; } }
                 const res = await API.post('/api/voice_library/save', { cast, characters: have, cast_specific: [] });
-                showToast(`Saved ${have.length} current voices to the library as "${cast}".`, 'success');
+                showToast(t('voice.library.saved', 'Saved {count} current voices to the library as "{cast}".', {count: have.length, cast}), 'success');
                 if (typeof loadCastLibrary === 'function') { try { await loadCastLibrary(); } catch (e) { /* display only */ } }
                 return !!res;
             } catch (e) {
-                showActionError('Not started: saving current voices to the library failed', e, 'Check the cast library for the saved voices before starting again. Keep the save-to-library option enabled to protect the current assignments.');
+                showActionError(t('voice.library.save-failed', 'Not started: saving current voices to the library failed'), e, t('voice.library.save-failed-recovery', 'Check the cast library for the saved voices before starting again. Keep the save-to-library option enabled to protect the current assignments.'));
                 return false;
             }
         }
@@ -4422,13 +5771,13 @@
             const advancedToggle = document.getElementById('advanced-persona-toggle');
             const batchInput = document.getElementById('persona-batch-size');
             try {
-                if (!(await confirmIfRemote('this persona generation', true))) { return; }
+                if (!(await confirmIfRemote(t('core.remote.task.persona-generation', 'this persona generation'), true))) { return; }
                 const advanced = !!(advancedToggle && advancedToggle.checked);
                 const batchSize = Math.max(1, Math.min(parseInt(batchInput?.value || '40', 10) || 40, 200));
                 const contextLines = getPersonaContextLines();
                 const newOnly = voicesScopeIsNew();
                 if (!newOnly && !(await keepCurrentVoicesIfAsked())) { return; }
-                statusSpan.innerHTML = `<i class="fas fa-spinner fa-spin me-1"></i>${advanced ? 'Starting advanced...' : 'Starting...'}`;
+                statusSpan.innerHTML = `<i class="fas fa-spinner fa-spin me-1"></i>${escapeHtml(advanced ? t('voice.persona.starting-advanced', 'Starting advanced...') : t('voice.persona.starting', 'Starting...'))}`;
                 if (cancelButton) {
                     cancelButton.style.display = '';
                 }
@@ -4436,7 +5785,7 @@
                 started = true;
                 pollPersonaStatus();
             } catch (e) {
-                showActionError("Failed to start persona generation", e, "Check the persona task status before starting again. For an LLM refusal, use Setup → Test Connection and review the selected model.");
+                showActionError(t('voice.persona.start-failed', 'Failed to start persona generation'), e, t('voice.persona.start-failed-recovery', 'Check the persona task status before starting again. For an LLM refusal, use Setup → Test Connection and review the selected model.'));
                 statusSpan.innerText = '';
                 if (cancelButton) {
                     cancelButton.style.display = 'none';
@@ -4450,9 +5799,9 @@
             await cancelTask('/api/cancel_persona', {
                 onSuccess: () => {
                     const statusSpan = document.getElementById('persona-status');
-                    if (statusSpan) { statusSpan.innerText = 'Cancelling...'; }
+                    if (statusSpan) { statusSpan.innerText = t('core.cancel.cancelling', 'Cancelling...'); }
                 },
-                errorMessage: (e) => getActionErrorMessage('Persona cancellation is unconfirmed', e, 'Check the persona task status before cancelling again; generation may still be running.'),
+                errorMessage: (e) => getActionErrorMessage(t('voice.persona.cancel-unconfirmed', 'Persona cancellation is unconfirmed'), e, t('voice.persona.cancel-recovery', 'Check the persona task status before cancelling again; generation may still be running.')),
                 toastType: 'error',
             });
         }
@@ -4464,8 +5813,8 @@
             const states = window._voicesByName?.[speaker]?.persona_states || [];
             const token = typeof _voiceCardsBookToken === 'undefined' ? '' : _voiceCardsBookToken;
             const previous = field.dataset.bookToken === token && field.dataset.speaker === speaker ? field.value : '';
-            field.innerHTML = (states.length ? '<option value="" disabled>Choose base or state persona</option>' : '')
-                + '<option value="__base__">Base character persona</option>'
+            field.innerHTML = (states.length ? `<option value="" disabled>${escapeHtml(t('voices.recovery.choose-state', 'Choose base or state persona'))}</option>` : '')
+                + `<option value="__base__" data-i18n="voices.recovery.base" data-i18n-source="Base character persona">${escapeHtml(t('voices.recovery.base', 'Base character persona'))}</option>`
                 + states.map(state => `<option value="${escapeHtml(state.version_id)}">${escapeHtml(`${state.gender} · ${state.age_group.replaceAll('_', ' ')} · state ${state.state_number}`)}</option>`).join('');
             field.value = states.length ? (previous === '__base__' || states.some(state => state.version_id === previous) ? previous : '') : '__base__';
             field.dataset.bookToken = token;
@@ -4487,7 +5836,7 @@
         const personaJson = document.getElementById('persona-recovery-json')?.value.trim();
         const status = document.getElementById('persona-recovery-status');
         if (!speaker || !personaJson) {
-            if (status) { status.textContent = 'Speaker and persona JSON are required.'; }
+            if (status) { status.textContent = t('voices.recovery.required', 'Speaker and persona JSON are required.'); }
             return;
         }
         try {
@@ -4508,12 +5857,12 @@
                 Object.assign(payload, {state_version: state.version_id, book_token: token});
             }
             await API.post('/api/persona/recover', payload);
-            if (status) { status.textContent = resume ? 'Validated and resumed.' : 'Validated and saved.'; }
+            if (status) { status.textContent = resume ? t('voices.recovery.validated-resumed', 'Validated and resumed.') : t('voices.recovery.validated-saved', 'Validated and saved.'); }
             await loadVoices();
-            showToast(`Persona recovered for ${speaker}.`, 'success');
+            showToast(t('voices.recovery.recovered', 'Persona recovered for {speaker}.', {speaker}), 'success');
         } catch (e) {
-            if (status) { status.textContent = getActionErrorMessage('Persona recovery failed', e, 'Keep the pasted JSON. Check the speaker and validation details before correcting and submitting it again.'); }
-            showActionError("Persona recovery failed", e, "Keep the pasted persona JSON. Check the speaker and validation details, then correct the JSON before submitting again.");
+            if (status) { status.textContent = getActionErrorMessage(t('voices.recovery.failed', 'Persona recovery failed'), e, t('voices.recovery.failed-recovery', 'Keep the pasted JSON. Check the speaker and validation details before correcting and submitting it again.')); }
+            showActionError(t('voices.recovery.failed', 'Persona recovery failed'), e, t('voices.recovery.retry-recovery', 'Keep the pasted persona JSON. Check the speaker and validation details, then correct the JSON before submitting again.'));
         }
     };
 
@@ -4530,7 +5879,7 @@
         const scope = state ? `\nUse only this state's supplied evidence: ${state.gender}, ${state.age_group}, segment ${state.state_number}.` : '';
         const prompt = `${system}\n\n${userTemplate.replaceAll('{speaker}', speaker)
             .replaceAll('{sample_lines}', samples).replaceAll('{narrator_context}', narration)}${scope}`;
-        await copyToClipboard(prompt, 'Persona prompt');
+        await copyToClipboard(prompt, t('core.copy.subject-persona-prompt', 'Persona prompt'));
     };
 
         let personaVoiceRefreshRequest = 0;
@@ -4544,7 +5893,7 @@
             const retry = document.getElementById('persona-refresh-retry');
             personaVoiceRefreshPending = true;
             retry.disabled = true;
-            status.textContent = 'Refreshing Voices after the persona task…';
+            status.textContent = t('voices.refresh.refreshing', 'Refreshing Voices after the persona task…');
             let refreshedResources = [];
             const failedResources = new Set();
             try {
@@ -4574,7 +5923,7 @@
                 if (!isCurrent()) { return false; }
                 const complete = failedResources.size === 0;
                 status.textContent = complete ? ''
-                    : 'The persona task has ended, but Voices or its reference lists could not be fully refreshed. Previously loaded lists are kept. Check that Alexandria is running, then retry the Voices refresh; this does not regenerate personas.';
+                    : t('voices.refresh.incomplete', 'The persona task has ended, but Voices or its reference lists could not be fully refreshed. Previously loaded lists are kept. Check that Alexandria is running, then retry the Voices refresh; this does not regenerate personas.');
                 retry.hidden = complete;
                 return complete;
             } finally {
@@ -4582,7 +5931,7 @@
                     personaVoiceRefreshPending = false;
                     retry.disabled = false;
                     if (book !== currentBookFilename) {
-                        status.textContent = 'The book changed during the Voices refresh. Review the current book, then retry the Voices refresh.';
+                        status.textContent = t('voices.refresh.book-changed', 'The book changed during the Voices refresh. Review the current book, then retry the Voices refresh.');
                         retry.hidden = false;
                     }
                 }
@@ -4601,7 +5950,8 @@
                 onTick: status => {
                     const advanced = !!(document.getElementById('advanced-persona-toggle')?.checked);
                     renderManualRequest(status, 'persona');
-                    statusSpan.innerText = status.running ? (advanced ? 'Advanced running...' : 'Running...') : 'Finished';
+                    statusSpan.innerText = status.ownership_unconfirmed ? getTaskOwnershipMessage(status)
+                        : status.running ? (advanced ? t('voices.status.running-advanced', 'Advanced running...') : t('voices.status.running', 'Running...')) : t('voices.status.finished', 'Finished');
                     if (cancelButton) {
                         cancelButton.style.display = status.running ? '' : 'none';
                     }
@@ -4619,16 +5969,16 @@
                         const recoveryContext = document.getElementById('persona-recovery-context');
                         const lastLog = (status.logs || []).filter(Boolean).slice(-1)[0] || 'Unknown persona-generation error';
                         if (recoveryContext) {
-                            recoveryContext.textContent = `Stage: persona generation · Error: ${lastLog} · Next action: paste validated persona JSON below, then resume.`;
+                            recoveryContext.textContent = t('voices.recovery.stage-error', 'Stage: persona generation · Error: {error} · Next action: paste validated persona JSON below, then resume.', {error: lastLog});
                             recoveryContext.style.display = '';
                         }
                         if (recoveryStatus) {
-                            recoveryStatus.textContent = 'Persona generation stopped with an error. Copy the prompt, paste validated JSON, and resume manually.';
+                            recoveryStatus.textContent = t('voices.recovery.stopped', 'Persona generation stopped with an error. Copy the prompt, paste validated JSON, and resume manually.');
                         }
                     }
                     const refreshed = await refreshPersonaVoiceResources(true);
-                    showToast(failed ? 'Persona generation stopped; manual recovery is available.'
-                        : refreshed ? 'Persona task ended. Voices refreshed.' : 'Persona task ended; the Voices refresh needs attention.', failed || !refreshed ? 'warning' : 'success');
+                    showToast(failed ? t('voices.persona.stopped-toast', 'Persona generation stopped; manual recovery is available.')
+                        : refreshed ? t('voices.persona.ended-refreshed', 'Persona task ended. Voices refreshed.') : t('voices.persona.ended-refresh-needed', 'Persona task ended; the Voices refresh needs attention.'), failed || !refreshed ? 'warning' : 'success');
                     statusSpan.innerText = '';
                     if (cancelButton) {
                         cancelButton.style.display = 'none';
@@ -4700,43 +6050,46 @@
             return null;
         }
 
-        function setCandidatePlayButton(button, playing) {
+        // One look for every Voices-tab preview button: Stop and the solid
+        // colour while playing, Play and the outline colour otherwise.
+        window.setVoicePreviewButton = function setVoicePreviewButton(button, playing, label, colour) {
             button.innerHTML = playing ? '<i class="fas fa-stop"></i>' : '<i class="fas fa-play"></i>';
-            button.setAttribute('aria-label', playing
+            button.setAttribute('aria-label', label);
+            button.classList.toggle('btn-' + colour, playing);
+            button.classList.toggle('btn-outline-' + colour, !playing);
+        };
+
+        function setCandidatePlayButton(button, playing) {
+            window.setVoicePreviewButton(button, playing, playing
                 ? t('voice.candidate.stop-aria', 'Stop candidate {candidate}', {candidate: button.dataset.label})
-                : t('voice.candidate.play-aria', 'Play candidate {candidate}', {candidate: button.dataset.label}));
-            button.classList.toggle('btn-primary', playing);
-            button.classList.toggle('btn-outline-primary', !playing);
+                : t('voice.candidate.play-aria', 'Play candidate {candidate}', {candidate: button.dataset.label}), 'primary');
         }
 
-        // One candidate plays at a time: Play on another stops the current one,
-        // and Stop (or the end of the audio) turns the button back to Play.
-        window.toggleCandidatePlayback = async function toggleCandidatePlayback(button, candidateId) {
-            const current = window._candidatePlayback;
+        // One voice preview plays at a time on the Voices tab: a saved
+        // candidate or a voice card's reference recording (#1933). Pressing the
+        // playing button stops it, pressing another stops it and starts that
+        // one, and the end of the audio turns the button back to Play.
+        // getUrl runs after any stop; render(button, playing) draws the button.
+        window.toggleVoicePreviewPlayback = async function toggleVoicePreviewPlayback(button, getUrl, render, failureMessage) {
+            const current = window._voicePreviewPlayback;
             if (current) {
-                current.audio.pause();
-                setCandidatePlayButton(current.button, false);
-                window._candidatePlayback = null;
+                stopVoicePreviewPlayback(current);
                 if (current.button === button) {
                     return;
                 }
             }
-            const card = button.closest('.voice-card');
-            const candidate = (getVoiceCardMetadata(card).candidates || [])
-                .find(item => item && item.candidate_id === candidateId);
-            const url = candidate ? getCandidateAudioUrl(candidate) : null;
+            const url = getUrl();
             if (!url) {
-                showToast(t('voice.candidate.no-audio', 'This candidate has no audio to play.'), 'warning');
                 return;
             }
             const audio = new Audio(url);
-            const playback = {audio, button};
-            window._candidatePlayback = playback;
-            setCandidatePlayButton(button, true);
+            const playback = {audio, button, render, stopped: false};
+            window._voicePreviewPlayback = playback;
+            render(button, true);
             const finish = () => {
-                if (window._candidatePlayback === playback) {
-                    window._candidatePlayback = null;
-                    setCandidatePlayButton(button, false);
+                if (window._voicePreviewPlayback === playback) {
+                    window._voicePreviewPlayback = null;
+                    render(button, false);
                 }
             };
             audio.addEventListener('ended', finish);
@@ -4744,8 +6097,42 @@
                 await audio.play();
             } catch (error) {
                 finish();
-                showToast(t('voice.candidate.play-failed', 'Could not play this candidate. Check that Alexandria is running, then try Play again.'), 'warning');
+                // Stop pressed before the audio started aborts play(); that is
+                // the user's choice, not a failure to report.
+                if (!playback.stopped) {
+                    showToast(failureMessage, 'warning');
+                }
             }
+        };
+
+        function stopVoicePreviewPlayback(playback) {
+            playback.stopped = true;
+            playback.audio.pause();
+            playback.render(playback.button, false);
+            window._voicePreviewPlayback = null;
+        }
+
+        // A redrawn voice list or a cleared reference removes or hides the
+        // playing button; stop its audio rather than leave it with no Stop.
+        window.stopOrphanedVoicePreview = function stopOrphanedVoicePreview() {
+            const current = window._voicePreviewPlayback;
+            if (current && (!current.button.isConnected || current.button.style.display === 'none')) {
+                stopVoicePreviewPlayback(current);
+            }
+        };
+
+        window.toggleCandidatePlayback = function toggleCandidatePlayback(button, candidateId) {
+            return window.toggleVoicePreviewPlayback(button, () => {
+                const card = button.closest('.voice-card');
+                const candidate = (getVoiceCardMetadata(card).candidates || [])
+                    .find(item => item && item.candidate_id === candidateId);
+                const url = candidate ? getCandidateAudioUrl(candidate) : null;
+                if (!url) {
+                    showToast(t('voice.candidate.no-audio', 'This candidate has no audio to play.'), 'warning');
+                }
+                return url;
+            }, setCandidatePlayButton,
+            t('voice.candidate.play-failed', 'Could not play this candidate. Check that Alexandria is running, then try Play again.'));
         };
 
         // Gender/age per line (#653): one tag per character - the most common
@@ -4810,17 +6197,17 @@
                 (/\sdata-stale-allowed(\s|=|$)/.test(attributes) ? tag : `<${kind}${attributes} disabled>`));
         }
 
-        function getStateVoiceCardsMarkup(voices) {
+        function getStateVoiceCardsMarkup(voices, bookId = window._voiceRosterBookToken || '') {
             let index = 0;
             return voices.map(voice => {
-                const base = createVoiceCard(voice, index++);
+                const base = createVoiceCard(voice, index++, bookId);
                 if (!voice.persona_states?.length) { return base; }
                 const states = voice.persona_states.map(state => {
                     const config = voice.config?.versions?.[state.version_id] || {};
                     const label = t('voice.state.card-label', '{name} ({gender} · {age}) — state {number}', {name: voice.name, gender: state.gender, age: state.age_group.replaceAll('_', ' '), number: state.state_number});
                     const stale = state.current !== true;   // the server's rule (#1040 review C37)
                     const markup = createVoiceCard({...voice, version_id: state.version_id, display_name: label,
-                        config, state_stale: stale, state_line_count: state.line_count, traits: null, persona_states: voice.persona_states}, index++);
+                        config, state_stale: stale, state_line_count: state.line_count, traits: null, persona_states: voice.persona_states}, index++, bookId);
                     // Generate the persona first; pending/stale forms cannot publish invented versions.
                     return stale ? disableStaleCardControls(markup) : markup;
                 }).join('');
@@ -4829,7 +6216,198 @@
         }
 
 
-        function createVoiceCard(voice, index) {
+        function setVoiceReviewVisibility(shown, persist = true) {
+            document.getElementById('voices-tab')?.classList.toggle('voice-reviews-hidden', !shown);
+            const toggle = document.getElementById('voices-show-reviews');
+            if (toggle) { toggle.checked = shown; }
+            if (persist) {
+                try { localStorage.setItem('alex-voice-reviews-shown', String(shown)); } catch (error) {}
+            }
+        }
+
+        function restoreVoiceReviewVisibility() {
+            let shown = true;
+            try { shown = localStorage.getItem('alex-voice-reviews-shown') !== 'false'; } catch (error) {}
+            setVoiceReviewVisibility(shown, false);
+        }
+
+        function getVoiceReviewButtonsMarkup(config) {
+            const actions = [
+                ['approved', uiMessageMarkup('voice.card.approve-persona', 'Approve persona'), uiMessageMarkup('voice.card.approve-voice', 'Approve voice'), uiMessageMarkup('voice.card.persona-approved', 'Persona approved'), uiMessageMarkup('voice.card.voice-approved', 'Voice approved')],
+                ['reviewed', uiMessageMarkup('voice.card.review-persona', 'Review persona'), uiMessageMarkup('voice.card.review-voice', 'Review voice'), uiMessageMarkup('voice.card.persona-reviewed', 'Persona reviewed'), uiMessageMarkup('voice.card.voice-reviewed', 'Voice reviewed')],
+                ['rejected', uiMessageMarkup('voice.card.reject-persona', 'Reject persona'), uiMessageMarkup('voice.card.reject-voice', 'Reject voice'), uiMessageMarkup('voice.card.persona-rejected', 'Persona rejected'), uiMessageMarkup('voice.card.voice-rejected', 'Voice rejected')],
+            ];
+            return actions.map(([status, personaLabel, voiceLabel, personaState, voiceState]) =>
+                ['persona', 'voice'].map((side, index) => {
+                    const pressed = config[`${side}_status`] === status;
+                    const label = pressed ? [personaState, voiceState][index] : [personaLabel, voiceLabel][index];
+                    return `<button class="btn btn-sm voice-review-button" type="button" data-review-status="${status}" data-review-side="${side}" aria-pressed="${pressed}" onclick="setVoiceApproval(this, '${side}_status', '${status}')">${label}</button>`;
+                }).join('')
+            ).join('');
+        }
+
+        function getVoiceReviewStatusLabel(status) {
+            if (status === 'unreviewed') { return t('voice.card.review-unreviewed', 'unreviewed'); }
+            if (status === 'unassigned') { return t('voice.card.review-unassigned', 'unassigned'); }
+            if (status === 'assigned') { return t('voice.review.assigned', 'assigned'); }
+            if (status === 'generated') { return t('voice.review.generated', 'generated'); }
+            if (status === 'reviewed') { return t('voice.review.reviewed', 'reviewed'); }
+            if (status === 'approved') { return t('voice.review.approved', 'approved'); }
+            if (status === 'rejected') { return t('voice.review.rejected', 'rejected'); }
+            return t('voice.review.unknown', 'Unknown status');
+        }
+
+        function getVoiceReviewText(persona, voice) {
+            return t('voice.card.review-line', 'Persona review: {persona} \u00b7 Voice review: {voice}', {
+                persona: getVoiceReviewStatusLabel(persona), voice: getVoiceReviewStatusLabel(voice)});
+        }
+
+        function getVoiceReviewSupportText(persona, voice) {
+            return t('voice.review.saved-values', 'Saved status values: persona={persona}; voice={voice}', {persona, voice});
+        }
+
+        function getVoiceLineCountText(count, state) {
+            const one = pluralForm(count) === 'one';
+            if (state) {
+                return {
+                    text: one ? t('voice.card.state-lines-one', '{count} line in this state', {count}) : t('voice.card.state-lines', '{count} lines in this state', {count}),
+                    title: one ? t('voice.card.state-lines-title-one', '{count} line spoken in this state', {count}) : t('voice.card.state-lines-title', '{count} lines spoken in this state', {count}),
+                };
+            }
+            return {
+                text: one ? t('voice.card.lines-one', '{count} line', {count}) : t('voice.card.lines', '{count} lines', {count}),
+                title: one ? t('voice.card.lines-title-one', '{count} line in this book', {count}) : t('voice.card.lines-title', '{count} lines in this book', {count}),
+            };
+        }
+
+        function getVoiceLineCountMarkup(count, state = false) {
+            const message = getVoiceLineCountText(count, state);
+            return `<span class="badge bg-secondary ms-2 voice-line-count" data-line-count="${count}" data-state-count="${state}" title="${escapeHtml(message.title)}">${escapeHtml(message.text)}</span>`;
+        }
+
+        function renderVoiceLocaleChrome() {
+            for (const node of document.querySelectorAll('.chunk-status-label')) {
+                node.textContent = chunkStatusLabel(node.getAttribute('data-status'));
+            }
+            for (const node of document.querySelectorAll('.voice-state-needs-generation')) {
+                node.textContent = t('voice.card.state-needs-generation', 'State persona needs generation for the current script.');
+            }
+            for (const node of document.querySelectorAll('.voice-review-actions')) {
+                const persona = node.getAttribute('data-persona-status');
+                const voice = node.getAttribute('data-voice-status');
+                node.setAttribute('aria-label', t('voice.card.approval-group', 'Approval status'));
+                node.setAttribute('aria-description', getVoiceReviewText(persona, voice));
+                node.title = getVoiceReviewSupportText(persona, voice);
+            }
+            for (const node of document.querySelectorAll('.voice-line-count')) {
+                const message = getVoiceLineCountText(Number(node.getAttribute('data-line-count')), node.getAttribute('data-state-count') === 'true');
+                node.textContent = message.text;
+                node.title = message.title;
+            }
+            for (const node of document.querySelectorAll('.voice-seed-proposal')) {
+                node.textContent = t('voice.seed.proposal', '{name}: proposed seed {seed}', {name: node.getAttribute('data-name'), seed: node.getAttribute('data-seed')});
+            }
+        }
+
+        function getVoiceSectionStorageKey(bookId) {
+            return 'alex-voice-sections:' + encodeURIComponent(bookId);
+        }
+
+        const VOICE_SECTION_LIMITS = {books: 20, sections: 1000};
+
+        function getVoiceSectionId(speaker, version) {
+            return JSON.stringify([speaker, version || '', 'persona-review']);
+        }
+
+        function ensureVoiceSectionState(bookId) {
+            if (!bookId) { return {sections: {}, updatedAt: 0}; }
+            if (!window._voiceSectionStates) { window._voiceSectionStates = new Map(); }
+            let state = window._voiceSectionStates.get(bookId);
+            if (!state) {
+                state = {sections: {}, updatedAt: 0};
+                try { const stored = JSON.parse(window.localStorage.getItem(getVoiceSectionStorageKey(bookId)));
+                    if (stored?.sections && typeof stored.sections === 'object' && !Array.isArray(stored.sections)) {
+                        state.sections = Object.fromEntries(Object.entries(stored.sections)
+                            .filter(([, open]) => typeof open === 'boolean').slice(-VOICE_SECTION_LIMITS.sections));
+                    }
+                } catch (error) { console.warn?.('Could not read voice section state.', error); }
+            }
+            window._voiceSectionStates.delete(bookId);
+            window._voiceSectionStates.set(bookId, state);
+            while (window._voiceSectionStates.size > VOICE_SECTION_LIMITS.books) {
+                window._voiceSectionStates.delete(window._voiceSectionStates.keys().next().value);
+            }
+            return state;
+        }
+
+        function isVoiceSectionOpen(bookId, speaker, version) {
+            return window._voiceSectionStates?.get(bookId)?.sections[getVoiceSectionId(speaker, version)] ?? true;
+        }
+
+        function saveVoiceSectionStates(bookId, sections) {
+            if (!bookId) { return; }
+            const state = ensureVoiceSectionState(bookId);
+            state.sections = Object.fromEntries(Object.entries(sections)
+                .filter(([, open]) => typeof open === 'boolean').slice(-VOICE_SECTION_LIMITS.sections));
+            state.updatedAt = Date.now();
+            let keys = [];
+            let migrated = false;
+            try { keys = Array.from({length: window.localStorage.length}, (_, index) => window.localStorage.key(index)); migrated = window.localStorage.getItem('alex-voice-sections-migrated') === 'true';
+            } catch (error) { console.warn?.('Could not persist voice section state.', error); return; }
+            if (!migrated) {
+                for (const key of keys) {
+                    if (!key?.startsWith('alex-voice-section-collapsed-')) { continue; }
+                    try { window.localStorage.removeItem(key); } catch (error) { console.warn?.('Could not persist voice section state.', error); return; }
+                }
+                try { window.localStorage.setItem('alex-voice-sections-migrated', 'true'); } catch (error) { console.warn?.('Could not persist voice section state.', error); return; }
+            }
+            const currentKey = getVoiceSectionStorageKey(bookId);
+            const books = [];
+            for (const key of keys) {
+                if (!key?.startsWith('alex-voice-sections:') || key === currentKey) { continue; }
+                let updatedAt = 0;
+                try { updatedAt = Number(JSON.parse(window.localStorage.getItem(key))?.updatedAt) || 0; } catch (error) { }
+                books.push({key, updatedAt});
+            }
+            books.sort((left, right) => right.updatedAt - left.updatedAt);
+            for (const book of books.slice(VOICE_SECTION_LIMITS.books - 1)) {
+                try { window.localStorage.removeItem(book.key); } catch (error) { console.warn?.('Could not persist voice section state.', error); return; }
+            }
+            try { window.localStorage.setItem(currentKey, JSON.stringify(state)); } catch (error) { console.warn?.('Could not persist voice section state.', error); }
+        }
+
+        function pruneVoiceSectionStates(bookId, voices) {
+            const live = new Set();
+            for (const voice of voices) {
+                live.add(getVoiceSectionId(voice.name, voice.version_id));
+                for (const state of voice.persona_states || []) { live.add(getVoiceSectionId(voice.name, state.version_id)); }
+            }
+            const state = ensureVoiceSectionState(bookId);
+            saveVoiceSectionStates(bookId, Object.fromEntries(Object.entries(state.sections).filter(([key]) => live.has(key))));
+        }
+
+        function saveVoiceSectionState(details) {
+            if (!details.isConnected) { return; }
+            const card = details.closest('.voice-card');
+            details.querySelector('summary').setAttribute('aria-expanded', String(details.open));
+            const bookId = card?.dataset.voiceSectionBook;
+            if (!bookId) { return; }
+            const state = ensureVoiceSectionState(bookId);
+            const key = getVoiceSectionId(card.dataset.voice, card.dataset.version);
+            if ((state.sections[key] ?? true) === details.open) { return; }
+            delete state.sections[key];
+            state.sections[key] = details.open;
+            saveVoiceSectionStates(bookId, state.sections);
+        }
+
+        function setVoiceSectionsOpen(open) {
+            for (const details of document.querySelectorAll('#voices-list .voice-card-advanced')) {
+                details.open = open;
+                saveVoiceSectionState(details);
+            }
+        }
+
+        function createVoiceCard(voice, index, bookId = window._voiceRosterBookToken || '') {
             const roster = ensureVoiceRosterCache();
             const config = voice.config || {};
             const label = voice.display_name || voice.name;
@@ -4839,78 +6417,77 @@
                 ? [config.voice, ...AVAILABLE_VOICES] : AVAILABLE_VOICES;
 
             const ready = !!config.ready;
+            ensureVoiceSectionState(bookId);
+            const sectionOpen = isVoiceSectionOpen(bookId, voice.name, voice.version_id);
             return `
-                <div class="card voice-card mb-3${ready ? ' border-success' : ''}" data-voice="${escapeHtml(voice.name)}" data-version="${escapeHtml(voice.version_id || '')}" data-has-states="${voice.persona_states?.length ? '1' : '0'}" data-ready="${ready ? '1' : '0'}">
+                <div class="card voice-card mb-3${ready ? ' border-success' : ''}" data-voice="${escapeHtml(voice.name)}" data-version="${escapeHtml(voice.version_id || '')}" data-voice-section-book="${escapeHtml(bookId)}" data-has-states="${voice.persona_states?.length ? '1' : '0'}" data-ready="${ready ? '1' : '0'}">
                     <div class="card-body">
                         <div class="row">
                             <div class="col-md-3">
-                                <h5 class="card-title">${escapeHtml(label)} ${getEffectiveVoiceAlias(config) ? `<span class="badge bg-info ms-2" title="${escapeHtml(t('voice.card.alias-of', 'Alias of {alias}', {alias: getEffectiveVoiceAlias(config)}))}">${escapeHtml(getEffectiveVoiceAlias(config))}</span>` : ''}${(!voice.version_id && window._lineCounts && window._lineCounts[voice.name] != null) ? `<span class="badge bg-secondary ms-2" title="${escapeHtml(t('voice.card.lines-title', '{count} lines in this book', {count: window._lineCounts[voice.name]}))}">${escapeHtml(t('voice.card.lines', '{count} lines', {count: window._lineCounts[voice.name]}))}</span>` : ''}${(voice.version_id && Number.isInteger(voice.state_line_count)) ? `<span class="badge bg-secondary ms-2" title="${escapeHtml(t('voice.card.state-lines-title', '{count} lines spoken in this state', {count: voice.state_line_count}))}">${escapeHtml(t('voice.card.state-lines', '{count} lines in this state', {count: voice.state_line_count}))}</span>` : ''}${getTraitBadgeHtml(voice.traits)}</h5>
-                                <button class="btn btn-sm btn-outline-primary mt-1" type="button" data-stale-allowed aria-label="${escapeHtml(t('voice.card.regenerate-aria', 'Regenerate persona for {name}', {name: label}))}" onclick="regeneratePersona(this)"><i class="fas fa-rotate me-1"></i>${t('voice.card.regenerate', 'Regenerate persona')}</button>
-                                <button class="btn btn-sm btn-outline-primary mt-1" type="button" aria-label="${escapeHtml(t('voice.card.age-version-aria', 'Generate age version for {name}', {name: label}))}" onclick="generateAgeVersion(this)" ${voice.version_id ? 'hidden' : ''}><i class="fas fa-person-circle-plus me-1"></i>${t('voice.card.age-version', 'Generate age version')}</button>
-                                <div class="input-group input-group-sm mt-1">
-                                    <select class="form-select design-line-select" aria-label="${escapeHtml(t('voice.card.design-line-aria', 'Line to design the voice of {name} from', {name: label}))}" onfocus="loadDesignLines(this)"><option value="">${t('voice.card.design-line-empty', 'Design from one of their lines…')}</option></select>
-                                    <input type="number" class="form-control design-count" min="1" max="100" value="1" style="max-width: 4.5rem;" title="${escapeHtml(t('voice.card.design-count-title', 'How many voices to design from the line; each is saved under Saved candidates'))}" aria-label="${escapeHtml(t('voice.card.design-count-aria', 'How many voices to design for {name}', {name: label}))}">
-                                    <button class="btn btn-outline-primary" type="button" aria-label="${escapeHtml(t('voice.card.design-aria', 'Design the voice of {name} from the chosen line', {name: label}))}" onclick="designFromChosenLine(this)">${t('voice.card.design', 'Design')}</button>
-                                </div>
-                                ${voice.version_id ? `<button class="btn btn-sm btn-outline-secondary mt-1" type="button" data-stale-allowed aria-label="${escapeHtml(t('voice.card.recover-aria', 'Recover persona for {name}', {name: label}))}" onclick="openStatePersonaRecovery(this)">${t('voice.card.recover', 'Recover persona')}</button>` : ''}
-                                ${voice.version_id ? `<button class="btn btn-sm btn-outline-danger mt-1" type="button"${config.persona_state ? ' data-stale-allowed' : ''} aria-label="${escapeHtml(t('voice.card.remove-state-aria', 'Remove saved state persona for {name}', {name: label}))}" onclick="removeStatePersona(this)">${t('voice.card.remove-state', 'Remove saved state persona')}</button>` : ''}
-                                <div class="small text-muted">${escapeHtml(joinUiSentences([voice.version_id && voice.state_stale ? t('voice.card.state-needs-generation', 'State persona needs generation for the current script.') : '', t('voice.card.review-line', 'Persona review: {persona} · Voice review: {voice}', {persona: config.persona_status || t('voice.card.review-unreviewed', 'unreviewed'), voice: config.voice_status || t('voice.card.review-unassigned', 'unassigned')})]))}</div>
-                                ${config.persona_voice_audit ? `<div class="small text-muted" title="${escapeHtml(config.persona_voice_audit.suggestion_reason || '')}">${escapeHtml(t('voice.card.audit', 'Persona-to-voice audit: {adapter} · {persona}', {adapter: config.persona_voice_audit.voice_adapter_id || t('voice.card.audit-manual', 'manual'), persona: config.persona_voice_audit.persona_ref || t('voice.card.audit-inline', 'inline persona')}))} <button class="btn btn-sm btn-link p-0" type="button" aria-label="${escapeHtml(t('voice.card.audit-edit-aria', 'Edit persona-to-voice audit for {name}', {name: label}))}" onclick="editPersonaVoiceAudit(this)">${t('voice.card.audit-edit', 'Edit')}</button></div>` : ''}
-                                <div class="d-flex flex-wrap gap-1 mt-1" role="group" aria-label="${escapeHtml(t('voice.card.approval-group', 'Approval status'))}" aria-describedby="voice-approval-help">
-                                    <button style="flex:1 1 45%;min-width:0;" class="btn btn-sm btn-outline-success" type="button" onclick="setVoiceApproval(this, 'persona_status', 'approved')">${t('voice.card.approve-persona', 'Approve persona')}</button>
-                                    <button style="flex:1 1 45%;min-width:0;" class="btn btn-sm btn-outline-secondary" type="button" onclick="setVoiceApproval(this, 'persona_status', 'reviewed')">${t('voice.card.mark-persona', 'Mark persona reviewed')}</button>
-                                    <button style="flex:1 1 45%;min-width:0;" class="btn btn-sm btn-outline-danger" type="button" onclick="setVoiceApproval(this, 'persona_status', 'rejected')">${t('voice.card.reject-persona', 'Reject persona')}</button>
-                                    <button style="flex:1 1 45%;min-width:0;" class="btn btn-sm btn-outline-success" type="button" onclick="setVoiceApproval(this, 'voice_status', 'approved')">${t('voice.card.approve-voice', 'Approve voice')}</button>
-                                    <button style="flex:1 1 45%;min-width:0;" class="btn btn-sm btn-outline-secondary" type="button" onclick="setVoiceApproval(this, 'voice_status', 'reviewed')">${t('voice.card.mark-voice', 'Mark voice reviewed')}</button>
-                                    <button style="flex:1 1 45%;min-width:0;" class="btn btn-sm btn-outline-danger" type="button" onclick="setVoiceApproval(this, 'voice_status', 'rejected')">${t('voice.card.reject-voice', 'Reject voice')}</button>
-                                </div>
-                                <div class="input-group input-group-sm mt-2" ${voice.version_id ? 'hidden' : ''}>
-                                    <select class="form-select voice-version-select" aria-label="${escapeHtml(t('voice.card.version-aria', 'Voice version for {name}', {name: label}))}" onchange="selectVoiceVersion(this)">
-                                        <option value="" disabled>${t('voice.card.version-empty', 'Choose a saved version')}</option>
-                                        ${Object.entries(config.versions || {}).map(([id, version]) => `<option value="${escapeHtml(id)}" ${config.active_version === id ? 'selected' : ''}>${escapeHtml(id)}${version.age_group ? ` · ${escapeHtml(version.age_group)}` : ''}</option>`).join('')}
-                                    </select>
-                                    <button class="btn btn-outline-secondary" type="button" aria-label="${escapeHtml(t('voice.card.add-version-aria', 'Add voice version for {name}', {name: label}))}" onclick="addVoiceVersion(this)">${t('voice.card.add-version', 'Version')}</button>
-                                </div>
-                                <div class="form-text" ${voice.version_id ? 'hidden' : ''}>${t('voice.card.version-help', 'Selecting a saved version replaces the current voice settings. Save the current settings as a version first if you want to return to them later.')}</div>
-                                ${((voice.traits && voice.traits.states) || []).length > 1 ? `<div class="voice-states mt-1"><button class="btn btn-sm btn-outline-primary" type="button" aria-label="${escapeHtml(t('voice.card.voice-changes-aria', 'Load voice changes for {name}', {name: label}))}" onclick="openVoiceStates(this)"><i class="fas fa-user-clock me-1"></i>${escapeHtml(voice.traits.states.length === 2 ? t('voice.card.voice-changes.one', 'Voice changes ({count} change)', {count: 1}) : t('voice.card.voice-changes.many', 'Voice changes ({count} changes)', {count: voice.traits.states.length - 1}))}</button><div class="form-text">${t('voice.card.voice-changes-help', 'Review which voice is used before and after each change.')}</div><div class="voice-state-rows"></div></div>` : ''}
-                                <button class="btn btn-sm btn-outline-secondary mt-1" type="button" aria-label="${escapeHtml(t('voice.card.more-candidates-aria', 'Generate more voice candidates for {name}', {name: label}))}" onclick="suggestMoreVoices(this)"><i class="fas fa-wand-magic-sparkles me-1"></i>${t('voice.card.more-candidates', 'Generate more candidates')}</button>
-                                <div class="saved-voice-candidates">${getVoiceCandidateMarkup(config.candidates, config.active_candidate)}</div>
+                                <h5 class="card-title">${escapeHtml(label)} ${getEffectiveVoiceAlias(config) ? `<span class="badge bg-info ms-2" title="${escapeHtml(t('voice.card.alias-of', 'Alias of {alias}', {alias: getEffectiveVoiceAlias(config)}))}">${escapeHtml(getEffectiveVoiceAlias(config))}</span>` : ''}${(!voice.version_id && window._lineCounts && window._lineCounts[voice.name] != null) ? getVoiceLineCountMarkup(window._lineCounts[voice.name]) : ''}${(voice.version_id && Number.isInteger(voice.state_line_count)) ? getVoiceLineCountMarkup(voice.state_line_count, true) : ''}${getTraitBadgeHtml(voice.traits)}</h5>
                                 <div class="form-check form-switch small">
                                     <input class="form-check-input voice-ready" aria-label="${escapeHtml(t('voice.card.ready-aria', 'Ready for audio generation for {name}', {name: label}))}" type="checkbox" id="voice-ready-${index}" ${ready ? 'checked' : ''} onchange="onVoiceReadyChange(this)">
-                                    <label class="form-check-label" for="voice-ready-${index}">${t('voice.card.ready', 'Ready')}</label>
+                                    <label class="form-check-label" for="voice-ready-${index}">${uiMessageMarkup('voice.card.ready', 'Ready')}</label>
                                 </div>
-                                ${voice.version_id ? `<label class="form-label small mt-1">${t('voice.card.state-seed', 'State seed')}<input class="form-control form-control-sm voice-seed" type="number" min="-1" max="4294967295" aria-label="${escapeHtml(t('voice.card.seed-aria', 'Seed for {name}', {name: label}))}" value="${escapeHtml(String(config.seed ?? '-1'))}"></label>` : ''}
-                                <div class="form-text small text-muted mt-1">${t('voice.card.alias-label', 'Alias of:')}</div>
+                                <p class="small voice-next-step">${config.ready ? uiMessageMarkup('voices.essential.ready', 'Ready is explicitly selected. Review persona and voice approvals separately.') : uiMessageMarkup('voices.essential.next', 'Next: pick a voice, listen, then mark Ready.')}</p>
+                                <details class="voice-card-advanced workflow-disclosure" ${sectionOpen ? 'open' : ''} ontoggle="saveVoiceSectionState(this)">
+                                    <summary data-voice-focus-key="persona-review" aria-expanded="${sectionOpen}">${uiMessageMarkup('voices.card.advanced', 'Persona review, versions, design and aliases')}</summary>
+                                <button class="btn btn-sm btn-outline-primary mt-1" type="button" data-stale-allowed aria-label="${escapeHtml(t('voice.card.regenerate-aria', 'Regenerate persona for {name}', {name: label}))}" onclick="regeneratePersona(this)"><i class="fas fa-rotate me-1"></i>${uiMessageMarkup('voice.card.regenerate', 'Regenerate persona')}</button>
+                                <button class="btn btn-sm btn-outline-primary mt-1" type="button" aria-label="${escapeHtml(t('voice.card.age-version-aria', 'Generate age version for {name}', {name: label}))}" onclick="generateAgeVersion(this)" ${voice.version_id ? 'hidden' : ''}><i class="fas fa-person-circle-plus me-1"></i>${uiMessageMarkup('voice.card.age-version', 'Generate age version')}</button>
+                                <div class="input-group input-group-sm mt-1">
+                                    <select class="form-select design-line-select" aria-label="${escapeHtml(t('voice.card.design-line-aria', 'Line to design the voice of {name} from', {name: label}))}" onfocus="loadDesignLines(this)"><option value="" data-i18n="voice.card.design-line-empty" data-i18n-source="Design from one of their lines…">${t('voice.card.design-line-empty', 'Design from one of their lines…')}</option></select>
+                                    <input type="number" class="form-control design-count" min="1" max="100" value="1" style="max-width: 4.5rem;" title="${escapeHtml(t('voice.card.design-count-title', 'How many voices to design from the line; each is saved under Saved candidates'))}" aria-label="${escapeHtml(t('voice.card.design-count-aria', 'How many voices to design for {name}', {name: label}))}">
+                                    <button class="btn btn-outline-primary" type="button" aria-label="${escapeHtml(t('voice.card.design-aria', 'Design the voice of {name} from the chosen line', {name: label}))}" onclick="designFromChosenLine(this)">${uiMessageMarkup('voice.card.design', 'Design')}</button>
+                                </div>
+                                ${voice.version_id ? `<button class="btn btn-sm btn-outline-secondary mt-1" type="button" data-stale-allowed aria-label="${escapeHtml(t('voice.card.recover-aria', 'Recover persona for {name}', {name: label}))}" onclick="openStatePersonaRecovery(this)">${uiMessageMarkup('voice.card.recover', 'Recover persona')}</button>` : ''}
+                                ${voice.version_id ? `<button class="btn btn-sm btn-outline-danger mt-1" type="button"${config.persona_state ? ' data-stale-allowed' : ''} aria-label="${escapeHtml(t('voice.card.remove-state-aria', 'Remove saved state persona for {name}', {name: label}))}" onclick="removeStatePersona(this)">${uiMessageMarkup('voice.card.remove-state', 'Remove saved state persona')}</button>` : ''}
+                                ${voice.version_id && voice.state_stale ? `<div class="small text-muted voice-state-needs-generation">${uiMessageMarkup('voice.card.state-needs-generation', 'State persona needs generation for the current script.')}</div>` : ''}
+                                ${config.persona_voice_audit ? `<div class="small text-muted" title="${escapeHtml(config.persona_voice_audit.suggestion_reason || '')}">${uiMessageMarkup('voice.card.audit', 'Persona-to-voice audit: {adapter} · {persona}', {adapter: config.persona_voice_audit.voice_adapter_id || t('voice.card.audit-manual', 'manual'), persona: config.persona_voice_audit.persona_ref || t('voice.card.audit-inline', 'inline persona')})} <button class="btn btn-sm btn-link p-0" type="button" aria-label="${escapeHtml(t('voice.card.audit-edit-aria', 'Edit persona-to-voice audit for {name}', {name: label}))}" onclick="editPersonaVoiceAudit(this)">${uiMessageMarkup('voice.card.audit-edit', 'Edit')}</button></div>` : ''}
+                                <div class="voice-review-actions mt-1 mb-2" data-persona-status="${escapeHtml(config.persona_status || 'unreviewed')}" data-voice-status="${escapeHtml(config.voice_status || 'unassigned')}" role="group" aria-label="${escapeHtml(t('voice.card.approval-group', 'Approval status'))}" aria-describedby="voice-approval-help" aria-description="${escapeHtml(getVoiceReviewText(config.persona_status || 'unreviewed', config.voice_status || 'unassigned'))}" title="${escapeHtml(getVoiceReviewSupportText(config.persona_status || 'unreviewed', config.voice_status || 'unassigned'))}">${getVoiceReviewButtonsMarkup(config)}</div>
+                                <div class="input-group input-group-sm mt-2" ${voice.version_id ? 'hidden' : ''}>
+                                    <select class="form-select voice-version-select" aria-label="${escapeHtml(t('voice.card.version-aria', 'Voice version for {name}', {name: label}))}" onchange="selectVoiceVersion(this)">
+                                        <option value="" disabled data-i18n="voice.card.version-empty" data-i18n-source="Choose a saved version">${t('voice.card.version-empty', 'Choose a saved version')}</option>
+                                        ${Object.entries(config.versions || {}).map(([id, version]) => `<option value="${escapeHtml(id)}" ${config.active_version === id ? 'selected' : ''}>${escapeHtml(id)}${version.age_group ? ` · ${escapeHtml(version.age_group)}` : ''}</option>`).join('')}
+                                    </select>
+                                    <button class="btn btn-outline-secondary" type="button" aria-label="${escapeHtml(t('voice.card.add-version-aria', 'Add voice version for {name}', {name: label}))}" onclick="addVoiceVersion(this)">${uiMessageMarkup('voice.card.add-version', 'Version')}</button>
+                                </div>
+                                <div class="form-text" ${voice.version_id ? 'hidden' : ''}>${uiMessageMarkup('voice.card.version-help', 'Selecting a saved version replaces the current voice settings. Save the current settings as a version first if you want to return to them later.')}</div>
+                                ${((voice.traits && voice.traits.states) || []).length > 1 ? `<div class="voice-states mt-1"><button class="btn btn-sm btn-outline-primary" type="button" aria-label="${escapeHtml(t('voice.card.voice-changes-aria', 'Load voice changes for {name}', {name: label}))}" onclick="openVoiceStates(this)"><i class="fas fa-user-clock me-1"></i>${escapeHtml(voice.traits.states.length === 2 ? t('voice.card.voice-changes.one', 'Voice changes ({count} change)', {count: 1}) : t('voice.card.voice-changes.many', 'Voice changes ({count} changes)', {count: voice.traits.states.length - 1}))}</button><div class="form-text">${uiMessageMarkup('voice.card.voice-changes-help', 'Review which voice is used before and after each change.')}</div><div class="voice-state-rows"></div></div>` : ''}
+                                <button class="btn btn-sm btn-outline-secondary mt-1" type="button" aria-label="${escapeHtml(t('voice.card.more-candidates-aria', 'Generate more voice candidates for {name}', {name: label}))}" onclick="suggestMoreVoices(this)"><i class="fas fa-wand-magic-sparkles me-1"></i>${uiMessageMarkup('voice.card.more-candidates', 'Generate more candidates')}</button>
+                                <div class="saved-voice-candidates">${getVoiceCandidateMarkup(config.candidates, config.active_candidate)}</div>
+                                ${voice.version_id ? `<label class="form-label small mt-1">${uiMessageMarkup('voice.card.state-seed', 'State seed')}<input class="form-control form-control-sm voice-seed" type="number" min="-1" max="4294967295" aria-label="${escapeHtml(t('voice.card.seed-aria', 'Seed for {name}', {name: label}))}" value="${escapeHtml(String(config.seed ?? '-1'))}"></label>` : ''}
+                                <div class="form-text small text-muted mt-1">${uiMessageMarkup('voice.card.alias-label', 'Alias of:')}</div>
                                 <select class="form-select form-select-sm alias-select mt-1" data-voice-roster="alias" data-roster-book="${escapeHtml(roster.book)}" ${voice.version_id ? 'disabled' : ''} aria-label="${escapeHtml(t('voice.card.alias-target-aria', 'Alias target for {name}', {name: label}))}">
-                                    <option value="">${t('voice.card.alias-none', '-- None --')}</option>
+                                    <option value="" data-i18n="voice.card.alias-none" data-i18n-source="-- None --">${t('voice.card.alias-none', '-- None --')}</option>
                                     ${renderInitialAliasOptions(voice)}
                                 </select>
+                                </details>
                             </div>
                             <div class="col-md-9">
                                 <div class="mb-2">
                                     <div class="form-check form-check-inline">
                                         <input class="form-check-input voice-type" type="radio" name="type_${index}" value="custom" id="voice-type-${index}-custom" aria-label="${escapeHtml(t('voice.card.type.custom-aria', 'Custom voice for {name}', {name: label}))}" ${voiceType === 'custom' ? 'checked' : ''} onchange="toggleVoiceType(this)">
-                                        <label class="form-check-label" for="voice-type-${index}-custom">${t('voice.card.type.custom', 'Custom voice')}</label>
+                                        <label class="form-check-label" for="voice-type-${index}-custom">${uiMessageMarkup('voice.card.type.custom', 'Custom voice')}</label>
                                     </div>
                                     <div class="form-check form-check-inline">
                                         <input class="form-check-input voice-type" type="radio" name="type_${index}" value="builtin_lora" id="voice-type-${index}-builtin_lora" aria-label="${escapeHtml(t('voice.card.type.builtin-lora-aria', 'Built-in LoRA voice for {name}', {name: label}))}" ${voiceType === 'builtin_lora' ? 'checked' : ''} onchange="toggleVoiceType(this)">
-                                        <label class="form-check-label" for="voice-type-${index}-builtin_lora">${t('voice.card.type.builtin-lora', 'Built-in LoRA voice')}</label>
+                                        <label class="form-check-label" for="voice-type-${index}-builtin_lora">${uiMessageMarkup('voice.card.type.builtin-lora', 'Built-in LoRA voice')}</label>
                                     </div>
                                     <div class="form-check form-check-inline">
                                         <input class="form-check-input voice-type" type="radio" name="type_${index}" value="clone" id="voice-type-${index}-clone" aria-label="${escapeHtml(t('voice.card.type.clone-aria', 'Clone voice for {name}', {name: label}))}" ${voiceType === 'clone' ? 'checked' : ''} onchange="toggleVoiceType(this)">
-                                        <label class="form-check-label" for="voice-type-${index}-clone">${t('voice.card.type.clone', 'Clone voice')}</label>
+                                        <label class="form-check-label" for="voice-type-${index}-clone">${uiMessageMarkup('voice.card.type.clone', 'Clone voice')}</label>
                                     </div>
                                     <div class="form-check form-check-inline">
                                         <input class="form-check-input voice-type" type="radio" name="type_${index}" value="lora" id="voice-type-${index}-lora" aria-label="${escapeHtml(t('voice.card.type.lora-aria', 'LoRA voice for {name}', {name: label}))}" ${voiceType === 'lora' ? 'checked' : ''} onchange="toggleVoiceType(this)">
-                                        <label class="form-check-label" for="voice-type-${index}-lora">${t('voice.card.type.lora', 'LoRA voice')}</label>
+                                        <label class="form-check-label" for="voice-type-${index}-lora">${uiMessageMarkup('voice.card.type.lora', 'LoRA voice')}</label>
                                     </div>
                                     <div class="form-check form-check-inline">
                                         <input class="form-check-input voice-type" type="radio" name="type_${index}" value="design" id="voice-type-${index}-design" aria-label="${escapeHtml(t('voice.card.type.design-aria', 'Voice Design for {name}', {name: label}))}" ${voiceType === 'design' ? 'checked' : ''} onchange="toggleVoiceType(this)">
-                                        <label class="form-check-label" for="voice-type-${index}-design">${t('voice.card.type.design', 'Voice Design')}</label>
+                                        <label class="form-check-label" for="voice-type-${index}-design">${uiMessageMarkup('voice.card.type.design', 'Voice Design')}</label>
                                     </div>
                                     <div class="form-check form-check-inline">
                                         <input class="form-check-input voice-type" type="radio" name="type_${index}" value="ensemble" id="voice-type-${index}-ensemble" aria-label="${escapeHtml(t('voice.card.type.ensemble-aria', 'Character ensemble for {name}', {name: label}))}" ${voiceType === 'ensemble' ? 'checked' : ''} onchange="toggleVoiceType(this)">
-                                        <label class="form-check-label" for="voice-type-${index}-ensemble">${t('voice.card.type.ensemble', 'Character ensemble')}</label>
+                                        <label class="form-check-label" for="voice-type-${index}-ensemble">${uiMessageMarkup('voice.card.type.ensemble', 'Character ensemble')}</label>
                                     </div>
                                 </div>
 
@@ -4958,7 +6535,7 @@
                                             <input type="text" class="form-control builtin-lora-style" aria-label="${escapeHtml(t('voice.card.builtin-style-aria', 'Built-in LoRA voice style for {name}', {name: label}))}" placeholder="Character style (e.g. refined aristocratic tone, heavy Scottish accent)" value="${escapeHtml(voiceType === 'builtin_lora' ? (config.character_style || '') : '')}">
                                         </div>
                                     </div>
-                                    <small class="text-muted mt-1 d-block">${t('voice.card.builtin-download-hint', 'Grayed-out voices need to be downloaded first. Download them from the Training tab.')}</small>
+                                    <small class="text-muted mt-1 d-block">${uiMessageMarkup('voice.card.builtin-download-hint', 'Grayed-out voices need to be downloaded first. Download them from the Training tab.')}</small>
                                 </div>
 
                                 <!-- Clone Options -->
@@ -4977,15 +6554,15 @@
                                             </select>
                                         </div>
                                         <div class="col-auto">
-                                            <button class="btn btn-sm btn-outline-primary" aria-label="${escapeHtml(t('voice.card.clone-upload-aria', 'Upload reference audio for {name}', {name: label}))}" onclick="uploadCloneVoice(this)" title="${escapeHtml(t('voice.card.clone-upload-title', 'Upload audio file'))}"><i class="fas fa-upload"></i> ${t('voice.card.clone-upload', 'Upload')}</button>
+                                            <button class="btn btn-sm btn-outline-primary" aria-label="${escapeHtml(t('voice.card.clone-upload-aria', 'Upload reference audio for {name}', {name: label}))}" onclick="uploadCloneVoice(this)" title="${escapeHtml(t('voice.card.clone-upload-title', 'Upload audio file'))}"><i class="fas fa-upload"></i> ${uiMessageMarkup('voice.card.clone-upload', 'Upload')}</button>
                                             <input type="file" class="clone-voice-file-input" aria-label="${escapeHtml(t('voice.card.clone-upload-aria', 'Upload reference audio for {name}', {name: label}))}" accept=".wav,.mp3,.flac,.ogg" style="display:none" onchange="handleCloneVoiceUpload(this)">
                                         </div>
                                     </div>
                                     <input type="text" class="form-control ref-text mb-2" aria-label="${escapeHtml(t('voice.card.clone-transcript-aria', 'Reference transcript for {name}', {name: label}))}" placeholder="${escapeHtml(t('voice.card.clone-transcript-placeholder', 'Reference Text'))}" value="${escapeHtml(config.ref_text || '')}">
-                                    <label class="form-label small d-block w-100">${t('voice.card.clone-persona-label', 'Persona description')}<textarea class="form-control persona-description" aria-label="${escapeHtml(t('voice.card.clone-persona-aria', 'Persona description for {name}', {name: label}))}">${escapeHtml(config.description || '')}</textarea></label>
+                                    <label class="form-label small d-block w-100">${uiMessageMarkup('voice.card.clone-persona-label', 'Persona description')}<textarea class="form-control persona-description" aria-label="${escapeHtml(t('voice.card.clone-persona-aria', 'Persona description for {name}', {name: label}))}">${escapeHtml(config.description || '')}</textarea></label>
                                     <div class="input-group">
                                         <input type="text" class="form-control ref-audio" aria-label="${escapeHtml(t('voice.card.clone-path-aria', 'Reference audio path for {name}', {name: label}))}" placeholder="${escapeHtml(t('voice.card.clone-path-placeholder', 'Path to audio file'))}" value="${escapeHtml(config.ref_audio || '')}" ${reference ? 'readonly' : ''}>
-                                        <button class="btn btn-sm btn-outline-secondary clone-play-btn" aria-label="${escapeHtml(t('voice.card.clone-play-aria', 'Play reference audio for {name}', {name: label}))}" onclick="playCloneVoice(this)" title="${escapeHtml(t('voice.card.clone-play-title', 'Play reference audio'))}" style="display:${config.ref_audio ? 'inline-block' : 'none'}"><i class="fas fa-play"></i></button>
+                                        <button class="btn btn-sm btn-outline-secondary clone-play-btn" data-label="${escapeHtml(label)}" aria-label="${escapeHtml(t('voice.card.clone-play-aria', 'Play reference audio for {name}', {name: label}))}" onclick="playCloneVoice(this)" title="${escapeHtml(t('voice.card.clone-play-title', 'Play or stop reference audio'))}" style="display:${config.ref_audio ? 'inline-block' : 'none'}"><i class="fas fa-play"></i></button>
                                         <button class="btn btn-sm btn-outline-danger clone-delete-btn" aria-label="${escapeHtml(t('voice.card.clone-delete-aria', 'Delete uploaded reference voice for {name}', {name: label}))}" onclick="deleteCloneVoice(this)" title="${escapeHtml(t('voice.card.clone-delete-title', 'Delete uploaded voice'))}" style="display:${reference?.type === 'clone' ? 'inline-block' : 'none'}"><i class="fas fa-trash"></i></button>
                                     </div>
                                 </div>
@@ -5007,18 +6584,18 @@
                                 </div>
 
                                 <div class="mb-2">
-                                    <label class="form-label small" for="voice-presentation-${index}">${t('voice.card.presentation-label', 'Voice presentation (optional, user confirmed)')}</label>
+                                    <label class="form-label small" for="voice-presentation-${index}">${uiMessageMarkup('voice.card.presentation-label', 'Voice presentation (optional, user confirmed)')}</label>
                                     <input type="text" class="form-control form-control-sm voice-presentation" id="voice-presentation-${index}" maxlength="500" aria-label="${escapeHtml(t('voice.card.presentation-aria', 'Voice presentation for {name}', {name: label}))}" placeholder="${escapeHtml(t('voice.card.presentation-placeholder', 'e.g. lower, resonant female voice; soft, light male voice'))}" value="${escapeHtml(config.voice_presentation || '')}">
-                                    <div class="form-text">${t('voice.card.presentation-help', 'Describe how this character should sound, separately from gender or appearance. Used by model-based voice suggestions; saving this hint does not change the assigned voice or rendered audio.')}</div>
+                                    <div class="form-text">${uiMessageMarkup('voice.card.presentation-help', 'Describe how this character should sound, separately from gender or appearance. Used by model-based voice suggestions; saving this hint does not change the assigned voice or rendered audio.')}</div>
                                 </div>
 
                                 <!-- Voice Design Options -->
                                 <div class="design-opts" style="display: ${voiceType === 'design' ? 'block' : 'none'}">
                                     <input type="text" class="form-control design-description mb-1" aria-label="${escapeHtml(t('voice.card.design-description-aria', 'Base voice description for {name}', {name: label}))}" placeholder="${escapeHtml(t('voice.card.design-description-placeholder', 'Base voice description (e.g. Young strong soldier)'))}" value="${escapeHtml(config.description || '')}">
-                                    <span class="text-muted small">${t('voice.card.design-instruct-note', 'Per-line instruct is appended to this description as delivery/emotion direction')}</span>
+                                    <span class="text-muted small">${uiMessageMarkup('voice.card.design-instruct-note', 'Per-line instruct is appended to this description as delivery/emotion direction')}</span>
                                     <div class="mt-2">
                                         <button type="button" class="btn btn-sm btn-outline-primary" aria-label="${escapeHtml(t('voice.card.redesign-aria', 'Re-design voice for {name}', {name: label}))}" onclick="openVoiceDesignEditor(this)">
-                                            <i class="fas fa-wand-magic-sparkles me-1"></i>${t('voice.card.redesign', 'Re-design Voice')}
+                                            <i class="fas fa-wand-magic-sparkles me-1"></i>${uiMessageMarkup('voice.card.redesign', 'Re-design Voice')}
                                         </button>
                                     </div>
                                 </div>
@@ -5026,7 +6603,7 @@
                                 <!-- Ensemble Options -->
                                 <div class="ensemble-opts" style="display: ${voiceType === 'ensemble' ? 'block' : 'none'}">
                                     <div class="ensemble-members small">${ensembleMembersMarkup(voice.name, config.members)}</div>
-                                    <span class="text-muted small">${t('voice.card.ensemble-help', 'Each character is voiced with whatever voice it already has, then mixed together. Clips are aligned to the longest, so this sounds like a chorus rather than exact unison.')}</span>
+                                    <span class="text-muted small">${uiMessageMarkup('voice.card.ensemble-help', 'Each character is voiced with whatever voice it already has, then mixed together. Clips are aligned to the longest, so this sounds like a chorus rather than exact unison.')}</span>
                                 </div>
                             </div>
                         </div>
@@ -5219,10 +6796,10 @@
         function getVoiceSeedRepairMarkup(snapshot) {
             const changes = snapshot?.seed_changes || [];
             if (!changes.length) { return ''; }
-            const rows = changes.map(change => `<li>${escapeHtml(change.name)}: proposed seed ${escapeHtml(change.seed)}</li>`).join('');
+            const rows = changes.map(change => `<li class="voice-seed-proposal" data-name="${escapeHtml(change.name)}" data-seed="${escapeHtml(change.seed)}">${uiMessageMarkup('voice.seed.proposal', '{name}: proposed seed {seed}', {name: change.name, seed: change.seed})}</li>`).join('');
             return `<div class="alert alert-warning"><strong>${t('safety.voice.seed_title', '{count} unseeded voice settings', {count: changes.length})}</strong>
                 <ul>${rows}</ul><p>${t('safety.voice.seed_body', 'An original-file backup will be saved. Existing rendered audio is kept. Regenerated audio may sound different. Individual and fast-batch rendering use saved character seeds; a nonnegative batch seed overrides them.')}</p>
-                <button type="button" class="btn btn-sm btn-outline-warning" onclick="applyStableVoiceSeeds()" ${_voiceSeedRepairPending ? 'disabled' : ''}>${t('voice.seed_apply', 'Apply stable seeds to unseeded entries only')}</button></div>`;
+                <button type="button" class="btn btn-sm btn-outline-warning" onclick="applyStableVoiceSeeds()" ${_voiceSeedRepairPending ? 'disabled' : ''}>${uiMessageMarkup('voice.seed_apply', 'Apply stable seeds to unseeded entries only')}</button></div>`;
         }
 
         window.applyStableVoiceSeeds = async function applyStableVoiceSeeds() {
@@ -5302,7 +6879,7 @@
                 || (document.activeElement !== document.body && document.activeElement !== snapshot.control)) { return; }
             const card = Array.from(container.querySelectorAll('.voice-card')).find(row => row.dataset.voice === snapshot.speaker && (row.dataset.version || '') === (snapshot.version || ''));
             if (!card) { return; }
-            const controls = Array.from(card.querySelectorAll('button,input,select,textarea'));
+            const controls = Array.from(card.querySelectorAll('button,input,select,textarea,summary'));
             const control = controls.includes(snapshot.control) ? snapshot.control : controls.find(field => field.tagName === snapshot.tag
                 && (snapshot.key ? field.getAttribute('data-voice-focus-key') === snapshot.key
                     : snapshot.label ? field.getAttribute('aria-label') === snapshot.label
@@ -5565,10 +7142,14 @@
                 }
                 updateNarratorPreviewFields();
                 const container = document.getElementById('voices-list');
+                for (const details of container.querySelectorAll?.('.voice-card-advanced') || []) {
+                    saveVoiceSectionState(details);
+                }
+                pruneVoiceSectionStates(ownBookToken, voices);
                 const focus = getVoiceListFocusSnapshot(container, _voiceCardsBookToken);
                 const panels = getVoicePanelSnapshot(container, _voiceCardsBookToken);
                 if (voices.length === 0) {
-                    container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
+                    container.innerHTML = `<div class="alert alert-info">${escapeHtml(t('voice.list.empty', 'No voices found. Generate a script first.'))}</div>`;
                     _voiceCardsRevision = ownRevision;
                     _voiceCardsBookToken = ownBookToken;
                     loadVoices.publishedGeneration = generation;
@@ -5579,7 +7160,8 @@
                     releaseStaleSingleVoiceFenceLocal();
                     return loadVoices.publishedResult;
                 }
-                container.innerHTML = getVoiceSeedRepairMarkup(ownSnapshot) + getStateVoiceCardsMarkup(voices);
+                container.innerHTML = getStateVoiceCardsMarkup(voices, ownBookToken) + getVoiceSeedRepairMarkup(ownSnapshot);
+                window.stopOrphanedVoicePreview?.();
                 window.applyTtsCapabilityGuidance?.();
                 _voiceCardsRevision = ownRevision;
                 _voiceCardsBookToken = ownBookToken;
@@ -5637,8 +7219,8 @@
                 await API.post(`/api/voices/${encodeURIComponent(speaker)}/versions/${encodeURIComponent(versionId)}/select`,
                     _voiceCardsBookToken ? {book_token: _voiceCardsBookToken} : {});
                 await loadVoices();
-                showToast(`Selected ${versionId} for ${speaker}.`, 'success');
-            } catch (e) { showActionError("Version selection failed", e, "Reload Voices to check the active saved version before selecting again."); }
+                showToast(t('voice.version.selected', 'Selected {version} for {speaker}.', {version: versionId, speaker}), 'success');
+            } catch (e) { showActionError(t('voice.version.select-failed', 'Version selection failed'), e, t('voice.version.select-failed-recovery', 'Reload Voices to check the active saved version before selecting again.')); }
         };
 
         window.addVoiceVersion = async function addVoiceVersion(button) {
@@ -5657,14 +7239,14 @@
                 }
                 await flushVoiceSaves();
                 if (book !== currentBookFilename || card?.isConnected === false) {
-                    showToast('The book changed. Review it before adding a voice version.', 'warning'); return;
+                    showToast(t('safety.voice.version_book_changed', 'The book changed. Review it before adding a voice version.'), 'warning'); return;
                 }
                 await API.post(`/api/voices/${encodeURIComponent(speaker)}/versions`, {
                     version_id: values.name, age_group: values.description || 'adult'
                 });
-                showToast(`Version saved for ${speaker}.`, 'success');
+                showToast(t('voice.version.saved', 'Version saved for {speaker}.', {speaker}), 'success');
                 if (book === currentBookFilename) { await loadVoices(); }
-            } catch (e) { showActionError("Version save failed", e, "Reload Voices to check whether the version was saved before adding it again."); }
+            } catch (e) { showActionError(t('voice.version.save-failed', 'Version save failed'), e, t('voice.version.save-failed-recovery', 'Reload Voices to check whether the version was saved before adding it again.')); }
             finally { button.disabled = false; }
         };
 
@@ -5699,12 +7281,12 @@
                 // point at this NEW revision, defeating the
                 // loader's stale-row detection.
                 _voiceSaveSnapshot = { ..._voiceSaveSnapshot, revision: result.revision };
-                if (isLatest()) { showToast('Narrator strategy saved.', 'success'); }
+                if (isLatest()) { showToast(t('voice.narrator.saved', 'Narrator strategy saved.'), 'success'); }
             })();
             window._narratorStrategySave = saving;
             try { await saving; }
             catch (e) {
-                if (isLatest()) { showActionError("Narrator strategy failed", e, "Reload Voices to check the saved narrator strategy before changing it again."); }
+                if (isLatest()) { showActionError(t('voice.narrator.failed', 'Narrator strategy failed'), e, t('voice.narrator.failed-recovery', 'Reload Voices to check the saved narrator strategy before changing it again.')); }
             } finally {
                 if (window._narratorStrategySave === saving) { window._narratorStrategySave = null; }
             }
@@ -5723,7 +7305,7 @@
             if (focus) {
                 const selected = focus.value;
                 const names = (window._voicesNames || []).filter(name => name !== 'NARRATOR' && name !== 'Narrator');
-                focus.innerHTML = '<option value="">No focus override</option>' +
+                focus.innerHTML = `<option value="">${escapeHtml(t('voice.narrator.no-focus-override', 'No focus override'))}</option>` +
                     names.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('');
                 focus.value = names.includes(selected) ? selected : '';
             }
@@ -5731,7 +7313,7 @@
                 const selected = version.value;
                 const narrator = window._voicesByName?.NARRATOR || window._voicesByName?.Narrator;
                 const versions = Object.keys(narrator?.config?.versions || {}).sort();
-                version.innerHTML = '<option value="">Default narrator</option>' +
+                version.innerHTML = `<option value="">${escapeHtml(t('voice.narrator.default-narrator', 'Default narrator'))}</option>` +
                     versions.map(id => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join('');
                 version.value = versions.includes(selected) ? selected : '';
             }
@@ -5756,19 +7338,25 @@
                 });
                 if (!isCurrent()) { return; }
                 const selected = result.selected || {};
-                status.textContent = `Selected ${selected.adapter_id || selected.voice || selected.type || 'default'}.`;
+                status.textContent = t('voice.narrator.preview-selected', 'Selected {voice}.', {voice: selected.adapter_id || selected.voice || selected.type || 'default'});
             } catch (e) {
-                if (isCurrent()) { showActionError("Narrator preview failed", e, "Check the narrator strategy, selected speaker and saved version, then preview again."); }
+                if (isCurrent()) { showActionError(t('voice.narrator.preview-failed', 'Narrator preview failed'), e, t('voice.narrator.preview-failed-recovery', 'Check the narrator strategy, selected speaker and saved version, then preview again.')); }
             }
         };
 
         window.setVoiceApproval = async function setVoiceApproval(button, field, status) {
-            const speaker = button.closest('.voice-card')?.dataset.voice;
+            if (button.disabled) { return; }
+            const card = button.closest('.voice-card');
+            const speaker = card?.dataset.voice;
+            if (!speaker) { return; }
+            const nextStatus = getVoiceCardMetadata(card)[field] === status ? 'unreviewed' : status;
+            button.disabled = true;
             try {
-                await postVoiceTarget(button, `/api/voices/${encodeURIComponent(speaker)}/approval`, {[field]: status});
+                await postVoiceTarget(button, `/api/voices/${encodeURIComponent(speaker)}/approval`, {[field]: nextStatus});
                 await loadVoices();
-                showToast(`${field === 'persona_status' ? 'Persona' : 'Voice'} marked ${status} for ${speaker}.`, 'success');
-            } catch (e) { showActionError('Approval update failed', e, 'Reload Voices to check the current approval before trying again. Your voice assignments remain available.'); }
+                showToast(t('voice.review.saved', 'Review status saved for {speaker}.', {speaker}), 'success');
+            } catch (e) { showActionError(t('voice.review.save-error', 'Approval update failed'), e, t('voice.review.save-recovery', 'Reload Voices to check the current approval before trying again. Your voice assignments remain available.')); }
+            finally { button.disabled = false; }
         };
 
         window.editPersonaVoiceAudit = async function editPersonaVoiceAudit(button) {
@@ -5787,7 +7375,7 @@
                     helperText: t('voice.audit.help', 'Correct the assignment notes. Empty fields leave existing saved values unchanged.')});
                 if (!values) { return; }
                 if (book !== currentBookFilename || card?.isConnected === false || card?.dataset.voice !== speaker) {
-                    showToast('The book or voice changed. Review it before saving the audit.', 'warning'); return;
+                    showToast(t('voice.audit.changed', 'The book or voice changed. Review it before saving the audit.'), 'warning'); return;
                 }
                 await postVoiceTarget(button, `/api/voices/${encodeURIComponent(speaker)}/persona-voice-audit`, {
                     persona_ref: current.persona_ref || null,
@@ -5796,8 +7384,8 @@
                     suggestion_reason: values.name,
                 });
                 if (book === currentBookFilename) { await loadVoices(); }
-                showToast(`Persona-to-voice audit updated for ${speaker}.`, 'success');
-            } catch (e) { showActionError("Audit update failed", e, "Reload Voices and check the current persona-to-voice audit before saving it again."); }
+                showToast(t('voice.audit.updated', 'Persona-to-voice audit updated for {speaker}.', {speaker}), 'success');
+            } catch (e) { showActionError(t('voice.audit.failed', 'Audit update failed'), e, t('voice.audit.failed-recovery', 'Reload Voices and check the current persona-to-voice audit before saving it again.')); }
             finally { button.disabled = false; }
         };
 
@@ -5812,8 +7400,8 @@
                 await ensureStateCardCurrent(card, token);
                 await API.del(`/api/voices/${encodeURIComponent(speaker)}/versions/${encodeURIComponent(version)}?book_token=${encodeURIComponent(token)}`);
                 await loadVoices();
-                showToast('Saved state persona removed. Its audio files were kept.', 'success');
-            } catch (e) { showActionError('State removal failed', e, 'Reload Voices and review its applied timeline before trying again.'); }
+                showToast(t('voice.state.removed', 'Saved state persona removed. Its audio files were kept.'), 'success');
+            } catch (e) { showActionError(t('voice.state.remove-failed', 'State removal failed'), e, t('voice.state.remove-failed-recovery', 'Reload Voices and review its applied timeline before trying again.')); }
         };
 
         window.regeneratePersona = async function regeneratePersona(button) {
@@ -5823,14 +7411,14 @@
             const token = version ? _voiceCardsBookToken : null;
             try {
                 if (version) { await flushVoiceSaves(); }
-                if (!(await confirmIfRemote('this persona regeneration', true))) { return; }
+                if (!(await confirmIfRemote(t('core.remote.task.persona-regeneration', 'this persona regeneration'), true))) { return; }
                 if (version) { await ensureStateCardCurrent(card, token); }
                 const payload = {speaker, advanced: false, context_lines: getPersonaContextLines()};
                 if (version) { Object.assign(payload, {advanced: true, state_version: version, book_token: token}); }
                 await API.post('/api/generate_personas', payload);
                 pollPersonaStatus();
-                showToast(`Persona regeneration started for ${speaker}.`, 'success');
-            } catch (e) { showActionError("Persona regeneration failed", e, "Check the persona task status before regenerating again. For an LLM refusal, use Setup → Test Connection."); }
+                showToast(t('voice.persona.regeneration-started', 'Persona regeneration started for {speaker}.', {speaker}), 'success');
+            } catch (e) { showActionError(t('voice.persona.regeneration-failed', 'Persona regeneration failed'), e, t('voice.persona.regeneration-failed-recovery', 'Check the persona task status before regenerating again. For an LLM refusal, use Setup → Test Connection.')); }
         };
 
         // Voice Design from a chosen line (#1232): the card lists the character's
@@ -5850,13 +7438,13 @@
                     const text = String(line.text || '');
                     option.value = text;
                     option.title = text;
-                    option.textContent = `[${line.chars} ch${line.in_range ? '' : ', outside range'}] ${text.length > 90 ? text.slice(0, 90) + '…' : text}`;
+                    option.textContent = t('voice.design.line-option', '[{chars} ch{range}] {text}', {chars: line.chars, range: line.in_range ? '' : t('voice.design.line-option-outside', ', outside range'), text: text.length > 90 ? text.slice(0, 90) + '…' : text});
                     return option;
                 });
                 select.replaceChildren(select.options[0], ...options);
                 select.dataset.loaded = '1';
             } catch (e) {
-                showActionError('Could not load the character\'s lines', e, 'Reload Voices and open the list again.');
+                showActionError(t('voice.design.load-lines-failed', "Could not load the character's lines"), e, t('voice.design.load-lines-recovery', 'Reload Voices and open the list again.'));
             } finally {
                 delete select.dataset.loading;
             }
@@ -5876,7 +7464,7 @@
             const speaker = card?.dataset.voice;
             const refText = card?.querySelector('.design-line-select')?.value || '';
             if (!speaker || !refText) {
-                showToast('Choose one of the character\'s lines first.', 'warning');
+                showToast(t('voice.design.choose-line-first', "Choose one of the character's lines first."), 'warning');
                 return;
             }
             const version = card.dataset.version || null;
@@ -5889,9 +7477,11 @@
                 if (version) { Object.assign(payload, {state_version: version, book_token: token}); }
                 await API.post('/api/generate_personas', payload);
                 pollPersonaStatus();
-                const what = count > 1 ? `${count} voices for ${speaker}` : `${speaker}'s voice`;
-                showToast(`Designing ${what} from the chosen line. Each new voice and the current one stay under Saved candidates.`, 'success');
-            } catch (e) { showActionError('Voice design failed', e, 'Check the persona task status before designing again. A character needs a persona first.'); }
+                const what = count > 1
+                    ? t('voice.design.what-voices', '{count} voices for {speaker}', {count, speaker})
+                    : t('voice.design.what-voice', "{speaker}'s voice", {speaker});
+                showToast(t('voice.design.designing', 'Designing {what} from the chosen line. Each new voice and the current one stay under Saved candidates.', {what}), 'success');
+            } catch (e) { showActionError(t('voice.design.failed', 'Voice design failed'), e, t('voice.design.failed-recovery', 'Check the persona task status before designing again. A character needs a persona first.')); }
         };
 
         window.generateAgeVersion = async function generateAgeVersion(button, presetAge) {
@@ -5910,17 +7500,17 @@
                 if (!isCurrent()) {
                     showToast(t('safety.voice.age_book_changed', 'The book or voice changed. Review it before generating an age version.'), 'warning'); return;
                 }
-                if (!(await confirmIfRemote('this age-version generation', true))) { return; }
+                if (!(await confirmIfRemote(t('core.remote.task.age-version-generation', 'this age-version generation'), true))) { return; }
                 if (!isCurrent()) {
-                    showToast('The book or voice changed. Review it before generating an age version.', 'warning'); return;
+                    showToast(t('safety.voice.age_book_changed', 'The book or voice changed. Review it before generating an age version.'), 'warning'); return;
                 }
                 await API.post('/api/generate_personas', {
                     speaker, age_group: values.name, advanced: false,
                     context_lines: getPersonaContextLines(),
                 });
                 pollPersonaStatus();
-                showToast(`Generating ${values.name} version for ${speaker}.`, 'success');
-            } catch (e) { showActionError("Age version generation failed", e, "Check the persona task status and saved age versions before generating again. Use an age profile listed in the dialog."); }
+                showToast(t('voice.age.generating', 'Generating {age} version for {speaker}.', {age: values.name, speaker}), 'success');
+            } catch (e) { showActionError(t('voice.age.failed', 'Age version generation failed'), e, t('voice.age.failed-recovery', 'Check the persona task status and saved age versions before generating again. Use an age profile listed in the dialog.')); }
             finally { button.disabled = false; }
         };
 
@@ -6007,7 +7597,7 @@
                 && cast === (window._selectedCast || null)
                 && generation === (window._voiceSuggestionGeneration || 0)};
             try {
-                if (!(await confirmIfRemote('this voice suggestion', true))) { return; }
+                if (!(await confirmIfRemote(t('core.remote.task.voice-suggestion', 'this voice suggestion'), true))) { return; }
                 if (!context.isCurrent()) { return; }
                 const onlyUnset = characterNames ? false : voicesScopeIsNew();
                 if (!characterNames && !onlyUnset && !(await keepCurrentVoicesIfAsked())) { return; }
@@ -6110,7 +7700,7 @@
             const token = _voiceCardsBookToken;
             try {
                 await flushVoiceSaves();
-                if (!(await confirmIfRemote('these state voice suggestions', true))) { return; }
+                if (!(await confirmIfRemote(t('core.remote.task.state-voice-suggestions', 'these state voice suggestions'), true))) { return; }
                 await ensureStateCardCurrent(card, token);
                 const result = await API.post('/api/suggest_voices', {characters: [speaker],
                     state_version: card.dataset.version, book_token: token});
@@ -6242,17 +7832,22 @@
             }};
         }
 
-        // An alias or voice timeline would keep another voice in effect (#1800):
-        // the server refuses with the overrides; ask, then retry clearing them.
+        // An alias, voice timeline or narrator strategy would keep another voice
+        // in effect (#1800, #2015): the server refuses with the overrides; ask,
+        // then retry clearing them.
         // -> the response, or null when the user keeps the overrides.
         async function postVoiceSuggestionApply(url, body) {
             try {
                 return await API.post(url, body);
             } catch (e) {
                 if (e.status !== 409 || !e.detail || e.detail.code !== 'voice_overrides') { throw e; }
-                const found = (e.detail.overrides || []).map(o => (o.alias_of
-                    ? t('voice.suggest.override_alias', '{character} speaks as {alias} (alias)', {character: o.character, alias: o.alias_of})
-                    : t('voice.suggest.override_timeline', '{character} follows a voice timeline', {character: o.character})));
+                const found = (e.detail.overrides || []).flatMap(o => {
+                    const parts = [];
+                    if (o.alias_of) { parts.push(t('voice.suggest.override_alias', '{character} speaks as {alias} (alias)', {character: o.character, alias: o.alias_of})); }
+                    if (o.version_timeline) { parts.push(t('voice.suggest.override_timeline', '{character} follows a voice timeline', {character: o.character})); }
+                    if (o.narrator_strategy) { parts.push(t('voice.suggest.override_narrator', "{character} narrates with the '{strategy}' narrator strategy", {character: o.character, strategy: o.narrator_strategy})); }
+                    return parts;
+                });
                 const ok = await showConfirm(formatUiSafetyText('safety.voice.clear_overrides', '{overrides}. Clear these so the suggested voice is used? Saved voice versions are kept.', {overrides: found.join('; ')}),
                     {title: t('voice.clear_overrides.title', 'Clear voice overrides?'), actionLabel: t('voice.clear_overrides.action', 'Clear and apply')});
                 if (!ok) { return null; }
@@ -6357,7 +7952,7 @@
             }
             sel.innerHTML = castNames.length
                 ? castNames.map(n => `<option value="${escapeHtml(n)}" ${n === window._selectedCast ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('')
-                : `<option value="">${escapeHtml(t('voice.cast.none-option', '(no casts yet)'))}</option>`;
+                : `<option value="" data-i18n="voice.cast.none-option" data-i18n-source="(no casts yet)">${escapeHtml(t('voice.cast.none-option', '(no casts yet)'))}</option>`;
 
             const hasCast = !!window._selectedCast;
             document.getElementById('btn-cast-save').disabled = !hasCast;
@@ -6383,7 +7978,7 @@
             const cast = getSelectedCastObj();
             const shared = window._voiceLibrary.shared || [];
             if (!window._selectedCast) {
-                panel.innerHTML = '<div class="alert alert-light border small mb-0">' + escapeHtml(t('voice.cast.empty', 'No casts yet. Click New to create one for this series, then save your configured character voices to it.')) + '</div>';
+                panel.innerHTML = '<div class="alert alert-light border small mb-0">' + uiMessageMarkup('voice.cast.empty', 'No casts yet. Click New to create one for this series, then save your configured character voices to it.') + '</div>';
                 return;
             }
             const memberRow = (m, castName) => `
@@ -6775,7 +8370,7 @@
                     </li>`).join('');
                 panel.innerHTML = `
                     <div class="border rounded p-2">
-                        <div class="small fw-bold mb-1">${escapeHtml(summary)} — cast "${escapeHtml(cast)}"</div>
+                        <div class="small fw-bold mb-1">${escapeHtml(t('voice.cast.bulk-result-heading', '{summary} — cast "{cast}"', {summary, cast}))}</div>
                         <div class="alert alert-light border py-1 px-2 small mb-2"><i class="fas fa-info-circle me-1"></i>${escapeHtml(total === 1 ? t('voice.cast.bulk-total.one', '{count} voice applied in total, across the selected saved books. Your currently loaded book\'s voice settings and audio are unchanged. To use a saved book\'s updated voices, load it from Saved Scripts; loading replaces the current script and chunks.', {count: total}) : t('voice.cast.bulk-total.many', '{count} voices applied in total, across the selected saved books. Your currently loaded book\'s voice settings and audio are unchanged. To use a saved book\'s updated voices, load it from Saved Scripts; loading replaces the current script and chunks.', {count: total}))}</div>
                         <ul class="list-group list-group-flush border rounded mb-2">${rows || '<li class="list-group-item small text-muted py-2 px-2">' + escapeHtml(t('voice.cast.bulk-no-books', 'No books updated.')) + '</li>'}</ul>
                         <button class="btn btn-sm btn-outline-secondary" onclick="renderCastMembers()">${escapeHtml(t('voice.cast.done', 'Done'))}</button>
@@ -6791,18 +8386,40 @@
         // Identity anchors that take over from a line onward (#603): shown under
         // the character's style, added from the Editor ("Voice changes here").
         function renderStyleTimeline(name, config) {
-            const points = (config && config.style_timeline) || [];
+            const timeline = config?.style_timeline;
+            const points = Array.isArray(timeline) ? timeline.filter(p => p && typeof p === 'object') : [];
             if (!points.length) { return ''; }
-            return `<div class="small text-muted mt-1">${escapeHtml(t('voice.cast.style-changes', 'Changes:'))}` + points.map(p =>
-                ` <span class="badge bg-light text-dark border">${escapeHtml(t('voice.cast.style-from', 'from line {line}: {style}', {line: p.from_index + 1, style: p.character_style}))}` +
-                ` <a href="#" title="${escapeHtml(t('voice.cast.style-remove-title', 'Remove'))}" onclick="removeStylePoint(${getInlineStringArgument(name)}, ${p.from_index}, this); return false;">&times;</a></span>`).join('') + `</div>`;
+            return `<div class="small text-muted mt-1">${escapeHtml(t('voice.cast.style-changes', 'Changes:'))}` + points.map(point => {
+                const storedIndex = getStyleTimelineActionIndex(point.from_index === undefined ? '0' : point.from_index);
+                const displayIndex = getStyleTimelineActionIndex(point.display_index ?? storedIndex);
+                const style = point.character_style ?? '';
+                const label = displayIndex === null ? style : t('voice.cast.style-from', 'from line {line}: {style}',
+                    {line: String(BigInt(displayIndex) + 1n), style});
+                const remove = storedIndex === null ? '' : ` <a href="#" data-delete-key="${escapeHtml(point.delete_key || '')}" title="${escapeHtml(t('voice.cast.style-remove-title', 'Remove'))}" onclick="removeStylePoint(${getInlineStringArgument(name)}, ${getInlineStringArgument(storedIndex)}, this, ${point.from_uid ? getInlineStringArgument(point.from_uid) : 'null'}, ${getInlineStringArgument(displayIndex ?? storedIndex)}); return false;">&times;</a>`;
+                return ` <span class="badge bg-light text-dark border">${escapeHtml(label)}${remove}</span>`;
+            }).join('') + `</div>`;
         }
 
-        async function removeStylePoint(name, fromIndex, button = null) {
+        function getStyleTimelineActionIndex(value) {
+            if (typeof value === 'number' && !Number.isSafeInteger(value)) { return null; }
+            if ((typeof value !== 'string' && typeof value !== 'number') || !/^[0-9]+$/.test(String(value))) { return null; }
+            const decimal = String(value).replace(/^0+(?=\d)/, '');
+            const limit = String(Number.MAX_SAFE_INTEGER);
+            return decimal.length < limit.length || (decimal.length === limit.length && decimal <= limit) ? decimal : null;
+        }
+
+        async function removeStylePoint(name, fromIndex, button = null, fromUid = null, displayIndex = null) {
+            const index = getStyleTimelineActionIndex(fromIndex);
+            if (index === null) { return; }
+            const position = getStyleTimelineActionIndex(displayIndex) ?? index;
             try {
-                await applyConfirmedVoiceRemoval(button, formatUiSafetyText('safety.voice.style_remove', 'Remove the voice-style change for {name} from line {line}? Existing rendered audio is not changed.', {name, line: fromIndex + 1}), async () => {
-                    const scope = _voiceCardsBookToken ? `?book_token=${encodeURIComponent(_voiceCardsBookToken)}` : '';
-                    await API.del(`/api/voices/${encodeURIComponent(name)}/style_timeline/${fromIndex}${scope}`);
+                await applyConfirmedVoiceRemoval(button, formatUiSafetyText('safety.voice.style_remove', 'Remove the voice-style change for {name} from line {line}? Existing rendered audio is not changed.', {name, line: String(BigInt(position) + 1n)}), async () => {
+                    const query = new URLSearchParams();
+                    if (_voiceCardsBookToken) { query.set('book_token', _voiceCardsBookToken); }
+                    if (fromUid) { query.set('from_uid', fromUid); }
+                    else { query.set('legacy_only', 'true'); }
+                    if (button?.dataset?.deleteKey) { query.set('delete_key', button.dataset.deleteKey); }
+                    await API.del(`/api/voices/${encodeURIComponent(name)}/style_timeline/${index}?${query}`);
                     await loadVoices();
                 });
             } catch (e) {
@@ -6815,7 +8432,7 @@
         // ones other characters use, then generating an age version. Nothing
         // changes audio until Apply.
         function getVoiceStateDefault(state, applied, index) {
-            const point = (applied || []).find(p => p.from_index === state.from_index);
+            const point = getAppliedVoiceStatePoint(state.from_index, applied);
             if (point) { return point.version_id ? `version:${point.version_id}` : 'main'; }
             const sources = state.sources || {};
             if (state.state_version && (sources.versions || []).some(version => version.version_id === state.state_version)) {
@@ -6835,8 +8452,9 @@
             const rows = states.map((state, index) => {
                 const sources = state.sources || {};
                 const selected = getVoiceStateDefault(state, data.applied, index);
-                const where = state.from_index === null || state.from_index === undefined
-                    ? t('voice.states.line-not-found', 'line not found in the Editor yet') : t('voice.states.from-line', 'from line {line}', {line: state.from_index + 1});
+                const mapped = Number.isSafeInteger(state.from_index) && state.from_index >= 0;
+                const where = mapped ? t('voice.states.from-line', 'from line {line}', {line: state.from_index + 1})
+                    : t('voice.states.line-not-found', 'line not found in the Editor yet');
                 const library = (c, usedBy) => option(`library:${c.adapter_id}`, usedBy === null
                     ? t('voice.states.library-option-unused', '{name} · {gender} · {age} · unused', {name: c.name, gender: c.gender, age: c.age_group})
                     : t('voice.states.library-option-used', '{name} · {gender} · {age} · used by {books}', {name: c.name, gender: c.gender, age: c.age_group, books: usedBy.join(', ')}), selected);
@@ -6850,10 +8468,10 @@
                     .join('');
                 const generate = sources.offer_generate
                     ? `<button class="btn btn-sm btn-link p-0" type="button" data-age="${escapeHtml(state.age_group)}" onclick="generateAgeVersion(this, this.dataset.age)">${escapeHtml(t('voice.states.generate-age', 'Generate {age} version', {age: state.age_group.replace(/_/g, ' ')}))}</button>` : '';
-                return `<div class="voice-state-row small mt-1" data-from-index="${state.from_index === null || state.from_index === undefined ? '' : Number(state.from_index)}" data-age="${escapeHtml(state.age_group)}">`
+                return `<div class="voice-state-row small mt-1" data-from-index="${mapped ? state.from_index : ''}" data-uid="${escapeHtml(state.uid || '')}" data-age="${escapeHtml(state.age_group)}">`
                     + `<div>${escapeHtml(state.gender)} · ${escapeHtml(state.age_group.replace(/_/g, ' '))}${state.chapter ? `, ${escapeHtml(state.chapter)}` : ''} <span class="text-muted">(${escapeHtml(where)})</span></div>`
                     + (state.possible_gender_reveal ? `<div class="alert alert-warning py-1 px-2 mb-1" role="note">${t('voice.states.identity-reveal', 'Possible identity reveal: the text may have misidentified this character earlier. Review their actual voice; a gender label change alone does not require a different voice.')}</div>` : '')
-                    + `<select class="form-select form-select-sm voice-state-source" aria-label="${escapeHtml(t('voice.states.voice-aria', 'Voice for {speaker}, {gender}, {age}, {where}', {speaker, gender: state.gender, age: state.age_group.replace(/_/g, ' '), where}))}"${where.startsWith('from') ? '' : ' disabled'}>${options}</select>${generate}</div>`;
+                    + `<select class="form-select form-select-sm voice-state-source" onchange="this.dataset.changed = 'true'" aria-label="${escapeHtml(t('voice.states.voice-aria', 'Voice for {speaker}, {gender}, {age}, {where}', {speaker, gender: state.gender, age: state.age_group.replace(/_/g, ' '), where}))}"${mapped ? '' : ' disabled'}>${options}</select>${generate}</div>`;
             }).join('');
             const revealHelp = `<div class="small mt-2">${t('voice.states.reveal-help', 'Narrative age and gender labels are evidence, not instructions to change the voice. For one consistent voice, set the character’s base voice and choose Main voice for every segment.')} <button class="btn btn-sm btn-outline-secondary" type="button" aria-label="${escapeHtml(t('voice.states.choose-main-aria', 'Choose Main voice throughout for {speaker}', {speaker}))}" onclick="chooseMainVoiceStates(this)">${t('voice.states.choose-main', 'Choose Main voice throughout')}</button> ${t('voice.states.review-then-apply', 'Review, then Apply.')}</div>`;
             return rows + revealHelp + `<div class="mt-1"><button class="btn btn-sm btn-primary" type="button" aria-label="${escapeHtml(t('voice.states.apply-aria', 'Apply voice changes for {speaker}', {speaker}))}" onclick="applyVoiceStates(this)">${t('voice.states.apply', 'Apply')}</button> <button class="btn btn-sm btn-outline-secondary" type="button" aria-label="${escapeHtml(t('voice.states.clear-aria', 'Clear voice changes for {speaker}', {speaker}))}" onclick="clearVoiceStates(this)">${t('voice.states.clear', 'Clear')}</button></div>`;
@@ -6863,7 +8481,10 @@
             const card = button.closest('.voice-card');
             if (!card || button.disabled) { return; }
             card.querySelectorAll('.voice-state-source').forEach(select => {
-                if (!select.disabled) { select.value = 'main'; }
+                if (!select.disabled) {
+                    select.value = 'main';
+                    select.dataset.changed = 'true';
+                }
             });
         }
 
@@ -6947,6 +8568,26 @@
             }
         }
 
+        function getAppliedVoiceStatePoint(index, applied) {
+            for (let i = (applied?.length || 0) - 1; i >= 0; i--) {
+                const point = applied[i];
+                if (point && (point.display_index ?? point.from_index) === index) { return point; }
+            }
+        }
+
+        function getPreviousVoiceStateVersion(points, before) {
+            let position = -1;
+            let version = null;
+            for (const point of points) {
+                const index = point?.display_index ?? point?.from_index;
+                if (Number.isSafeInteger(index) && index < before && index >= position) {
+                    position = index;
+                    version = point.version_id ?? null;
+                }
+            }
+            return version;
+        }
+
         async function applyVoiceStates(button) {
             const card = button.closest('.voice-card');
             const speaker = card?.dataset.voice;
@@ -6958,14 +8599,24 @@
                     candidates.set(c.adapter_id, JSON.parse(JSON.stringify(c)));
                 }
             }
-            const rows = [...card.querySelectorAll('.voice-state-row')].map(row => ({
-                fromIndex: row.dataset.fromIndex, age: row.dataset.age,
-                value: row.querySelector('.voice-state-source')?.value || 'main'}));
-            const points = [], skipped = [];
+            const rows = [...card.querySelectorAll('.voice-state-row')].map(row => {
+                const select = row.querySelector('.voice-state-source');
+                return {fromIndex: row.dataset.fromIndex, uid: row.dataset.uid || undefined, age: row.dataset.age,
+                    value: select?.value || 'main', changed: select?.dataset?.changed === 'true'};
+            });
+            const added = [], skipped = [];
+            const applied = data.applied || [];
+            const removed = new Set();
+            const mappedRows = rows.filter(row => row.fromIndex !== '');
+            const allMain = mappedRows.every(row => row.value === 'main') && mappedRows.some(row => row.changed);
+            const replay = (data.applied === null || applied.length) && mappedRows.every(row => {
+                const active = getPreviousVoiceStateVersion(applied, Number(row.fromIndex) + 1);
+                return !row.changed && row.value === (active ? `version:${active}` : 'main');
+            });
             const versions = JSON.parse(JSON.stringify(window._voicesByName?.[speaker]?.config?.versions || {}));
             try {
                 await applyVoiceStateSave(button, speaker, t('voice.states.applying', 'Applying…'), async (isCurrent, bookToken) => {
-                for (const row of rows) {
+                for (const [position, row] of (replay ? [] : rows).entries()) {
                     if (!isCurrent()) { throw new Error(t('safety.voice.clear_states.book_changed_remaining', 'The book changed; remaining voice changes were not saved.')); }
                     const value = row.value;
                     if (row.fromIndex === '') {
@@ -6975,14 +8626,15 @@
                         continue;
                     }
                     const fromIndex = Number(row.fromIndex);
+                    let versionId;
                     if (value === 'main') {
-                        if (points.length) { points.push({from_index: fromIndex, version_id: null}); }
+                        versionId = null;
                     } else if (value.startsWith('version:')) {
-                        points.push({from_index: fromIndex, version_id: value.slice(8)});
+                        versionId = value.slice(8);
                     } else if (value.startsWith('library:')) {
                         const chosen = candidates.get(value.slice(8));
                         if (!chosen) { continue; }
-                        let versionId = Object.keys(versions).find(id => versions[id]?.age_group === row.age
+                        versionId = Object.keys(versions).find(id => versions[id]?.age_group === row.age
                             && Object.keys(chosen.config).every(key => versions[id][key] === chosen.config[key]));
                         if (!versionId) {
                             const base = `${row.age}-${chosen.adapter_id}`.slice(0, 80);
@@ -6996,15 +8648,34 @@
                                 version_id: versionId, age_group: row.age, config: chosen.config, book_token: bookToken});
                             versions[versionId] = {...chosen.config, age_group: row.age};
                         }
-                        points.push({from_index: fromIndex, version_id: versionId});
+                    } else {
+                        continue;
+                    }
+                    const next = rows[position + 1];
+                    const end = allMain || !next ? data.chunk_count ?? Infinity
+                        : next.fromIndex === '' ? fromIndex + 1 : Number(next.fromIndex);
+                    const boundary = getAppliedVoiceStatePoint(fromIndex, applied);
+                    const keepBoundary = boundary && (boundary.version_id ?? null) === versionId;
+                    for (const point of applied) {
+                        const index = point?.display_index ?? point?.from_index;
+                        if (Number.isSafeInteger(index) && index < end
+                                && (index > fromIndex || (index === fromIndex && !keepBoundary))) {
+                            removed.add(point);
+                        }
+                    }
+                    if (!keepBoundary && getPreviousVoiceStateVersion(
+                            applied.filter(point => !removed.has(point)).concat(added), fromIndex) !== versionId) {
+                        added.push({from_index: fromIndex, from_uid: row.uid, version_id: versionId});
                     }
                 }
+                const points = replay ? data.applied : applied.filter(point => !removed.has(point)).concat(added);
+                const changed = removed.size > 0 || added.length > 0;
                 if (!isCurrent()) { throw new Error(t('safety.voice.clear_states.book_changed_timeline', 'The book changed; the voice timeline was not saved.')); }
-                if (points.length) {
-                    await API.post(`/api/voices/${encodeURIComponent(speaker)}/version_timeline`, {points, book_token: bookToken});
-                } else {
-                    await API.del(`/api/voices/${encodeURIComponent(speaker)}/version_timeline?book_token=${encodeURIComponent(bookToken)}`);
-                }
+                await API.post(`/api/voices/${encodeURIComponent(speaker)}/version_timeline`, {
+                    points, book_token: bookToken,
+                    ...(changed ? {expected_chunks_revision: data.chunks_revision} : {}),
+                    expected_timeline_revision: data.timeline_revision
+                });
                 if (!isCurrent()) { return; }
                 await loadVoices();
                 showToast(t('voice.states.saved', 'Voice changes saved for {speaker}. Affected lines are pending; use Render Pending in the Editor to regenerate them.', {speaker}), 'success');
@@ -7018,9 +8689,12 @@
         async function clearVoiceStates(button) {
             const speaker = button.closest('.voice-card')?.dataset.voice;
             if (!speaker) { return; }
+            const revision = window._voiceStateSuggestions?.[speaker]?.timeline_revision;
             try {
                 await applyVoiceStateSave(button, speaker, t('voice.states.clearing', 'Clearing…'), async (isCurrent, bookToken) => {
-                    await API.del(`/api/voices/${encodeURIComponent(speaker)}/version_timeline?book_token=${encodeURIComponent(bookToken)}`);
+                    if (!revision) { throw new Error(t('voice.states.reload-first', 'Reload Voices before saving changes for this book.')); }
+                    const query = new URLSearchParams({book_token: bookToken, expected_timeline_revision: revision});
+                    await API.del(`/api/voices/${encodeURIComponent(speaker)}/version_timeline?${query}`);
                     if (!isCurrent()) { return; }
                     await loadVoices();
                     showToast(t('voice.states.cleared', '{speaker} uses the main voice throughout. Affected lines are pending; use Render Pending in the Editor.', {speaker}), 'success');
@@ -7036,7 +8710,9 @@
             const row = document.querySelector(`#chunks-table-body tr[data-id="${chunkId}"]`);
             const getSpeaker = () => row ? (row.querySelector('.chunk-speaker')?.value || row.querySelector('select')?.value || '') : '';
             const speaker = getSpeaker();
-            if (!speaker) { showToast('Pick the line\'s speaker first.', 'warning'); return; }
+            const uid = row?.dataset?.uid;
+            const bookToken = row?.dataset?.bookToken;
+            if (!speaker) { showToast(t('voice.change.pick-speaker', "Pick the line's speaker first."), 'warning'); return; }
             const book = currentBookFilename;
             const current = (window._voicesByName && window._voicesByName[speaker])?.config || {};
             try {
@@ -7045,14 +8721,19 @@
                     allowEmptyName: true, includeDescription: false, actionLabel: t('voice.change.save-action', 'Save change point'),
                     helperText: t('voice.change.help', 'Describe how the character sounds from this line on. Leave empty to remove this change point. Regenerate later lines to hear the change.')});
                 if (!values) { return; }
-                if (book !== currentBookFilename || row?.isConnected === false || getSpeaker() !== speaker) {
-                    showToast('The book or line speaker changed. Review it before saving the change point.', 'warning'); return;
+                if (book !== currentBookFilename || row?.isConnected === false || getSpeaker() !== speaker
+                    || row?.dataset?.uid !== uid || row?.dataset?.bookToken !== bookToken) {
+                    showToast(t('voice.change.changed', 'The book or line speaker changed. Review it before saving the change point.'), 'warning'); return;
                 }
-                await API.post(`/api/voices/${encodeURIComponent(speaker)}/style_timeline`, { from_index: chunkId, character_style: values.name });
+                await API.post(`/api/voices/${encodeURIComponent(speaker)}/style_timeline`, {
+                    from_index: chunkId, from_uid: uid, expected_book_token: bookToken, character_style: values.name
+                });
                 if (book === currentBookFilename) { await loadVoices(); }
-                showToast(values.name ? `${speaker} changes from line ${chunkId + 1}. Regenerate the later lines to hear it.` : `Change point at line ${chunkId + 1} removed.`, 'success', 8000);
+                showToast(values.name
+                    ? t('voice.change.saved', '{speaker} changes from line {line}. Regenerate the later lines to hear it.', {speaker, line: chunkId + 1})
+                    : t('voice.change.removed', 'Change point at line {line} removed.', {line: chunkId + 1}), 'success', 8000);
             } catch (e) {
-                showActionError("Could not save the change", e, "Review the current book, line speaker and saved change point before saving again.");
+                showActionError(t('voice.change.save-failed', 'Could not save the change'), e, t('voice.change.save-failed-recovery', 'Review the current book, line speaker and saved change point before saving again.'));
             }
         }
 
@@ -7197,6 +8878,11 @@
             if (card) {
                 card.dataset.ready = box.checked ? '1' : '0';
                 card.classList.toggle('border-success', box.checked);
+                const summary = card.querySelector?.('.voice-next-step');
+                if (summary) {
+                    if (box.checked) { setUiMessage(summary, 'voices.essential.ready', 'Ready is explicitly selected. Review persona and voice approvals separately.'); }
+                    else { setUiMessage(summary, 'voices.essential.next', 'Next: pick a voice, listen, then mark Ready.'); }
+                }
             }
             renderReadyCount();
             onToggleHideReady();
@@ -7433,7 +9119,7 @@
         }
 
         // pagehide is best-effort; the synchronous draft is the reload/closure safety net.
-        window.addEventListener('pagehide', () => { flushVoiceSaves().catch(() => {}); });
+        window.addEventListener('pagehide', () => { flushVoiceSaves().catch(error => { reportBrowserFailure('save_pagehide', error); }); });
         window.addEventListener('beforeunload', event => {
             if (voiceSaveQueue.isDirty()) { event.preventDefault(); event.returnValue = ''; }
         });
@@ -7454,14 +9140,38 @@
             editorIntegrityView++;
             const badge = document.getElementById('editor-integrity-badge');
             if (badge) {
-                badge.textContent = message;
+                if (message === 'Save edits before checking source') {
+                    setUiMessage(badge, 'editor.integrity.save-first', 'Save edits before checking source');
+                } else if (message === 'Edits awaiting save') {
+                    setUiMessage(badge, 'editor.integrity.unsaved', 'Edits awaiting save');
+                } else {
+                    setUiMessage(badge, 'editor.integrity.pending', 'Source check pending');
+                }
                 badge.className = 'badge bg-secondary';
             }
+        }
+
+        function showFailedEditorIntegrity(badge) {
+            const failed = getFailedChunkEdits();
+            const first = failed[0];
+            editorIntegrityView++;
+            if (failed.length === 1) {
+                setUiMessage(badge, 'editor.integrity.save-failed-one', 'Line {line} failed to save — {reason}',
+                    () => ({line: first.line, reason: first.reason}));
+            } else {
+                setUiMessage(badge, 'editor.integrity.save-failed', '{count} line edits failed to save — {reason}',
+                    () => ({count: failed.length, reason: first.reason}));
+            }
+            badge.className = 'badge bg-danger';
         }
 
         async function refreshEditorIntegrity() {
             const badge = document.getElementById('editor-integrity-badge');
             if (!badge) { return; }
+            if (typeof getEditorFailedEditsSummary === 'function' && getEditorFailedEditsSummary()) {
+                showFailedEditorIntegrity(badge);
+                return;
+            }
             if (isEditorEditPending()) {
                 invalidateEditorIntegrity('Save edits before checking source');
                 return;
@@ -7472,18 +9182,22 @@
                 const report = await API.get('/api/editor/integrity');
                 if (view !== editorIntegrityView || edits !== chunkEditsRevision) { return; }
                 if (report.status === 'verified') {
-                    badge.textContent = 'Saved text matches source';
+                    setUiMessage(badge, 'editor.integrity.verified', 'Saved text matches source');
                     badge.className = 'badge bg-success';
                 } else if (report.status === 'differences' && Array.isArray(report.hunks)) {
-                    badge.textContent = `${report.hunks.length} word differences`;
+                    if (pluralForm(report.hunks.length) === 'one') {
+                        setUiMessage(badge, 'editor.integrity.differences-one', '{count} word difference', {count: report.hunks.length});
+                    } else {
+                        setUiMessage(badge, 'editor.integrity.differences', '{count} word differences', {count: report.hunks.length});
+                    }
                     badge.className = 'badge bg-warning text-dark';
                 } else {
-                    badge.textContent = 'Source comparison unavailable';
+                    setUiMessage(badge, 'editor.integrity.unavailable', 'Source comparison unavailable');
                     badge.className = 'badge bg-secondary';
                 }
             } catch (e) {
                 if (view === editorIntegrityView) {
-                    badge.textContent = 'Source comparison unavailable';
+                    setUiMessage(badge, 'editor.integrity.unavailable', 'Source comparison unavailable');
                     badge.className = 'badge bg-secondary';
                 }
             }
@@ -7494,27 +9208,38 @@
             if (!label) { return; }
             try {
                 const estimate = await API.get('/api/audio/estimate');
-                label.textContent = formatRuntimeEstimate(estimate);
+                renderRuntimeEstimate(label, estimate);
             } catch (e) {
+                label.removeAttribute('data-i18n');
                 label.textContent = '';
             }
         }
 
         function formatRuntimeEstimate(estimate) {
-            const total = formatRuntimeDuration(estimate.total_seconds);
+            const node = document.createElement('span');
+            renderRuntimeEstimate(node, estimate);
+            return node.textContent;
+        }
+
+        function renderRuntimeEstimate(node, estimate) {
             if (estimate.basis === 'fallback') {
-                return `≈ ${total} (rough: fewer than 3 chunks rendered)`;
+                setUiMessage(node, 'editor.estimate.rough', '≈ {total} (rough: fewer than 3 chunks rendered)', () => ({total: formatRuntimeDuration(estimate.total_seconds)}));
+                return;
             }
-            const range = `${formatRuntimeDuration(estimate.low_seconds)} – ${formatRuntimeDuration(estimate.high_seconds)}`;
             const sizeMb = Math.round(estimate.mp3_bytes / (1024 * 1024));
-            return `≈ ${total} (${range}) · ≈ ${sizeMb} MB MP3 · from ${estimate.samples} rendered chunks`;
+            const values = () => ({total: formatRuntimeDuration(estimate.total_seconds), range: `${formatRuntimeDuration(estimate.low_seconds)} – ${formatRuntimeDuration(estimate.high_seconds)}`, size: sizeMb, count: estimate.samples});
+            if (pluralForm(estimate.samples) === 'one') {
+                setUiMessage(node, 'editor.estimate.sample-one', '≈ {total} ({range}) · ≈ {size} MB MP3 · from {count} rendered chunk', values);
+            } else {
+                setUiMessage(node, 'editor.estimate.samples', '≈ {total} ({range}) · ≈ {size} MB MP3 · from {count} rendered chunks', values);
+            }
         }
 
         function formatRuntimeDuration(seconds) {
             const totalMinutes = Math.max(0, Math.round((Number(seconds) || 0) / 60));
             const hours = Math.floor(totalMinutes / 60);
             const minutes = totalMinutes % 60;
-            return `${hours} h ${minutes} m`;
+            return t('editor.estimate.duration', '{hours} h {minutes} m', {hours, minutes});
         }
 
         async function ensureMergeIntegrityApproval(actionLabel) {
@@ -7554,7 +9279,7 @@
                 panel.style.display = 'none';
                 return;
             }
-            summary.textContent = 'Comparing…';
+            summary.textContent = t('editor.integrity.comparing', 'Comparing…');
             try {
                 const diff = await API.get('/api/editor/integrity');
                 if (!isCurrent()) { return; }
@@ -7562,7 +9287,7 @@
             } catch (e) {
                 if (!isCurrent()) { return; }
                 summary.textContent = '';
-                showActionError("Text integrity unavailable", e, "Refresh the Editor and run Text integrity again. A failed check does not establish that the source matches.", "error");
+                showActionError(t('editor.integrity.failed', 'Text integrity unavailable'), e, t('editor.integrity.failed-recovery', 'Refresh the Editor and run Text integrity again. A failed check does not establish that the source matches.'), "error");
             }
         }
 
@@ -7570,22 +9295,26 @@
             const panel = document.getElementById('text-diff-panel');
             const summary = document.getElementById('text-diff-summary');
             if (diff.status === 'unavailable') {
-                summary.textContent = 'Source comparison unavailable';
+                summary.textContent = t('editor.integrity.unavailable', 'Source comparison unavailable');
                 panel.style.display = '';
-                panel.textContent = diff.reason || 'No original source is on record.';
+                panel.textContent = diff.reason || t('editor.integrity.no-source', 'No original source is on record.');
                 textDiffRequest++;
                 return;
             }
-            const t = diff.totals || {};
+            const totals = diff.totals || {};
             const hunks = diff.hunks || [];
-            summary.textContent = `${t.script_words} script words vs ${t.source_words} source · ${t.deleted} dropped, ${t.inserted} added, ${t.replaced} changed · ${hunks.length} place${hunks.length === 1 ? '' : 's'}`;
+            const diffValues = {script: totals.script_words, source: totals.source_words, deleted: totals.deleted,
+                inserted: totals.inserted, replaced: totals.replaced, count: hunks.length};
+            summary.textContent = pluralForm(hunks.length) === 'one'
+                ? t('editor.integrity.summary-one', '{script} script words vs {source} source · {deleted} dropped, {inserted} added, {replaced} changed · {count} place', diffValues)
+                : t('editor.integrity.summary', '{script} script words vs {source} source · {deleted} dropped, {inserted} added, {replaced} changed · {count} places', diffValues);
             const kindClass = { delete: 'table-danger', insert: 'table-success', replace: 'table-warning' };
             const rows = hunks.map(h => `
                 <tr class="${kindClass[h.kind] || ''}">
-                    <td class="text-nowrap small">${escapeHtml(h.kind)}<br><span class="text-muted">chunk ${escapeHtml(String(h.chunk))}</span></td>
+                    <td class="text-nowrap small">${escapeHtml(h.kind)}<br><span class="text-muted">${escapeHtml(t('editor.integrity.chunk', 'chunk {number}', {number: String(h.chunk)}))}</span></td>
                     <td class="small"><span class="text-muted">${escapeHtml(h.source_before)}</span> <strong>${escapeHtml(h.source_words) || '∅'}</strong> <span class="text-muted">${escapeHtml(h.source_after)}</span></td>
                     <td class="small"><strong>${escapeHtml(h.script_words) || '∅'}</strong></td>
-                    <td class="text-nowrap">${h.entry_index != null ? `<button class="btn btn-sm btn-link p-0" onclick="scrollToChunkRow(${Number(h.entry_index)})">entry ${Number(h.entry_index) + 1}</button>` : ''}</td>
+                    <td class="text-nowrap">${h.entry_index != null ? `<button class="btn btn-sm btn-link p-0" onclick="scrollToChunkRow(${Number(h.entry_index)})">${escapeHtml(t('editor.integrity.entry', 'entry {number}', {number: Number(h.entry_index) + 1}))}</button>` : ''}</td>
                 </tr>`).join('');
             panel.style.display = '';
             panel.innerHTML = `
@@ -7593,10 +9322,10 @@
                     ${hunks.length ? `
                     <div class="table-responsive" style="max-height: 40vh; overflow-y: auto;">
                         <table class="table table-sm mb-0">
-                            <thead><tr><th>Kind</th><th>Source</th><th>Script</th><th></th></tr></thead>
+                            <thead><tr><th>${escapeHtml(t('editor.integrity.col-kind', 'Kind'))}</th><th>${escapeHtml(t('editor.integrity.col-source', 'Source'))}</th><th>${escapeHtml(t('editor.integrity.col-script', 'Script'))}</th><th></th></tr></thead>
                             <tbody>${rows}</tbody>
                         </table>
-                    </div>` : '<div class="small text-success mb-0">Every source word is in the script, in order.</div>'}
+                    </div>` : `<div class="small text-success mb-0">${escapeHtml(t('editor.integrity.all-present', 'Every source word is in the script, in order.'))}</div>`}
                 </div>`;
             textDiffRequest++;
         }
@@ -7604,7 +9333,7 @@
         function scrollToChunkRow(id) {
             const tr = document.querySelector(`tr[data-id="${id}"]`);
             if (!tr) {
-                showToast(`Entry ${id + 1} is not in the table yet.`, 'warning');
+                showToast(t('editor.integrity.entry-missing', 'Entry {number} is not in the table yet.', {number: id + 1}), 'warning');
                 return;
             }
             if (tr.style.display === 'none') {
@@ -7612,10 +9341,10 @@
                 if (filter?.checked) {
                     filter.checked = false;
                     applyDriftFilter();
-                    showToast(`Showing all chunks to reveal entry ${id + 1}.`, 'info');
+                    showToast(t('editor.integrity.entry-showing-all', 'Showing all chunks to reveal entry {number}.', {number: id + 1}), 'info');
                 }
                 if (tr.style.display === 'none') {
-                    showToast(`Entry ${id + 1} is hidden. Show all chunks, then try its link again.`, 'warning');
+                    showToast(t('editor.integrity.entry-hidden', 'Entry {number} is hidden. Show all chunks, then try its link again.', {number: id + 1}), 'warning');
                     return;
                 }
             }
@@ -7644,7 +9373,7 @@
             const current = (chunk.speaker || '').trim();
             const label = current && !roster.editorSet.has(current) ? `${current} (custom)` : current;
             const option = `<option value="${escapeHtml(current)}" selected>${escapeHtml(label || '-- No speaker selected --')}</option>`;
-            return `<select class="form-select form-select-sm" data-voice-roster="speaker" data-roster-book="${escapeHtml(roster.book)}" onchange="updateChunk(${chunk.id}, 'speaker', this.value)">${option}</select>`;
+            return `<label class="visually-hidden" for="chunk-speaker-${chunk.id}">${escapeHtml(t('core.editor.speaker-line', 'Speaker for line {line}', {line: chunk.id + 1}))}</label><select id="chunk-speaker-${chunk.id}" class="form-select form-select-sm" data-voice-roster="speaker" data-roster-book="${escapeHtml(roster.book)}" onchange="updateChunk(${chunk.id}, 'speaker', this.value)">${option}</select>`;
         }
 
         // Check if any audio is currently playing
@@ -7686,7 +9415,7 @@
                 const res = await API.post('/api/chunks/drift_check', indices ? { indices } : {});
                 if (!res.measured) {
                     if (btn) { btn.disabled = false; }
-                    showToast('Voice check not measured: no speechbrain interpreter configured (Voice Lab → rocm_python).', 'warning');
+                    showToast(t('editor.drift.not-measured', 'Voice check not measured: no speechbrain interpreter configured (Voice Lab → rocm_python).'), 'warning');
                     return;
                 }
                 _startPolling('logs:drift_check', () => API.get('/api/status/drift_check'), {
@@ -7696,12 +9425,12 @@
                         if (btn) { btn.disabled = false; }
                         await loadChunks(true);
                         const last = (s.logs || []).slice(-1)[0] || '';
-                        showToast(last.startsWith('NOT MEASURED') ? last : `Voice check: ${last}`, /\b0 flagged\b/.test(last) ? 'success' : 'warning');
+                        showToast(last.startsWith('NOT MEASURED') ? last : t('editor.drift.result', 'Voice check: {result}', {result: last}), /\b0 flagged\b/.test(last) ? 'success' : 'warning');
                     },
                 });
             } catch (e) {
                 if (btn) { btn.disabled = false; }
-                showActionError("Voice check failed", e, "Check the Voice Lab interpreter and speechbrain setup, then check the voice-check task status before starting again.", "error");
+                showActionError(t('editor.drift.failed', 'Voice check failed'), e, t('editor.drift.failed-recovery', 'Check the Voice Lab interpreter and speechbrain setup, then check the voice-check task status before starting again.'), "error");
             }
         }
 
@@ -7712,12 +9441,17 @@
             const statusColor = chunk.status === 'done' ? 'success' :
                               chunk.status === 'generating' ? 'warning' :
                               chunk.status === 'error' ? 'danger' : 'secondary';
+            if (typeof getChunkRowState === 'function') { tr.dataset.renderState = getChunkRowState(chunk); }
 
-            // Update status badge
+            // Update status badge. Keep the locale selector class and the
+            // data-status it repaints from; otherwise a save freezes the badge
+            // in the language that happened to be active at save time.
             const badge = tr.querySelector('.badge');
             if (badge) {
-                badge.className = `badge bg-${statusColor}`;
-                badge.innerText = chunk.status;
+                const statusLabel = typeof chunkStatusLabel === 'function' ? chunkStatusLabel(chunk.status) : chunk.status;
+                badge.className = `badge bg-${statusColor} chunk-status-label`;
+                badge.setAttribute?.('data-status', chunk.status);
+                badge.innerText = statusLabel;
                 const oldDrift = tr.querySelector('.drift-badge');
                 if (oldDrift) { oldDrift.remove(); }
                 badge.insertAdjacentHTML('afterend', _driftBadge(chunk));
@@ -7729,15 +9463,16 @@
             const actionContainer = tr.querySelector('.chunk-actions');
             if (actionContainer) {
                 const existingBtn = actionContainer.querySelector('button');
-                const existingProgress = actionContainer.querySelector('.progress');
+                const existingProgress = actionContainer.querySelector('.tp');
 
                 if (chunk.status === 'generating') {
                     if (existingBtn && !existingProgress) {
+                        // Per-line bars are indeterminate by design: one line has
+                        // no fraction to report (dither, the audio texture).
                         const progressBar = document.createElement('div');
-                        progressBar.className = 'progress';
+                        progressBar.className = 'tp tp-dither tp-sm tp-indeterminate';
                         progressBar.style.width = '100px';
-                        progressBar.style.height = '20px';
-                        progressBar.innerHTML = '<div class="progress-bar progress-bar-striped progress-bar-animated bg-warning flex-grow-1" role="status" aria-label="Generating audio">Generating…</div>';
+                        progressBar.innerHTML = `<span class="tp-label" role="status" aria-label="${escapeHtml(t('core.editor.generating-aria', 'Generating audio'))}">${escapeHtml(t('core.editor.generating', 'Generating…'))}</span>`;
                         actionContainer.replaceChild(progressBar, existingBtn);
                     }
                 } else {
@@ -7745,26 +9480,63 @@
                         const btn = document.createElement('button');
                         btn.className = 'btn btn-sm btn-primary';
                         btn.onclick = () => generateChunk(chunk.id);
-                        btn.innerHTML = '<i class="fas fa-play"></i> Gen';
+                        btn.innerHTML = `<i class="fas fa-play"></i> ${escapeHtml(t('core.editor.generate-short', 'Gen'))}`;
                         actionContainer.replaceChild(btn, existingProgress);
+                    }
+                    const action = actionContainer.querySelector('button');
+                    if (action) {
+                        action.innerHTML = `<i class="fas fa-play"></i> ${escapeHtml(chunk.status === 'error'
+                            ? t('core.editor.retry-line', 'Retry') : t('core.editor.generate-short', 'Gen'))}`;
+                        action.classList?.toggle('btn-outline-danger', chunk.status === 'error');
+                        action.classList?.toggle('btn-primary', chunk.status !== 'error');
                     }
                 }
 
-                // Update audio player when status is done - always refresh src to bust cache
-                if (chunk.status === 'done' && chunk.audio_path) {
-                    const existingAudio = actionContainer.querySelector('audio');
-                    const existingNoAudio = actionContainer.querySelector('.text-muted');
-                    const newSrc = encodeURI(`/${chunk.audio_path}`) + `?t=${encodeURIComponent(chunk.audio_revision || Date.now())}`;
-
-                    if (existingNoAudio) {
-                        // No audio element yet, create one
+                // The player is owned by the audio identity, not by the row
+                // status. A pause-only save leaves that identity untouched and
+                // must not interrupt playback; 'generating' with valid audio
+                // keeps the old take listenable. Only a cleared path removes it.
+                const existingAudio = actionContainer.querySelector('audio.chunk-audio');
+                if (chunk.audio_path) {
+                    const path = encodeURI(`/${chunk.audio_path}`);
+                    const currentSrc = existingAudio?.getAttribute?.('src');
+                    // Legacy rows have no revision. Keep their original cache
+                    // buster while the audio path remains the same.
+                    const newSrc = !chunk.audio_revision && currentSrc?.startsWith(`${path}?t=`)
+                        ? currentSrc : `${path}?t=${encodeURIComponent(chunk.audio_revision || Date.now())}`;
+                    if (existingAudio) {
+                        if (currentSrc !== newSrc) {
+                            existingAudio.src = newSrc;
+                            existingAudio.load?.();
+                        }
+                    } else {
+                        const existingNoAudio = actionContainer.querySelector('.text-muted');
                         const audioHtml = `<audio class="chunk-audio" data-id="${chunk.id}" controls src="${newSrc}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>`;
-                        existingNoAudio.outerHTML = audioHtml;
-                    } else if (existingAudio) {
-                        // Audio exists - just update the src with new cache-busting timestamp
-                        // This forces browser to fetch the regenerated file
-                        existingAudio.src = newSrc;
-                        existingAudio.load(); // Force reload
+                        if (existingNoAudio) { existingNoAudio.outerHTML = audioHtml; }
+                        else if (typeof actionContainer.insertAdjacentHTML === 'function') { actionContainer.insertAdjacentHTML('beforeend', audioHtml); }
+                    }
+                } else {
+                    // A semantic edit can downgrade a previously rendered row to
+                    // pending with no audio. Stop and remove the stale player so
+                    // neither the table nor the inspector can play the old take.
+                    if (existingAudio) {
+                        try { existingAudio.pause?.(); existingAudio.removeAttribute?.('src'); existingAudio.load?.(); } catch (error) {}
+                        try { existingAudio.remove?.(); } catch (error) {}
+                    }
+                    if (!actionContainer.querySelector('.text-muted')) {
+                        const noAudio = typeof document.createElement === 'function' ? document.createElement('span') : null;
+                        if (noAudio) {
+                            noAudio.className = 'text-muted small';
+                            if (typeof setUiMessage === 'function' && typeof noAudio.setAttribute === 'function') {
+                                setUiMessage(noAudio, 'core.editor.no-audio', 'No audio');
+                            } else {
+                                noAudio.textContent = t('core.editor.no-audio', 'No audio');
+                            }
+                            if (typeof actionContainer.appendChild === 'function') { actionContainer.appendChild(noAudio); }
+                            else if (typeof actionContainer.insertAdjacentHTML === 'function') { actionContainer.insertAdjacentHTML('beforeend', `<span class="text-muted small">${uiMessageMarkup('core.editor.no-audio', 'No audio')}</span>`); }
+                        } else if (typeof actionContainer.insertAdjacentHTML === 'function') {
+                            actionContainer.insertAdjacentHTML('beforeend', `<span class="text-muted small">${uiMessageMarkup('core.editor.no-audio', 'No audio')}</span>`);
+                        }
                     }
                 }
             }
@@ -7799,17 +9571,20 @@
             if (!panel) { return; }
             if (!info || !Number.isInteger(info.count) || !Array.isArray(info.rows)) {
                 panel.style.display = '';
-                panel.textContent = 'Delivery review is unavailable; refresh before relying on its warnings.';
+                panel.textContent = t('editor.delivery.unavailable', 'Delivery review is unavailable; refresh before relying on its warnings.');
                 return;
             }
             panel.style.display = info.count || deliveryRetryClaim ? '' : 'none';
-            const rows = info.rows.map(row => `<li><strong>Entry ${escapeHtml(String(row.entry))} · ${escapeHtml(row.speaker)}</strong>: ${escapeHtml(row.text)}<br><small>${escapeHtml(row.instruct)}</small></li>`).join('');
-            panel.innerHTML = `<strong>Needs delivery review: ${info.count} entries</strong>
-                <p class="small mb-2">Step 3 exhausted its retries for these entries and used generic delivery instructions. Text and speakers were retained.</p>
+            const rows = info.rows.map(row => `<li><strong>${escapeHtml(t('editor.delivery.row', 'Entry {entry} · {speaker}', {entry: String(row.entry), speaker: row.speaker}))}</strong>: ${escapeHtml(row.text)}<br><small>${escapeHtml(row.instruct)}</small></li>`).join('');
+            const heading = pluralForm(info.count) === 'one'
+                ? t('editor.delivery.heading-one', 'Needs delivery review: {count} entry', {count: info.count})
+                : t('editor.delivery.heading', 'Needs delivery review: {count} entries', {count: info.count});
+            panel.innerHTML = `<strong>${escapeHtml(heading)}</strong>
+                <p class="small mb-2">${escapeHtml(t('editor.delivery.explanation', 'Step 3 exhausted its retries for these entries and used generic delivery instructions. Text and speakers were retained.'))}</p>
                 <div style="max-height:16rem;overflow:auto"><ol>${rows}</ol></div>
                 ${info.retry_refusal ? `<p class="small">${escapeHtml(info.retry_refusal)}</p>` : ''}
-                <button class="btn btn-sm btn-outline-warning" onclick="retryDeliveryInstructions()" ${!info.retry_available || deliveryRetryPending || deliveryRetryClaim ? 'disabled' : ''}>Retry delivery only</button>
-                ${deliveryRetryClaim ? '<button class="btn btn-sm btn-outline-danger ms-2" onclick="cancelDeliveryInstructions()">Cancel delivery retry</button>' : ''}`;
+                <button class="btn btn-sm btn-outline-warning" onclick="retryDeliveryInstructions()" ${!info.retry_available || deliveryRetryPending || deliveryRetryClaim ? 'disabled' : ''}>${escapeHtml(t('editor.delivery.retry-only', 'Retry delivery only'))}</button>
+                ${deliveryRetryClaim ? `<button class="btn btn-sm btn-outline-danger ms-2" onclick="cancelDeliveryInstructions()">${escapeHtml(t('editor.delivery.cancel-retry', 'Cancel delivery retry'))}</button>` : ''}`;
         }
 
         async function refreshDeliveryReview() {
@@ -7832,7 +9607,7 @@
                 await ensureEditorRenderSnapshot();
                 const info = await refreshDeliveryReview();
                 if (!info || !info.count || !info.retry_available) { return; }
-                if (!await confirmIfRemote('this delivery-only retry', true)) { return; }
+                if (!await confirmIfRemote(t('core.remote.task.delivery-retry', 'this delivery-only retry'), true)) { return; }
                 const started = await API.post('/api/annotated_script/delivery_review/retry', {snapshot: info.snapshot});
                 deliveryRetryClaim = started.claim_id;
                 renderDeliveryReview(info);
@@ -7845,11 +9620,11 @@
                         deliveryRetryClaim = null;
                         await loadChunks(true);
                         await refreshDeliveryReview();
-                        showToast('Delivery retry is no longer running. Review the refreshed flagged entries before generating audio.', 'info');
+                        showToast(t('editor.delivery.no-longer-running', 'Delivery retry is no longer running. Review the refreshed flagged entries before generating audio.'), 'info');
                     },
                 });
             } catch (e) {
-                showActionError("Delivery retry failed", e, "Check the delivery retry status and refreshed flagged entries before retrying. For an LLM refusal, use Setup \u2192 Test Connection.", "warning");
+                showActionError(t('editor.delivery.retry-failed', 'Delivery retry failed'), e, t('editor.delivery.retry-failed-recovery', 'Check the delivery retry status and refreshed flagged entries before retrying. For an LLM refusal, use Setup → Test Connection.'), "warning");
             } finally {
                 deliveryRetryPending = false;
                 await refreshDeliveryReview();
@@ -7861,9 +9636,9 @@
             const claim = deliveryRetryClaim;
             try {
                 await API.post('/api/annotated_script/delivery_review/cancel', {claim_id: claim});
-                showToast('Cancellation queued; the provider call must return before ownership is released.', 'info');
+                showToast(t('editor.delivery.cancel-queued', 'Cancellation queued; the provider call must return before ownership is released.'), 'info');
             } catch (e) {
-                showActionError("Delivery cancellation failed", e, "Check delivery retry status before cancelling again; the provider call may still be running.", "warning");
+                showActionError(t('editor.delivery.cancel-failed', 'Delivery cancellation failed'), e, t('editor.delivery.cancel-failed-recovery', 'Check delivery retry status before cancelling again; the provider call may still be running.'), "warning");
             }
         };
 
@@ -7873,6 +9648,18 @@
                 error: t('core.editor.status.error', 'error'), pending: t('core.editor.status.pending', 'pending'),
                 skipped: t('core.editor.status.skipped', 'skipped'),
             }[status] || status;
+        }
+
+        // The Script tab's ingest controls sit in three different blocks; these
+        // buttons only move focus to each one, in the order the work happens.
+        function focusScriptIngestStep(step) {
+            const targets = { upload: '#file-upload', existing: '#existing-upload-select', generate: '#btn-gen-script', analyze: '#btn-build-cast-list' };
+            const selector = targets[step];
+            const node = selector ? document.querySelector(selector) : null;
+            if (!node) { return; }
+            if (typeof revealWorkflowTarget === 'function') { revealWorkflowTarget(node); return; }
+            node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            node.focus({ preventScroll: true });
         }
 
         async function loadChunks(forceFullRedraw = false) {
@@ -7891,9 +9678,26 @@
             } catch (e) {
                 console.error("Error loading chunks:", e);
                 window.markEditorReviewStale?.();
+                // A first load that fails would otherwise leave the loading row
+                // in place, so the table reads "Loading chunks..." forever while
+                // the only explanation sits in the status line above it.
+                const tbody = document.getElementById('chunks-table-body');
+                const placeholder = tbody && tbody.children && tbody.children.length === 1 ? tbody.children[0] : null;
+                const refused = e.status === 409 || e.status === 400 || e.status === 422;
+                const message = refused
+                    ? t('core.editor.prerequisite-refused', 'Editor is unavailable for the selected source. {reason} Open Script to review the source and publish its script before editing.', {reason: describeApiError(e)})
+                    : t('core.editor.load-failed', 'Could not load editor chunks. Displayed rows may be out of date. Check that Alexandria is running, then retry.');
+                if (placeholder && placeholder.children.length === 1) {
+                    placeholder.children[0].textContent = message;
+                }
                 const status = document.getElementById('chunk-load-status');
                 if (status) {
-                    status.innerHTML = `<span class="text-warning">${escapeHtml(t('core.editor.load-failed', 'Could not load editor chunks. Displayed rows may be out of date. Check that Alexandria is running, then retry.'))}</span> <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadChunks(true)">${escapeHtml(t('core.editor.retry', 'Retry chunks'))}</button>`;
+                    status.innerHTML = `<div class="alert alert-warning mb-2">${escapeHtml(message)}</div> `
+                        + (refused
+                            ? `<button type="button" class="btn btn-sm btn-outline-secondary" data-help-key="openScriptWorkspace" onclick="activateTab('script')">${escapeHtml(t('home.workspace.open-script', 'Open Script'))}</button>`
+                            : `<button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadChunks(true)">${escapeHtml(t('core.editor.retry', 'Retry chunks'))}</button>`)
+                        + ` <a href="/api/logs/diagnostics?download=true" class="btn btn-sm btn-outline-secondary" download>${escapeHtml(t('setup.tts.failure-log-download', 'Download failure log'))}</a>`
+                        + `<p class="small text-muted mt-2">${escapeHtml(t('diagnostics.failure-log.privacy', 'The failure log is separate from the support report and may contain private paths and error details. Review and redact before sharing.'))}</p>`;
                 }
             }
         }
@@ -7903,6 +9707,78 @@
             return JSON.stringify([chunk.audio_path, revision,
                 ...(revision ? [] : [chunk.text, chunk.instruct, chunk.speaker])]);
         }
+
+        // --- Textured progress bars (#2042) ---
+        // The ONE renderer for every progress bar in the app (Rule 15). `el` is
+        // the `.tp` track; its `.tp-fill` child carries the fraction and the
+        // `.tp-lead`/`.tp-lead2` siblings are the texture's fill-edge
+        // transition. Every colour lives in index.html's component CSS, so a
+        // theme switch recolours a bar with no re-render.
+        //
+        // `fraction` is 0-1 (values outside that range are clamped) and `null`
+        // means the task has not reported one yet: indeterminate, so no fill,
+        // no aria-valuenow, and a slowly sliding track texture.
+        //
+        // Texture per bar, one texture for one meaning:
+        //   ticks    - Script Review, script generation, casting review
+        //   dither   - rendering audio (whole book and the per-line bars)
+        //   halftone - LoRA training and the Voice Lab pipeline
+        //   hatch    - dataset builder and dataset preparer
+        //
+        // `task` is the translated task name; passing it builds the spoken
+        // value here so no caller re-derives it.
+        function renderTexturedProgress(el, { fraction = null, label = '', valueText = null, task = '' } = {}) {
+            if (!el) { return; }
+            const indeterminate = fraction === null || fraction === undefined
+                || !Number.isFinite(Number(fraction));
+            const percentage = indeterminate
+                ? 0 : Math.round(Math.min(1, Math.max(0, Number(fraction))) * 100);
+            // Slice harnesses hand this function a bare element stub, so every
+            // child is optional: without them the element itself is painted.
+            const fill = el.querySelector?.('.tp-fill') || el;
+            const wrap = el.closest?.('.tp-wrap') || null;
+            const labelEl = wrap ? wrap.querySelector('.tp-label') : null;
+            const valueEl = wrap ? wrap.querySelector('.tp-value') : null;
+            // The bar's accessible NAME belongs to the markup: an aria-label, or
+            // an aria-labelledby pointing at the head-row label's id. This
+            // renderer never touches either attribute and never rewrites that
+            // id, so the name survives every render -- but for a labelledby bar
+            // the label's TEXT is the name, so an empty `label` must not blank
+            // it, or the bar would end up nameless.
+            const namedByLabel = !!labelEl && !!labelEl.id
+                && (el.getAttribute?.('aria-labelledby') || '')
+                    .split(/\s+/).includes(labelEl.id);
+            if (el.classList) {
+                if (indeterminate) { el.classList.add?.('tp-indeterminate'); }
+                else { el.classList.remove?.('tp-indeterminate'); }
+            }
+            fill.style.width = indeterminate ? '' : `${percentage}%`;
+            if (labelEl) {
+                if (label || !namedByLabel) { labelEl.textContent = label; }
+            } else { fill.innerText = label; }
+            if (valueEl) { valueEl.textContent = indeterminate ? '' : `${percentage}%`; }
+            el.ariaValueMin = '0';
+            el.ariaValueMax = '100';
+            // Both forms: the IDL property reflects to the attribute in a
+            // browser, and slice harnesses read one or the other off a stub.
+            if (indeterminate) {
+                el.removeAttribute?.('aria-valuenow');
+                el.ariaValueNow = null;
+            } else {
+                el.setAttribute?.('aria-valuenow', String(percentage));
+                el.ariaValueNow = String(percentage);
+            }
+            if (valueText === null) {
+                valueText = !task ? label
+                    : indeterminate
+                        ? t('core.progress.indeterminate', '{task}: progress is not reported yet', {task})
+                        : t('core.progress.value', '{task}: {percentage}%', {task, percentage});
+            }
+            el.ariaValueText = valueText;
+            el.ariaBusy = indeterminate ? 'true' : 'false';
+        }
+        window.renderTexturedProgress = renderTexturedProgress;
+        // --- End textured progress bars ---
 
         async function refreshChunkSnapshot(forceFullRedraw = false) {
             const refreshBook = currentBookFilename;
@@ -7949,23 +9825,20 @@
                 chunkSnapshotRevision = null;
                 throw new Error(t('core.editor.snapshot-incomplete', 'Editor snapshot is incomplete.'));
             }
-            if (chunks.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="6" class="text-center">${escapeHtml(t('core.editor.no-chunks', 'No chunks found. Please generate script first.'))}</td></tr>`;
-                cachedChunks = [];
-                chunkSnapshotBook = refreshBook;
-                chunkSnapshotRevision = snapshot.revision;
-                window.renderEditorQualityInbox?.();
-                return chunks;
-            }
-
-            // Update Full Progress Bar
             const completed = chunks.filter(c => c.status === 'done').length;
+            window.renderPendingCount?.(chunks);
             const total = chunks.length;
             const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
-            const progressBar = document.getElementById('full-progress-bar');
-            if (progressBar) {
-                progressBar.style.width = `${percentage}%`;
-                progressBar.innerText = `${percentage}% (${completed}/${total})`;
+            renderTexturedProgress(document.getElementById('full-progress-bar'), {
+                fraction: total > 0 ? completed / total : 0,
+                label: t('core.editor.render-progress-label', 'Rendered {completed} of {total} lines', {completed, total}),
+                valueText: t('core.editor.render-progress-value', 'Rendered {completed} of {total} lines ({percentage}%)', {completed, total, percentage}),
+            });
+            if (chunks.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="6" class="text-center">${escapeHtml(t('core.editor.no-chunks', 'No chunks found. Please generate script first.'))}</td></tr>`;
+                cacheChunkSnapshot(chunks, refreshBook, snapshot);
+                window.renderEditorQualityInbox?.();
+                return chunks;
             }
 
             // Skip redraw if playing audio (unless forced)
@@ -7974,9 +9847,7 @@
                 chunks.forEach(chunk => {
                     if (snapshot.full || snapshot.changed_ids.includes(chunk.id)) { updateChunkRow(chunk); }
                 });
-                cachedChunks = chunks;
-                chunkSnapshotBook = refreshBook;
-                chunkSnapshotRevision = snapshot.revision;
+                cacheChunkSnapshot(chunks, refreshBook, snapshot);
                 window.renderEditorQualityInbox?.();
 
                 // Continue polling if generating
@@ -8003,125 +9874,159 @@
                     }
                 });
             } else {
-                const editorFields = [
-                    ['.chunk-text', 'text'], ['.chunk-instruct', 'instruct'],
-                    ['.chunk-pause-after', 'pause_after'], ['select', 'speaker']
-                ];
-                const drafts = new Map();
-                if (chunkSnapshotBook === refreshBook) {
-                    const previous = new Map(cachedChunks.map(chunk => [String(chunk.id), chunk]));
-                    for (const row of tbody.querySelectorAll?.('.chunk-row') || []) {
-                        const chunk = previous.get(row.dataset.id);
-                        if (!chunk?.uid) { continue; }
-                        const controls = editorFields.map(([selector, key]) => {
-                            const field = row.querySelector(selector);
-                            if (!field) { return null; }
-                            return {selector, value: field.value,
-                                dirty: getEditorFieldValue(key, field.value, String(chunk[key] ?? '')) !== String(chunk[key] ?? ''),
-                                focused: field === document.activeElement,
-                                selectionStart: field.selectionStart, selectionEnd: field.selectionEnd,
-                                selectionDirection: field.selectionDirection};
-                        }).filter(Boolean);
-                        drafts.set(chunk.uid, {expanded: row.classList.contains('expanded'), controls});
-                    }
-                }
-                // Keep an unchanged audition when rebuilding the surrounding rows.
-                const playingAudio = Array.from(document.querySelectorAll('#chunks-table-body .chunk-audio'))
-                    .find(audio => !audio.paused && !audio.ended);
-                const playingChunk = playingAudio
-                    ? cachedChunks.find(chunk => String(chunk.id) === playingAudio.dataset.id) : null;
-                const retainedChunk = refreshBook === currentBookFilename && playingChunk?.uid && chunks.find(chunk => chunk.uid === playingChunk.uid
-                    && chunk.audio_path && getChunkAudioIdentity(chunk) === getChunkAudioIdentity(playingChunk));
-                const playbackTime = playingAudio?.currentTime;
-                // Full redraw needed
-                tbody.innerHTML = chunks.map(chunk => {
-                    const statusColor = chunk.status === 'done' ? 'success' :
-                                      chunk.status === 'generating' ? 'warning' :
-                                      chunk.status === 'error' ? 'danger' : 'secondary';
-
-                    const audioPlayer = chunk.audio_path ?
-                        `<audio class="chunk-audio" data-id="${chunk.id}" controls src="${encodeURI(`/${chunk.audio_path}`)}?t=${encodeURIComponent(chunk.audio_revision || Date.now())}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>` :
-                        `<span class="text-muted small">${escapeHtml(t('core.editor.no-audio', 'No audio'))}</span>`;
-
-                    const actionArea = chunk.status === 'generating' ?
-                        `<div class="progress" style="width: 100px; height: 20px;">
-                            <div class="progress-bar progress-bar-striped progress-bar-animated bg-warning flex-grow-1" role="status" aria-label="${escapeHtml(t('core.editor.generating-aria', 'Generating audio'))}">${escapeHtml(t('core.editor.generating', 'Generating…'))}</div>
-                         </div>` :
-                        `<button class="btn btn-sm btn-primary" onclick="generateChunk(${chunk.id})"><i class="fas fa-play"></i> ${escapeHtml(t('core.editor.generate-short', 'Gen'))}</button>`;
-
-                    return `
-                        <tr data-id="${chunk.id}" data-uid="${escapeHtml(chunk.uid)}" data-book-token="${escapeHtml(snapshot.book_token)}" class="chunk-row">
-                            <td class="text-center align-middle" style="white-space:nowrap;">
-                                <button type="button" class="chunk-action-btn" onclick="selectEditorReviewLineById(${chunk.id})" title="${escapeHtml(t('core.editor.inspect-line', 'Inspect line {line}', {line: chunk.id + 1}))}" aria-label="${escapeHtml(t('core.editor.inspect-line', 'Inspect line {line}', {line: chunk.id + 1}))}"><i class="fas fa-magnifying-glass"></i></button><button class="chunk-action-btn chunk-toggle-btn" onclick="toggleChunkExpand(this)" title="${escapeHtml(t('core.editor.expand', 'Expand/collapse'))}"><i class="fas fa-chevron-down"></i></button><button class="chunk-action-btn" onclick="insertChunkAfter(${chunk.id})" title="${escapeHtml(t('core.editor.insert-line', 'Insert line below'))}"><i class="fas fa-plus"></i></button><button class="chunk-action-btn" onclick="deleteChunk(${chunk.id})" title="${escapeHtml(t('core.editor.delete-line', 'Delete line'))}"><i class="fas fa-trash" style="color:#dc3545;"></i></button><button class="chunk-action-btn" onclick="voiceChangesHere(${chunk.id})" title="${escapeHtml(t('core.editor.voice-change', 'Voice changes here: from this line on, this character sounds different (time skip, older)'))}"><i class="fas fa-user-clock"></i></button>${document.getElementById('reproducible-takes')?.checked === true ? `<button class="chunk-action-btn" onclick="differentTake(${chunk.id})" title="${escapeHtml(t('core.editor.different-take', 'Different take: render this line again with a new seed'))}"><i class="fas fa-dice"></i></button>` : ''}
-                            </td>
-                            <td>${buildSpeakerSelect(chunk)}</td>
-                            <td><textarea class="form-control form-control-sm chunk-text" rows="2" onchange="updateChunk(${chunk.id}, 'text', this.value)">${escapeHtml(chunk.text)}</textarea></td>
-                            <td>
-                                <textarea class="form-control form-control-sm chunk-instruct" rows="2" onchange="updateChunk(${chunk.id}, 'instruct', this.value)" title="${escapeHtml(t('core.editor.delivery-title', 'Delivery instruction (3-8 words)'))}">${escapeHtml(chunk.instruct || '')}</textarea>
-                                <div class="chunk-pause-row d-none mt-1 align-items-center gap-1">
-                                    <small class="text-muted text-nowrap">${escapeHtml(t('core.editor.pause-after', 'Pause after (ms):'))}</small>
-                                    <input type="number" class="form-control form-control-sm chunk-pause-after" style="width:80px;" value="${chunk.pause_after ?? ''}" placeholder="${escapeHtml(t('core.editor.pause-default', 'default'))}" min="0"${typeof maxPauseMs !== 'undefined' && maxPauseMs != null ? ` max="${maxPauseMs}"` : ''} step="50" onchange="updateChunk(${chunk.id}, 'pause_after', this.value === '' ? null : parseInt(this.value))">
-                                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="suggestChunkGap(${chunk.id}, this)" title="${escapeHtml(t('core.editor.suggest-gap-title', 'Opt-in gap suggestion; uses the exact NARRATOR speaker label. Explicit pauses are not replaced.'))}">${escapeHtml(t('core.editor.suggest-gap', 'Suggest gap'))}</button>
-                                </div>
-                            </td>
-                            <td><span class="badge bg-${statusColor}">${escapeHtml(chunkStatusLabel(chunk.status))}</span>${_driftBadge(chunk)}</td>
-                            <td>
-                                <div class="chunk-actions d-flex align-items-center gap-2">
-                                    ${actionArea}
-                                    ${audioPlayer}
-                                </div>
-                            </td>
-                        </tr>
-                    `;
-                }).join('');
-                for (const chunk of chunks) {
-                    const draft = drafts.get(chunk.uid);
-                    const row = draft && tbody.querySelector(`tr[data-id="${chunk.id}"]`);
-                    if (!row) { continue; }
-                    for (const saved of draft.controls) {
-                        const field = row.querySelector(saved.selector);
-                        if (!field) { continue; }
-                        if (saved.dirty) {
-                            if (saved.selector === 'select' && !Array.from(field.options).some(option => option.value === saved.value)) {
-                                const option = document.createElement('option');
-                                option.value = saved.value;
-                                option.textContent = saved.value + ' (custom)';
-                                field.appendChild(option);
-                            }
-                            field.value = saved.value;
-                        }
-                        if (saved.focused) {
-                            field.focus({preventScroll: true});
-                            if (typeof saved.selectionStart === 'number' && field.setSelectionRange) {
-                                field.setSelectionRange(saved.selectionStart, saved.selectionEnd, saved.selectionDirection);
-                            }
+                const renderBatchSize = 20;
+                const yieldRender = async () => {
+                    if (globalThis.scheduler?.yield) { await globalThis.scheduler.yield(); }
+                    else { await new Promise(resolve => setTimeout(resolve, 0)); }
+                };
+                const activeField = document.activeElement;
+                tbody.setAttribute('aria-busy', 'true');
+                tbody.inert = true;
+                try {
+                    const editorFields = [
+                        ['.chunk-text', 'text'], ['.chunk-instruct', 'instruct'],
+                        ['.chunk-pause-after', 'pause_after'], ['select', 'speaker']
+                    ];
+                    const drafts = new Map();
+                    if (chunkSnapshotBook === refreshBook) {
+                        const previous = new Map(cachedChunks.map(chunk => [String(chunk.id), chunk]));
+                        const previousRows = Array.from(tbody.querySelectorAll?.('.chunk-row') || []);
+                        for (const [rowIndex, row] of previousRows.entries()) {
+                            if (rowIndex && rowIndex % renderBatchSize === 0) { await yieldRender(); }
+                            const chunk = previous.get(row.dataset.id);
+                            if (!chunk?.uid) { continue; }
+                            const controls = editorFields.map(([selector, key]) => {
+                                const field = row.querySelector(selector);
+                                if (!field) { return null; }
+                                return {selector, value: field.value,
+                                    dirty: getEditorFieldValue(key, field.value, String(chunk[key] ?? '')) !== String(chunk[key] ?? ''),
+                                    focused: field === activeField,
+                                    selectionStart: field.selectionStart, selectionEnd: field.selectionEnd,
+                                    selectionDirection: field.selectionDirection};
+                            }).filter(control => control && (control.dirty || control.focused));
+                            const expanded = row.classList.contains('expanded');
+                            if (expanded || controls.length) { drafts.set(chunk.uid, {expanded, controls}); }
                         }
                     }
-                    if (draft.expanded) { window.toggleChunkExpand(row.querySelector('.chunk-toggle-btn')); }
-                }
-                if (retainedChunk) {
-                    const replacement = tbody.querySelector(`audio.chunk-audio[data-id="${retainedChunk.id}"]`);
-                    if (replacement) {
-                        playingAudio.dataset.id = String(retainedChunk.id);
-                        playingAudio.setAttribute('onplay', `stopOthers(${retainedChunk.id})`);
-                        playingAudio.addEventListener('loadedmetadata', () => {
-                            if (refreshBook !== currentBookFilename || !playingAudio.isConnected) { return; }
-                            playingAudio.currentTime = playbackTime;
-                            void playingAudio.play().then(() => {
-                                if (refreshBook !== currentBookFilename || !playingAudio.isConnected) { playingAudio.pause(); }
-                            }).catch(() => {
-                                showToast('The editor refreshed, but playback could not resume. Press Play on the chunk to continue listening.', 'warning');
-                            });
-                        }, {once: true});
-                        replacement.replaceWith(playingAudio);
-                        playingAudio.load();
+                    // Keep an unchanged audition when rebuilding the surrounding rows.
+                    const playingAudio = Array.from(document.querySelectorAll('#chunks-table-body .chunk-audio'))
+                        .find(audio => !audio.paused && !audio.ended);
+                    const playingChunk = playingAudio
+                        ? cachedChunks.find(chunk => String(chunk.id) === playingAudio.dataset.id) : null;
+                    const retainedChunk = refreshBook === currentBookFilename && playingChunk?.uid && chunks.find(chunk => chunk.uid === playingChunk.uid
+                        && chunk.audio_path && getChunkAudioIdentity(chunk) === getChunkAudioIdentity(playingChunk));
+                    const playbackTime = playingAudio?.currentTime;
+                    // Full redraw needed
+                    const renderChunk = chunk => {
+                        const statusColor = chunk.status === 'done' ? 'success' :
+                                          chunk.status === 'generating' ? 'warning' :
+                                          chunk.status === 'error' ? 'danger' : 'secondary';
+
+                        const audioPlayer = chunk.audio_path ?
+                            `<audio class="chunk-audio" data-id="${chunk.id}" controls src="${encodeURI(`/${chunk.audio_path}`)}?t=${encodeURIComponent(chunk.audio_revision || Date.now())}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>` :
+                            `<span class="text-muted small">${uiMessageMarkup('core.editor.no-audio', 'No audio')}</span>`;
+
+                        const actionArea = chunk.status === 'generating' ?
+                            `<div class="tp tp-dither tp-sm tp-indeterminate" style="width: 100px;"><span class="tp-label" role="status" aria-label="${escapeHtml(t('core.editor.generating-aria', 'Generating audio'))}">${escapeHtml(t('core.editor.generating', 'Generating…'))}</span></div>` :
+                            `<button class="btn btn-sm ${chunk.status === 'error' ? 'btn-outline-danger' : 'btn-primary'}" onclick="generateChunk(${chunk.id})"><i class="fas fa-play"></i> ${chunk.status === 'error' ? uiMessageMarkup('core.editor.retry-line', 'Retry') : uiMessageMarkup('core.editor.generate-short', 'Gen')}</button>`;
+
+                        const failedMarkup = (typeof getFailedChunkEntries === 'function' && typeof chunkEditKey === 'function'
+                            && getFailedChunkEntries(chunkEditKey(chunk.uid, snapshot.book_token)).length > 0) ? ' text-danger' : '';
+
+                        return `
+                            <tr data-id="${chunk.id}" data-uid="${escapeHtml(chunk.uid)}" data-book-token="${escapeHtml(snapshot.book_token)}" data-render-state="${window.getChunkRowState?.(chunk) || 'pending'}" class="chunk-row${failedMarkup}">
+                                <td class="text-center align-middle" style="white-space:nowrap;">
+                                    <button type="button" class="chunk-action-btn" onclick="selectEditorReviewLineById(${chunk.id})" title="${escapeHtml(t('core.editor.inspect-line', 'Inspect line {line}', {line: chunk.id + 1}))}" aria-label="${escapeHtml(t('core.editor.inspect-line', 'Inspect line {line}', {line: chunk.id + 1}))}"><i class="fas fa-magnifying-glass"></i></button><button class="chunk-action-btn chunk-toggle-btn" onclick="toggleChunkExpand(this)" title="${escapeHtml(t('core.editor.expand', 'Expand/collapse'))}"><i class="fas fa-chevron-down"></i></button><button class="chunk-action-btn" onclick="insertChunkAfter(${chunk.id})" title="${escapeHtml(t('core.editor.insert-line', 'Insert line below'))}"><i class="fas fa-plus"></i></button><button class="chunk-action-btn" onclick="deleteChunk(${chunk.id})" title="${escapeHtml(t('core.editor.delete-line', 'Delete line'))}"><i class="fas fa-trash" style="color:#dc3545;"></i></button><button class="chunk-action-btn" onclick="voiceChangesHere(${chunk.id})" title="${escapeHtml(t('core.editor.voice-change', 'Voice changes here: from this line on, this character sounds different (time skip, older)'))}"><i class="fas fa-user-clock"></i></button>${document.getElementById('reproducible-takes')?.checked === true ? `<button class="chunk-action-btn" onclick="differentTake(${chunk.id})" title="${escapeHtml(t('core.editor.different-take', 'Different take: render this line again with a new seed'))}"><i class="fas fa-dice"></i></button>` : ''}
+                                </td>
+                                <td>${buildSpeakerSelect(chunk)}</td>
+                                <td><label class="visually-hidden" for="chunk-text-${chunk.id}">${escapeHtml(t('core.editor.text-line', 'Text for line {line}', {line: chunk.id + 1}))}</label><textarea id="chunk-text-${chunk.id}" class="form-control form-control-sm chunk-text" rows="2" onchange="updateChunk(${chunk.id}, 'text', this.value)">${escapeHtml(chunk.text)}</textarea></td>
+                                <td>
+                                    <label class="visually-hidden" for="chunk-instruct-${chunk.id}">${escapeHtml(t('core.editor.delivery-line', 'Delivery instruction for line {line}', {line: chunk.id + 1}))}</label><textarea id="chunk-instruct-${chunk.id}" class="form-control form-control-sm chunk-instruct" rows="2" onchange="updateChunk(${chunk.id}, 'instruct', this.value)" title="${escapeHtml(t('core.editor.delivery-title', 'Delivery instruction (3-8 words)'))}">${escapeHtml(chunk.instruct || '')}</textarea>
+                                    <div class="chunk-pause-row d-none mt-1 align-items-center gap-1">
+                                        <small class="text-muted text-nowrap">${escapeHtml(t('core.editor.pause-after', 'Pause after (ms):'))}</small>
+                                        <label class="visually-hidden" for="chunk-pause-after-${chunk.id}">${escapeHtml(t('core.editor.pause-line', 'Pause after line {line} (milliseconds)', {line: chunk.id + 1}))}</label>
+                                        <input id="chunk-pause-after-${chunk.id}" type="number" class="form-control form-control-sm chunk-pause-after" style="width:80px;" value="${chunk.pause_after ?? ''}" placeholder="${escapeHtml(t('core.editor.pause-default', 'default'))}" min="0"${typeof maxPauseMs !== 'undefined' && maxPauseMs != null ? ` max="${maxPauseMs}"` : ''} step="50" onchange="updateChunk(${chunk.id}, 'pause_after', this.value === '' ? null : parseInt(this.value))">
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="suggestChunkGap(${chunk.id}, this)" title="${escapeHtml(t('core.editor.suggest-gap-title', 'Opt-in gap suggestion; uses the exact NARRATOR speaker label. Explicit pauses are not replaced.'))}">${escapeHtml(t('core.editor.suggest-gap', 'Suggest gap'))}</button>
+                                    </div>
+                                </td>
+                                <td data-phone-label="${escapeHtml(t('editor.table.status', 'Status'))}"><span class="badge bg-${statusColor} chunk-status-label" data-status="${escapeHtml(chunk.status)}">${escapeHtml(chunkStatusLabel(chunk.status))}</span>${_driftBadge(chunk)}</td>
+                                <td data-phone-label="${escapeHtml(t('editor.table.audio-actions', 'Audio / Actions'))}">
+                                    <div class="chunk-actions d-flex align-items-center gap-2">
+                                        ${actionArea}
+                                        ${audioPlayer}
+                                    </div>
+                                </td>
+                            </tr>
+                        `;
+                    };
+                    if (refreshBook !== currentBookFilename || chunkSnapshotBookToken !== snapshot.book_token) { return cachedChunks; }
+                    cachedChunks = chunks;
+                    chunkSnapshotBook = refreshBook;
+                    chunkSnapshotRevision = snapshot.revision;
+                    const previousRows = Array.from(tbody.children);
+                    if (previousRows.length > renderBatchSize) {
+                        for (const [rowIndex, row] of previousRows.entries()) {
+                            row.remove();
+                            if ((rowIndex + 1) % renderBatchSize === 0) { await yieldRender(); }
+                        }
+                    } else { tbody.innerHTML = ''; }
+                    for (let offset = 0; offset < chunks.length; offset += renderBatchSize) {
+                        if (refreshBook !== currentBookFilename || chunkSnapshotBookToken !== snapshot.book_token) { return cachedChunks; }
+                        tbody.insertAdjacentHTML('beforeend', chunks.slice(offset, offset + renderBatchSize).map(renderChunk).join(''));
+                        if (offset + renderBatchSize < chunks.length) { await yieldRender(); }
                     }
+                    if (refreshBook !== currentBookFilename || chunkSnapshotBookToken !== snapshot.book_token) { return cachedChunks; }
+                    tbody.inert = false;
+                    for (const chunk of chunks) {
+                        const draft = drafts.get(chunk.uid);
+                        const row = draft && tbody.querySelector(`tr[data-id="${chunk.id}"]`);
+                        if (!row) { continue; }
+                        for (const saved of draft.controls) {
+                            const field = row.querySelector(saved.selector);
+                            if (!field) { continue; }
+                            if (saved.dirty) {
+                                if (saved.selector === 'select' && !Array.from(field.options).some(option => option.value === saved.value)) {
+                                    const option = document.createElement('option');
+                                    option.value = saved.value;
+                                    option.textContent = saved.value + ' (custom)';
+                                    field.appendChild(option);
+                                }
+                                field.value = saved.value;
+                            }
+                            if (saved.focused) {
+                                field.focus({preventScroll: true});
+                                if (typeof saved.selectionStart === 'number' && field.setSelectionRange) {
+                                    field.setSelectionRange(saved.selectionStart, saved.selectionEnd, saved.selectionDirection);
+                                }
+                            }
+                        }
+                        if (draft.expanded) { window.toggleChunkExpand(row.querySelector('.chunk-toggle-btn')); }
+                    }
+                    if (retainedChunk) {
+                        const replacement = tbody.querySelector(`audio.chunk-audio[data-id="${retainedChunk.id}"]`);
+                        if (replacement) {
+                            playingAudio.dataset.id = String(retainedChunk.id);
+                            playingAudio.setAttribute('onplay', `stopOthers(${retainedChunk.id})`);
+                            playingAudio.addEventListener('loadedmetadata', () => {
+                                if (refreshBook !== currentBookFilename || !playingAudio.isConnected) { return; }
+                                playingAudio.currentTime = playbackTime;
+                                void playingAudio.play().then(() => {
+                                    if (refreshBook !== currentBookFilename || !playingAudio.isConnected) { playingAudio.pause(); }
+                                }).catch(() => {
+                                    showToast(t('editor.playback.resume-failed', 'The editor refreshed, but playback could not resume. Press Play on the chunk to continue listening.'), 'warning');
+                                });
+                            }, {once: true});
+                            replacement.replaceWith(playingAudio);
+                            playingAudio.load();
+                        }
+                    }
+                } finally {
+                    tbody.inert = false;
+                    tbody.setAttribute('aria-busy', 'false');
                 }
             }
 
-            cachedChunks = chunks;
-            chunkSnapshotBook = refreshBook;
-            chunkSnapshotRevision = snapshot.revision;
+            cacheChunkSnapshot(chunks, refreshBook, snapshot);
             window.renderEditorQualityInbox?.();
 
             // If any chunk is generating, poll (without full redraw)
@@ -8130,6 +10035,23 @@
             }
 
             return chunks;
+        }
+
+        function cacheChunkSnapshot(chunks, book, snapshot) {
+            cachedChunks = chunks;
+            chunkSnapshotBook = book;
+            chunkSnapshotRevision = snapshot.revision;
+            // Only a complete snapshot proves that a refused edit's UID is
+            // gone. An index may now belong to a different line.
+            if (snapshot.full && typeof failedChunkEdits !== 'undefined' && failedChunkEdits.size) {
+                const presentUids = new Set(chunks.map(chunk => chunk.uid));
+                for (const key of failedChunkEdits.keys()) {
+                    const {bookToken, uid} = readChunkEditKey(key);
+                    if (bookToken === snapshot.book_token && uid && !presentUids.has(uid)) {
+                        failedChunkEdits.delete(key);
+                    }
+                }
+            }
         }
 
         window.toggleChunkExpand = (btn) => {
@@ -8166,11 +10088,15 @@
             const book = currentBookFilename;
             const token = chunkSnapshotBookToken;
             const uid = cachedChunks.find(chunk => chunk.id === id)?.uid;
+            if (document.getElementById('chunks-table-body')?.getAttribute?.('aria-busy') === 'true') {
+                throw new Error(t('editor.loading-wait', 'Wait for the Editor to finish loading before changing a line.'));
+            }
             if (!token || !uid || chunkSnapshotBook !== book) {
                 throw new Error('Reload the Editor before changing this row.');
             }
             return {
                 query: new URLSearchParams({expected_book_token: token, expected_uid: uid}).toString(),
+                uid, bookToken: token,
                 isCurrent: () => book === currentBookFilename && token === chunkSnapshotBookToken
             };
         }
@@ -8184,7 +10110,7 @@
                 }
                 await API.post('/api/tts/recovery/clear', {expected_book_token: token});
                 if (book === currentBookFilename && token === chunkSnapshotBookToken) {
-                    showToast('Retained recovery windows cleared. Saved takes were kept.', 'success');
+                    showToast(t('editor.recovery.cleared', 'Retained recovery windows cleared. Saved takes were kept.'), 'success');
                 }
             } catch (error) {
                 showToast(error.message, 'error');
@@ -8201,7 +10127,7 @@
                 await loadChunks();
                 await window.generateChunk(id);
             } catch (e) {
-                showActionError("Failed to change take", e, "Refresh the Editor and check whether the take changed before retrying.", "error");
+                showActionError(t('editor.take.change-failed', 'Failed to change take'), e, t('editor.take.change-failed-recovery', 'Refresh the Editor and check whether the take changed before retrying.'), "error");
             }
         };
 
@@ -8212,69 +10138,103 @@
                 if (!context.isCurrent()) { return; }
                 await loadChunks(true);
             } catch (e) {
-                showActionError("Failed to insert line", e, "Refresh the Editor and check whether the new line exists before inserting again.", "error");
+                showActionError(t('editor.line.insert-failed', 'Failed to insert line'), e, t('editor.line.insert-failed-recovery', 'Refresh the Editor and check whether the new line exists before inserting again.'), "error");
             }
         };
 
         let _lastDeleted = null;
-        let _undoTimer = null;
+        const _deletedChunks = [];
+        function renderDeleteUndo() {
+            const button = document.getElementById('editor-undo-delete');
+            const deleted = _deletedChunks.at(-1);
+            _lastDeleted = deleted || null;
+            if (!button) { return; }
+            button.hidden = !deleted;
+            if (deleted) {
+                const count = _deletedChunks.length;
+                if (pluralForm(count) === 'one') {
+                    setUiMessage(button, 'editor.delete.undo-count-one', 'Undo last deletion ({count} deletion available)', {count});
+                } else {
+                    setUiMessage(button, 'editor.delete.undo-count-many', 'Undo last deletion ({count} deletions available)', {count});
+                }
+            }
+        }
         let _undoToastSequence = 0;
+        let _deleteChunkQueue = Promise.resolve();
 
         window.deleteChunk = async (id) => {
             try {
                 const context = captureChunkMutation(id);
-                const res = await fetch(`/api/chunks/${id}?${context.query}`, { method: 'DELETE' });
-                await API._handleError(res);
-                const data = await res.json();
-                if (!context.isCurrent()) { return; }
+                const uid = cachedChunks.find(chunk => chunk.id === id).uid;
+                const previous = _deleteChunkQueue;
+                let release;
+                _deleteChunkQueue = new Promise(resolve => { release = resolve; });
+                try {
+                    await previous;
+                    if (!context.isCurrent()) { return; }
+                    const currentId = cachedChunks.find(chunk => chunk.uid === uid)?.id;
+                    const request = captureChunkMutation(currentId);
+                    const res = await fetch(`/api/chunks/${currentId}?${request.query}`, { method: 'DELETE' });
+                    await API._handleError(res);
+                    const data = await res.json();
+                    if (!context.isCurrent()) { return; }
 
-                // Store for undo
-                const toastId = 'toast-undo-' + Date.now() + '-' + (++_undoToastSequence);
-                _lastDeleted = { chunk: data.deleted, at_index: id, undo_token: data.undo_token, toastId };
-                clearTimeout(_undoTimer);
+                    // Store for undo
+                    const toastId = 'toast-undo-' + Date.now() + '-' + (++_undoToastSequence);
+                    _deletedChunks.push({ chunk: data.deleted, at_index: currentId, undo_token: data.undo_token, toastId, book: currentBookFilename, bookToken: chunkSnapshotBookToken });
+                    if (_deletedChunks.length > 128) { _deletedChunks.shift(); }
+                    renderDeleteUndo();
 
-                // Show toast with undo action
-                const container = document.getElementById('toast-container');
-                const wrapper = document.createElement('div');
-                wrapper.innerHTML = `
-                    <div id="${toastId}" class="toast align-items-center text-white bg-warning border-0" role="alert">
-                        <div class="d-flex">
-                            <div class="toast-body text-dark"><span class="deleted-line-summary"></span>
-                                <a href="#" class="ms-2 fw-bold text-dark">Undo</a>
+                    // Show toast with undo action
+                    const container = document.getElementById('toast-container');
+                    const wrapper = document.createElement('div');
+                    wrapper.innerHTML = `
+                        <div id="${toastId}" class="toast align-items-center text-white bg-warning border-0" role="alert">
+                            <div class="d-flex">
+                                <div class="toast-body text-dark"><span class="deleted-line-summary"></span>
+                                    <a href="#" class="ms-2 fw-bold text-dark">${escapeHtml(t('editor.delete.undo', 'Undo'))}</a>
+                                </div>
+                                <button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast" aria-label="${escapeHtml(t('core.toast.dismiss', 'Dismiss notification'))}"></button>
                             </div>
-                            <button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button>
-                        </div>
-                    </div>`;
-                const el = wrapper.firstElementChild;
-                el.querySelector('.deleted-line-summary').textContent =
-                    `Line deleted (${data.deleted.speaker}: "${(data.deleted.text || '').substring(0, 40)}...")`;
-                el.querySelector('a').addEventListener('click', (event) => {
-                    event.preventDefault();
-                    undoDeleteChunk(toastId);
-                });
-                container.appendChild(el);
-                const toast = new bootstrap.Toast(el, { delay: 8000 });
-                toast.show();
-                el.addEventListener('hidden.bs.toast', () => { el.remove(); });
+                        </div>`;
+                    const el = wrapper.firstElementChild;
+                    setUiMessage(el.querySelector('.deleted-line-summary'), 'editor.delete.summary', 'Line deleted ({speaker}: "{text}...")', {speaker: data.deleted.speaker, text: (data.deleted.text || '').substring(0, 40)});
+                    setUiMessage(el.querySelector('a'), 'editor.delete.undo', 'Undo');
+                    el.querySelector('a').addEventListener('click', (event) => {
+                        event.preventDefault();
+                        undoDeleteChunk(toastId);
+                    });
+                    container.appendChild(el);
+                    const toast = new bootstrap.Toast(el, { delay: 8000 });
+                    toast.show();
+                    el.addEventListener('hidden.bs.toast', () => { el.remove(); });
 
-                // Clear undo data after timeout
-                _undoTimer = setTimeout(() => { _lastDeleted = null; }, 8000);
-
-                await loadChunks(true);
+                    await loadChunks(true);
+                } finally {
+                    release();
+                }
             } catch (e) {
-                showActionError("Failed to delete line", e, "Refresh the Editor and check whether the line was removed before deleting again. Use Undo if the completed deletion is still offered.", "error");
+                showActionError(t('editor.line.delete-failed', 'Failed to delete line'), e, t('editor.line.delete-failed-recovery', 'Refresh the Editor and check whether the line was removed before deleting again. Use Undo if the completed deletion is still offered.'), "error");
             }
         };
 
-        window.undoDeleteChunk = async (toastId) => {
+        window.undoDeleteChunk = async (toastId = _lastDeleted?.toastId) => {
             if (!_lastDeleted || _lastDeleted.toastId !== toastId) {
-                showToast('Nothing to undo', 'warning');
+                showToast(t('editor.delete.nothing', 'Nothing to undo'), 'warning');
                 return;
             }
 
             const deleted = _lastDeleted;
+            if (deleted.book !== currentBookFilename || deleted.bookToken !== chunkSnapshotBookToken) {
+                _deletedChunks.length = 0;
+                renderDeleteUndo();
+                showToast(t('editor.delete.stale', 'Undo is unavailable because the book changed. Refresh the Editor.'), 'warning');
+                return;
+            }
+            _deletedChunks.pop();
             _lastDeleted = null;
-            clearTimeout(_undoTimer);
+            const button = document.getElementById('editor-undo-delete');
+            if (button) { button.disabled = true; }
             try {
                 await API.post('/api/chunks/restore', {
                     chunk: deleted.chunk,
@@ -8289,14 +10249,13 @@
                     if (toast) { toast.hide(); }
                 }
 
-                if (_lastDeleted === deleted) {
-                    _lastDeleted = null;
-                    clearTimeout(_undoTimer);
-                }
-                showToast('Line restored', 'success');
+                showToast(t('editor.delete.restored', 'Line restored'), 'success');
                 await loadChunks(true);
             } catch (e) {
-                showActionError("Undo failed", e, "Refresh the Editor and check whether the deleted line was restored before using Undo again.", "error");
+                showActionError(t('editor.delete.undo-failed', 'Undo failed'), e, t('editor.delete.undo-failed-recovery', 'Refresh the Editor and check whether the deleted line was restored before using Undo again.'), "error");
+            } finally {
+                if (button) { button.disabled = false; }
+                renderDeleteUndo();
             }
         };
 
@@ -8316,7 +10275,7 @@
             sequencePauseTimer = null;
             const isCurrentSequence = () => isPlayingSequence && sequenceEpoch === playbackSequenceEpoch;
             const btn = document.getElementById('btn-play-seq');
-            btn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
+            btn.innerHTML = `<i class="fas fa-stop me-1"></i>${escapeHtml(t('editor.sequence.stop', 'Stop'))}`;
             btn.onclick = stopSequence;
             btn.classList.replace('btn-primary', 'btn-danger');
 
@@ -8347,7 +10306,7 @@
             } catch (error) {
                 if (!isCurrentSequence()) { return; }
                 console.error('Playback timing plan failed:', error);
-                showActionError('Could not load playback timing', error, 'Check the reported error and your connection, then try playing the sequence again.', 'warning');
+                showActionError(t('editor.playback.timing-failed', 'Could not load playback timing'), error, t('editor.playback.timing-failed-recovery', 'Check the reported error and your connection, then try playing the sequence again.'), 'warning');
                 stopSequence();
                 return;
             }
@@ -8400,7 +10359,7 @@
             const finish = () => {
                 stopSequence();
                 if (skippedCount > 0) {
-                    showToast(`Play Sequence finished - ${skippedCount} chunk(s) skipped due to playback errors`, 'warning');
+                    showToast(t('editor.sequence.finished', 'Play Sequence finished - {count} chunk(s) skipped due to playback errors', {count: skippedCount}), 'warning');
                 }
             };
             const startAudio = (audio, chunkId) => {
@@ -8578,7 +10537,7 @@
 
             const btn = document.getElementById('btn-play-seq');
             if (btn) {
-                btn.innerHTML = '<i class="fas fa-play me-1"></i>Play Sequence';
+                btn.innerHTML = `<i class="fas fa-play me-1"></i>${escapeHtml(t('editor.toolbar.play-sequence', 'Play Sequence'))}`;
                 btn.onclick = playSequence;
                 btn.classList.replace('btn-danger', 'btn-primary');
             }
@@ -8590,36 +10549,176 @@
 
         const pendingChunkEdits = new Map();
         const failedChunkEdits = new Map();
+        const queuedChunkEdits = new Map();
         let chunkEditsRevision = 0;
+        let chunkEditOrder = 0;
+
+        // A numeric row id is reused after a reorder or a book switch, and the
+        // same uid can move to a different index. Work and failures are owned
+        // by the stable book token + uid (with the field kept in the failure
+        // map), never by the transient index.
+        function chunkEditKey(uid, bookToken) {
+            return JSON.stringify([bookToken, uid]);
+        }
+
+        function readChunkEditKey(key) {
+            if (typeof key !== 'string') { return {bookToken: null, uid: null, id: Number(key)}; }
+            try {
+                const [bookToken, uid, id] = JSON.parse(key);
+                return {bookToken, uid, id};
+            } catch (error) {
+                return {bookToken: null, uid: null, id: Number(key)};
+            }
+        }
+
+        function isRelevantChunkEditKey(key, bookToken = chunkSnapshotBookToken, uids = null) {
+            const owner = readChunkEditKey(key);
+            return owner.bookToken === null || (owner.bookToken === bookToken && (!uids || uids.has(owner.uid)));
+        }
+
+        function getCurrentChunkEditRow(id, uid, bookToken) {
+            if (bookToken !== chunkSnapshotBookToken) { return null; }
+            const row = document.querySelector(`#chunks-table-body tr[data-id="${id}"]`);
+            return row?.dataset.uid === uid && row?.dataset.bookToken === bookToken ? row : null;
+        }
+
+        function getFailedChunkEntries(key) {
+            const entry = failedChunkEdits.get(key);
+            if (!entry) { return []; }
+            if (entry.failures instanceof Map) { return Array.from(entry.failures.values()); }
+            return [{error: entry.error || entry, fields: entry.field ? String(entry.field).split(', ') : []}];
+        }
+
+        function isCurrentChunkEditRow(id, uid, bookToken) {
+            return !!getCurrentChunkEditRow(id, uid, bookToken)
+                && cachedChunks.find(chunk => chunk.id === id && chunk.uid === uid)?.uid === uid;
+        }
+
+        function getFailedChunkEdits() {
+            return Array.from(failedChunkEdits.entries(), ([key, entry]) => {
+                if (!isRelevantChunkEditKey(key)) { return null; }
+                const {uid} = readChunkEditKey(key);
+                // The line number follows the uid in the *current* snapshot,
+                // not the index captured when the save was first refused.
+                const current = typeof cachedChunks !== 'undefined' && Array.isArray(cachedChunks)
+                    ? cachedChunks.find(chunk => chunk.uid === uid) : null;
+                const failures = getFailedChunkEntries(key);
+                return {
+                    line: (current ? current.id : (entry?.id ?? 0)) + 1,
+                    field: Array.from(new Set(failures.flatMap(failure => failure.fields || []))).join(', '),
+                    reason: failures[0]?.error?.message || String(failures[0]?.error || ''),
+                };
+            }).filter(Boolean);
+        }
+
+        function getEditorFailedEditsSummary() {
+            const failed = getFailedChunkEdits();
+            if (!failed.length) { return ''; }
+            const first = failed[0];
+            return failed.length === 1
+                ? t('editor.integrity.save-failed-one', 'Line {line} failed to save — {reason}', {line: first.line, reason: first.reason})
+                : t('editor.integrity.save-failed', '{count} line edits failed to save — {reason}', {count: failed.length, reason: first.reason});
+        }
+        window.getEditorFailedEditsSummary = getEditorFailedEditsSummary;
+
+        function setFailedChunkEdits(key, id, uid, bookToken, fields, error, order) {
+            let entry = failedChunkEdits.get(key);
+            if (!(entry?.failures instanceof Map)) {
+                entry = {failures: new Map(), error, field: '', id, uid, bookToken};
+                failedChunkEdits.set(key, entry);
+            }
+            for (const field of fields) { entry.failures.set(field, {error, fields, order}); }
+            entry.error = error;
+            entry.field = Array.from(entry.failures.keys()).join(', ');
+        }
+
+        function clearFailedChunkEdits(key, fields, order) {
+            const entry = failedChunkEdits.get(key);
+            if (!entry) { return; }
+            if (!(entry.failures instanceof Map)) {
+                const recorded = String(entry.field || '').split(', ').filter(Boolean);
+                if (!recorded.length || recorded.some(field => fields.includes(field))) { failedChunkEdits.delete(key); }
+                return;
+            }
+            for (const field of fields) {
+                const failure = entry.failures.get(field);
+                if (failure && failure.order <= order) { entry.failures.delete(field); }
+            }
+            if (!entry.failures.size) { failedChunkEdits.delete(key); return; }
+            entry.field = Array.from(entry.failures.keys()).join(', ');
+            entry.error = entry.failures.values().next().value.error;
+        }
+
+        // The red marker is derived, never set directly: an unrelated field
+        // settling or a full redraw must not hide a still-outstanding failure.
+        function syncChunkRowFailureMarker(row, key) {
+            if (!row?.classList) { return; }
+            const failed = getFailedChunkEntries(key).length > 0;
+            if (typeof row.classList.toggle === 'function') { row.classList.toggle('text-danger', failed); }
+            else if (failed && typeof row.classList.add === 'function') { row.classList.add('text-danger'); }
+            else if (!failed && typeof row.classList.remove === 'function') { row.classList.remove('text-danger'); }
+        }
 
         function applyChunkEdits(id, data) {
             const row = document.querySelector(`#chunks-table-body tr[data-id="${id}"]`);
             const uid = row?.dataset.uid;
             const bookToken = row?.dataset.bookToken;
             if (!uid || !bookToken) { throw new Error('Reload the Editor before saving this row.'); }
+            const key = chunkEditKey(uid, bookToken);
             const query = new URLSearchParams({expected_book_token: bookToken, expected_uid: uid}).toString();
-            const previous = pendingChunkEdits.get(id);
+            const previous = pendingChunkEdits.get(key);
             const captured = JSON.parse(JSON.stringify(data));
+            const fields = Object.keys(captured);
             chunkEditsRevision++;
+            const order = ++chunkEditOrder;
+            let intents = queuedChunkEdits.get(key);
+            if (!intents) { intents = new Map(); queuedChunkEdits.set(key, intents); }
+            intents.set(order, captured);
             invalidateEditorIntegrity('Edits awaiting save');
             window.markEditorReviewStale?.();
             const request = (async () => {
                 if (previous) { await previous.catch(() => {}); }
                 try {
-                    await API.post(`/api/chunks/${id}?${query}`, captured);
-                    if (bookToken !== chunkSnapshotBookToken || cachedChunks.find(chunk => chunk.id === id)?.uid !== uid) { return; }
-                    cachedChunks = cachedChunks.map(chunk => chunk.id === id ? { ...chunk, ...captured } : chunk);
+                    const saved = await API.post(`/api/chunks/${id}?${query}`, captured);
+                    if (!isCurrentChunkEditRow(id, uid, bookToken)) { return; }
+                    cachedChunks = cachedChunks.map(chunk => {
+                        if (chunk.id !== id || chunk.uid !== uid) { return chunk; }
+                        const next = {...chunk, ...captured};
+                        if (saved && typeof saved === 'object') {
+                            // Only the confirmed reply may change cached state.
+                            // Queued field drafts stay in the DOM until their own
+                            // POST succeeds, so a full redraw keeps showing them.
+                            for (const field of [...fields, 'status', 'error', 'audio_path', 'audio_revision', 'drift']) {
+                                if (Object.prototype.hasOwnProperty.call(saved, field)) { next[field] = saved[field]; }
+                            }
+                        }
+                        return next;
+                    });
                     // The server can normalize an edit without changing its revision.
                     chunkSnapshotRevision = null;
-                    failedChunkEdits.delete(id);
+                    clearFailedChunkEdits(key, fields, order);
+                    const activeRow = getCurrentChunkEditRow(id, uid, bookToken);
+                    syncChunkRowFailureMarker(activeRow, key);
+                    const confirmed = cachedChunks.find(chunk => chunk.id === id && chunk.uid === uid);
+                    if (confirmed && activeRow && typeof updateChunkRow === 'function') { updateChunkRow(confirmed); }
                 } catch (error) {
-                    failedChunkEdits.set(id, error);
+                    // A refusal belongs to the saved UID even if it moved.
+                    // A different book or a removed UID has no row to mark.
+                    if (bookToken !== chunkSnapshotBookToken) { return; }
+                    const current = cachedChunks.find(chunk => chunk.uid === uid);
+                    if (!current) { return; }
+                    setFailedChunkEdits(key, current.id, uid, bookToken, fields, error, order);
+                    const activeRow = getCurrentChunkEditRow(current.id, uid, bookToken);
+                    syncChunkRowFailureMarker(activeRow, key);
                     throw error;
+                } finally {
+                    intents.delete(order);
+                    if (!intents.size) { queuedChunkEdits.delete(key); }
                 }
             })();
-            pendingChunkEdits.set(id, request);
+            pendingChunkEdits.set(key, request);
             request.finally(() => {
-                if (pendingChunkEdits.get(id) === request) { pendingChunkEdits.delete(id); }
+                if (pendingChunkEdits.get(key) === request) { pendingChunkEdits.delete(key); }
                 window.renderEditorLineInspector?.();
                 void refreshEditorIntegrity();
             }).catch(() => {});
@@ -8627,24 +10726,53 @@
         }
 
         function isEditorEditPending() {
-            return pendingChunkEdits.size > 0 || failedChunkEdits.size > 0;
+            const currentBook = typeof chunkSnapshotBookToken === 'undefined' ? null : chunkSnapshotBookToken;
+            const inBook = key => {
+                if (typeof key !== 'string') { return true; }
+                try { return currentBook === null || JSON.parse(key)[0] === currentBook; }
+                catch (error) { return true; }
+            };
+            return Array.from(pendingChunkEdits.keys()).some(inBook)
+                || Array.from(failedChunkEdits.keys()).some(inBook);
         }
 
         async function flushChunkEdits() {
-            while (pendingChunkEdits.size) {
-                await Promise.allSettled(Array.from(pendingChunkEdits.values()));
+            return flushChunkEditsFor(chunkSnapshotBookToken);
+        }
+
+        async function flushChunkEditsFor(bookToken, uids = null) {
+            while (true) {
+                const pending = Array.from(pendingChunkEdits.entries())
+                    .filter(([key]) => isRelevantChunkEditKey(key, bookToken, uids))
+                    .map(([, request]) => request);
+                if (!pending.length) { break; }
+                await Promise.allSettled(pending);
             }
-            if (failedChunkEdits.size) { throw failedChunkEdits.values().next().value; }
+            const failure = Array.from(failedChunkEdits.entries())
+                .find(([key]) => isRelevantChunkEditKey(key, bookToken, uids));
+            if (failure) { throw failure[1].error; }
         }
 
         async function ensureEditorRenderSnapshot() {
+            // Pin the book for the whole barrier. Another book can become
+            // active while A's writes are still in flight; its pending save
+            // must not be mistaken for A's, and its snapshot must never be
+            // returned as A's.
+            const bookToken = chunkSnapshotBookToken;
+            const stillCurrent = () => chunkSnapshotBookToken === bookToken;
+            const refuse = () => { throw new Error(t('safety.core.editor.restart-render', 'Active book changed; restart rendering for the current book.')); };
             while (true) {
+                if (!stillCurrent()) { refuse(); }
                 // Includes the focused textarea whose onchange has not fired yet.
                 await Promise.all(Array.from(document.querySelectorAll('#chunks-table-body tr[data-id]'))
+                    .filter(row => row.dataset.bookToken === bookToken)
                     .map(row => saveRowEdits(Number(row.dataset.id), true)));
-                await flushChunkEdits();
+                if (!stillCurrent()) { refuse(); }
+                await flushChunkEditsFor(bookToken);
+                if (!stillCurrent()) { refuse(); }
                 const revision = chunkEditsRevision;
                 const chunks = await API.get('/api/chunks');
+                if (!stillCurrent()) { refuse(); }
                 if (revision === chunkEditsRevision) { return chunks; }
             }
         }
@@ -8670,7 +10798,7 @@
                     return;
                 }
                 if (!await showConfirm(formatUiSafetyText('safety.core.editor.apply-gap', 'Set pause after this line to {pause} ms? Uses NARRATOR as the narrator. Speech, delivery instructions and takes stay unchanged.', {pause: suggestion.pause_after}), {title: t('safety.core.editor.apply-gap.title', 'Apply suggested gap?'), actionLabel: t('core.editor.apply-gap', 'Apply gap')})) { return; }
-                await flushChunkEdits();
+                await flushChunkEditsFor(target.bookToken, new Set([target.uid]));
                 if (!target.isCurrent()) { throw new Error(t('safety.core.editor.book-changed', 'Active book changed; request a new suggestion.')); }
                 await API.post(url, {expected_revision: suggestion.revision});
                 if (!target.isCurrent()) { return; }
@@ -8692,7 +10820,8 @@
                 // For now, next loadChunks will show updated status (pending)
             } catch (e) {
                 console.error("Update failed", e);
-                showToast(t('core.editor.update-failed', 'Failed to update chunk'), 'error');
+                showActionError(t('core.editor.save-line-failed', 'Could not save this line'), e,
+                    t('core.editor.save-line-recovery', 'Fix the reported problem, then edit and save the line again. Reload the Editor if it keeps refusing.'));
             }
         };
 
@@ -8703,6 +10832,7 @@
 
             const inputs = tr.querySelectorAll('input, textarea, select');
             const data = {};
+            const editKey = chunkEditKey(tr.dataset.uid, tr.dataset.bookToken);
             const cached = cachedChunks.find(chunk => chunk.id === id && chunk.uid === tr.dataset.uid);
 
             inputs.forEach(input => {
@@ -8721,7 +10851,7 @@
                 data.pause_after = data.pause_after === '' ? null : parseInt(data.pause_after);
             }
 
-            if (changedOnly && !pendingChunkEdits.has(id) && !failedChunkEdits.has(id)) {
+            if (changedOnly && !pendingChunkEdits.has(editKey) && !failedChunkEdits.has(editKey)) {
                 if (cached) {
                     for (const field of Object.keys(data)) {
                         const saved = field === 'pause_after' ? (cached[field] ?? null) : (cached[field] ?? '');
@@ -8758,18 +10888,21 @@
                 // Optimistic UI update
                 if (tr) {
                     const statusBadge = tr.querySelector('.badge');
-                    statusBadge.className = 'badge bg-warning';
-                    statusBadge.innerText = t('core.editor.status.generating', 'generating');
+                    if (statusBadge) {
+                        statusBadge.className = 'badge bg-warning chunk-status-label';
+                        statusBadge.setAttribute?.('data-status', 'generating');
+                        statusBadge.innerText = typeof chunkStatusLabel === 'function' ? chunkStatusLabel('generating') : t('core.editor.status.generating', 'generating');
+                    }
 
                     // Replace button with progress bar
                     const container = tr.querySelector('.d-flex');
                     const btn = container.querySelector('button');
                     if (btn) {
+                        // Same indeterminate per-line bar as updateChunkRow's.
                          const progressBar = document.createElement('div');
-                         progressBar.className = 'progress';
+                         progressBar.className = 'tp tp-dither tp-sm tp-indeterminate';
                          progressBar.style.width = '100px';
-                         progressBar.style.height = '20px';
-                         progressBar.innerHTML = `<div class="progress-bar progress-bar-striped progress-bar-animated bg-warning flex-grow-1" role="status" aria-label="${escapeHtml(t('core.editor.generating-aria', 'Generating audio'))}">${escapeHtml(t('core.editor.generating', 'Generating…'))}</div>`;
+                         progressBar.innerHTML = `<span class="tp-label" role="status" aria-label="${escapeHtml(t('core.editor.generating-aria', 'Generating audio'))}">${escapeHtml(t('core.editor.generating', 'Generating…'))}</span>`;
                          container.replaceChild(progressBar, btn);
                     }
                 }
@@ -8819,6 +10952,7 @@
             const batchBook = currentBookFilename;
             const batchToken = chunkSnapshotBookToken;
             let rowsMarked = false;
+            let dispatched = false;
             isRenderingAll = true;
             document.getElementById('btn-batch-fast').style.display = 'none';
             document.getElementById('btn-regen-all').style.display = 'none';
@@ -8828,15 +10962,17 @@
                 if (!batchToken || chunkSnapshotBook !== batchBook) { throw new Error(t('core.editor.reload-before-render', 'Reload the Editor before rendering.')); }
                 const chunks = await ensureEditorRenderSnapshot();
                 await refreshDeliveryReview();
-                const selectRows = rows => repairPreview ? getEditorRepairSelection(rows, repairPreview)
-                    : (regenerateAll ? rows : rows.filter(c => c.status !== 'done'));
+                // A chapter selection without regenerate renders only its pending
+                // lines (#1921); repair and Regenerate All replace what they select.
+                const selectRows = rows => (repairPreview ? getEditorRepairSelection(rows, repairPreview) : rows)
+                    .filter(c => regenerateAll || isChunkPendingRender(c));
                 let toProcess = selectRows(chunks)
                     .filter(c => c.text && c.text.trim());
 
                 if (toProcess.length === 0) {
                     showToast(t('core.editor.no-renderable', 'No non-empty chunks to render!'), 'warning');
                     cancelRender(true);
-                    return;
+                    return false;
                 }
 
                 if (regenerateAll) {
@@ -8845,7 +10981,7 @@
                         : formatUiSafetyText('safety.core.editor.regenerate-all', 'Regenerate all {count} non-empty chunks? This will replace existing audio.', {count: toProcess.length});
                     if (!await showConfirm(confirmBody, {title: repairPreview ? t('safety.core.editor.regenerate-selection.title', 'Replace selected audio?') : t('safety.core.editor.regenerate-all.title', 'Replace all rendered audio?'), actionLabel: repairPreview ? t('core.editor.regenerate-selection', 'Regenerate selection') : t('core.editor.regenerate-all', 'Regenerate all'), danger: true})) {
                         cancelRender(true);
-                        return;
+                        return false;
                     }
                     // Re-fetch after the user confirms - showConfirm only
                     // resolves on a click, so server-side chunk state can
@@ -8869,8 +11005,9 @@
                         tr.classList.add('table-info');
                         const badge = tr.querySelector('.badge');
                         if (badge) {
-                            badge.className = 'badge bg-warning';
-                            badge.innerText = t('core.editor.status.generating', 'generating');
+                            badge.className = 'badge bg-warning chunk-status-label';
+                            badge.setAttribute?.('data-status', 'generating');
+                            badge.innerText = typeof chunkStatusLabel === 'function' ? chunkStatusLabel('generating') : t('core.editor.status.generating', 'generating');
                         }
                     }
                 }
@@ -8880,6 +11017,7 @@
                     expected_uids: toProcess.map(chunk => chunk.uid),
                     ...(repairPreview ? {expected_repair_revision: repairPreview.repair_revision} : {})
                 });
+                dispatched = true;
                 console.log(`${label} started: ${describeStart(response)}`);
 
                 // Poll for completion via the shared engine - gets the
@@ -8893,7 +11031,7 @@
                     return { audio, chunks };
                 }, {
                     intervalMs: 2000,
-                    doneCheck: updated => !isRenderingAll || !updated.audio.running,
+                    doneCheck: updated => !isRenderingAll || (!updated.audio.running && !updated.audio.ownership_unconfirmed),
                     onDone: async (updated) => {
                         if (!isRenderingAll) { return; }
                         document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
@@ -8913,15 +11051,22 @@
                         if (outcome.completed > 0) {
                             runDriftCheck(selected.filter(chunk => chunk.status === 'done').map(chunk => chunk.id));
                         }
+                        if (typeof window.refreshEditorChapterMap === 'function') { window.refreshEditorChapterMap(); }
                     },
                 });
+                return dispatched;
 
             } catch (e) {
                 console.error(`${label} error:`, e);
                 showActionError(t('core.editor.batch-failed', 'Error during batch rendering'), e, t('core.editor.batch-recovery', 'Check the audio task status and refreshed chunks before starting another render; some audio may already have been generated.'), "error");
                 cancelRender(true);
                 if (rowsMarked) { await loadChunks(true); }
+                return false;
             }
+        }
+
+        function isChunkPendingRender(chunk) {
+            return chunk.status !== 'done' && !!chunk.text?.trim();
         }
 
         window.renderAll = (regenerateAll = false, repairPreview = null) => _runBatchRender('/api/generate_batch', regenerateAll, {
@@ -9138,7 +11283,7 @@
             const request = {};
             window._chapterPresetImportRequest = request;
             const isCurrent = () => window._chapterPresetImportRequest === request;
-            if (file.size > 1048576) { showToast('Could not import presets: file exceeds the 1 MiB limit.', 'error'); return; }
+            if (file.size > 1048576) { showToast(t('audio.presets.too-large', 'Could not import presets: file exceeds the 1 MiB limit.'), 'error'); return; }
             const reader = new FileReader();
             reader.onload = () => {
                 if (!isCurrent()) { return; }
@@ -9151,37 +11296,41 @@
                     const merged = {...getChapterTemplatePresets(), ...valid};
                     if (!setLocalStorageValue(CHAPTER_PRESETS_KEY, JSON.stringify(merged))) { throw new Error('browser storage is unavailable'); }
                     renderChapterTemplatePresets();
-                    showToast(`Imported ${Object.keys(valid).length} chapter preset(s).`, 'success');
-                } catch (e) { showActionError("Could not import presets", e, "Keep the preset file. Check that it contains valid chapter presets and that browser storage is available, then import again.", "error"); }
+                    showToast(t('audio.presets.imported', 'Imported {count} chapter preset(s).', {count: Object.keys(valid).length}), 'success');
+                } catch (e) { showActionError(t('audio.presets.import-failed', 'Could not import presets'), e, t('audio.presets.import-failed-recovery', 'Keep the preset file. Check that it contains valid chapter presets and that browser storage is available, then import again.'), "error"); }
             };
             reader.onerror = () => {
-                if (isCurrent()) { showToast('Could not import presets: file could not be read.', 'error'); }
+                if (isCurrent()) { showToast(t('audio.presets.unreadable', 'Could not import presets: file could not be read.'), 'error'); }
             };
             reader.readAsText(file);
         };
         renderChapterTemplatePresets();
+        // One parser for every chapter-range box: Result-tab export and the
+        // Editor's generate-by-chapter panel (#1921). Returns zero-based numbers.
+        window.parseChapterSelection = parseChapterSelection;
         function parseChapterSelection(value) {
             const text = value || '';
             if (text.length > 65536) { throw new Error('Chapter selection exceeds the 65,536-character input limit.'); }
+            if (!text.trim()) { return null; }
             const selected = new Set();
             let expanded = 0;
-            text.split(',').forEach(part => {
-                const bits = part.trim().split('-').map(Number);
-                if (bits.some(n => Number.isInteger(n) && !Number.isSafeInteger(n))) {
+            for (const part of text.split(',')) {
+                const token = part.trim();
+                if (!token) { continue; }
+                const [first, last = first] = token.split('-').map(Number);
+                if (!/^\d+(?:\s*-\s*\d+)?$/.test(token) || first < 1 || last < first) {
+                    throw new Error(t('editor.chapters.enter', 'Enter chapter numbers, for example 1-3, 5.'));
+                }
+                if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last)) {
                     throw new Error('Chapter numbers must be safe whole numbers.');
                 }
-                let first, last;
-                if (bits.length === 1 && Number.isSafeInteger(bits[0]) && bits[0] > 0) { first = last = bits[0]; }
-                if (bits.length === 2 && Number.isSafeInteger(bits[0]) && Number.isSafeInteger(bits[1]) && bits[0] > 0 && bits[1] >= bits[0]) {
-                    [first, last] = bits;
-                }
-                if (first === undefined) { return; }
                 const count = last - first + 1;
                 if (count > 10000 - expanded) { throw new Error('Chapter selection exceeds the 10,000-entry expansion limit.'); }
                 expanded += count;
                 for (let n = first; n <= last; n += 1) { selected.add(n - 1); }
-            });
-            return selected.size ? Array.from(selected).sort((a, b) => a - b) : null;
+            }
+            if (!selected.size) { throw new Error(t('editor.chapters.enter', 'Enter chapter numbers, for example 1-3, 5.')); }
+            return Array.from(selected).sort((a, b) => a - b);
         }
         function chapterExportParams() {
             return {
@@ -9202,7 +11351,7 @@
         function renderChapterList(rows, exported) {
             const el = document.getElementById('chapter-list');
             document.getElementById('chapter-zip-link').style.display = exported && rows.some(r => r.exists) ? '' : 'none';
-            if (!rows.length) { el.innerHTML = `<span class="text-muted">${exported ? 'No exported chapter files found.' : 'No chapter files are currently planned. Export checks saved files before keeping them.'}</span>`; return; }
+            if (!rows.length) { el.innerHTML = `<span class="text-muted">${escapeHtml(exported ? t('audio.chapters.none-exported', 'No exported chapter files found.') : t('audio.chapters.none-planned', 'No chapter files are currently planned. Export checks saved files before keeping them.'))}</span>`; return; }
             el.innerHTML = '<ol class="mb-0 ps-3">' + rows.map(r => {
                 const name = escapeHtml(r.file);
                 if (exported && r.exists) {
@@ -9240,10 +11389,12 @@
                 if (request !== chapterPreviewRequest || book !== currentBookFilename ||
                     JSON.stringify(params) !== JSON.stringify(chapterExportParams())) { return; }
                 renderChapterList(result.chapters, false);
-                document.getElementById('chapter-status').textContent = `${result.chapters.length} chapter(s) planned for export${params.changed_only ? ' with Changed only enabled' : ''}. Saved files are checked during export.`;
+                document.getElementById('chapter-status').textContent = params.changed_only
+                    ? t('audio.chapters.planned-changed-only', '{count} chapter(s) planned for export with Changed only enabled. Saved files are checked during export.', {count: result.chapters.length})
+                    : t('audio.chapters.planned', '{count} chapter(s) planned for export. Saved files are checked during export.', {count: result.chapters.length});
             } catch (e) {
                 if (request === chapterPreviewRequest && book === currentBookFilename) {
-                    showActionError("Preview failed", e, "Review the chapter range and filename template, then preview the export again.", "error");
+                    showActionError(t('audio.chapters.preview-failed', 'Preview failed'), e, t('audio.chapters.preview-failed-recovery', 'Review the chapter range and filename template, then preview the export again.'), "error");
                 }
             }
         });
@@ -9259,16 +11410,18 @@
                 const params = chapterExportParams();
                 await getChapterExportPreview(params);
                 if (book !== currentBookFilename || JSON.stringify(params) !== JSON.stringify(chapterExportParams())) {
-                    throw new Error('The book or chapter settings changed. Preview the current selection before exporting.');
+                    throw new Error(t('audio.chapters.export.settings-changed', 'The book or chapter settings changed. Preview the current selection before exporting.'));
                 }
-                statusEl.textContent = `Checking saved files and exporting selected chapters${params.changed_only ? ' with Changed only enabled' : ''}…`;
+                statusEl.textContent = params.changed_only
+                    ? t('audio.chapters.exporting-changed-only', 'Checking saved files and exporting selected chapters with Changed only enabled…')
+                    : t('audio.chapters.exporting', 'Checking saved files and exporting selected chapters…');
                 window.resetExportMasteringView?.(); window.resetExportQualityView?.();
                 await API.post('/api/export_chapters', params);
                 pollExport('chapter_export');
             } catch (e) {
                 releaseTaskStart('chapter_export');
                 cancelBtn.style.display = 'none';
-                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage('Chapter export start is unconfirmed', e, 'Check the export task status and output list before starting again. If the server refused the request, review the validation details below.'))}</span>`;
+                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage(t('audio.chapters.export-unconfirmed', 'Chapter export start is unconfirmed'), e, t('safety.core.export.audacity-recovery', 'Check the export task status and output list before starting again. If the server refused the request, review the validation details below.')))}</span>`;
             }
         });
         document.getElementById('chapter-cancel-btn').addEventListener('click', async () => {
@@ -9287,7 +11440,7 @@
             try {
                 const resp = await fetch('/api/m4b_cover', { method: 'POST', body: formData });
                 if (!resp.ok) { throw new Error((await resp.json()).detail || resp.statusText); }
-                statusEl.textContent = 'Uploaded';
+                statusEl.textContent = t('audio.m4b.cover.uploaded', 'Uploaded');
                 statusEl.className = 'small text-success';
             } catch (err) {
                 console.error('Failed to upload M4B cover:', err);
@@ -9302,7 +11455,7 @@
             try {
                 await API.del('/api/m4b_cover');
                 document.getElementById('m4b-cover-input').value = '';
-                statusEl.textContent = 'Removed';
+                statusEl.textContent = t('audio.m4b.cover.removed', 'Removed');
                 statusEl.className = 'small text-muted';
             } catch (err) {
                 console.error('Failed to remove M4B cover:', err);
@@ -9317,7 +11470,7 @@
             if (!claimTaskStart('m4b_export')) { return; }
             const statusEl = document.getElementById('m4b-status');
             const perChunk = document.getElementById('m4b-per-chunk').checked;
-            statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Exporting M4B...</span>';
+            statusEl.innerHTML = `<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>${escapeHtml(t('audio.m4b.exporting', 'Exporting M4B...'))}</span>`;
 
             try {
                 const publication = await window.getM4bPublicationPayload?.() || {};
@@ -9338,7 +11491,7 @@
                 pollExport('m4b_export');
             } catch (e) {
                 releaseTaskStart('m4b_export');
-                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage('M4B export start is unconfirmed', e, 'Check the export task status and output list before starting again. If the server refused the request, review the validation details below.'))}</span>`;
+                statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${escapeHtml(getActionErrorMessage(t('audio.m4b.export-unconfirmed', 'M4B export start is unconfirmed'), e, t('safety.core.export.audacity-recovery', 'Check the export task status and output list before starting again. If the server refused the request, review the validation details below.')))}</span>`;
             }
         };
 
@@ -9354,9 +11507,41 @@
         // Also generalizes pollLogs's stale-response generation-counter guard
         // to any poller. See FIXED.md F-053/058/072/073/079.
         const _pollGen = {};
-        function _startPolling(key, fetchFn, { intervalMs = 1000, doneCheck, onTick, onDone, immediate = true, pauseWhenHidden = false, displayLabel = null } = {}) {
+        function syncScriptReservationControls(status) {
+            const generate = document.getElementById('btn-gen-script');
+            if (generate) { generate.disabled = !!(status.running || status.ownership_unconfirmed || scriptBatchPoller); }
+            const display = status.running && !status.worker_pending ? 'inline-block' : 'none';
+            for (const id of ['btn-pause-script', 'btn-cancel-script']) {
+                const button = document.getElementById(id);
+                if (button) { button.style.display = display; }
+            }
+            syncSnapshotButton(status);
+        }
+
+        function pollConfirmedScriptSuccessor(status, previousToken) {
+            const claimId = isScriptStopped(status)
+                ? status.worker_claim_id || status.task_claim_id : status.task_claim_id;
+            const token = window.observeScriptRecoveryRun(claimId, true);
+            const successor = window.getScriptAdmissionByToken(token);
+            if (!successor || successor.token === previousToken || successor.claimId !== claimId
+                || !isCurrentScriptRecoveryRun(successor.token)) {
+                return false;
+            }
+            if (successor.state === 'provisional'
+                && !confirmScriptRecoveryRun(successor.token, successor.source, false, claimId)) {
+                return false;
+            }
+            successor.observedByPoll = true;
+            successor.observedStartTime = status.start_time;
+            pollScriptLogs('script', null, successor.token, status);
+            return true;
+        }
+
+        function _startPolling(key, fetchFn, { intervalMs = 1000, doneCheck, onTick, onDone, immediate = true, pauseWhenHidden = false, displayLabel = null, scriptRunToken = typeof window !== 'undefined' ? (window._scriptRecoveryRunToken || 0) : 0 } = {}) {
             const myGen = (_pollGen[key] = (_pollGen[key] || 0) + 1);
+            const isScriptPoll = key === 'logs:script' || key === 'reattach:script';
             let consecutiveErrors = 0;
+            let pendingScriptClaim = null;
             const MAX_SILENT_ERRORS = 3;
             let pending = false;
             const tick = async () => {
@@ -9366,14 +11551,128 @@
                     return;
                 }
                 pending = true;
+                let completed = false;
                 try {
                     const data = await fetchFn();
                     if (myGen !== _pollGen[key]) { return; }
                     consecutiveErrors = 0;
-                    if (onTick) { await onTick(data); }
-                    if (doneCheck(data)) {
-                        if (onDone) { onDone(data); }
-                        return;
+                    let handler = 'onTick';
+                    try {
+                        const record = isScriptPoll && typeof window !== 'undefined'
+                            ? window.getScriptAdmissionByToken?.(scriptRunToken) : null;
+                        const restartBound = record?.restartClaimId && record.claimId === record.restartClaimId;
+                        const liveClaim = data?.running && !data.ownership_unconfirmed && data.task_claim_id;
+                        const terminalClaim = isScriptPoll && data?.worker_claim_id && isScriptStopped(data)
+                            ? data.worker_claim_id : null;
+                        const successorClaim = liveClaim || terminalClaim;
+                        if (restartBound && record.state === 'delivered' && !isCurrentScriptRecoveryRun(scriptRunToken)) {
+                            const current = window.getScriptAdmissionByToken(window._scriptRecoveryRunToken);
+                            const replacement = current?.restartPredecessor === scriptRunToken;
+                            if (!(current === record || (replacement && ['provisional', 'rejected'].includes(current.state)))
+                                || record.epoch !== window._bookSelectionEpoch
+                                || !scriptRecoverySelectionMatches(record.selection)) { return; }
+                            // The stop arrived before this poll saw the successor. A pending
+                            // replacement may own the claim when its ACK arrives. A verified
+                            // terminal can notify now without taking over that replacement.
+                            if (replacement && current.state === 'provisional') {
+                                if (!data?.worker_pending && terminalClaim && terminalClaim !== record.claimId) {
+                                    notifyScriptCompletion(data, terminalClaim);
+                                }
+                                setTimeout(tick, intervalMs);
+                                return;
+                            }
+                            const workerClaim = terminalClaim || (data?.worker_claim_id === liveClaim && liveClaim);
+                            if (!data?.worker_pending && workerClaim && workerClaim !== record.claimId
+                                && pollConfirmedScriptSuccessor(data, scriptRunToken)) { return; }
+                            if (data?.worker_pending || data?.running || data?.ownership_unconfirmed) {
+                                if (data.worker_pending) {
+                                    pendingScriptClaim = data.task_claim_id;
+                                    syncScriptReservationControls(data);
+                                }
+                                setTimeout(tick, intervalMs);
+                            } else if (pendingScriptClaim) {
+                                syncScriptReservationControls(data);
+                            }
+                            return;
+                        }
+                        if (isScriptPoll && data?.worker_pending) {
+                            if (scriptRunToken && !isCurrentScriptRecoveryRun(scriptRunToken)) { return; }
+                            if (restartBound && data.task_claim_id !== record.claimId) {
+                                record.restartContended = true;
+                            }
+                            pendingScriptClaim = data.task_claim_id;
+                            syncScriptReservationControls(data);
+                            setTimeout(tick, intervalMs);
+                            return;
+                        }
+                        if (pendingScriptClaim) {
+                            if (scriptRunToken && !isCurrentScriptRecoveryRun(scriptRunToken)) { return; }
+                            const awaitedClaim = pendingScriptClaim;
+                            pendingScriptClaim = null;
+                            if (data?.running && !data.ownership_unconfirmed && data.task_claim_id
+                                && (!record || (record.claimId && data.task_claim_id !== record.claimId))) {
+                                if (!pollConfirmedScriptSuccessor(data, scriptRunToken)) {
+                                    pendingScriptClaim = awaitedClaim;
+                                    setTimeout(tick, intervalMs);
+                                }
+                                return;
+                            }
+                            syncScriptReservationControls(data);
+                            if (isScriptStopped(data)) {
+                                const endedClaim = data.worker_claim_id || data.task_claim_id;
+                                if (endedClaim === awaitedClaim && record?.claimId !== endedClaim
+                                    && pollConfirmedScriptSuccessor(data, scriptRunToken)) {
+                                    return;
+                                }
+                                if (!record) { return; }
+                                const startTime = restartBound ? record.restartStartTime : record.observedStartTime;
+                                if (record.claimId && !isExpectedScriptStop(data, record.claimId, startTime)) {
+                                    retireUnverifiedScriptStop(record);
+                                    return;
+                                }
+                            }
+                        }
+                        if (record?.state === 'accepted' && record.claimId && successorClaim
+                            && successorClaim !== record.claimId && isCurrentScriptRecoveryRun(record.token)) {
+                            if (pollConfirmedScriptSuccessor(data, scriptRunToken)) { return; }
+                            setTimeout(tick, intervalMs);
+                            return;
+                        }
+                        if (restartBound || record?.observedByPoll) {
+                            if (!isCurrentScriptRecoveryRun(record.token)) { return; }
+                            const startTime = restartBound ? record.restartStartTime : record.observedStartTime;
+                            const stopped = isScriptStopped(data);
+                            if (stopped && (record.restartInvalidated
+                                    || !isExpectedScriptStop(data, record.claimId, startTime))) {
+                                retireUnverifiedScriptStop(record);
+                                return;
+                            }
+                            if (data?.task_claim_id && data.task_claim_id !== record.claimId) {
+                                if (data.running && !data.ownership_unconfirmed
+                                    && pollConfirmedScriptSuccessor(data, scriptRunToken)) {
+                                    return;
+                                }
+                                setTimeout(tick, intervalMs);
+                                return;
+                            }
+                        }
+                        if (record?.claimId && data?.running && data.task_claim_id === record.claimId
+                            && !Number.isFinite(record.observedStartTime)) {
+                            record.observedStartTime = data.start_time;
+                        }
+                        if (onTick) { await onTick(data); }
+                        handler = 'doneCheck';
+                        if (myGen !== _pollGen[key]) { return; }
+                        if (!data?.ownership_unconfirmed && doneCheck(data)) {
+                            completed = true;
+                            handler = 'onDone';
+                            if (isScriptPoll) {
+                                if (typeof window !== 'undefined') { window.onScriptTaskTerminal?.(data, scriptRunToken); }
+                            }
+                            if (onDone) { await onDone(data); }
+                        }
+                    } catch (e) {
+                        console.error(`Poll ${handler} error (${key}):`, e);
                     }
                 } catch (e) {
                     consecutiveErrors++;
@@ -9385,12 +11684,12 @@
                     if (consecutiveErrors % MAX_SILENT_ERRORS === 0) {
                         const taskKey = key.replace(/^reattach:/, '');
                         const label = displayLabel || (typeof TASK_LABELS !== 'undefined' && TASK_LABELS[taskKey] ? getTaskLabel(taskKey) : t('core.task.fallback-label', 'Task'));
-                        showToast(`Having trouble reaching Alexandria for ${label} status updates. It is still retrying and has not cancelled the run from this page. Save your work, check that Alexandria is still running, then reopen the page if this continues.`, 'warning');
+                        showToast(t('core.poll.reconnect-trouble', 'Having trouble reaching Alexandria for {task} status updates. It is still retrying and has not cancelled the run from this page. Save your work, check that Alexandria is still running, then reopen the page if this continues.', {task: label}), 'warning');
                     }
                 } finally {
                     pending = false;
                 }
-                if (myGen === _pollGen[key]) { setTimeout(tick, intervalMs); }
+                if (!completed && myGen === _pollGen[key]) { setTimeout(tick, intervalMs); }
             };
             if (immediate) { tick(); } else { setTimeout(tick, intervalMs); }
             // Callers that need to stop a poll before its own doneCheck fires
@@ -9412,7 +11711,7 @@
             if (!btn) { return; }
             const showsResume = btn.classList.contains('btn-outline-success');
             if (status.paused && !showsResume) {
-                btn.innerHTML = '<i class="fas fa-play me-1"></i>Resume';
+                btn.innerHTML = `<i class="fas fa-play me-1"></i>${escapeHtml(t('core.pause.resume', 'Resume'))}`;
                 btn.classList.remove('btn-outline-warning');
                 btn.classList.add('btn-outline-success');
                 if (!_autoPauseNotified[taskName] && status.logs.some(l => l.includes('[AUTO-PAUSE]'))) {
@@ -9432,10 +11731,23 @@
         // markers ("Step 2 (speakers): window 2/4", "Retrying... (attempt 3
         // of 4)") say what is in flight, and the clock since the log last
         // grew says how long. Client-side only (#588).
-        const ACTIVITY_MARKER = /Step \d \([a-z]+\): |Retrying\.\.\.|Reviewing batch \d+\/\d+|Progress: \d+\/\d+/;
+        // "Merging duplicate names:" is the speaker alias-merge stage's own
+        // marker (core.SPEAKER_MERGE_MARKER, #2037): it runs after the last
+        // review batch, so without it the row kept the finished count.
+        const ACTIVITY_MARKER = /Step \d \([a-z]+\): |Retrying\.\.\.|Reviewing batch \d+\/\d+|Merging duplicate names: |Progress: \d+\/\d+/;
         const ACTIVITY_QUIET_MS = 10000;
+        function getTaskOwnershipMessage(state) {
+            const logs = Array.isArray(state.logs) ? state.logs.filter(line => typeof line === 'string') : [];
+            const detail = logs.at(-1) || t('core.task.ownership-recovery', 'End the owned processes in Task Manager or restart the app. Locks release automatically after shutdown is confirmed.');
+            return t('core.task.ownership-retained', 'Failed — still holding processes. {detail}', {detail});
+        }
         function renderActivity(el, status, track) {
             if (!el) { return; }
+            if (status.ownership_unconfirmed) {
+                el.hidden = false;
+                el.textContent = getTaskOwnershipMessage(status);
+                return;
+            }
             if (!status.running) { el.hidden = true; return; }
             const logs = status.logs || [];
             const now = Date.now();
@@ -9467,15 +11779,17 @@
         // the script task is running - applied on every status tick.
         function syncSnapshotButton(status) {
             const snap = document.getElementById('btn-snapshot-script');
-            if (snap) { snap.style.display = status && status.running ? 'inline-block' : 'none'; }
+            if (snap) { snap.style.display = status?.running && !status.ownership_unconfirmed && !status.worker_pending ? 'inline-block' : 'none'; }
         }
 
-        function pollScriptLogs(taskName, onDone) {
+        function pollScriptLogs(taskName, onDone, scriptRunToken, initialStatus) {
             return pollLogs(taskName, 'script-logs', status => {
-                syncSnapshotButton({ running: false });
-                if (taskName === 'script') { clearScriptCancellation('script'); }
+                if (taskName === 'script') {
+                    syncSnapshotButton({ running: false });
+                    clearScriptCancellation('script');
+                }
                 if (onDone) { onDone(status); }
-            }, 'script-activity');
+            }, 'script-activity', scriptRunToken, initialStatus);
         }
 
         // Manual transport (#593): the run is waiting for the user to answer a
@@ -9487,8 +11801,27 @@
         let _manualLoadWarningFor = null;
         let _manualReplyFor = null;
         let _manualReplySubmitting = null;
+        let _manualReplySequence = 0;
+        let _manualFeedbackToast = null;
         let _manualReplyAcknowledged = null;
         let _manualAcknowledgedText = null;
+        function clearManualReplyFeedback() {
+            if (_manualFeedbackToast) {
+                bootstrap.Toast.getInstance(_manualFeedbackToast)?.dispose();
+                _manualFeedbackToast.remove();
+                _manualFeedbackToast = null;
+            }
+        }
+
+        function showManualReplyToast(message, type, duration) {
+            clearManualReplyFeedback();
+            _manualFeedbackToast = showToast(message, type, duration);
+        }
+
+        function renderManualReplyHint(text) {
+            document.getElementById('manual-llm-hint').textContent = text;
+        }
+
         async function renderManualRequest(status, taskName) {
             const panel = document.getElementById('manual-llm-panel');
             if (!panel) { return; }
@@ -9499,12 +11832,16 @@
                 _manualRequested = null;
                 _manualShown = null;
                 window._manualPending = null;
+                ++_manualReplySequence;
+                _manualReplySubmitting = null;
+                clearManualReplyFeedback();
+                renderManualReplyHint('');
                 const reply = document.getElementById('manual-llm-reply');
                 const retained = document.getElementById('manual-llm-retained-replies');
                 panel.hidden = !reply.value.trim() && !retained.children.length;
                 document.getElementById('manual-llm-submit').disabled = true;
                 reply.disabled = false;
-                document.getElementById('manual-llm-status').textContent = 'The pipeline is no longer waiting for this request. Any reply text is retained below; check the task activity before continuing.';
+                document.getElementById('manual-llm-status').textContent = t('manual.no-longer-waiting', 'The pipeline is no longer waiting for this request. Any reply text is retained below; check the task activity before continuing.');
                 return;
             }
             _manualTask = taskName;
@@ -9514,7 +11851,7 @@
             try { full = (await API.get('/api/manual_llm/pending')).pending; } catch (e) {
                 if (_manualRequested === req.id && _manualTask === taskName && _manualLoadWarningFor !== req.id && _manualShown !== req.id) {
                     _manualLoadWarningFor = req.id;
-                    document.getElementById('manual-llm-status').textContent = 'Could not load this model request. Automatic checks will continue; if it does not appear, check that Alexandria is still running.';
+                    document.getElementById('manual-llm-status').textContent = t('manual.load-failed', 'Could not load this model request. Automatic checks will continue; if it does not appear, check that Alexandria is still running.');
                 }
                 console.error('Failed to load manual model request:', e);
                 return;
@@ -9522,15 +11859,17 @@
             if (!full || full.id !== req.id || _manualRequested !== req.id ||
                 _manualTask !== taskName || _manualShown === req.id) { return; }
             _manualShown = req.id;
+            ++_manualReplySequence;
+            _manualReplySubmitting = null;
             window._manualPending = full;
-            document.getElementById('manual-llm-title').textContent = `request ${full.sequence}`;
-            document.getElementById('manual-llm-hint').textContent = full.stage_hint || '';
+            document.getElementById('manual-llm-title').textContent = t('manual.title', 'request {sequence}', {sequence: full.sequence});
+            renderManualReplyHint(full.stage_hint || '');
             document.getElementById('manual-llm-prompt').textContent = manualPromptText(full);
             const reply = document.getElementById('manual-llm-reply');
             if (reply.value.trim() && _manualReplyFor !== full.id && (_manualReplyAcknowledged !== _manualReplyFor || reply.value !== _manualAcknowledgedText)) {
                 const retained = document.createElement('details');
                 const title = document.createElement('summary');
-                title.textContent = 'Retained reply from an earlier request';
+                title.textContent = t('manual.retained-reply', 'Retained reply from an earlier request');
                 const draft = document.createElement('textarea');
                 draft.value = reply.value;
                 draft.readOnly = true;
@@ -9545,9 +11884,9 @@
             reply.disabled = false;
             document.getElementById('manual-llm-submit').disabled = false;
             panel.hidden = false;
-            document.getElementById('manual-llm-status').textContent = `Your turn: request ${full.sequence}. Paste the model’s answer and submit it. Earlier unsent replies, if any, are retained below.`;
-            const message = `The pipeline needs your reply to request ${full.sequence}. Use the manual reply panel at the top of the page.`;
-            showToast(message, 'warning', 8000);
+            document.getElementById('manual-llm-status').textContent = t('manual.your-turn', 'Your turn: request {sequence}. Paste the model’s answer and submit it. Earlier unsent replies, if any, are retained below.', {sequence: full.sequence});
+            const message = t('manual.needs-reply', 'The pipeline needs your reply to request {sequence}. Use the manual reply panel at the top of the page.', {sequence: full.sequence});
+            showManualReplyToast(message, 'warning', 8000);
             notifyJobDone(taskName, message, 'needs your reply');
         }
 
@@ -9558,7 +11897,7 @@
         async function copyManualPrompt() {
             const req = window._manualPending;
             if (!req) { return; }
-            await copyToClipboard(manualPromptText(req), 'Prompt');
+            await copyToClipboard(manualPromptText(req), t('core.copy.subject-prompt', 'Prompt'));
         }
 
         async function submitManualReply() {
@@ -9567,32 +11906,33 @@
             const btn = document.getElementById('manual-llm-submit');
             if (_manualReplySubmitting) { return; }
             if (!req || req.id !== _manualRequested || _manualReplyFor !== req.id) {
-                showToast('This request is no longer waiting. Your reply is still here; check the task activity.', 'warning');
+                showManualReplyToast('This request is no longer waiting. Your reply is still here; check the task activity.', 'warning');
                 return;
             }
-            if (!reply.value.trim()) { showToast('Paste the answer first.', 'warning'); return; }
+            if (!reply.value.trim()) { showManualReplyToast('Paste the answer first.', 'warning'); return; }
             const submittedText = reply.value;
+            const submission = ++_manualReplySequence;
             _manualReplySubmitting = req.id;
             btn.disabled = true;
             reply.disabled = true;
             try {
                 await API.post('/api/manual_llm/response', { id: req.id, content: submittedText });
+                if (submission !== _manualReplySequence || _manualRequested !== req.id || window._manualPending?.id !== req.id) { return; }
                 _manualReplyAcknowledged = req.id;
                 _manualAcknowledgedText = submittedText;
-                if (window._manualPending?.id === req.id) {
-                    document.getElementById('manual-llm-status').textContent = `Reply to request ${req.sequence} sent. The pipeline will validate it; wait for the next task update.`;
-                }
-                showToast(`Reply to request ${req.sequence} sent to the pipeline.`, 'success');
+                renderManualReplyHint('');
+                document.getElementById('manual-llm-status').textContent = t('manual.reply-sent-status', 'Reply to request {sequence} sent. The pipeline will validate it; wait for the next task update.', {sequence: req.sequence});
+                showManualReplyToast(t('manual.reply-sent-toast', 'Reply to request {sequence} sent to the pipeline.', {sequence: req.sequence}), 'success');
             } catch (e) {
                 console.error('Failed to submit manual model reply:', e);
-                if (window._manualPending?.id !== req.id) { return; }
-                const message = 'Could not confirm submission. Your text is still here. Check the task activity; if it is still waiting for this request, select Submit reply again.';
+                if (submission !== _manualReplySequence || _manualRequested !== req.id || window._manualPending?.id !== req.id) { return; }
+                const message = t('manual.submit-unconfirmed', 'Could not confirm submission. Your text is still here. Check the task activity; if it is still waiting for this request, select Submit reply again.');
                 document.getElementById('manual-llm-status').textContent = message;
-                showToast(message, 'error');
+                showManualReplyToast(message, 'error');
                 btn.disabled = false;
                 reply.disabled = false;
             } finally {
-                _manualReplySubmitting = null;
+                if (submission === _manualReplySequence) { _manualReplySubmitting = null; }
             }
         }
 
@@ -9609,7 +11949,7 @@
                 }
                 player.style.display = response.ok ? 'block' : 'none';
                 empty.style.display = response.ok ? 'none' : '';
-                empty.textContent = 'No final audiobook is loaded here yet. In Editor, choose Merge All to build the MP3.';
+                setUiMessage(empty, 'audio.final.empty-guidance', 'No final audiobook is loaded here yet. In Editor, choose Merge All to build the MP3.');
                 const audio = document.getElementById('main-audio');
                 const download = document.getElementById('download-link');
                 if (response.ok) {
@@ -9624,28 +11964,44 @@
                 if (request !== finalAudioRequest) { return; }
                 console.error('Failed to check final audiobook:', error);
                 empty.style.display = '';
-                empty.textContent = 'Could not check the final audiobook. Check the connection and reopen Result to retry.';
+                setUiMessage(empty, 'audio.final.check-failed', 'Could not check the final audiobook. Check the connection and reopen Result to retry.');
             }
         }
 
-        async function pollLogs(taskName, elementId, onDone, activityId) {
+        async function pollLogs(taskName, elementId, onDone, activityId, scriptRunToken = taskName === 'script' ? (window._scriptRecoveryRunToken || 0) : 0, initialStatus) {
             const el = document.getElementById(elementId);
             const activityEl = activityId ? document.getElementById(activityId) : null;
+            const ownsScriptControls = () => !scriptRunToken || window._scriptRecoveryRunToken === scriptRunToken;
             const track = { count: -1, changedAt: Date.now() };
             const renderLogs = createTaskLogRenderer(el);
-            _startPolling(`logs:${taskName}`, () => API.get(`/api/status/${taskName}`), {
+            const fetchStatus = () => {
+                if (!initialStatus) { return API.get(`/api/status/${taskName}`); }
+                const status = initialStatus;
+                initialStatus = null;
+                return status;
+            };
+            _startPolling(`logs:${taskName}`, fetchStatus, {
+                scriptRunToken,
                 doneCheck: status => !status.running,
                 onTick: status => {
+                    if (!ownsScriptControls()) { return; }
+                    if (taskName === 'script' && window._scriptRecoveryTerminalDelivered) { return; }
                     renderLogs(status);
                     syncPauseButton(taskName, status);
                     if (taskName === 'script') { syncSnapshotButton(status); }
                     renderActivity(activityEl, status, track);
+                    if (activityId === 'script-activity') { renderScriptTabProgress(status, taskName); }
                     if (activityId) { renderManualRequest(status, taskName); }
                 },
                 onDone: status => {
+                    if (!ownsScriptControls()) { return; }
                     if (activityEl) { activityEl.hidden = true; }
+                    if (activityId === 'script-activity') { renderScriptTabProgress({ running: false }, taskName); }
                     if (activityId) { renderManualRequest({ running: false }, taskName); }
-                    notifyJobDone(taskName, '', 'finished', status);
+                    if (!scriptRunToken) {
+                        notifyJobDone(taskName, '', 'finished', status);
+                    }
+                    if (['script', 'review', 'cast_list'].includes(taskName) && currentTabName === 'script') { window.refreshScriptIngestFacts?.(); }
                     if (onDone) { onDone(status); }
                     if (taskName === 'audio' && getTaskCompletionOutcome(status) === 'finished' && status.logs.some(l => l.includes("complete"))) {
                         loadFinalAudio();
@@ -9661,5 +12017,43 @@
                         }
                     }
                 }
+            });
+        }
+
+        // --- Script tab progress (#2042) ---
+        // The Script tab's own bar, next to its activity row. It reads the
+        // fraction the server already embeds in the status payload (`eta`, the
+        // same estimate /api/status/eta serves) - no extra request, no new
+        // endpoint.
+        //
+        // Two cases have no fraction to draw and go indeterminate:
+        //   * the task has not reported one yet (eta.fraction is null);
+        //   * the speaker alias-merge stage, whose fraction is 1.0 (it runs
+        //     after the last review batch) but whose single model call has no
+        //     known length, so core._compute_eta withholds eta_seconds too
+        //     (#2037, core.SPEAKER_MERGE_MARKER).
+        //
+        // Which stage that is comes from the server: core._compute_eta's own
+        // tail scan puts the merge line into `eta.progress`. Deciding it here
+        // from `status.logs` as well would be a second implementation of the
+        // same call, and the two drift (Rule 15).
+        const SCRIPT_MERGE_STAGE_MARKER = 'Merging duplicate names:';
+        function isSpeakerMergeStage(eta) {
+            return String((eta && eta.progress) || '').includes(SCRIPT_MERGE_STAGE_MARKER);
+        }
+
+        function renderScriptTabProgress(status, taskName) {
+            const wrap = document.getElementById('script-progress');
+            if (!wrap) { return; }
+            const running = !!(status && status.running);
+            wrap.hidden = !running;
+            if (!running) { return; }
+            const eta = status.eta || null;
+            const indeterminate = isSpeakerMergeStage(eta)
+                || !eta || !Number.isFinite(eta.fraction);
+            renderTexturedProgress(document.getElementById('script-progress-bar'), {
+                fraction: indeterminate ? null : eta.fraction,
+                label: getTaskLabel(taskName),
+                task: getTaskLabel(taskName),
             });
         }

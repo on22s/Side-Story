@@ -20,17 +20,27 @@ function changeUiLocale(locale) {
 }
 
 // JS-built chrome does not carry data-i18n attributes, so the locale change
-// repaints it here: the finder status and the Home task-guide cards. Guide
-// text is rebuilt through translateUiMessage on every render.
+// repaints it here: the finder status, the Home task-guide cards and the
+// Editor shortcut list. Guide and shortcut text is rebuilt from its keys on
+// every render.
 function renderUiLocaleChrome() {
     renderSetupSearchStatus();
+    if (typeof renderThemeControl === 'function') { renderThemeControl(); }
+    if (typeof renderWorkspaceLocaleChrome === 'function') { renderWorkspaceLocaleChrome(); }
+    if (typeof renderEtaLocaleChrome === 'function') { renderEtaLocaleChrome(); }
+    if (typeof renderVoiceLocaleChrome === 'function') { renderVoiceLocaleChrome(); }
+    if (typeof applyTtsCapabilityGuidance === 'function') { applyTtsCapabilityGuidance(); }
     if (typeof renderTaskGuides === 'function') { renderTaskGuides(); }
+    if (typeof renderEditorShortcutHelp === 'function') { renderEditorShortcutHelp(); }
+    if (typeof renderFollowupLocaleChrome === 'function') { renderFollowupLocaleChrome(); }
+    if (typeof renderDeleteUndo === 'function') { renderDeleteUndo(); }
+    if (typeof renderReviewLabelsOnlyPointer === 'function') { renderReviewLabelsOnlyPointer(); }
 }
 
 function applyUiLocaleAndSearchStatus(locale) {
     const applied = applyUiLocale(locale);
     renderUiLocaleChrome();
-    return applied.then(renderSetupSearchStatus);
+    return applied.then(renderUiLocaleChrome);
 }
 
 function renderSetupSearchStatus() {
@@ -109,6 +119,10 @@ function renderSetupSettingsSearch() {
 
 function openSetupSetting(id) {
     const control = document.getElementById(id);
+    // A link from another tab (Script's labels-only review pointer) cannot focus
+    // anything until Setup is the visible tab; the finder is already here, where
+    // this is a no-op.
+    if (control && typeof activateTab === 'function') { activateTab('setup', true); }
     if (!control || !isSetupSettingAvailable(control)) {
         renderSetupSettingsSearch();
         return;
@@ -118,6 +132,7 @@ function openSetupSetting(id) {
     results.hidden = true;
     setupSearchStatus = [{form: 'opened', values: {}}];
     renderSetupSearchStatus();
+    revealExpertSettingsFor(control);
     openConfigField(control);
 }
 
@@ -138,11 +153,55 @@ function openSetupSettingsSection(id, focusHeading = true) {
     }
 }
 
+// Advanced tuning stays behind a switch so a first run shows only the connection
+// and the speech engine. The choice is browser-local, like the interface
+// language, and never reaches the saved configuration.
+const SETUP_EXPERT_STORAGE_KEY = 'alexandria.setupExpert';
+
+function readSetupExpertMode() {
+    try { return localStorage.getItem(SETUP_EXPERT_STORAGE_KEY) === '1'; }
+    catch (error) { return false; }
+}
+
+function applySetupExpertMode(expert) {
+    for (const node of document.querySelectorAll('[data-setup-advanced]')) { node.hidden = !expert; }
+    if (expert) { return; }
+    // Hiding a category must never leave its panel on screen.
+    const visible = Array.from(document.querySelectorAll('#config-form [data-settings-section]')).find(panel => !panel.hidden);
+    if (visible?.hasAttribute('data-setup-advanced-section')) { openSetupSettingsSection('settings-llm', false); }
+}
+
+function setSetupExpertMode(expert) {
+    try { localStorage.setItem(SETUP_EXPERT_STORAGE_KEY, expert ? '1' : '0'); }
+    catch (error) { /* a blocked store keeps the choice for this page only */ }
+    applySetupExpertMode(expert);
+}
+
+// A search hit or a validation error can point into advanced tuning; reveal it
+// rather than focusing a control the reader cannot see. The finder keeps
+// indexing these panels while they are hidden, like any collapsed control.
+function revealExpertSettingsFor(control) {
+    if (!control.closest('[data-settings-section]')?.hasAttribute('data-setup-advanced-section')) { return; }
+    const toggle = document.getElementById('setup-expert-toggle');
+    // Show the panel now without persisting: the switch is the reader's choice,
+    // and a validation error should not silently become their saved preference.
+    if (toggle && !toggle.checked) { toggle.checked = true; applySetupExpertMode(true); }
+}
+
+const setupExpertToggle = document.getElementById('setup-expert-toggle');
+if (setupExpertToggle) {
+    setupExpertToggle.checked = readSetupExpertMode();
+    applySetupExpertMode(setupExpertToggle.checked);
+}
+
 // Browser constraint validation happens before submit. Reveal only the first
 // rejected control so later invalid events cannot hide the browser's focus target.
 function onSetupSettingsInvalid(event) {
     const form = document.getElementById('config-form');
-    if (form.querySelector('input:invalid, select:invalid, textarea:invalid') === event.target) { openConfigField(event.target); }
+    if (form.querySelector('input:invalid, select:invalid, textarea:invalid') === event.target) {
+        revealExpertSettingsFor(event.target);
+        openConfigField(event.target);
+    }
 }
 
 document.getElementById('config-form').addEventListener('invalid', onSetupSettingsInvalid, true);

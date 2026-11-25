@@ -2,7 +2,10 @@ from audio_generation_owner import AUDIO_GENERATION_CANCELLED, AudioGenerationCa
 from merge_integrity import get_source_integrity, is_source_integrity_admitted
 from pathlib import Path
 from review_report import get_review_report_info, apply_review_report_explanation
-from book_state_transaction import ensure_book_state, get_book_operation_identity
+from completed_review_receipt import get_review_progress_paths
+from book_state_transaction import (ensure_book_state, reuse_book_state,
+    get_book_fault_response, get_book_operation_identity, get_book_operation_token)
+from chunk_status_journal import get_chunk_state_file_version, get_chunk_status_journal_path
 from task_ownership import ensure_startup_recovery
 import asyncio
 import copy
@@ -14,13 +17,14 @@ import os
 import soundfile
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
-from contextlib import contextmanager
-from typing import Annotated, Any, List, Optional
+from contextlib import contextmanager, ExitStack
+from typing import Annotated, Any, List, NamedTuple, Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, Query, Path as PathParameter
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, Query, Request, Path as PathParameter
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse, Response
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, StrictBool, field_validator
@@ -28,15 +32,21 @@ from publication_preview import get_publication_review, get_publication_preview,
 from config_settings import load_app_config
 from export_limits import MAX_PAUSE_MS
 from audio_mastering import MasteringOptions, get_audio_sha256
+from audio_take_history import _version
 from export_quality import ExportQualityOptions
 from export_quality_session import ExportQualityAttempt, get_session_evidence
-from project_scope_exports import require_scope_export_current
+from export_publication import get_export_editor_revision
+from project_scope_exports import (get_export_reader_identity, open_current_export_reader,
+                                   require_scope_export_current)
 from audio_stream_response import AudioStreamResponse
 from export_download import ExportFileResponse, open_export_reader
 
 from book_placeholder import is_book_placeholder, is_book_placeholder_stream
 from export_download import SWITCH_IN_PROGRESS
 from core import (
+    _init_task_log,
+    AppError,
+    mark_expected_probe_response,
     AUDIOBOOK_PATH,
     CONFIG_PATH,
     DATA_DIR,
@@ -54,7 +64,7 @@ from core import (
     check_global_gpu_lock,
     claim_gpu_task, schedule_claimed_background_task,
     reserve_background_task, register_claimed_background_task, release_gpu_task_claim,
-    process_state, is_task_running,
+    process_state, is_task_running, update_claimed_task_state,
     project_manager,
 )
 from generation_checkpoint_deltas import load_generation_checkpoint_document
@@ -62,15 +72,16 @@ from generation_checkpoint_shards import get_generation_checkpoint_artifacts
 from editor_poll_snapshot import EditorPollSnapshots, get_snapshot_digest
 from editor_review_facts import get_editor_review_facts
 from speech_verification_receipt import get_speech_verification_chunk_view
-from utils import safe_load_json, is_path_inside
+from utils import safe_load_json, is_path_inside, is_windows_reserved_device_name
 from project import (CHAPTER_EXPORT_DIR, CHAPTER_TEMPLATE_FIELDS,
-                     DEFAULT_CHAPTER_TEMPLATE, get_chapter_export_rows, get_index_selection,
+                     DEFAULT_CHAPTER_TEMPLATE, get_chapter_export_rows, get_chapter_selection, get_index_selection,
                      get_chunk_generation_requests, get_playback_pause_plan,
                      get_playback_trim_plan, get_speaker)
 from runtime_estimate import get_book_runtime_estimate
 from routers.voices import get_script_speaker
-from tts import (voice_config_for_chunk, resolve_narrator_voice_config, voice_category,
+from tts import (voice_category, get_chunk_render_voice_selection, get_ensemble_member_names,
                  ExportCancelled, ensure_audio_export_active, get_pause_duration_ms)
+from timeline_anchors import resolve_timeline_anchors
 import voice_drift
 
 
@@ -78,7 +89,7 @@ logger = logging.getLogger("AlexandriaUI")
 router = APIRouter()
 
 
-def build_zip_download(members, filename):
+def build_zip_download(members, filename, *, fence_root=None, expected=None):
     """Build a ZIP on disk and remove it after FileResponse finishes.
 
     Each member is copied from one opened file, so a book switch's
@@ -90,7 +101,9 @@ def build_zip_download(members, filename):
         written = 0
         with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
             for source, name in members:
-                with open(source, "rb") as stream:
+                stream = (open_current_export_reader(fence_root, source, expected=expected)
+                          if fence_root is not None else open(source, "rb"))
+                with stream:
                     info = os.fstat(stream.fileno())
                     if is_book_placeholder_stream(stream, info.st_size):
                         continue
@@ -367,9 +380,14 @@ class NarrationMarkupApplication(NarrationMarkupSelection):
 
 
 class AudioRepairSelection(BaseModel):
+    # Refuse the retired single `chapter` field instead of ignoring it: an
+    # ignored chapter would silently widen the selection to the whole book.
+    model_config = ConfigDict(extra="forbid")
     expected_options_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_book_token: str = Field(pattern=r"^[0-9a-f]{64}$")
-    chapter: Optional[Annotated[StrictInt, Field(ge=0)]] = None
+    # Zero-based chapter numbers from repair_options; None means the whole book.
+    chapters: Optional[List[Annotated[StrictInt, Field(ge=0)]]] = Field(
+        default=None, min_length=1, max_length=10000)
     speakers: List[Annotated[str, Field(max_length=500)]] = Field(min_length=1, max_length=10000)
 
 
@@ -378,7 +396,7 @@ def get_audio_repair_revision(chunks):
     files = []
     for path in (project_manager.voice_config_path,
                  os.path.join(project_manager.root_dir, "character_aliases.json"), CONFIG_PATH,
-                 pronunciation.DEFAULT_PATH):
+                 pronunciation.get_pronunciation_path()):
         try:
             value = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         except FileNotFoundError:
@@ -393,7 +411,7 @@ def get_audio_repair_options(chunks):
                          for i, (title, first, last) in enumerate(groups)],
             "speakers": sorted({get_speaker(chunk) for chunk in chunks
                                 if chunk.get("text", "").strip()}),
-            "grouping_note": "Uses export chapter detection; without headings, each line is a chapter."}
+            "grouping_note": "Uses export chapter detection; without headings, the whole script is one chapter."}
 
 
 @router.get("/api/chunks/repair_options")
@@ -421,15 +439,18 @@ def _get_audio_repair_preview_sync(request):
         if request.expected_options_revision != get_snapshot_digest(chunks):
             raise HTTPException(status_code=409, detail="Chapter options are stale. Load current chapters and speakers again.")
         options = get_audio_repair_options(chunks)
-        first, last = 0, len(chunks) - 1
-        if request.chapter is not None:
-            if request.chapter >= len(options["chapters"]):
+        chosen = None
+        if request.chapters is not None:
+            if max(request.chapters) >= len(options["chapters"]):
                 raise HTTPException(status_code=409, detail="Chapter selection changed; refresh repair options.")
-            chapter = options["chapters"][request.chapter]
-            first, last = chapter["first"], chapter["last"]
+            chosen = set()
+            for number in set(request.chapters):
+                chapter = options["chapters"][number]
+                chosen.update(range(chapter["first"], chapter["last"] + 1))
         if not set(request.speakers).issubset(options["speakers"]):
             raise HTTPException(status_code=409, detail="Speaker selection changed; refresh repair options.")
-        selected = [chunk for i, chunk in enumerate(chunks) if first <= i <= last
+        selected = [chunk for i, chunk in enumerate(chunks)
+                    if (chosen is None or i in chosen)
                     and chunk.get("text", "").strip() and get_speaker(chunk) in request.speakers]
         return {"book_token": request.expected_book_token,
                 "repair_revision": get_audio_repair_revision(chunks), "rows": selected,
@@ -444,24 +465,30 @@ class OutlierCheckRequest(BaseModel):
     expected_book_token: str = Field(pattern=r'^[0-9a-f]{64}$')
 
 
-def _require_export_download(path, missing_detail):
+def _require_export_download(path, missing_detail, *, probe=False):
     """404 for a missing export, 409 while a book switch holds its name.
 
     Downloads run without the book lock. A switch creating or removing an
     export briefly leaves a placeholder there (#1660); serving it would hand
     the user 64 bytes named audiobook.mp3."""
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=missing_detail)
+        with mark_expected_probe_response(expected=probe):
+            raise HTTPException(status_code=404, detail=missing_detail)
     if is_book_placeholder(path):   # early answer; the served descriptor is checked again
         raise HTTPException(status_code=409, detail=SWITCH_IN_PROGRESS)
 
 
 @router.head("/api/audiobook")
 @router.get("/api/audiobook")
-async def get_audiobook():
-    _require_export_download(AUDIOBOOK_PATH, "Audiobook not found")
+async def get_audiobook(request: Request = None):
+    expected = get_export_reader_identity(DATA_DIR)
+    _require_export_download(AUDIOBOOK_PATH, "Audiobook not found",
+                             probe=request is not None and request.method == "HEAD")
     require_scope_export_current(DATA_DIR, AUDIOBOOK_PATH)
-    return ExportFileResponse(AUDIOBOOK_PATH, filename="audiobook.mp3", media_type="audio/mpeg")
+    stream = await asyncio.to_thread(open_current_export_reader, DATA_DIR,
+                                      AUDIOBOOK_PATH, expected=expected)
+    return ExportFileResponse(AUDIOBOOK_PATH, filename="audiobook.mp3",
+                              media_type="audio/mpeg", stream=stream)
 
 # --- Chunk Management Endpoints ---
 
@@ -540,7 +567,115 @@ def _ensure_editor_selection():
         from script_selection_binding import require_published_selection
         require_published_selection(os.path.dirname(SCRIPT_PATH))
     except (ValueError, OSError, RecursionError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        fault = get_book_fault_response(error)
+        raise HTTPException(status_code=fault.status_code if fault else 409,
+                            detail=fault.detail if fault else str(error)) from error
+
+
+CHUNK_SNAPSHOT_CONFLICT_DETAIL = (
+    "Saved book state is unreadable. Reload or switch books before continuing; "
+    "saved progress and audio have been preserved."
+)
+
+
+class _ExportAdmission(NamedTuple):
+    rows: list | None
+    token: str
+    versions: tuple
+
+
+def _export_chunk_versions():
+    snapshot = project_manager.chunks_path
+    return (get_chunk_state_file_version(snapshot),
+            get_chunk_state_file_version(get_chunk_status_journal_path(snapshot)))
+
+
+def _require_export_chunks():
+    """Request-time export admission: refuse before a worker is enqueued.
+
+    Read the saved rows only, under non-recovering admission. The mutating
+    loader would regenerate/backfill a corrupt or absent snapshot, silently
+    repairing the very evidence a stale journal conflict is meant to protect.
+    A genuinely absent snapshot is not a conflict; any other unreadable state
+    is. Keep the absent pair distinct from a saved empty array, and bind the
+    rows to the selected book and the two files that supplied them.
+    """
+    try:
+        with ensure_book_state(DATA_DIR, recover=False):
+            _ensure_editor_selection()
+            versions = _export_chunk_versions()
+            try:
+                rows = project_manager.read_saved_chunk_rows()
+            except FileNotFoundError:
+                rows = None
+            if _export_chunk_versions() != versions:
+                raise ValueError("Editor rows changed during export admission")
+            return _ExportAdmission(rows, get_book_operation_token(DATA_DIR), versions)
+    except (ValueError, OSError, RecursionError) as error:
+        # Non-recovering admission refuses a pending book transaction without
+        # mutating its staged publication artifacts.
+        raise AppError(409, "Saved book state is unreadable. Reload or switch books before continuing; saved progress and audio have been preserved.", key='error.book.chunk_snapshot_unreadable') from error
+
+
+def _assert_export_admission_locked(admission):
+    """Verify the same selection and row versions under book admission."""
+    _ensure_editor_selection()
+    if get_book_operation_token(DATA_DIR) != admission.token:
+        raise ValueError("The selected book changed during export admission")
+    if _export_chunk_versions() != admission.versions:
+        raise ValueError("Editor rows changed during export admission")
+
+
+class _ExportReadAdmission:
+    """Non-recovering admission whose *entry* conflict is an actionable 409.
+
+    Errors raised inside the scope (for example a malformed chapter request)
+    pass through unchanged so genuine content validation keeps its own codes.
+    """
+    def __enter__(self):
+        try:
+            self._context = ensure_book_state(DATA_DIR, recover=False)
+            return self._context.__enter__()
+        except (ValueError, OSError, RecursionError) as error:
+            raise AppError(409, "Saved book state is unreadable. Reload or switch books before continuing; saved progress and audio have been preserved.",
+                                key='error.book.chunk_snapshot_unreadable') from error
+
+    def __exit__(self, *exc_info):
+        return self._context.__exit__(*exc_info)
+
+
+def _chapter_preview_with_rows(admission, **options):
+    """Validate identity and consume admitted rows under one read-only admission."""
+    def checked():
+        try:
+            _assert_export_admission_locked(admission)
+        except (ValueError, OSError, RecursionError) as error:
+            raise AppError(409, "Saved book state is unreadable. Reload or switch books before continuing; saved progress and audio have been preserved.", key='error.book.chunk_snapshot_unreadable') from error
+    with _ExportReadAdmission():
+        checked()
+        result = project_manager.preview_chapter_filenames(rows=admission.rows or [], **options)
+        checked()
+        return result
+
+
+def _reserve_export_task(background_tasks, task_name, admission, callback):
+    """Verify identity, then reserve under the held book lock (book before GPU).
+
+    The reservation's verify hook runs while that admission is still held and
+    reuses it, so a completed switch cannot slip between the last check and the
+    claim. The worker verifies its source again independently.
+    """
+    try:
+        with ensure_book_state(DATA_DIR, recover=False):
+            _assert_export_admission_locked(admission)
+            def verify():
+                with reuse_book_state(DATA_DIR):
+                    _assert_export_admission_locked(admission)
+            return schedule_claimed_background_task(
+                background_tasks, task_name, callback, verify=verify)
+    except (ValueError, OSError, RecursionError) as error:
+        raise AppError(409, "Saved book state is unreadable. Reload or switch books before continuing; saved progress and audio have been preserved.",
+                            key='error.book.chunk_snapshot_unreadable') from error
 
 
 def _ensure_editor_chunks():
@@ -655,15 +790,25 @@ def _get_editor_quality_sync(expected_book_token):
                     voice_config=voices)}
 
 
+_DELETED_CHUNK_UNDO_TTL_SECONDS = 1800
+_deleted_chunk_receipts_lock = threading.RLock()
 _deleted_chunk_receipts = {}
 
 
 def _get_undo_take_rows():
-    """Caller holds the book lock; unexpired deletion undo still owns its audio."""
+    """Caller holds the book lock; unexpired deletion undo still owns its audio.
+
+    Snapshot under the receipts' own leaf lock and filter outside it: the
+    writers prune, cap and rewrite receipts while a take action reads them,
+    and a resizing dict must never be iterated mid-mutation. The leaf lock is
+    never held while acquiring the book or GPU lock, so it adds no ordering.
+    """
     book = get_editor_book_identity(os.path.dirname(SCRIPT_PATH))
     now = time.monotonic()
-    return [receipt['chunk'] for receipt in _deleted_chunk_receipts.values()
-            if receipt['book'] == book and now - receipt['created'] <= 60]
+    with _deleted_chunk_receipts_lock:
+        receipts = [dict(receipt) for receipt in _deleted_chunk_receipts.values()]
+    return [receipt['chunk'] for receipt in receipts
+            if receipt['book'] == book and now - receipt['created'] <= _DELETED_CHUNK_UNDO_TTL_SECONDS]
 
 
 
@@ -717,13 +862,13 @@ def ensure_audio_generation_requests(indices, expected_book_token=None, expected
 
 
 def apply_chunk_update(index, updates, expected_book_token, expected_uid):
-    with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
+    with reuse_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
         check_chunk_identity(index, expected_book_token, expected_uid)
         return project_manager.update_chunk(index, updates)
 
 
 def apply_editor_gap(index, expected_book_token, expected_uid, expected_revision):
-    with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
+    with reuse_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
         check_chunk_identity(index, expected_book_token, expected_uid)
         if expected_revision is None:
             return project_manager.get_gap_suggestion(index)
@@ -751,42 +896,62 @@ async def apply_gap_suggestion_endpoint(index: int, request: GapSuggestionReques
 
 
 def apply_chunk_insertion(index, expected_book_token=None, expected_uid=None):
-    with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
-        check_chunk_identity(index, expected_book_token, expected_uid)
+    with reuse_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25, recover=False):
+        check_chunk_identity(index, expected_book_token)
+        if expected_uid is not None:
+            return project_manager.insert_chunk(index, expected_uid=expected_uid)
         return project_manager.insert_chunk(index)
 
 
 def apply_chunk_deletion(index, expected_book_token=None, expected_uid=None):
     root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root, timeout=0.25):
-        check_chunk_identity(index, expected_book_token, expected_uid)
-        result = project_manager.delete_chunk(index)
+    with reuse_book_state(root, timeout=0.25, recover=False):
+        check_chunk_identity(index, expected_book_token)
+        result = project_manager.delete_chunk(index, expected_uid=expected_uid, include_before_revision=True)
         if result is None:
             return None
-        deleted, chunks = result
+        deleted, chunks, before_revision = result
         now = time.monotonic()
-        for token, receipt in list(_deleted_chunk_receipts.items()):
-            if now - receipt['created'] > 60:
-                del _deleted_chunk_receipts[token]
-        while len(_deleted_chunk_receipts) >= 128:
-            del _deleted_chunk_receipts[next(iter(_deleted_chunk_receipts))]
-        token = uuid.uuid4().hex
-        _deleted_chunk_receipts[token] = {'created': now, 'book': get_editor_book_identity(root),
-            'chunk': copy.deepcopy(deleted), 'index': index}
+        identity = get_editor_book_identity(root)
+        revision = get_snapshot_digest(chunks)
+        with _deleted_chunk_receipts_lock:
+            for token, receipt in list(_deleted_chunk_receipts.items()):
+                if now - receipt['created'] > _DELETED_CHUNK_UNDO_TTL_SECONDS:
+                    del _deleted_chunk_receipts[token]
+            while len(_deleted_chunk_receipts) >= 128:
+                del _deleted_chunk_receipts[next(iter(_deleted_chunk_receipts))]
+            for receipt in _deleted_chunk_receipts.values():
+                if receipt['book'] == identity and receipt.get('revision') == before_revision:
+                    receipt['revision'] = revision
+            token = uuid.uuid4().hex
+            _deleted_chunk_receipts[token] = {'created': now, 'book': identity, 'revision': revision,
+                'chunk': copy.deepcopy(deleted), 'index': index}
         return deleted, chunks, token
 
 
 def apply_chunk_restore(request):
     root = os.path.dirname(SCRIPT_PATH)
-    with ensure_book_state(root, timeout=0.25):
-        receipt = _deleted_chunk_receipts.get(request.undo_token)
-        if (receipt is None or time.monotonic() - receipt['created'] > 60
-                or receipt['book'] != get_editor_book_identity(root)
+    with reuse_book_state(root, timeout=0.25):
+        revision = get_snapshot_digest(project_manager.load_chunks())
+        identity = get_editor_book_identity(root)
+        with _deleted_chunk_receipts_lock:
+            receipt = dict(_deleted_chunk_receipts[request.undo_token]) if request.undo_token in _deleted_chunk_receipts else None
+            latest = next((token for token in reversed(_deleted_chunk_receipts)
+                if _deleted_chunk_receipts[token]['book'] == identity
+                and _deleted_chunk_receipts[token].get('revision') == revision), None)
+        if (receipt is None or time.monotonic() - receipt['created'] > _DELETED_CHUNK_UNDO_TTL_SECONDS
+                or request.undo_token != latest or receipt.get('revision') != revision
+                or receipt['book'] != identity
                 or request.chunk != receipt['chunk'] or request.at_index != receipt['index']):
             raise HTTPException(status_code=409, detail='Undo expired or belongs to another book or deletion; refresh the Editor')
         chunks = project_manager.restore_chunk(receipt['index'], copy.deepcopy(receipt['chunk']))
         if chunks is not None:
-            del _deleted_chunk_receipts[request.undo_token]
+            restored_revision = get_snapshot_digest(chunks)
+            with _deleted_chunk_receipts_lock:
+                del _deleted_chunk_receipts[request.undo_token]
+                for previous in _deleted_chunk_receipts.values():
+                    if previous['book'] == receipt['book'] and previous.get('revision') == revision:
+                        previous['revision'] = restored_revision
         return chunks
 
 
@@ -795,16 +960,35 @@ class ChunkRestoreRequest(BaseModel):
     at_index: int
     undo_token: Optional[str] = Field(default=None, max_length=64)
 
-def _apply_chunk_edit(operation, *args):
-    """Keep the conflict check and chunk mutation atomic with task claims."""
-    with _gpu_lock:
-        check_global_gpu_lock("audio")
-        try:
-            return operation(*args)
-        except TimeoutError as error:
-            raise HTTPException(status_code=409, detail='The edit could not be confirmed. Refresh the Editor and check the line before retrying.') from error
-        except (ValueError, OSError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+def _apply_chunk_edit(operation, *args, recover=True):
+    """Book lock then GPU mutex — the one order for edits and generation start.
+
+    start_script_generation holds the book journal across its task claim, so
+    taking the GPU mutex first here inverts that order and stalls both paths.
+    The book admission is re-used by the operation's own reuse_book_state, and
+    no local lock path is ever exposed in a user-visible detail. Markup passes
+    recover=False so its preview/apply/replay never auto-recovers a pending
+    journal on the caller's behalf.
+
+    The GPU mutex and task check run as a guard under the already-held book
+    lock, before ensure_book_state recovers anything. A busy refusal therefore
+    leaves a pending journal byte-for-byte intact; recovery only happens once
+    the task is admitted and the book admission is still held.
+    """
+    try:
+        with ExitStack() as stack:
+            def guard():
+                stack.enter_context(_gpu_lock)
+                check_global_gpu_lock("audio")
+
+            with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25,
+                                   recover=recover, guard=guard):
+                return operation(*args)
+    except (TimeoutError, OSError, ValueError) as error:
+        fault = get_book_fault_response(error)
+        if fault is not None:
+            raise HTTPException(status_code=fault.status_code, detail=fault.detail) from error
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 @router.post("/api/chunks/restore")
 async def restore_chunk(request: ChunkRestoreRequest):
@@ -955,7 +1139,7 @@ async def insert_chunk(index: int,
                        expected_uid: Annotated[Optional[str], Query(max_length=128)] = None):
     """Insert an empty chunk after the given index."""
     chunks = await asyncio.to_thread(_apply_chunk_edit, apply_chunk_insertion, index,
-                                    expected_book_token, expected_uid)
+                                    expected_book_token, expected_uid, recover=False)
     if chunks is None:
         raise HTTPException(status_code=404, detail="Invalid chunk index")
     return {"status": "ok", "total": len(chunks)}
@@ -968,7 +1152,9 @@ async def preview_narration_markup(index: int, request: NarrationMarkupSelection
         return await asyncio.to_thread(get_saved_narration_markup_preview,
             project_manager, index, request.expected_book_token, request.expected_uid)
     except (TimeoutError, ValueError, OSError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        fault = get_book_fault_response(error)
+        raise HTTPException(status_code=fault.status_code if fault else 409,
+                            detail=fault.detail if fault else str(error)) from error
 
 
 @router.post("/api/chunks/{index}/narration-markup/apply")
@@ -976,7 +1162,7 @@ async def apply_narration_markup(index: int, request: NarrationMarkupApplication
     from narration_markup_edit import apply_saved_narration_markup
     return await asyncio.to_thread(_apply_chunk_edit, apply_saved_narration_markup,
         project_manager, index, request.expected_book_token, request.expected_uid,
-        request.binding, request.decision)
+        request.binding, request.decision, recover=False)
 
 
 @router.delete("/api/chunks/{index}")
@@ -985,7 +1171,7 @@ async def delete_chunk(index: int,
                        expected_uid: Annotated[Optional[str], Query(max_length=128)] = None):
     """Delete a chunk at the given index."""
     result = await asyncio.to_thread(_apply_chunk_edit, apply_chunk_deletion, index,
-                                    expected_book_token, expected_uid)
+                                    expected_book_token, expected_uid, recover=False)
     if result is None:
         raise HTTPException(status_code=400, detail="Cannot delete chunk (invalid index or last remaining chunk)")
     deleted, chunks, token = result
@@ -1006,25 +1192,30 @@ async def generate_chunk_endpoint(index: int, background_tasks: BackgroundTasks,
             raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
 
         def task():
-            state = process_state["audio"]
-            state["start_time"] = time.time()
-            state["logs"] = [f"Generating chunk {index}..."]
-            state["status"] = "running"
-            state["error"] = None
+            # Every public lifecycle write is bound to this worker's exact
+            # claim. A successor that installed its own claim (or acknowledged
+            # its own cancel) while this worker ran must not be overwritten
+            # during completion or in the finally block (F08).
+            _set_audio_task_state(start_time=time.time(),
+                                  logs=[f"Generating chunk {index}..."],
+                                  status="running", error=None)
+
+            def log(message):
+                _set_audio_task_state(logs_append=message)
+
             try:
                 success, message = project_manager.generate_chunk_audio(index, admitted_chunk=requested[index])
                 cancelled = not success and message == AUDIO_GENERATION_CANCELLED
-                state["status"] = "cancelled" if cancelled else ("done" if success else "failed")
-                state["error"] = None if success or cancelled else message
-                state["logs"].append(
-                    f"Generation {'complete' if success else 'failed'}: {message}")
+                _set_audio_task_state(
+                    status="cancelled" if cancelled else ("done" if success else "failed"),
+                    error=None if success or cancelled else message)
+                log(f"Generation {'complete' if success else 'failed'}: {message}")
             except Exception as exc:
                 logger.exception("Single-chunk generation error")
-                state["status"] = "failed"
-                state["error"] = str(exc)
-                state["logs"].append(f"Generation failed: {exc}")
+                _set_audio_task_state(status="failed", error=str(exc))
+                log(f"Generation failed: {exc}")
             finally:
-                state["running"] = False
+                _set_audio_task_state(running=False)
 
         # Same GPU resource as /api/generate_batch - must not race it. See F-032.
         register_claimed_background_task(background_tasks, "audio", claim_id, task)
@@ -1038,8 +1229,17 @@ class MergeRequest(BaseModel):
 
 
 def _ensure_editor_integrity_locked():
-    """Caller holds book state; native chunk loading may initialize missing rows."""
-    chunks = project_manager.load_chunks()
+    """Caller holds book state; fence the selection before reading any rows.
+
+    Without the fence a source switch can leave a pending publication whose
+    old compacted rows - or rows regenerated from the retained old script -
+    would otherwise be certified as belonging to the newly selected book.
+    """
+    _ensure_editor_selection()
+    try:
+        chunks = project_manager.load_chunks()
+    except (ValueError, OSError) as error:
+        raise AppError(409, "Saved book state is unreadable. Reload or switch books before continuing; saved progress and audio have been preserved.", key='error.book.chunk_snapshot_unreadable') from error
     state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
     try:
         script_bytes = Path(SCRIPT_PATH).read_bytes()
@@ -1059,13 +1259,15 @@ async def get_editor_integrity():
     return await asyncio.to_thread(_ensure_editor_integrity)
 
 
-def get_export_quality_attempt(request, state, *, audacity=False):
+def get_export_quality_attempt(request, state, *, audacity=False, expected_token=None):
     # A cancelled queued worker must not start book I/O for evidence capture.
     ensure_audio_export_active(lambda: state.get('cancel', False))
     options = getattr(request, 'export_quality', None)
-    with ensure_book_state(DATA_DIR):
+    with ensure_book_state(DATA_DIR, recover=expected_token is None):
         _ensure_editor_selection()
         token = get_snapshot_digest(get_editor_book_identity(DATA_DIR))
+        if expected_token is not None and token != expected_token:
+            raise ValueError("The selected book changed during export admission")
         # Stamp the input revision at admitted start under the book lock.
         return ExportQualityAttempt(state, token,
             options.model_dump() if options is not None else None, audacity=audacity,
@@ -1184,6 +1386,12 @@ class AbsReconcileRequest(BaseModel):
     delivery_id: str = Field(max_length=64)
 
 
+class AbsDiscardRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    delivery_id: str = Field(max_length=64)
+    confirm: StrictBool = False
+
+
 class AbsCancelRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     preview_id: str = Field(max_length=64)
@@ -1192,6 +1400,34 @@ class AbsCancelRequest(BaseModel):
 def _abs_book_check(token):
     with ensure_book_state(DATA_DIR):
         check_chunk_identity(0, token)
+
+
+def _read_abs_key_presence(base_url):
+    """(present, reason): True/False when known, None when the store cannot answer.
+
+    A store failure is not the same as "no key stored". An insecure backend is
+    also not the same as an unavailable one: it has its own advice. Neither the
+    key nor the store error text ever leaves this process.
+    """
+    import audiobookshelf_delivery as delivery
+    if not base_url:
+        return False, None
+    try:
+        return bool(delivery.get_api_key(base_url)), None
+    except delivery.InsecureBackendError:
+        return None, 'credential-store-insecure'
+    except delivery.DeliveryError as error:
+        if error.status != 503:
+            raise
+        return None, 'credential-store-unavailable'
+
+
+def _abs_config_response(config, key_present, key_status=None):
+    response = {'base_url': config.get('base_url'), 'has_key': key_present,
+                'library_id': config.get('library_id'), 'folder_id': config.get('folder_id')}
+    if key_status:
+        response['key_status'] = key_status
+    return response
 
 
 @router.post('/api/abs/config')
@@ -1210,25 +1446,27 @@ def _save_abs_config_sync(request):
             stored = delivery.save_api_key(request.base_url, raw_key)
         config = delivery.save_server_config(DATA_DIR, request.base_url,
                                              request.library_id, request.folder_id)
-        key_present = bool(delivery.get_api_key(config['base_url']))
+        key_present, key_status = _read_abs_key_presence(config['base_url'])
     except delivery.DeliveryError as error:
         raise HTTPException(status_code=error.status, detail=str(error)) from error
-    return {'base_url': config['base_url'], 'has_key': key_present,
-            'key_store': stored, 'library_id': config.get('library_id'),
-            'folder_id': config.get('folder_id')}
+    response = _abs_config_response(config, key_present, key_status)
+    response['key_store'] = stored
+    return response
 
 
 @router.get('/api/abs/config')
 async def get_abs_config():
+    return await asyncio.to_thread(_get_abs_config_sync)
+
+
+def _get_abs_config_sync():
     import audiobookshelf_delivery as delivery
     config = delivery.get_server_config(DATA_DIR)
-    base_url = config.get('base_url')
     try:
-        key_present = bool(base_url and delivery.get_api_key(base_url))
+        key_present, key_status = _read_abs_key_presence(config.get('base_url'))
     except delivery.DeliveryError as error:
         raise HTTPException(status_code=error.status, detail=str(error)) from error
-    return {'base_url': base_url, 'has_key': key_present,
-            'library_id': config.get('library_id'), 'folder_id': config.get('folder_id')}
+    return _abs_config_response(config, key_present, key_status)
 
 
 @router.get('/api/abs/libraries')
@@ -1372,6 +1610,20 @@ def _reconcile_abs_delivery_sync(request):
     return updated
 
 
+@router.post('/api/abs/discard')
+async def discard_abs_delivery(request: AbsDiscardRequest):
+    return await asyncio.to_thread(_discard_abs_delivery_sync, request)
+
+
+def _discard_abs_delivery_sync(request):
+    import audiobookshelf_delivery as delivery
+    try:
+        return delivery.discard_unknown_delivery(DATA_DIR, request.delivery_id,
+                                                 request.confirm)
+    except delivery.DeliveryError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from error
+
+
 @router.get('/api/abs/progress')
 async def get_abs_progress(preview_id: Annotated[str, Query(max_length=64)]):
     import audiobookshelf_delivery as delivery
@@ -1400,9 +1652,17 @@ def _start_merge_audio(background_tasks, request):
         admitted_snapshot = report["snapshot"]
 
         def task():
-            process_state["audio"]["start_time"] = time.time()
-            process_state["audio"]["logs"] = ["Starting merge..."]
+            # Every public-state write below is claim-aware: once a successor
+            # owns "audio", this obsolete worker must not clobber its status,
+            # cancel flag, logs or running state (R4/R6).
+            _set_audio_task_state(start_time=time.time(),
+                                      logs_append=None, logs=["Starting merge..."],
+                                      status="running", error=None)
             quality_attempt = None
+
+            def log(message):
+                _set_audio_task_state(logs_append=message)
+
             try:
                 with ensure_book_state(DATA_DIR):
                     current, chunks = _ensure_editor_integrity_locked()
@@ -1411,27 +1671,50 @@ def _start_merge_audio(background_tasks, request):
                 quality_attempt = get_export_quality_attempt(request, process_state["audio"])
                 success, msg = project_manager.merge_audio(
                     cancel_check=lambda: process_state["audio"]["cancel"],
-                    progress_callback=lambda m: process_state["audio"]["logs"].append(m),
+                    progress_callback=log,
                     chunks=chunks, **ensure_export_mastering_context(request, process_state["audio"]),
                     **quality_attempt.kwargs)
                 quality_attempt.finish(success, msg)
                 if success:
-                    process_state["audio"]["logs"].append(f"Merge complete: {msg}")
+                    _set_audio_task_state(status="done",
+                                              logs_append=f"Merge complete: {msg}")
                 elif msg == "Merge cancelled":
-                    process_state["audio"]["logs"].append("Merge cancelled")
+                    _set_audio_task_state(status="cancelled",
+                                              logs_append="Merge cancelled")
                 else:
-                    process_state["audio"]["logs"].append(f"Merge failed: {msg}")
+                    _set_audio_task_state(status="failed", error=msg,
+                                              logs_append=f"Merge failed: {msg}")
             except Exception as e:
                 record_export_quality_error(quality_attempt, e)
-                process_state["audio"]["logs"].append('Merge cancelled' if isinstance(e, ExportCancelled)
-                                                    else f"Merge error: {e}")
+                cancelled = isinstance(e, (ExportCancelled, AudioGenerationCancelled))
+                _set_audio_task_state(
+                    status="cancelled" if cancelled else "failed",
+                    error=None if cancelled else str(e),
+                    logs_append='Merge cancelled' if cancelled else f"Merge error: {e}")
             finally:
-                process_state["audio"]["running"] = False
-                process_state["audio"]["cancel"] = False
+                # Release owns running-state removal only for the live claim;
+                # clearing cancel here must not erase a successor's request.
+                _set_audio_task_state(running=False, cancel=False)
 
         # Keep the existing atomic owned GPU/TTS admission after integrity approval.
     schedule_claimed_background_task(background_tasks, "audio", task)
     return {"status": "started"}
+
+def _set_audio_task_state(*, logs_append=None, **fields):
+    """Publish audio worker state only while its exact claim is current.
+
+    Direct/legacy callers with no bound owner (``None``) keep the historical
+    write; a stale worker (``False``) is silently dropped so it cannot erase a
+    successor's terminal status, cancel flag or logs (R4/R6).
+    """
+    result = update_claimed_task_state("audio", logs_append=logs_append, **fields)
+    if result is None:
+        state = process_state["audio"]
+        state.update(fields)
+        if logs_append is not None:
+            state.setdefault("logs", []).append(logs_append)
+    return result is not False
+
 
 def get_export_task_result(success, message):
     """Adapt the project's success flag and exact cancellation sentinel, not logs."""
@@ -1440,7 +1723,7 @@ def get_export_task_result(success, message):
 
 
 def get_export_task_error(error):
-    if isinstance(error, ExportCancelled):
+    if isinstance(error, (ExportCancelled, AudioGenerationCancelled)):
         return {'status': 'cancelled', 'message': 'Export cancelled'}
     return {'status': 'failed', 'message': str(error)}
 
@@ -1451,13 +1734,14 @@ async def export_audacity_endpoint(background_tasks: BackgroundTasks):
     # where two rapid POSTs both pass a plain running check before either sets it).
     # audacity_export is a NON_GPU_TASK, so this only guards against self-double-start.
 
-    await asyncio.to_thread(_ensure_editor_selection)
+    admission = await asyncio.to_thread(_require_export_chunks)
 
     def task():
         process_state["audacity_export"]["logs"] = ["Starting Audacity export..."]
         quality_attempt = None
         try:
-            quality_attempt = get_export_quality_attempt(None, process_state["audacity_export"], audacity=True)
+            quality_attempt = get_export_quality_attempt(None, process_state["audacity_export"],
+                audacity=True, expected_token=admission.token)
             success, msg = project_manager.export_audacity(
                 progress_callback=lambda m: process_state["audacity_export"]["logs"].append(m),
                 **quality_attempt.kwargs)
@@ -1474,16 +1758,18 @@ async def export_audacity_endpoint(background_tasks: BackgroundTasks):
         finally:
             process_state["audacity_export"]["running"] = False
 
-    schedule_claimed_background_task(background_tasks, "audacity_export", task)
+    await asyncio.to_thread(_reserve_export_task, background_tasks,
+                            "audacity_export", admission, task)
     process_state["audacity_export"]["result"] = None
     return {"status": "started"}
 
 @router.get("/api/export_zip")
 async def export_zip():
-    return await asyncio.to_thread(_build_export_zip_response)
+    expected = get_export_reader_identity(DATA_DIR)
+    return await asyncio.to_thread(_build_export_zip_response, expected=expected)
 
 
-def _build_export_zip_response():
+def _build_export_zip_response(expected=None):
     """One zip of whatever exported audio exists (MP3, M4B); 404 when nothing does."""
     members = [(path, name) for path, name in ((AUDIOBOOK_PATH, "audiobook.mp3"), (M4B_PATH, "audiobook.m4b"))
                if os.path.exists(path) and not is_book_placeholder(path)]
@@ -1491,17 +1777,28 @@ def _build_export_zip_response():
         raise HTTPException(status_code=404, detail="No exported audio found. Merge or export first.")
     for path, _name in members:
         require_scope_export_current(DATA_DIR, path)
-    return build_zip_download(members, "alexandria_export.zip")
+    return build_zip_download(members, "alexandria_export.zip",
+                              fence_root=DATA_DIR, expected=expected)
 
 @router.get("/api/export_audacity")
 async def get_audacity_export():
     zip_path = os.path.join(DATA_DIR, "audacity_export.zip")
+    expected = get_export_reader_identity(DATA_DIR)
     _require_export_download(zip_path, "Audacity export not found. Generate it first.")
     require_scope_export_current(DATA_DIR, zip_path)
-    return ExportFileResponse(zip_path, filename="audacity_export.zip", media_type="application/zip")
+    stream = await asyncio.to_thread(open_current_export_reader, DATA_DIR,
+                                      zip_path, expected=expected)
+    return ExportFileResponse(zip_path, filename="audacity_export.zip",
+                              media_type="application/zip", stream=stream)
 
-def get_unready_export_speakers():
-    """Read readiness without treating unusable state as an empty roster."""
+def get_unready_export_speakers(admitted_rows):
+    """Read readiness without treating unusable state as an empty roster.
+
+    Admitted rows are immutable evidence captured under the selection token;
+    never reread a different book's chunks for a request that already admitted
+    its rows. The legacy script fallback applies only to a genuinely absent
+    snapshot/journal pair, never to a storage read failure or an empty book.
+    """
     script = safe_load_json(SCRIPT_PATH)
     voices = safe_load_json(os.path.join(DATA_DIR, "voice_config.json"))
     if not isinstance(script, list):
@@ -1511,26 +1808,25 @@ def get_unready_export_speakers():
     for speaker, config in voices.items():
         if not isinstance(config, dict):
             raise HTTPException(status_code=503, detail=f"Export readiness unavailable: voice config for {speaker} must be an object")
-    chunks_path = os.path.join(DATA_DIR, "chunks.json")
-    chunks = safe_load_json(chunks_path) if os.path.exists(chunks_path) else None
+    chunks = admitted_rows
     if chunks is None and not any(config.get("version_timeline") for config in voices.values()):
         chunks = script
     if not isinstance(chunks, list) or any(not isinstance(chunk, dict) for chunk in chunks):
         raise HTTPException(status_code=503, detail="Export readiness unavailable: rebuild the active chunks")
+    voices = resolve_timeline_anchors(voices, chunks)
     missing = set()
     try:
         for index, chunk in enumerate(chunks):
             speaker = get_script_speaker(chunk)
             if not speaker:
                 continue
-            canonical = project_manager._resolve_alias(speaker, voices)
-            effective = voice_config_for_chunk(
-                resolve_narrator_voice_config(canonical, voices, chunk), canonical, index)
+            canonical, effective, _ = get_chunk_render_voice_selection(
+                voices, speaker, chunk, index)
             config = effective.get(canonical) or {}
             if not config.get("ready"):
                 missing.add(speaker)
             if voice_category(config) == "ensemble":
-                for member in config.get("members") or []:
+                for member in get_ensemble_member_names(config):
                     if not (effective.get(member) or {}).get("ready"):
                         missing.add(speaker)
     except (TypeError, ValueError, AttributeError) as exc:
@@ -1539,13 +1835,22 @@ def get_unready_export_speakers():
     return missing
 
 
-async def validate_export_readiness(require_ready):
-    await asyncio.to_thread(_ensure_editor_selection)
-    if require_ready:
-        missing = await asyncio.to_thread(get_unready_export_speakers)
-        if missing:
-            raise HTTPException(status_code=409, detail={
-                "message": "Mark every speaker ready before exporting.", "speakers": missing})
+async def validate_export_readiness(require_ready, admission):
+    def check():
+        with ensure_book_state(DATA_DIR, recover=False):
+            # Validate the admitted book before reading readiness: a completed
+            # switch must never report another book's unready speakers.
+            _assert_export_admission_locked(admission)
+            if require_ready:
+                missing = get_unready_export_speakers(admission.rows)
+                _assert_export_admission_locked(admission)
+                if missing:
+                    raise HTTPException(status_code=409, detail={
+                        "message": "Mark every speaker ready before exporting.", "speakers": missing})
+    try:
+        await asyncio.to_thread(check)
+    except (ValueError, OSError, RecursionError) as error:
+        raise AppError(409, "Saved book state is unreadable. Reload or switch books before continuing; saved progress and audio have been preserved.", key='error.book.chunk_snapshot_unreadable') from error
 
 
 from m4b_metadata import PublicationCoverSelection
@@ -1593,7 +1898,7 @@ def _get_uploaded_cover_preview_sync(data_dir, expected_book_token, sha256):
     except (OSError, ValueError, RecursionError) as error:
         raise HTTPException(status_code=409,
             detail='Selected cover is unavailable or changed. Refresh cover options.',
-            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'}) from error
+            headers={'Cache-Control': 'no-store'}) from error
 
 
 @router.get('/api/m4b_cover/preview')
@@ -1604,7 +1909,7 @@ async def preview_uploaded_m4b_cover(
     raw, media_type = await asyncio.to_thread(_get_uploaded_cover_preview_sync,
         data_dir, expected_book_token, sha256)
     return Response(raw, media_type=media_type,
-        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+        headers={'Cache-Control': 'no-store'})
 
 
 @router.post('/api/m4b_publication/resolve')
@@ -1627,7 +1932,10 @@ class M4bExportRequest(BaseModel):
 
 @router.post("/api/merge_m4b")
 async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: BackgroundTasks):
-    await validate_export_readiness(request.require_ready)
+    # Journal readability is authoritative: report a stale book before optional
+    # readiness, which would otherwise mask it with an unrelated speaker list.
+    admission = await asyncio.to_thread(_require_export_chunks)
+    await validate_export_readiness(request.require_ready, admission)
     # Atomic check-and-set on the request thread (closes the double-start TOCTOU
     # where two rapid POSTs both pass a plain running check before either sets it).
 
@@ -1635,7 +1943,8 @@ async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: Backgr
         process_state["m4b_export"]["logs"] = ["Starting M4B export..."]
         quality_attempt = None
         try:
-            quality_attempt = get_export_quality_attempt(request, process_state["m4b_export"])
+            quality_attempt = get_export_quality_attempt(request, process_state["m4b_export"],
+                expected_token=admission.token)
             meta = {name: getattr(request, name) for name in ('title', 'author', 'narrator', 'year', 'description')
                     if getattr(request, name) is not None}
             meta['cover_path'] = os.path.join(DATA_DIR, 'm4b_cover.jpg') if os.path.exists(os.path.join(DATA_DIR, 'm4b_cover.jpg')) else ''
@@ -1644,6 +1953,9 @@ async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: Backgr
                 publication_options['source_cover'] = request.source_cover.model_dump()
             if request.expected_book_token is not None:
                 publication_options['expected_book_token'] = request.expected_book_token
+            if request.require_ready:
+                publication_options['expected_editor_revision'] = get_export_editor_revision(
+                    admission.token, admission.rows)
             success, msg = project_manager.merge_m4b(
                 per_chunk_chapters=request.per_chunk_chapters, metadata=meta,
                 cancel_check=lambda: process_state["m4b_export"].get("cancel", False),
@@ -1664,7 +1976,8 @@ async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: Backgr
         finally:
             process_state["m4b_export"]["running"] = False
 
-    schedule_claimed_background_task(background_tasks, "m4b_export", task)
+    await asyncio.to_thread(_reserve_export_task, background_tasks,
+                            "m4b_export", admission, task)
     process_state["m4b_export"]["result"] = None
     return {"status": "started"}
 
@@ -1716,47 +2029,67 @@ async def export_chapters(request: ChapterExportRequest, background_tasks: Backg
     """Write chapters as separate MP3/WAV files (CPU only, no GPU lock)."""
     if request.format not in ("mp3", "wav"):
         raise HTTPException(status_code=400, detail="format must be mp3 or wav")
-    await validate_export_readiness(request.require_ready)
+    admission = await asyncio.to_thread(_require_export_chunks)
+    await validate_export_readiness(request.require_ready, admission)
     chapters = request.chapters
     if chapters is not None:
         try:
             preview = await asyncio.to_thread(
-                project_manager.preview_chapter_filenames,
+                _chapter_preview_with_rows, admission,
                 fmt=request.format, per_chunk_chapters=request.per_chunk_chapters,
                 template=request.template, padding=request.padding,
                 book_name=request.book_name, series_name=request.series_name,
                 volume_number=request.volume_number)
-            chapters = get_index_selection(chapters, len(preview))
+            # Book chapter numbers: a chapter is selectable once it has audio (#1921).
+            chapters = get_chapter_selection(chapters, {row["number"] - 1 for row in preview})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     state = process_state["chapter_export"]
 
     def task():
-        state["logs"] = ["Starting chapter export..."]
+        # A superseded chapter worker (replaced claim) must not overwrite a
+        # successor's result, logs, running bit or acknowledged cancel, in the
+        # body or in the finally block (F08). Direct/legacy callers with no
+        # bound claim keep the historical write.
+        def publish(**fields):
+            if update_claimed_task_state("chapter_export", **fields) is None:
+                state.update(fields)
+
+        def log(message):
+            if update_claimed_task_state("chapter_export", logs_append=message) is None:
+                state.setdefault("logs", []).append(message)
+
+        publish(logs=["Starting chapter export..."])
         quality_attempt = None
         try:
-            quality_attempt = get_export_quality_attempt(request, state)
+            quality_attempt = get_export_quality_attempt(request, state,
+                expected_token=admission.token)
+            # Chapter indices refer to the previewed row order even when
+            # speaker readiness is optional.
+            expected_editor_revision = (get_export_editor_revision(admission.token, admission.rows)
+                                        if request.require_ready or chapters is not None else None)
             success, msg = project_manager.export_chapters(
                 fmt=request.format, per_chunk_chapters=request.per_chunk_chapters,
                 template=request.template, padding=request.padding,
                 book_name=request.book_name, series_name=request.series_name,
                 volume_number=request.volume_number, chapters=chapters,
                 changed_only=request.changed_only,
-                progress_callback=lambda m: state["logs"].append(m),
+                expected_editor_revision=expected_editor_revision,
+                progress_callback=log,
                 cancel_check=lambda: state["cancel"], **ensure_export_mastering_context(request, state),
                 **quality_attempt.kwargs)
             quality_attempt.finish(success, msg)
-            state["result"] = get_export_task_result(success, msg)
-            state["logs"].append(f"Export complete: {msg}" if success else f"Export failed: {msg}")
+            publish(result=get_export_task_result(success, msg))
+            log(f"Export complete: {msg}" if success else f"Export failed: {msg}")
         except Exception as e:
             record_export_quality_error(quality_attempt, e)
-            state["result"] = get_export_task_error(e)
-            state["logs"].append(f"Export error: {e}")
+            publish(result=get_export_task_error(e))
+            log(f"Export error: {e}")
         finally:
-            state["running"] = False
-            state["cancel"] = False
+            publish(running=False, cancel=False)
 
-    schedule_claimed_background_task(background_tasks, "chapter_export", task)
+    await asyncio.to_thread(_reserve_export_task, background_tasks,
+                            "chapter_export", admission, task)
     state["result"] = None
     return {"status": "started"}
 
@@ -1778,13 +2111,14 @@ async def preview_chapter_filenames(format: str = "mp3", per_chunk_chapters: boo
         raise HTTPException(status_code=400, detail="format must be mp3 or wav")
     if not 0 <= padding <= 6:
         raise HTTPException(status_code=400, detail="padding must be 0-6 digits")
-    await validate_export_readiness(require_ready)
+    admission = await asyncio.to_thread(_require_export_chunks)
+    await validate_export_readiness(require_ready, admission)
     try:
         mastering_options = MasteringOptions.model_validate_json(mastering).model_dump() if mastering is not None else None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail='Invalid mastering options.') from exc
     try:
-        rows = await asyncio.to_thread(project_manager.preview_chapter_filenames,
+        rows = await asyncio.to_thread(_chapter_preview_with_rows, admission,
             fmt=format, per_chunk_chapters=per_chunk_chapters, template=template,
             padding=padding, book_name=book_name,
             series_name=series_name, volume_number=volume_number,
@@ -1816,7 +2150,8 @@ def _get_chapter_export_listing():
 def _exported_chapter_path(name):
     safe = os.path.basename(name)
     path = os.path.join(_chapter_export_dir(), safe)
-    if (safe != name or "\\" in name
+    if (safe != name or "\\" in name or ":" in name
+            or is_windows_reserved_device_name(name)
             or os.path.splitext(safe)[1].lower() not in {".mp3", ".wav"}
             or not is_path_inside(path, _chapter_export_dir())
             or not os.path.isfile(path)):
@@ -1827,9 +2162,13 @@ def _exported_chapter_path(name):
 
 @router.get("/api/chapter_exports/file/{name}")
 async def download_chapter(name: str):
+    expected = get_export_reader_identity(DATA_DIR)
     path, safe = await asyncio.to_thread(_get_listed_chapter_path, name)
     media = "audio/mpeg" if safe.lower().endswith(".mp3") else "audio/wav"
-    return ExportFileResponse(path, filename=safe, media_type=media)
+    require_scope_export_current(DATA_DIR, path)
+    stream = await asyncio.to_thread(open_current_export_reader, DATA_DIR,
+                                      path, expected=expected)
+    return ExportFileResponse(path, filename=safe, media_type=media, stream=stream)
 
 
 def _get_listed_chapter_path(name):
@@ -1841,26 +2180,65 @@ def _get_listed_chapter_path(name):
 
 @router.get("/api/chapter_exports/zip")
 async def download_chapters_zip(names: Optional[str] = None):
-    return await asyncio.to_thread(_build_chapter_zip_response, names)
+    expected = get_export_reader_identity(DATA_DIR)
+    return await asyncio.to_thread(_build_chapter_zip_response, names, expected=expected)
 
 
-def _build_chapter_zip_response(names: Optional[str] = None):
+def _build_chapter_zip_response(names: Optional[str] = None, expected=None):
     """All exported chapters, or the comma-separated `names`, in one zip."""
-    manifest = safe_load_json(os.path.join(_chapter_export_dir(), "manifest.json"), {}) or {}
-    wanted = set(n for n in (names or "").split(",") if n) or None
-    members = []
-    for row in get_chapter_export_rows(manifest):
-        if wanted is not None and row["file"] not in wanted:
-            continue
-        try:
-            members.append(_exported_chapter_path(row["file"]))
-        except HTTPException:
-            continue
-    if not members:
-        raise HTTPException(status_code=404, detail="No exported chapters found. Export first.")
-    return build_zip_download(
-        members,
-        "chapters.zip")
+    from project_scope_exports import (export_reader_admission, is_export_set_pending, read_prior_export_set_member,
+                                       read_set_journal)
+    with export_reader_admission(DATA_DIR):
+        directory = _chapter_export_dir()
+        manifest_path = os.path.join(directory, "manifest.json")
+        wanted = set(n for n in (names or "").split(",") if n) or None
+        pending_set = read_set_journal(DATA_DIR)
+        pending_manifest = None
+        if is_export_set_pending(pending_set):
+            relative_dir = Path(os.path.relpath(directory, DATA_DIR))
+            for member in pending_set['members']:
+                target = Path(member['target'])
+                if target.parent != relative_dir:
+                    continue
+                if wanted is None or target.name in wanted:
+                    require_scope_export_current(DATA_DIR, os.path.join(directory, target.name))
+                if target.name == 'manifest.json':
+                    pending_manifest = member
+        if pending_manifest is None:
+            manifest = safe_load_json(manifest_path, {}) or {}
+        else:
+            try:
+                raw = read_prior_export_set_member(DATA_DIR, pending_manifest)
+                manifest = json.loads(raw) if raw is not None else None
+            except (OSError, ValueError):
+                manifest = None
+            if not isinstance(manifest, dict) or not isinstance(manifest.get('chapters'), list):
+                require_scope_export_current(DATA_DIR, manifest_path)
+        members = []
+        for row in get_chapter_export_rows(manifest):
+            name = row["file"]
+            if wanted is not None and name not in wanted:
+                continue
+            valid = (isinstance(name, str) and name == os.path.basename(name)
+                     and "\\" not in name and ":" not in name
+                     and not is_windows_reserved_device_name(name)
+                     and os.path.splitext(name)[1].lower() in {".mp3", ".wav"}
+                     and is_path_inside(os.path.join(_chapter_export_dir(), name),
+                                        _chapter_export_dir()))
+            if not valid:
+                continue
+            try:
+                members.append(_exported_chapter_path(name))
+            except HTTPException as error:
+                if error.status_code == 409 or (error.status_code == 404
+                        and wanted is not None):
+                    raise
+                continue
+        if not members:
+            raise HTTPException(status_code=404, detail="No exported chapters found. Export first.")
+        return build_zip_download(
+            members,
+            "chapters.zip", fence_root=DATA_DIR, expected=expected)
 
 
 class ReadalongSidecarRequest(BaseModel):
@@ -2249,7 +2627,11 @@ def _serve_bound_audio(expected_sha256, filename, label):
     except OSError as error:
         raise HTTPException(status_code=404, detail="Read-along MP3 is unavailable. Build the sidecar first.") from error
     try:
-        size = os.fstat(stream.fileno()).st_size
+        from project_scope_exports import require_scope_export_current
+        opened = os.fstat(stream.fileno())
+        require_scope_export_current(DATA_DIR, AUDIOBOOK_PATH,
+                                     expected_version=list(_version(opened)))
+        size = opened.st_size
         digest = hashlib.sha256()
         while True:
             block = stream.read(1024 * 1024)
@@ -2275,12 +2657,21 @@ def _validated_sidecar_doc():
     path = get_sidecar_output_path(DATA_DIR)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Read-along sidecar not found. Build it from the Result tab first.")
-    require_scope_export_current(DATA_DIR, path)
+    stream = None
     try:
-        raw = Path(path).read_bytes()
+        stream = open_current_export_reader(DATA_DIR, path)
+        from readalong_sidecar import MAX_SIDECAR_BYTES
+        raw = stream.read(MAX_SIDECAR_BYTES + 1)
+        if len(raw) > MAX_SIDECAR_BYTES:
+            raise ValueError('sidecar exceeds its bound')
         doc = get_validated_sidecar(raw)
+    except HTTPException:
+        raise
     except (ValueError, OSError) as error:
         raise HTTPException(status_code=409, detail=f"Read-along sidecar is invalid: {error}") from error
+    finally:
+        if stream is not None:
+            stream.close()
     if not os.path.isfile(AUDIOBOOK_PATH):
         raise HTTPException(status_code=409, detail="Read-along sidecar needs its MP3; rebuild the sidecar.")
     try:
@@ -2327,44 +2718,9 @@ async def build_readaloud_epub_endpoint(background_tasks: BackgroundTasks,
 
 
 def _read_bounded_preference_bytes(path, *, file_description="Timing preference"):
-    """Read preference bytes under the bounded/no-follow contract.
-
-    Returns None for a missing file; raises ValueError for a
-    present file that is not a bounded regular file.
-    """
-    import stat as _stat
-    from audio_take_history import _version
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISREG(info.st_mode) \
-            or info.st_size > 16384:
-        raise ValueError("%s is not a bounded regular file." % file_description)
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) \
-        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(path, flags)
-    try:
-        opened = os.fstat(descriptor)
-        if not _stat.S_ISREG(opened.st_mode) or _version(opened) != _version(info):
-            raise ValueError("%s changed during read." % file_description)
-        chunks = []
-        total = 0
-        while True:
-            block = os.read(descriptor, 8192)
-            if not block:
-                break
-            total += len(block)
-            if total > 16384:
-                raise ValueError("%s exceeds its bound." % file_description)
-            chunks.append(block)
-        if (total != opened.st_size
-                or _version(os.fstat(descriptor)) != _version(opened)
-                or _version(os.lstat(path)) != _version(opened)):
-            raise ValueError("%s changed during read." % file_description)
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
+    """Read preference bytes under the shared bounded/no-follow contract."""
+    from readalong_export import read_bounded_metadata_bytes
+    return read_bounded_metadata_bytes(path, file_description=file_description)
 
 
 def _restore_readaloud_timing_preference_bytes(path, prior_bytes):
@@ -2382,6 +2738,25 @@ def _restore_readaloud_timing_preference_bytes(path, prior_bytes):
     # A fixed scratch name could follow or destroy an unrelated file/link.
     from adapter_publication import save_adapter_publication_bytes
     save_adapter_publication_bytes(path, prior_bytes)
+
+
+def _save_readaloud_log(state):
+    """Keep a finished build's log on disk so a failure can be attached to a bug report.
+
+    The progress panel only shows the live tail; the reason a build refused
+    (#1844) belongs in a file the user can find and post, at
+    logs/api/readaloud_epub-latest.log. The panel's own lines are left
+    unchanged: their last line is the build outcome. Never raises.
+    """
+    lines = state.get("logs")
+    if not isinstance(lines, list):
+        return
+    path = _init_task_log("readaloud_epub")
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.writelines(f"{line}\n" for line in lines)
+    except OSError:
+        pass
 
 
 def _start_readaloud_epub(background_tasks, request):
@@ -2604,6 +2979,7 @@ def _start_readaloud_epub(background_tasks, request):
                         else f"EPUB read-aloud error: {e}")
                 finally:
                     if _is_current_readalong_generation("readaloud_epub", generation):
+                        _save_readaloud_log(state)
                         state["running"] = False
                         state["cancel"] = False
 
@@ -2692,6 +3068,7 @@ def _validated_epub_bytes():
     from audio_source_io import read_bounded_audio_hash
     try:
         with ensure_export_file(path) as (stream, version):
+            require_scope_export_current(DATA_DIR, path, expected_version=list(version))
             digest, size = read_bounded_audio_hash(stream, version[2], lambda: None)
             if size != version[2] or digest != receipt["epub_sha256"]:
                 raise HTTPException(status_code=409, detail="EPUB read-aloud does not match its receipt. Rebuild the EPUB read-aloud.")
@@ -2790,9 +3167,13 @@ async def download_readaloud_epub_audio():
 
 @router.get("/api/audiobook_m4b")
 async def get_audiobook_m4b():
+    expected = get_export_reader_identity(DATA_DIR)
     _require_export_download(M4B_PATH, "M4B audiobook not found. Export it first.")
     require_scope_export_current(DATA_DIR, M4B_PATH)
-    return ExportFileResponse(M4B_PATH, filename="audiobook.m4b", media_type="audio/mp4")
+    stream = await asyncio.to_thread(open_current_export_reader, DATA_DIR,
+                                      M4B_PATH, expected=expected)
+    return ExportFileResponse(M4B_PATH, filename="audiobook.m4b",
+                              media_type="audio/mp4", stream=stream)
 
 def _apply_m4b_cover(cover_tmp, cover_path):
     """Validate uploaded image data before publishing an MP4-compatible cover."""
@@ -2861,19 +3242,16 @@ async def generate_batch_endpoint(request: BatchGenerateRequest, background_task
 
         def progress_callback(completed, failed, total):
             """Update logs with progress."""
-            process_state["audio"]["logs"].append(
-                f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
-            )
+            _set_audio_task_state(logs_append=(
+                f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"))
 
         def cancel_check():
             return process_state["audio"]["cancel"]
 
         def task():
-            process_state["audio"]["running"] = True
-            process_state["audio"]["start_time"] = time.time()
-            process_state["audio"]["logs"] = [
-                f"Starting parallel generation of {total} chunks with {workers} workers..."
-            ]
+            _set_audio_task_state(running=True, start_time=time.time(),
+                status="running", error=None,
+                logs=[f"Starting parallel generation of {total} chunks with {workers} workers..."])
             try:
                 results = project_manager.generate_chunks_parallel(
                     indices, workers, progress_callback, cancel_check=cancel_check,
@@ -2885,16 +3263,21 @@ async def generate_batch_endpoint(request: BatchGenerateRequest, background_task
                 msg = f"Batch generation complete: {completed} succeeded, {failed} failed"
                 if cancelled:
                     msg += f", {cancelled} cancelled"
-                process_state["audio"]["logs"].append(msg)
+                # Each batch owns its terminal status: a prior cancelled merge
+                # must not linger once this operation succeeds (R6).
+                status = "failed" if failed else ("cancelled" if cancelled else "done")
+                error = results["failed"][0][1] if results["failed"] else None
+                _set_audio_task_state(status=status, error=error,
+                                          logs_append=msg)
                 if results["failed"]:
                     for idx, err in results["failed"]:
-                        process_state["audio"]["logs"].append(f"  Chunk {idx} failed: {err}")
+                        _set_audio_task_state(logs_append=f"  Chunk {idx} failed: {err}")
             except Exception as e:
                 logger.exception("Batch generation error")
-                process_state["audio"]["logs"].append(f"Batch generation error: {e}")
+                _set_audio_task_state(status="failed", error=str(e),
+                                          logs_append=f"Batch generation error: {e}")
             finally:
-                process_state["audio"]["running"] = False
-                process_state["audio"]["cancel"] = False
+                _set_audio_task_state(running=False, cancel=False)
 
         register_claimed_background_task(background_tasks, "audio", claim_id, task)
         return {"status": "started", "workers": workers, "total_chunks": total}
@@ -2930,19 +3313,16 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
         total = len(indices)
 
         def progress_callback(completed, failed, total):
-            process_state["audio"]["logs"].append(
-                f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
-            )
+            _set_audio_task_state(logs_append=(
+                f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"))
 
         def cancel_check():
             return process_state["audio"]["cancel"]
 
         def task():
-            process_state["audio"]["running"] = True
-            process_state["audio"]["start_time"] = time.time()
-            process_state["audio"]["logs"] = [
-                f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed})..."
-            ]
+            _set_audio_task_state(running=True, start_time=time.time(),
+                status="running", error=None,
+                logs=[f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed})..."])
             try:
                 results = project_manager.generate_chunks_batch(
                     indices, batch_seed, batch_size, progress_callback,
@@ -2955,16 +3335,19 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
                 msg = f"Batch generation complete: {completed} succeeded, {failed} failed"
                 if cancelled:
                     msg += f", {cancelled} cancelled"
-                process_state["audio"]["logs"].append(msg)
+                status = "failed" if failed else ("cancelled" if cancelled else "done")
+                error = results["failed"][0][1] if results["failed"] else None
+                _set_audio_task_state(status=status, error=error,
+                                          logs_append=msg)
                 if results["failed"]:
                     for idx, err in results["failed"]:
-                        process_state["audio"]["logs"].append(f"  Chunk {idx} failed: {err}")
+                        _set_audio_task_state(logs_append=f"  Chunk {idx} failed: {err}")
             except Exception as e:
                 logger.exception("Batch generation error")
-                process_state["audio"]["logs"].append(f"Batch generation error: {e}")
+                _set_audio_task_state(status="failed", error=str(e),
+                                          logs_append=f"Batch generation error: {e}")
             finally:
-                process_state["audio"]["running"] = False
-                process_state["audio"]["cancel"] = False
+                _set_audio_task_state(running=False, cancel=False)
 
         register_claimed_background_task(background_tasks, "audio", claim_id, task)
         return {"status": "started", "batch_seed": batch_seed, "batch_size": batch_size, "total_chunks": total}
@@ -2976,32 +3359,68 @@ async def cancel_audio():
 
 def _apply_audio_cancel():
     """Cancel ongoing audio generation and reset in-progress chunks."""
-    # Keep the idle decision and disk reset atomic with new audio claims.
-    with _gpu_lock:
+    def request_owned_cancel():
         if is_task_running("audio", process_state):
             process_state["audio"]["cancel"] = True
             process_state["audio"]["logs"].append("[CANCEL] Cancellation requested")
             return {"status": "cancelling"}
+        return None
 
-        # A foreign server may own the render even when our local flag is idle.
-        # Hold admission closed through recovery and update only still-generating
-        # UIDs, never replace a full snapshot over newer journal completions.
-        reset_count = 0
-        try:
-            with ensure_startup_recovery(DATA_DIR, timeout=0) as idle:
-                if not idle:
-                    raise HTTPException(status_code=409, detail="Another worker owns an active task; cancel it on its owning server")
-                with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
-                    for chunk in project_manager.load_chunks():
-                        if chunk.get("status") == "generating":
-                            updated = project_manager._update_chunk_fields_by_uid(
-                                chunk.get("uid"), expected_chunk=chunk,
-                                required_status="generating", status="pending")
-                            if updated is not None:
-                                reset_count += 1
-        except TimeoutError as exc:
-            raise HTTPException(status_code=409, detail="Task admission is busy; retry cancellation") from exc
-        return {"status": "not_running", "reset_chunks": reset_count}
+    # An owned active task needs only the claim mutex: flag it immediately,
+    # never wait on a book journal that an edit may be holding.
+    with _gpu_lock:
+        outcome = request_owned_cancel()
+        if outcome is not None:
+            return outcome
+
+    # Idle: keep the startup admission and book-state fences through the reset.
+    # The GPU mutex guards ownership checks, never chunk I/O.
+    reset_count = 0
+    try:
+        with ExitStack() as admission:
+            try:
+                idle = admission.enter_context(ensure_startup_recovery(DATA_DIR, timeout=0))
+            except TimeoutError:
+                # A local claimant holds the GPU mutex until its lease is
+                # registered. The failed admission attempt owns no lock here.
+                with _gpu_lock:
+                    outcome = request_owned_cancel()
+                if outcome is not None:
+                    return outcome
+                raise
+            if not idle:
+                # A local audio claim may have landed between the fast check
+                # above and this fence. Recheck local ownership under the GPU
+                # mutex: a real local task needs its cancel flag, not a
+                # foreign-owner refusal.
+                with _gpu_lock:
+                    outcome = request_owned_cancel()
+                if outcome is not None:
+                    return outcome
+                raise HTTPException(status_code=409, detail="Another worker owns an active task; cancel it on its owning server")
+            with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
+                # The startup admission barrier rejects new task leases while
+                # the idle reset holds it. An Editor writer can hold the chunk
+                # lock while waiting for the commit validator's task mutex.
+                with _gpu_lock:
+                    outcome = request_owned_cancel()
+                if outcome is not None:
+                    return outcome
+                # A foreign server may own the render even when our local
+                # flag is idle. Update only still-generating UIDs, never
+                # replace a full snapshot over newer journal completions.
+                for chunk in project_manager.load_chunks():
+                    if chunk.get("status") == "generating":
+                        updated = project_manager._update_chunk_fields_by_uid(
+                            chunk.get("uid"), expected_chunk=chunk,
+                            required_status="generating", status="pending")
+                        if updated is not None:
+                            reset_count += 1
+    except (TimeoutError, OSError, ValueError) as error:
+        fault = get_book_fault_response(error)
+        raise HTTPException(status_code=fault.status_code if fault else 409,
+                            detail=fault.detail if fault else "Task admission is busy; retry cancellation") from error
+    return {"status": "not_running", "reset_chunks": reset_count}
 
 ## ── Saved Scripts ──────────────────────────────────────────────
 
@@ -3182,7 +3601,7 @@ def _summarize_review_checkpoint(path: str) -> Optional[dict]:
 async def list_review_checkpoints():
     """List saved review checkpoints (what's done + where a re-run resumes), plus
     the live pass/order if a batch review is currently running."""
-    out = await asyncio.to_thread(_get_review_checkpoint_rows)
+    out, book_token = await asyncio.to_thread(_get_review_checkpoint_snapshot)
 
     # Live pass/order while a bidirectional batch is mid-flight.
     bstate = process_state.get("batch_review", {})
@@ -3197,14 +3616,20 @@ async def list_review_checkpoints():
                 for t in bstate.get("tasks", []) if isinstance(t, dict)
             ],
         }
-    return {"checkpoints": out, "live": live}
+    return {"checkpoints": out, "live": live, "book_token": book_token}
+
+
+def _get_review_checkpoint_snapshot():
+    from book_state_transaction import get_book_operation_token
+    with ensure_book_state(DATA_DIR):
+        return _get_review_checkpoint_rows(), get_book_operation_token(DATA_DIR)
 
 
 def _get_review_checkpoint_rows():
     out = []
-    suffix = ".review_checkpoint.json"
+    suffix = get_review_progress_paths('')[0]
 
-    active_cp = SCRIPT_PATH + suffix
+    active_cp = get_review_progress_paths(SCRIPT_PATH)[0]
     if os.path.exists(active_cp):
         s = _summarize_review_checkpoint(active_cp)
         if s:

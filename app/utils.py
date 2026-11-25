@@ -13,8 +13,113 @@ import hmac
 import base64
 import uuid
 import unicodedata
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _get_stat_file_identity(snapshot):
+    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    return tuple(getattr(snapshot, field) for field in fields)
+
+
+@lru_cache(maxsize=1)
+def _get_windows_file_cache_api():
+    import ctypes
+    from windows_export_staging_directory import _api, _FileInformation
+
+    class FileBasicInformation(ctypes.Structure):
+        _fields_ = [('created', ctypes.c_int64), ('accessed', ctypes.c_int64),
+                    ('written', ctypes.c_int64), ('changed', ctypes.c_int64),
+                    ('attributes', ctypes.c_uint32)]
+
+    api = _api()
+    api.GetFileInformationByHandleEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                ctypes.c_void_p, ctypes.c_uint32]
+    api.GetFileInformationByHandleEx.restype = ctypes.c_int
+    return api, FileBasicInformation, _FileInformation
+
+
+def _get_windows_file_cache_token(path, descriptor):
+    import ctypes
+    import msvcrt
+
+    api, basic_type, information_type = _get_windows_file_cache_api()
+    owned = descriptor is None
+    handle = (api.CreateFileW(os.fsdecode(path), 0x80, 7, None, 3, 0, None)
+              if owned else msvcrt.get_osfhandle(descriptor))
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        basic, information = basic_type(), information_type()
+        if not api.GetFileInformationByHandleEx(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not api.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return (information.volume, (information.index_high << 32) | information.index_low,
+                (information.size_high << 32) | information.size_low, basic.written, basic.changed)
+    finally:
+        if owned and not api.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def get_file_cache_token(path, *, descriptor=None):
+    """Return a cheap change identity, or None to require a content snapshot.
+
+    POSIX ctime is a change time. Windows requires FileBasicInfo.ChangeTime,
+    not os.stat's creation time; failed native queries never authorize a hit.
+    """
+    if sys.platform == 'win32':
+        try:
+            return _get_windows_file_cache_token(path, descriptor)
+        except (OSError, AttributeError):
+            return None
+    return _get_stat_file_identity(os.stat(path) if descriptor is None else os.fstat(descriptor))
+
+
+def is_file_cache_token_trusted(token, captured_at_ns):
+    """Allow metadata-only hits only after a capture outside the racy window.
+
+    Windows FILETIME and Python's wall clock share the system-time source;
+    convert its 100 ns ticks since 1601 to Unix nanoseconds before comparing.
+    A two-second margin covers coarse/lazy timestamps on both platforms.
+    """
+    if token is None or captured_at_ns is None:
+        return False
+    changed_at_ns = ((token[4] - 116444736000000000) * 100
+                     if sys.platform == 'win32' else token[4])
+    return (changed_at_ns > 0 and captured_at_ns - changed_at_ns > 2_000_000_000
+            and time.time_ns() >= captured_at_ns)
+
+
+def read_file_snapshot(path, *, opener=None):
+    """Capture bytes and (stat identity, SHA-256, cheap token, capture time).
+
+    Hash and parsing consumers use the same bytes. Reads use 64 KiB blocks;
+    O(file size) snapshot memory is temporary and is never stored in caches.
+    Capture-start wall time makes long reads conservative for racy-clean checks.
+    """
+    captured_at_ns = time.time_ns()
+    before = os.stat(path)
+    version = _get_stat_file_identity(before)
+    token = get_file_cache_token(path)
+    digest = hashlib.sha256()
+    blocks = []
+    with (opener or open)(path, 'rb') as source:
+        opened = os.fstat(source.fileno())
+        for block in iter(lambda: source.read(64 * 1024), b''):
+            digest.update(block)
+            blocks.append(block)
+        after = os.fstat(source.fileno())
+        descriptor_token = get_file_cache_token(path, descriptor=source.fileno())
+    current = os.stat(path)
+    current_token = get_file_cache_token(path)
+    payload = b''.join(blocks)
+    if (len(payload) != before.st_size or
+            any(_get_stat_file_identity(snapshot) != version for snapshot in (opened, after, current)) or
+            token is not None and (descriptor_token != token or current_token != token)):
+        raise OSError(errno.EAGAIN, 'File changed while capturing snapshot', os.fspath(path))
+    return payload, (version, digest.digest(), token, captured_at_ns)
 
 
 def get_unsafe_text_controls(text):
@@ -96,6 +201,22 @@ def is_path_inside(path: str, base_dir: str) -> bool:
 
 # --- Balanced-bracket text extraction ---
 
+# Characters examined by the fallback brace scan plus characters handed to
+# json.loads before extract_json_object gives up on a reply. A normal reply
+# stays far below this; the budget only refuses pathological brace storms
+# whose repeated full-length rescans would already cost a second or more
+# (measured at roughly 1.5e7 characters/second of Python scan). It is a work
+# bound rather than a candidate cap, so a real object behind thousands of
+# stray braced spans is still found while the total work stays below it.
+#
+# The ceiling for an object embedded in free-form prose follows from that: the
+# failed whole-text json.loads, one scan and one parse cost about 3x the
+# object's length, so the largest embedded object that survives is roughly
+# 6.67 MB (EXTRACT_JSON_OBJECT_WORK_BUDGET / 3). A clean top-level object is
+# parsed before any of this and is not subject to the budget.
+EXTRACT_JSON_OBJECT_WORK_BUDGET = 20_000_000
+
+
 def extract_balanced(text, open_char, close_char, search_from=0):
     """Find the first `open_char ... close_char`-balanced span in `text`
     starting the search at or after `search_from`, tracking string-escaping
@@ -170,27 +291,60 @@ def extract_json_object(text):
     matches cleanly but isn't JSON. If a candidate span fails to parse,
     retry from just past that span's opening brace instead of giving up,
     so a real object later in the text still gets found.
+
+    The retries are bounded by EXTRACT_JSON_OBJECT_WORK_BUDGET characters of
+    scanning and parsing, so a reply of stray braces can no longer cost
+    quadratic time. A RecursionError anywhere refuses the reply (None): a
+    depth-over-limit document is not a usable object, and rescanning for a
+    deeper candidate would only return a truncated inner object.
     """
+    return _extract_json_object_with_work(
+        text, EXTRACT_JSON_OBJECT_WORK_BUDGET)[0]
+
+
+def _extract_json_object_with_work(text, work_budget):
+    """extract_json_object with an explicit budget; returns (result, work)."""
     if not text:
-        return None
+        return None, 0
 
     try:
         parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
+        return (parsed if isinstance(parsed, dict) else None), len(text)
+    except RecursionError:
+        return None, len(text)
     except json.JSONDecodeError:
         pass
 
+    # work starts at the characters the failed full-text json.loads examined.
+    work = len(text)
+
+    # extract_balanced scans to the end of the text when an opening brace never
+    # balances, so retrying from every "{" costs O(n) each. Once past the last
+    # closing brace no later candidate can balance either, so one rfind skips
+    # that whole shape without spending work budget on it. The budget, not the
+    # rfind, is what bounds the remaining quadratic rescans.
+    last_close = text.rfind('}')
     search_from = 0
     while True:
         start = text.find('{', search_from)
-        if start == -1:
-            return None
+        if start == -1 or start > last_close:
+            return None, work
         span = extract_balanced(text, '{', '}', search_from=start)
         if span is None:
+            # The scan ran from this "{" to the end without balancing.
+            work += len(text) - start
+            if work > work_budget:
+                return None, work
             search_from = start + 1
             continue
+        # One scan and one json.loads, charged together before the parse.
+        work += 2 * len(span)
+        if work > work_budget:
+            return None, work
         try:
-            return json.loads(span)
+            return json.loads(span), work
+        except RecursionError:
+            return None, work
         except json.JSONDecodeError:
             search_from = start + 1
 
@@ -204,6 +358,13 @@ def warn_unparseable_llm_json(what: str, raw: str, fallback_action: str) -> None
 
 
 # --- Filename Sanitization ---
+
+def is_windows_reserved_device_name(filename: str) -> bool:
+    """Return whether a filename component names a reserved Windows device."""
+    device_name = filename.split(".", 1)[0].split(":", 1)[0].rstrip(" ").upper()
+    return re.fullmatch(r"CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³]",
+                        device_name) is not None
+
 
 def secure_filename(filename: str) -> str:
     """Sanitize a filename to prevent path-traversal attacks.
@@ -223,8 +384,7 @@ def secure_filename(filename: str) -> str:
     filename = filename.lstrip(". ")
     filename = re.sub(r"[^\w\-. ]", "_", filename)
     filename = filename.rstrip(". ")
-    device_name = filename.split(".", 1)[0].rstrip(" ").upper()
-    if re.fullmatch(r"CON|PRN|AUX|NUL|(?:COM|LPT)[1-9¹²³]", device_name):
+    if is_windows_reserved_device_name(filename):
         filename = "_" + filename
     encoded = filename.encode("utf-8")
     if len(encoded) > 150:
@@ -237,10 +397,11 @@ def secure_filename(filename: str) -> str:
 
 # --- Atomic JSON write (write-to-temp + rename) ---
 
-def safe_load_json(path, default=None):
+def safe_load_json(path, default=None, *, content=None, record_diagnostics=True):
     """Load JSON from `path`, returning `default` if missing, empty, or corrupted.
 
-    If `default` is a dict/list, a successfully-parsed value of a different
+    Optional binary `content` is an already validated snapshot, parsed without
+    reopening the path. If `default` is a dict/list, a value of a different
     type (e.g. a config.json truncated to "null" or "[]") is also treated as
     corrupted. Most callers pass a dict/list default and call .get()/iterate
     on the result immediately with no type check of their own - without this,
@@ -250,25 +411,70 @@ def safe_load_json(path, default=None):
     (e.g. to distinguish a missing file from a non-dict one themselves) should
     pass default=None, which skips this check entirely.
     """
-    if not os.path.exists(path):
+    if content is None and not os.path.exists(path):
         return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        if content is None:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = json.loads(content.decode('utf-8'))
     except (OSError, json.JSONDecodeError, ValueError) as e:
-        logger.warning(f"Corrupted/unreadable JSON at {path}, using default: {e}")
+        logger.warning('Corrupted/unreadable JSON; using default (%s)', type(e).__name__)
+        if record_diagnostics:
+            from review_startup import record_failure
+            record_failure('json_load_failed', e, task='storage', resource=path, level=logging.WARNING)
         return default
     if default is not None and not isinstance(data, type(default)):
-        logger.warning(
-            f"Unexpected JSON shape at {path} (expected {type(default).__name__}, "
-            f"got {type(data).__name__}), using default"
-        )
+        logger.warning('Unexpected JSON shape (expected %s, got %s); using default',
+                       type(default).__name__, type(data).__name__)
+        if record_diagnostics:
+            from review_startup import record_failure
+            record_failure('json_shape_invalid', task='storage', resource=path, level=logging.WARNING,
+                           expected_type=type(default).__name__, actual_type=type(data).__name__)
         return default
     return data
 
 
+def _fsync_copied_file(path):
+    """Flush a file published by copy, then (best-effort) its directory entry.
+
+    O_RDWR because Windows refuses fsync on a read-only descriptor; it opens
+    without truncating. The file fsync raises on failure; the directory fsync
+    is best-effort, as on the os.replace path.
+    """
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, AttributeError):
+        pass
+
+
+def is_same_review_file(first, second):
+    """Whether two path spellings name one existing physical file.
+
+    Lexical abspath is deliberately not trusted: a symlinked parent followed by
+    ``..`` can collapse to the same spelling while naming different inodes.
+    """
+    if first is None or second is None:
+        return False
+    try:
+        return os.path.samefile(first, second)
+    except (OSError, ValueError):
+        return False
+
+
 def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trailing_newline=False,
-                      newline=None, allow_nonatomic_fallback=True, return_written_bytes=False):
+                      newline=None, allow_nonatomic_fallback=True, return_written_bytes=False,
+                      encoder=None, before_replace=None):
     """Atomically write JSON data using a temp file and os.replace.
 
     Includes retry logic with exponential backoff for Windows file locking
@@ -278,11 +484,20 @@ def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trai
     succeeds rather than raising an unhandled OSError.
     Set allow_nonatomic_fallback=False when publication must refuse a
     cross-device rename instead of risking partial replacement by copying.
+    When the fallback is used it records a `nonatomic_json_fallback` storage
+    diagnostic (at most once a minute per file) BEFORE copying, logs a warning,
+    and fsyncs the copied file before returning: the copy is not atomic, so a
+    crash during it can leave a truncated destination that a later
+    safe_load_json sees as a default value.
     newline is passed to the text stream: None (the default) keeps each
     platform's native line ending; newline="\\n" writes the LF bytes a
     byte-pinned artifact was committed with regardless of platform.
     return_written_bytes captures the actual staged bytes before publication,
     so callers can bind the write without rereading a mutable destination.
+    encoder optionally selects a JSONEncoder without changing atomic publication.
+    before_replace, when supplied, is called at the start of every replacement
+    attempt (including retries) so a caller can revalidate evidence that may
+    have changed while the staged bytes were being written.
     """
     if not isinstance(max_retries, int) or max_retries < 1:
         raise ValueError("max_retries must be a positive integer")
@@ -294,7 +509,7 @@ def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trai
     written_bytes = None
     try:
         with os.fdopen(fd, "w+" if return_written_bytes else "w", encoding="utf-8", newline=newline) as f:
-            json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=sort_keys)
+            json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=sort_keys, cls=encoder)
             if trailing_newline:
                 f.write("\n")
             f.flush()
@@ -304,6 +519,8 @@ def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trai
                 written_bytes = f.buffer.read()
 
         for attempt in range(max_retries):
+            if before_replace is not None:
+                before_replace()
             try:
                 os.replace(tmp_path, target_path)
                 # Also fsync the directory so the rename itself is durable across
@@ -336,9 +553,27 @@ def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trai
                         raise OSError(
                             f"Refusing cross-device fallback write through a symlink at {target_path}"
                         ) from e
+                    # The fallback is safe against a pre-existing symlink but is
+                    # NOT atomic: a crash/OOM during shutil.move's copy can leave
+                    # a truncated destination while this call has not returned.
+                    # Record that publication lost atomicity — callers that
+                    # reread the file would otherwise see safe_load_json fall
+                    # back to a believable empty/default state with no trace.
+                    logger.warning(
+                        'Non-atomic JSON fallback: cross-device rename for %s; '
+                        'publishing by copy (a crash during the copy may truncate it)',
+                        target_path)
+                    # `operation` is on the trace's field allow-list; any other
+                    # keyword is dropped silently and never reaches the log.
+                    # Rate-limited per file: on a mount where every write lands
+                    # here, an unthrottled record per write fills the 256 KB
+                    # diagnostics log and rotates real failures out of it.
+                    from review_startup import record_failure
+                    record_failure('nonatomic_json_fallback', e, task='storage',
+                                   resource=target_path, level=logging.WARNING,
+                                   operation='copy_fallback', rate_limit_seconds=60)
                     try:
                         shutil.move(tmp_path, target_path)
-                        return written_bytes
                     except OSError as move_err:
                         # Let the same retry/backoff check below apply to a
                         # transient failure during the fallback copy too
@@ -346,6 +581,14 @@ def atomic_json_write(data, target_path, max_retries=5, *, sort_keys=False, trai
                         # is untouched unless copy_function fully succeeded,
                         # so retrying shutil.move again is safe.
                         e = move_err
+                    else:
+                        # shutil.move's copy does not fsync. Returning success
+                        # with the bytes still in the page cache let a power
+                        # loss AFTER this call leave an empty or truncated
+                        # file. Flush it before reporting success; a failure
+                        # here propagates, because the write is not durable.
+                        _fsync_copied_file(target_path)
+                        return written_bytes
                 # ERROR_ACCESS_DENIED (5) / ERROR_SHARING_VIOLATION (32) are raw
                 # Windows error codes, which only ever show up on e.winerror -
                 # e.errno holds the CRT's translated POSIX-equivalent (EACCES=13

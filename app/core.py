@@ -12,9 +12,11 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from subprocess_ownership import (SUBPROCESS_TERMINATE_GRACE_SECONDS,
                                  start_owned_subprocess, stop_owned_subprocess, send_subprocess_signal, get_subprocess_lease_options,
+                                 log_subprocess_stop_fallback,
                                  terminate_windows_process_tree as terminate_owned_windows_process_tree)
 from voicelab_settings import get_voicelab_python
 import threading
@@ -30,19 +32,22 @@ from fastapi.responses import JSONResponse
 from character_evidence import aliases_for
 from speaker_identity import is_speaker_merge_allowed
 from audio_generation_owner import (AUDIO_GENERATION_CANCELLED, AudioGenerationCancelled, AudioGenerationOwner,
-                                    ensure_audio_generation_owner)
+                                    ensure_audio_generation_owner, get_audio_generation_owner)
 from project import ProjectManager
 from config_settings import load_app_config
+from diagnostics import redact_text
 from utils import (atomic_json_write, get_app_config_path, get_app_storage_path, get_runtime_data_dir,
                    is_generic_speaker, is_path_inside, safe_load_json,
                    secure_filename)
 from lmstudio_settings import (get_active_llm_config, get_current_status, get_effective_max_tokens,
                                is_local_llm_endpoint)
-from hf_utils import fetch_builtin_manifest, is_adapter_downloaded
+from hf_utils import fetch_builtin_manifest, get_local_builtin_manifest, is_adapter_downloaded
 from run_history import finish_run, prune_runs, record_artifact, start_run
 from experiments.gpu_guard import acquire_gpu_lock, release_gpu_lock
 from task_ownership import (acquire_task_lease, ensure_startup_recovery, get_task_resource_path,
                             ensure_task_resources_available, TaskOwnershipBusy)
+from review_startup import record_failure
+from windows_subprocess_owner import WindowsOwnerCleanupError
 
 
 logger = logging.getLogger("AlexandriaUI")
@@ -70,6 +75,17 @@ async def handle_app_error(_request, exc: AppError):
     return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
 
 
+@contextmanager
+def mark_expected_probe_response(*, expected: bool = True):
+    """Keep an empty probe's HTTP response without treating it as a diagnostic failure."""
+    try:
+        yield
+    except HTTPException as error:
+        if expected:
+            error.expected_probe_response = True
+        raise
+
+
 def _warn_corrupted_json(kind: str, path: str, action: str, e: Exception) -> None:
     """Log a consistent warning for a corrupted/unreadable JSON file that's
     falling back to some default. Shared by every site that catches a JSON
@@ -78,7 +94,7 @@ def _warn_corrupted_json(kind: str, path: str, action: str, e: Exception) -> Non
     logger.warning(f"Corrupted {kind} at {path}, {action}: {e}")
 
 
-def _load_manifest(path, *, for_update=False):
+def _load_manifest(path, *, for_update=False, record_diagnostics=True):
     """Allow read-only fallback, but never replace an unreadable roster."""
     if for_update:
         try:
@@ -89,21 +105,22 @@ def _load_manifest(path, *, for_update=False):
         if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
             raise ValueError(f"Cannot update malformed voice manifest: {path}")
     else:
-        entries = safe_load_json(path, default=[])
+        entries = safe_load_json(path, default=[], record_diagnostics=record_diagnostics)
     valid = [entry for entry in entries if isinstance(entry, dict)]
     if len(valid) != len(entries):
         logger.warning("Ignoring malformed entries in manifest %s", path)
     return valid
 
 
-def _load_builtin_lora_manifest():
+def _load_builtin_lora_manifest(*, refresh=True):
     """Load built-in LoRA manifest from HF (with local fallback). Returns ALL entries with download status."""
-    entries = fetch_builtin_manifest(BUILTIN_LORA_DIR)
+    entries = (fetch_builtin_manifest(BUILTIN_LORA_DIR) if refresh else
+               get_local_builtin_manifest(BUILTIN_LORA_DIR, record_diagnostics=False))
     result = []
     for entry in entries:
         entry = dict(entry)  # avoid mutating cached list
         local_id = entry["id"] if entry["id"].startswith("builtin_") else f"builtin_{entry['id']}"
-        downloaded = is_adapter_downloaded(local_id, BUILTIN_LORA_DIR)
+        downloaded = is_adapter_downloaded(local_id, BUILTIN_LORA_DIR, record_diagnostics=refresh)
         entry["id"] = local_id
         entry["builtin"] = True
         entry["downloaded"] = downloaded
@@ -114,7 +131,7 @@ def _load_builtin_lora_manifest():
 
 def _save_manifest(path, manifest):
     """Write a JSON manifest file."""
-    atomic_json_write(manifest, path)
+    atomic_json_write(manifest, path, allow_nonatomic_fallback=False)
 
 
 def _safe_subpath(base_dir: str, name: str) -> str:
@@ -470,8 +487,8 @@ def _init_task_log(task_name: str, extra_header: str = "") -> str:
     try:
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"# {task_name} log — {time.strftime('%Y-%m-%d %H:%M:%S')}\n{extra_header}")
-    except OSError:
-        pass
+    except OSError as error:
+        record_failure('task_log_create_failed', error, task=task_name, resource=log_path)
     return log_path
 
 
@@ -612,8 +629,8 @@ process_state = {
     "report_explanation": {"running": False, "logs": [], "cancel": False, "status": "idle"},
     "review": {"running": False, "status": "idle", "logs": [], "cancel": False, "pid": None, "process": None, "paused": False, "start_time": None},
     "batch_review": {"running": False, "logs": [], "cancel": False, "tasks": [], "current_task_idx": -1, "process": None, "pid": None, "paused": False, "start_time": None, "bidirectional": False,
-                     "totals_fwd": {"text_changed": 0, "speaker_changed": 0, "instruct_changed": 0, "entries_added": 0, "entries_removed": 0, "narrators_merged": 0, "speakers_merged": 0, "batches_failed": 0, "batches_skipped_vram": 0, "total_changes": 0, "books_done": 0},
-                     "totals_bwd": {"text_changed": 0, "speaker_changed": 0, "instruct_changed": 0, "entries_added": 0, "entries_removed": 0, "narrators_merged": 0, "speakers_merged": 0, "batches_failed": 0, "batches_skipped_vram": 0, "total_changes": 0, "books_done": 0},
+                     "totals_fwd": {"text_changed": 0, "speaker_changed": 0, "instruct_changed": 0, "entries_added": 0, "entries_removed": 0, "narrators_merged": 0, "speakers_merged": 0, "batches_failed": 0, "batches_skipped_vram": 0, "total_changes": 0, "annotations_changed": 0, "books_done": 0},
+                     "totals_bwd": {"text_changed": 0, "speaker_changed": 0, "instruct_changed": 0, "entries_added": 0, "entries_removed": 0, "narrators_merged": 0, "speakers_merged": 0, "batches_failed": 0, "batches_skipped_vram": 0, "total_changes": 0, "annotations_changed": 0, "books_done": 0},
                      "aliases_fwd": [], "aliases_bwd": []},
     "nicknames": {"running": False, "logs": [], "cancel": False, "pid": None, "process": None, "paused": False, "start_time": None},
     "cast_list": {"running": False, "logs": [], "cancel": False, "pid": None, "process": None, "paused": False, "start_time": None},
@@ -655,15 +672,19 @@ def is_llm_on_this_gpu(config) -> bool:
     """The active LLM profile's `on_this_gpu`, or - when unset - whether its
     endpoint is local to this machine. Conservative on any failure: True."""
     try:
-        from lmstudio_settings import get_active_llm_config, is_remote_llm
+        from lmstudio_settings import get_active_llm_config, is_local_llm_endpoint
         llm = get_active_llm_config(config) or {}
         if llm.get("transport") == "manual":
             return False   # the user is the model; no GPU involved
         explicit = llm.get("on_this_gpu")
         if explicit is not None:
             return bool(explicit)
-        return not is_remote_llm(config.get("llm_mode", "local"), llm.get("base_url", ""))
-    except Exception:
+        # Physical placement follows the endpoint, not the billing mode:
+        # is_active_llm_remote() would call llm_mode="remote" remote even when
+        # base_url is loopback, bypassing the lock against audio (#2134).
+        return is_local_llm_endpoint(llm.get("base_url", ""))
+    except Exception as error:
+        record_failure('gpu_policy_read_failed', error, task='gpu_lock', rate_limit_seconds=300)
         return True
 
 
@@ -671,21 +692,45 @@ def llm_is_on_this_gpu() -> bool:
     """Read the active config through the shared local-GPU dispatch policy."""
     try:
         return is_llm_on_this_gpu(load_app_config(CONFIG_PATH))
-    except Exception:
+    except Exception as error:
+        record_failure('gpu_config_read_failed', error, task='gpu_lock', rate_limit_seconds=300)
         return True
 
 
-def gpu_lock_conflicts(new_task_name: str, *, cpu_only=False) -> set:
-    """The tasks that must not be running for `new_task_name` to start."""
+def gpu_lock_conflicts(new_task_name: str, *, cpu_only=False, llm_on_gpu=None) -> set:
+    """The tasks that must not be running for `new_task_name` to start.
+
+    `llm_on_gpu` lets one admission pass its already-resolved policy here;
+    None keeps the shared disk reader for every other caller.
+    """
     if cpu_only or new_task_name in NON_GPU_TASKS:
         return set()
     others = {name for name in GPU_TASKS - {new_task_name}
               if not is_task_cpu_only(name)}
-    if llm_is_on_this_gpu():
+    on_gpu = llm_is_on_this_gpu() if llm_on_gpu is None else llm_on_gpu
+    if on_gpu:
         return others
     if new_task_name in LLM_TASKS:
         return others & LLM_TASKS
     return others - LLM_TASKS
+
+
+def _get_retained_windows_controls(state):
+    if not state.get('_windows_cleanup_failed'):
+        return []
+    return [process._alexandria_windows_owner for process in state.get('processes', [])
+            if getattr(process, '_alexandria_windows_owner', None) is not None
+            and process._alexandria_windows_owner.job.handle is not None]
+
+
+def _retain_windows_owner_failure(state, error):
+    process = error.owner.process
+    process._alexandria_windows_owner = error.owner
+    if process not in state.setdefault('processes', []):
+        state['processes'].append(process)
+    state.update(process=process, pid=process.pid, running=False, status='failed',
+                 _windows_cleanup_failed=True)
+    state.setdefault('logs', []).append(f'Error: {error}')
 
 
 def is_task_running(task_name, states=None):
@@ -693,7 +738,8 @@ def is_task_running(task_name, states=None):
     owner = _task_claims.get(task_name)
     states = process_state if states is None else states
     return bool(states.get(task_name, {}).get("running")
-                or (owner and owner["phase"] in ("pending", "started")))
+                or _get_retained_windows_controls(states.get(task_name, {}))
+                or (owner and owner["phase"] in ("pending", "started", "cleanup_failed")))
 
 
 def is_task_cpu_only(task_name):
@@ -701,7 +747,20 @@ def is_task_cpu_only(task_name):
     return bool(_task_claims.get(task_name, {}).get("cpu_only"))
 
 
-def check_global_gpu_lock(new_task_name: str, *, cpu_only=False):
+def get_task_lifecycle(task_name, states=None):
+    """Public execution status is terminal even while failed ownership blocks admission."""
+    states = process_state if states is None else states
+    state = states.get(task_name, {})
+    if task_name == 'script' and is_script_worker_pending(state):
+        return {'running': True, 'ownership_unconfirmed': False, 'status': 'starting',
+                'worker_pending': True}
+    retained = bool(state.get('_windows_cleanup_failed'))
+    running = is_task_running(task_name, states=states) and not retained
+    return {'running': running, 'ownership_unconfirmed': retained,
+            'status': 'failed' if retained else state.get('status') or ('running' if running else 'idle')}
+
+
+def check_global_gpu_lock(new_task_name: str, *, cpu_only=False, llm_on_gpu=None):
     """Prevent multiple GPU-intensive tasks from running concurrently and causing an OOM crash.
 
     Raises HTTPException on conflict (every caller relies on this propagating
@@ -710,7 +769,7 @@ def check_global_gpu_lock(new_task_name: str, *, cpu_only=False):
     """
     if is_task_running(new_task_name):
         raise AppError(400, f"{new_task_name.replace('_', ' ').capitalize()} is already running.", key='error.task.already_running', values={'task': new_task_name.replace('_', ' ').capitalize()})
-    for task_name in gpu_lock_conflicts(new_task_name, cpu_only=cpu_only):
+    for task_name in gpu_lock_conflicts(new_task_name, cpu_only=cpu_only, llm_on_gpu=llm_on_gpu):
         if is_task_running(task_name):
             raise AppError(400, f"Cannot start {new_task_name.replace('_', ' ')}: {task_name.replace('_', ' ')} is currently running. Please wait for it to finish or cancel it to free up GPU VRAM.", key='error.task.gpu_busy', values={'task': new_task_name.replace('_', ' '), 'running': task_name.replace('_', ' ')})
 
@@ -719,6 +778,27 @@ _gpu_leases = {}
 _task_claims = {}
 _saved_book_publications = {}
 _request_task_claims = contextvars.ContextVar("alexandria_request_task_claims", default=None)
+_script_launch_guard = contextvars.ContextVar("alexandria_script_launch_guard", default=None)
+
+
+@contextmanager
+def guard_script_worker_launch(save_launch):
+    """Wrap only the scoped script's launch, after subprocess setup has succeeded."""
+    token = _script_launch_guard.set(save_launch)
+    try:
+        yield
+    finally:
+        _script_launch_guard.reset(token)
+
+_SCRIPT_RESERVATION_FIELDS = ('start_time', 'cancel', 'cpu_only', '_script_published_cleanup_stop',
+                              'worker_claim_id')
+
+
+def is_script_worker_pending(state):
+    owner = _task_claims.get('script')
+    return (owner is not None and not state.get('_windows_cleanup_failed')
+            and (owner.get('defer_process_state')
+                 or ('prior_script_status' in owner and state.get('start_time') is None)))
 
 
 def get_saved_book_destination_path(path):
@@ -782,15 +862,82 @@ def ensure_book_switch_allowed(*, operation="switch books", hold_task_mutex=True
 def _reap_gpu_leases():
     while True:
         with _gpu_lock:
+            failed = [(name, claim['id'], process_state[name])
+                      for name, claim in _task_claims.items() if claim['phase'] == 'cleanup_failed']
+        for name, claim_id, state in failed:
+            try:
+                for control in _get_retained_windows_controls(state):
+                    control.retry_cleanup()
+                release_gpu_task_claim(name, claim_id)
+            except OSError as error:
+                record_failure('windows_owner_recovery_failed', error, task=name, rate_limit_seconds=300)
+        with _gpu_lock:
             for task_name, handle in list(_gpu_leases.items()):
                 if not is_task_running(task_name):
                     release_gpu_lock(handle)
                     del _gpu_leases[task_name]
-            if not _gpu_leases:
+            if not _gpu_leases and not any(claim['phase'] == 'cleanup_failed'
+                                          for claim in _task_claims.values()):
                 return
         time.sleep(0.1)
 
-def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources=None):
+_AUDIO_LIFECYCLE_FIELDS = ('status', 'error')
+
+
+def _publish_task_claim_state(task_name, cpu_only, owner=None):
+    """Initialize the live task entry while holding the admission mutex."""
+    state = process_state[task_name]
+    if "cancel" in state:
+        state["cancel"] = False
+    if task_name == "script":
+        state.pop('_script_published_cleanup_stop', None)
+        state.pop('worker_claim_id', None)
+        state['start_time'] = None
+    if task_name == "audio":
+        # Each newly admitted audio operation owns its public result: a
+        # previous merge's terminal status (cancelled/done) must not outlive
+        # a fresh render or batch that is now starting (R6). Keep the prior
+        # lifecycle on the claim so a reservation that never starts work (a
+        # refused admission or a synchronous sound render that never owns an
+        # audio terminal writer) restores it instead of leaving a false
+        # running status (F07).
+        if owner is not None:
+            owner['prior_audio_lifecycle'] = {
+                key: state[key] for key in _AUDIO_LIFECYCLE_FIELDS if key in state}
+        state.update(status="running", error=None)
+    state.update(running=True, cpu_only=cpu_only)
+
+
+def update_claimed_task_state(task_name, claim_id=None, *, logs_append=None, **fields):
+    """Apply live state only while the caller's exact claim is still current.
+
+    Stale workers (a replaced claim or one whose successor already published)
+    must never overwrite a successor's terminal status, cancel flag or logs
+    (R4/R6). The captured owner is used when no explicit claim id is supplied.
+    Returns True when applied, False when a claim exists but is stale, and
+    None when the caller has no bound authority at all (direct/legacy call).
+    """
+    owner = get_audio_generation_owner()
+    if claim_id is None:
+        claim_id = owner.claim_id if owner is not None else None
+    if claim_id is None:
+        # No bound authority at all (direct/legacy caller): the claim check
+        # below is inapplicable, distinct from a stale/mismatched claim.
+        return None
+    with _gpu_lock:
+        current = _task_claims.get(task_name)
+        if (current is None or current.get('id') != claim_id
+                or current.get('phase') != 'started'):
+            return False
+        state = process_state[task_name]
+        state.update(fields)
+        if logs_append is not None:
+            state.setdefault('logs', []).append(logs_append)
+        return True
+
+
+def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources=None,
+                   defer_process_state=False):
     """Atomically re-check and reserve the GPU lock for task_name.
 
     check_global_gpu_lock() alone has a TOCTOU race: two requests for
@@ -805,10 +952,17 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources
             if not is_task_running(old_task):
                 release_gpu_lock(handle)
                 del _gpu_leases[old_task]
+        # One policy for the whole admission: the conflict set, the lock
+        # decision and the device choice must agree even if the passed config
+        # disagrees with config.json or the file changes between reads (#2098).
+        llm_on_gpu = None
+        if not cpu_only:
+            llm_on_gpu = (llm_is_on_this_gpu() if llm_config is None
+                          else is_llm_on_this_gpu(llm_config))
         if cpu_only:
             check_global_gpu_lock(task_name, cpu_only=True)
         else:
-            check_global_gpu_lock(task_name)
+            check_global_gpu_lock(task_name, llm_on_gpu=llm_on_gpu)
         if task_name == "audio":
             try:
                 with ensure_startup_recovery(DATA_DIR, timeout=0) as idle:
@@ -820,13 +974,11 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources
             except TimeoutError:
                 pass  # Ordinary task-lease admission still determines conflicts.
         needs_local_gpu = (not cpu_only and task_name not in NON_GPU_TASKS
-                           and (task_name not in LLM_TASKS
-                                or (llm_is_on_this_gpu() if llm_config is None
-                                    else is_llm_on_this_gpu(llm_config))))
+                           and (task_name not in LLM_TASKS or llm_on_gpu))
         task_lease = None
         handle = None
         try:
-            conflicts = gpu_lock_conflicts(task_name, cpu_only=cpu_only)
+            conflicts = gpu_lock_conflicts(task_name, cpu_only=cpu_only, llm_on_gpu=llm_on_gpu)
             lease_options = {} if resources is None else {"resources": resources}
             if cpu_only:
                 task_lease = acquire_task_lease(DATA_DIR, task_name, conflicts, cpu_only=True, **lease_options)
@@ -841,18 +993,19 @@ def claim_gpu_task(task_name: str, *, llm_config=None, cpu_only=False, resources
                 _gpu_leases[task_name] = handle
                 if len(_gpu_leases) == 1:
                     threading.Thread(target=_reap_gpu_leases, daemon=True).start()
-            if "cancel" in process_state[task_name]:
-                process_state[task_name]["cancel"] = False
-            if task_name == 'script':
-                process_state[task_name].pop('_script_published_cleanup_stop', None)
-            process_state[task_name]["running"] = True
             claim_id = uuid.uuid4().hex
-            _task_claims[task_name] = {"id": claim_id, "phase": "claimed", "lease": task_lease,
-                                      "cpu_only": cpu_only}
-            process_state[task_name]["cpu_only"] = cpu_only
+            owner = {"id": claim_id, "phase": "claimed", "lease": task_lease,
+                     "cpu_only": cpu_only}
+            if defer_process_state:
+                # Ownership must block other tasks even before the request
+                # publishes its book transaction and live task state.
+                owner.update(phase="pending", defer_process_state=True)
+            else:
+                _publish_task_claim_state(task_name, cpu_only, owner)
+            _task_claims[task_name] = owner
             return claim_id
         except BaseException as error:
-            if task_name in process_state:
+            if not defer_process_state and task_name in process_state:
                 process_state[task_name]["running"] = False
             _task_claims.pop(task_name, None)
             _gpu_leases.pop(task_name, None)
@@ -874,7 +1027,36 @@ def release_gpu_task_claim(task_name: str, claim_id=None, pending_only=False):
             return False
         if pending_only and (owner is None or owner["phase"] != "pending"):
             return False
-        process_state[task_name]["running"] = False
+        if not (owner and owner.get('defer_process_state')):
+            state = process_state[task_name]
+            if _get_retained_windows_controls(state):
+                if owner is not None:
+                    start_reaper = owner['phase'] != 'cleanup_failed' and task_name not in _gpu_leases
+                    owner['phase'] = 'cleanup_failed'
+                    if start_reaper:
+                        threading.Thread(target=_reap_gpu_leases, daemon=True).start()
+                state.update(running=False, status='failed')
+                return False
+            if state.pop('_windows_cleanup_failed', False):
+                state.update(process=None, pid=None, processes=[])
+            if task_name == 'script' and is_script_worker_pending(state):
+                for field in _SCRIPT_RESERVATION_FIELDS:
+                    state.pop(field, None)
+                state.update(owner['prior_script_status'])
+            state["running"] = False
+            if task_name == 'audio' and owner is not None:
+                # A reservation that never published a terminal audio status
+                # (refused admission, synchronous sound render, crashed worker)
+                # must not leave status=running with no owner. Restore the
+                # lifecycle this reservation displaced; a worker that did
+                # publish a terminal status keeps it (F07).
+                prior = owner.get('prior_audio_lifecycle')
+                if prior is not None and state.get('status') == 'running':
+                    for key in _AUDIO_LIFECYCLE_FIELDS:
+                        if key in prior:
+                            state[key] = prior[key]
+                        else:
+                            state.pop(key, None)
         _task_claims.pop(task_name, None)
         handle = _gpu_leases.pop(task_name, None)
         try:
@@ -891,32 +1073,59 @@ class _RequestTaskClaims(list):
     closed = False
 
 
-def reserve_background_task(task_name, *, cpu_only=False, saved_destinations=None, resources=None):
+def reserve_background_task(task_name, *, cpu_only=False, saved_destinations=None,
+                            resources=None, verify=None, defer_process_state=False):
     """Reserve unstarted work and bind its token to the current request."""
     destinations = (tuple(get_saved_book_destination_path(path) for path in saved_destinations)
                     if saved_destinations is not None else None)
     if destinations is not None:
         resources = tuple(resources or ()) + destinations
     resource_options = {} if resources is None else {"resources": resources}
+    if defer_process_state:
+        resource_options["defer_process_state"] = True
     claim_id = (claim_gpu_task(task_name, cpu_only=True, **resource_options) if cpu_only
                 else claim_gpu_task(task_name, **resource_options))
     try:
         with _gpu_lock:
+            owner = _task_claims.get(task_name)
+            if owner is None or owner["id"] != claim_id:
+                raise HTTPException(status_code=409, detail="Task reservation is no longer active")
             claims = _request_task_claims.get()
             if claims is not None and getattr(claims, "closed", False):
                 raise HTTPException(status_code=409, detail="The initiating request is no longer active")
             if destinations is not None and any(path in _saved_book_publications for path in destinations):
                 raise HTTPException(status_code=409, detail=(
                     "A selected saved book is being saved. Wait for it to finish before starting batch review."))
-            _task_claims[task_name]["phase"] = "pending"
+            if verify is not None:
+                # Last check before the claim is committed: callers hold book
+                # admission across reservation (book lock before GPU lock).
+                verify()
+            owner["phase"] = "pending"
             if destinations is not None:
-                _task_claims[task_name]["saved_destinations"] = destinations
+                owner["saved_destinations"] = destinations
             if claims is not None:
                 claims.append((task_name, claim_id))
     except BaseException:
         release_gpu_task_claim(task_name, claim_id)
         raise
     return claim_id
+
+
+def activate_background_task_claim(task_name, claim_id):
+    """Publish live state after the request commits and registers its worker."""
+    with _gpu_lock:
+        owner = _task_claims.get(task_name)
+        if owner is None or owner["id"] != claim_id:
+            raise HTTPException(status_code=409, detail="Task reservation is no longer active")
+        if owner.get("defer_process_state"):
+            if owner["phase"] == "pending" and getattr(_request_task_claims.get(), "closed", False):
+                raise HTTPException(status_code=409, detail="The initiating request is no longer active")
+            if task_name == 'script':
+                state = process_state[task_name]
+                owner['prior_script_status'] = {field: state[field] for field in _SCRIPT_RESERVATION_FIELDS
+                                                if field in state}
+            _publish_task_claim_state(task_name, owner["cpu_only"], owner)
+            del owner["defer_process_state"]
 
 
 def register_claimed_background_task(background_tasks, task_name, claim_id, callback, *args, **kwargs):
@@ -935,13 +1144,16 @@ def register_claimed_background_task(background_tasks, task_name, claim_id, call
 
 
 def schedule_claimed_background_task(background_tasks, task_name, callback, *args,
-                                    cpu_only=False, saved_destinations=None, **kwargs):
+                                     cpu_only=False, saved_destinations=None,
+                                     verify=None, **kwargs):
     """Reserve and register one owned worker; failed registration rolls back."""
     if saved_destinations is not None:
         claim_id = reserve_background_task(task_name, cpu_only=cpu_only,
-                                           saved_destinations=saved_destinations)
+                                           saved_destinations=saved_destinations,
+                                           verify=verify)
     else:
-        claim_id = reserve_background_task(task_name, cpu_only=True) if cpu_only else reserve_background_task(task_name)
+        claim_id = reserve_background_task(task_name, cpu_only=cpu_only,
+                                           verify=verify)
     return register_claimed_background_task(background_tasks, task_name, claim_id, callback, *args, **kwargs)
 
 
@@ -968,14 +1180,44 @@ def _ensure_owned_task_started(task_name, claim_id, already_started=False):
 
 @contextmanager
 def _ensure_audio_task_owner(claim_id, *, allow_cancelled=False, task_name='audio'):
-    # Same mutex as cancel admission. Always acquire it before Project chunk locks.
+    # Entry validation only. No task holds the global mutex across book, chunk
+    # or output work: every owner carries a commit-boundary validator instead,
+    # so an Editor writer holding chunk/output locks can never cycle with a
+    # speech/export worker that needs those locks while admitted.
     with _gpu_lock:
         owner = _task_claims.get(task_name)
         if (owner is None or owner["id"] != claim_id or owner["phase"] != "started"
                 or (process_state[task_name].get("cancel", False) and not allow_cancelled)):
             raise AudioGenerationCancelled('Speech verification cancelled' if task_name == 'speech_verification'
                                            else AUDIO_GENERATION_CANCELLED)
-        yield
+    yield
+
+
+def _audio_task_owner_validation(claim_id, *, task_name='audio'):
+    """Coherent commit-time claim/cancel check without reentering owner admission.
+
+    One _gpu_lock acquisition covers both reads so a claim replacement cannot
+    pair an old id with its successor's uncancelled flag. The lock is held only
+    for this snapshot, never across publication I/O, so unrelated admission
+    still proceeds. Book/Editor-held callers may take it: every _gpu_lock ->
+    book acquisition in this module is a timeout=0 try-lock, so no path waits
+    on a book journal while holding it (idle and active Cancel included).
+    """
+    with _gpu_lock:
+        owner = _task_claims.get(task_name)
+        if (owner is None or owner["id"] != claim_id or owner["phase"] != "started"
+                or process_state[task_name].get("cancel", False)):
+            raise AudioGenerationCancelled('Speech verification cancelled' if task_name == 'speech_verification'
+                                           else AUDIO_GENERATION_CANCELLED)
+
+
+def _audio_task_owner_claim_validation(claim_id, *, task_name='audio'):
+    """Coherent claim-only check for cleanup settlement; cancellation is expected."""
+    with _gpu_lock:
+        owner = _task_claims.get(task_name)
+        if owner is None or owner["id"] != claim_id or owner["phase"] != "started":
+            raise AudioGenerationCancelled('Speech verification cancelled' if task_name == 'speech_verification'
+                                           else AUDIO_GENERATION_CANCELLED)
 
 
 def _run_owned_background_task(task_name, claim_id, callback, already_started=False):
@@ -985,13 +1227,19 @@ def _run_owned_background_task(task_name, claim_id, callback, already_started=Fa
         # R2: read-along builds publish through ExportSourceSnapshot, whose
         # admission needs the exact-owner callback (cancel + book fencing).
         # Without an owner those checks were no-ops for readalong tasks.
-        owner = (AudioGenerationOwner(claim_id, functools.partial(_ensure_audio_task_owner,
-                    claim_id,task_name=task_name))
+        owner = (AudioGenerationOwner(claim_id,
+                    functools.partial(_ensure_audio_task_owner, claim_id, task_name=task_name),
+                    validate=functools.partial(_audio_task_owner_validation, claim_id, task_name=task_name),
+                    validate_claim=functools.partial(_audio_task_owner_claim_validation,
+                                                     claim_id, task_name=task_name))
                  if task_name in ('audio', 'speech_verification', 'm4b_export',
                                   'chapter_export', 'audacity_export',
                                   'readalong_sidecar', 'readaloud_epub') else None)
         with ensure_audio_generation_owner(owner):
             return callback()
+    except WindowsOwnerCleanupError as error:
+        _retain_windows_owner_failure(process_state[task_name], error)
+        raise
     finally:
         release_gpu_task_claim(task_name, claim_id)
 
@@ -1048,6 +1296,9 @@ def _init_batch_state(state: dict, logs: list, tasks: list) -> None:
     Common initialization shared by review_script_batch_start,
     generate_script_batch_start, and voicelab_start's background _run().
     """
+    retained = _get_retained_windows_controls(state)
+    if retained:
+        raise retained[0].cleanup_error
     state["running"] = True
     state["paused"] = False
     state["start_time"] = time.time()
@@ -1065,6 +1316,15 @@ def _init_batch_state(state: dict, logs: list, tasks: list) -> None:
         state["pid"] = None
     state["processes"] = []
 
+
+# The speaker alias-merge stage ("Merge duplicate character names", #2037).
+# review_script.dedupe_speakers prints one line per model call prefixed with
+# this marker, after the review's own last "Reviewing batch N/N" line - the
+# finished batch count that otherwise stays the newest progress marker for
+# the whole, potentially long, merge call. One definition, used by the
+# producers (review_script.py) and every reader (_compute_eta here,
+# routers/script.py's stage hint, static/js/app-core.js's ACTIVITY_MARKER).
+SPEAKER_MERGE_MARKER = "Merging duplicate names:"
 
 _PROGRESS_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
 # The three-pass pipeline prints its own estimate after every finished unit
@@ -1103,6 +1363,7 @@ def _compute_eta(state: dict) -> dict:
     sub_fraction = 0.0
     sub_progress = None
     pipeline_eta = None
+    merge_stage = False
     tail = state.get("logs", [])[-30:]
     # The pipeline's own line wins over any N/M marker after it ("chunk 5/5
     # done" would otherwise read as 100% between two ETA lines).
@@ -1125,6 +1386,18 @@ def _compute_eta(state: dict) -> dict:
             # N/M but describe book-level progress, not the current item's
             # sub-batch progress.
             continue
+        if SPEAKER_MERGE_MARKER in stripped:
+            # The alias-merge stage runs after the last review batch, so its
+            # own marker is what the run is doing now - not the frozen
+            # "Reviewing batch 5/5" behind it (#2037). It is one long model
+            # call whose own count is the stage's unit, so the whole line is
+            # the progress text and the review fraction stays complete.
+            # Batch review prefixes each book's lines ("[2] ..."), hence `in`
+            # rather than a prefix test.
+            merge_stage = True
+            sub_fraction = 1.0
+            sub_progress = stripped
+            break
         m = _PROGRESS_RE.search(line)
         if m:
             cur, tot = int(m.group(1)), int(m.group(2))
@@ -1173,8 +1446,14 @@ def _compute_eta(state: dict) -> dict:
         progress = sub_progress
 
     eta_seconds = None
-    if pipeline_eta is not None and not (tasks and idx is not None and idx >= 0):
+    single_item = not (tasks and idx is not None and idx >= 0)
+    if pipeline_eta is not None and single_item:
         eta_seconds = pipeline_eta
+    elif merge_stage and single_item:
+        # One model call of unknown length: a fraction of 1.0 would report
+        # "about 0s left" while it is still running, so report no estimate
+        # and let the activity row say it is waiting on the model.
+        eta_seconds = None
     elif fraction and fraction > 0.001:  # Avoid enormous ETAs at start
         eta_seconds = elapsed * (1 - fraction) / fraction
     return {"elapsed_seconds": elapsed, "eta_seconds": eta_seconds, "progress": progress, "fraction": fraction}
@@ -1193,12 +1472,21 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
     # abort every GPU task, deadlocking the queue.
     state["running"] = True
     state["logs"] = []
+    state.pop("failure_message", None)
+    state.pop("failure_kind", None)
     if "paused"      in state: state["paused"]      = False
     if "status"      in state: state["status"]      = "running"
     if "return_code" in state: state["return_code"] = None
     if "process"     in state: state["process"]     = None
     if "pid"         in state: state["pid"]         = None
-    if "start_time"  in state: state["start_time"]  = time.time()
+    if task_name == 'script':
+        with _gpu_lock:
+            owner = _task_claims.get(task_name)
+            if owner is not None:
+                state['worker_claim_id'] = owner['id']
+            state['start_time'] = time.time()
+    elif "start_time" in state:
+        state["start_time"] = time.time()
 
     logger.info(f"Starting task {task_name}: {' '.join(command)}")
 
@@ -1213,7 +1501,15 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
         return_code, _ = _stream_subprocess_to_logs(
             command, cwd or BASE_DIR, state, log_file=log_path, env=env)
 
-        if task_name == 'script' and state.get('_script_published_cleanup_stop'):
+        if task_name == "review":
+            failure = _extract_review_failure(state["logs"])
+            if failure:
+                state["failure_message"] = failure["message"]
+                if failure["kind"]:
+                    state["failure_kind"] = failure["kind"]
+
+        if (task_name == 'script' and state.get('_script_published_cleanup_stop')
+                and not state.get('_windows_cleanup_failed')):
             state['logs'].append('The worker was stopped after script publication.')
             state['logs'].append('Task script completed successfully.')
             if 'status' in state: state['status'] = 'done'
@@ -1227,7 +1523,7 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
             if task_name == "review":
                 stats = _extract_review_stats(state["logs"])
                 failures = _extract_failed_sections(state["logs"])
-                if stats is None or stats.get("batches_failed") or stats.get("batches_skipped_vram"):
+                if _review_is_incomplete(stats):
                     if "status" in state: state["status"] = "incomplete"
                 if stats is None:
                     completion_note = (
@@ -1235,7 +1531,22 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
                         "Review completion could not be verified; re-run the review."
                     )
                 if stats:
-                    if stats.get("batches_failed"):
+                    if stats.get("review_incomplete") and not (stats.get("batches_failed") or stats.get("batches_skipped_vram")):
+                        if stats.get("post_processing_abort"):
+                            stage = "all entries were reviewed; final checks did not finish"
+                        elif stats.get("unreviewed_entries"):
+                            stage = f"{stats['unreviewed_entries']} entries were left unreviewed"
+                        else:
+                            stage = "the review stopped before all entries were reviewed"
+                        disposition = ("The script, voice settings and audio were left unchanged."
+                                       if stats.get("publication_withheld") else
+                                       "The assembled entries were written to the output.")
+                        resume = ("Re-run to resume from its verified checkpoint."
+                                  if stats.get("resumable_checkpoint") else
+                                  "No resumable checkpoint was verified; re-run the review.")
+                        completion_note = (
+                            f"Task {task_name} stopped early: {stage}. {disposition} {resume}")
+                    elif _review_is_incomplete(stats) and stats.get("batches_failed"):
                         disposition = (
                             "The original entries were preserved" if failures.get("original_entries_preserved")
                             else "Source-bound partial label edits were retained; unresolved sections still need review"
@@ -1246,7 +1557,7 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
                             f"section(s) could not be reviewed. {disposition}; "
                             f"see the report for exact ranges and retry guidance."
                         )
-                    elif stats.get("batches_skipped_vram"):
+                    elif _review_is_incomplete(stats) and stats.get("batches_skipped_vram"):
                         completion_note = (
                             f"Task {task_name} completed, but {stats['batches_skipped_vram']} "
                             f"section(s) were skipped because the GPU ran low on memory. "
@@ -1260,27 +1571,35 @@ def run_process(command: List[str], task_name: str, cwd: str = None):
         else:
             # Check if process was killed by a signal (negative return code on Unix)
             if return_code < 0:
-                sig_name = signal.Signals(-return_code).name if hasattr(signal, 'Signals') else f"signal {-return_code}"
-                state["logs"].append(f"Task {task_name} was cancelled ({sig_name}).")
-                if "status" in state: state["status"] = "cancelled"
+                try:
+                    sig_name = signal.Signals(-return_code).name
+                except ValueError:
+                    sig_name = f"signal {-return_code}"
+                state["logs"].append(f"Task {task_name} was killed by {sig_name} (return code {return_code}).")
+                if "status" in state: state["status"] = "failed"
             else:
                 state["logs"].append(f"Task {task_name} failed with return code {return_code}.")
                 if "status" in state: state["status"] = "failed"
 
+    except WindowsOwnerCleanupError as error:
+        _retain_windows_owner_failure(state, error)
+        raise
     except Exception as e:
         # Catch-all so we always clean up the task state even if the exception
         # is unexpected (e.g. AttributeError, KeyError from internal bugs).
         logger.exception(f"Error running {task_name}: {e}")
         state["logs"].append(f"Error: {str(e)}")
-        if task_name == 'script' and state.get('_script_published_cleanup_stop'):
+        if (task_name == 'script' and state.get('_script_published_cleanup_stop')
+                and not state.get('_windows_cleanup_failed')):
             state['logs'].append('The script was published; worker cleanup reported an error.')
             state['logs'].append('Task script completed successfully.')
             if 'status' in state: state['status'] = 'done'
         elif "status" in state:
-            state["status"] = "cancelled" if state.get("cancel") else "failed"
+            state["status"] = "failed"
     finally:
-        if "process"     in state: state["process"]     = None
-        if "pid"         in state: state["pid"]         = None
+        if not state.get('_windows_cleanup_failed'):
+            if "process" in state: state["process"] = None
+            if "pid" in state: state["pid"] = None
         state["running"] = False
         if "return_code" in state: state["return_code"] = return_code
     return return_code
@@ -1325,12 +1644,16 @@ def _cancel_task(state_key: str, not_running_msg: str, exited_msg: str):
         _send_signal_tree(proc if proc is not None else pid, signal.SIGTERM)
     except ProcessLookupError:
         raise HTTPException(status_code=400, detail=exited_msg)
-    except OSError:
+    except OSError as error:
         if (sys.platform == 'win32'
                 and getattr(proc, '_alexandria_windows_owner', None) is not None):
             from subprocess_ownership import is_subprocess_tree_running
             if is_subprocess_tree_running(proc):
-                logger.warning('Graceful cancellation failed; cancellation remains requested', exc_info=True)
+                message = 'Cancellation requested; waiting for the worker to stop. Windows cleanup remains pending.'
+                logs = state.setdefault('logs', [])
+                if not logs or logs[-1] != message:
+                    logs.append(message)
+                log_subprocess_stop_fallback(error, message)
                 return {"status": "cancel requested", "pid": pid}
         raise HTTPException(status_code=400, detail=exited_msg)
     return {"status": "cancel signal sent", "pid": pid}
@@ -1402,15 +1725,20 @@ def _run_claimed_background_task(task_name: str, callback) -> None:
         callback()
     except Exception as e:
         error = str(e)
-        logger.exception("Background task %s failed: %s", task_name, e)
+        if isinstance(e, WindowsOwnerCleanupError):
+            _retain_windows_owner_failure(state, e)
+        record_failure('background_task_failed', e, task=task_name, resource=run_id)
         state.setdefault("logs", []).append(f"Error: {e}")
         if "status" in state:
             state["status"] = "failed"
     finally:
-        if "process" in state:
-            state["process"] = None
-        if "pid" in state:
-            state["pid"] = None
+        if state.get('_windows_cleanup_failed'):
+            state['status'] = 'failed'
+        if not state.get('_windows_cleanup_failed'):
+            if "process" in state:
+                state["process"] = None
+            if "pid" in state:
+                state["pid"] = None
         state["running"] = False
         state.pop("run_id", None)
         if run_id:
@@ -1420,14 +1748,7 @@ def _run_claimed_background_task(task_name: str, callback) -> None:
                         RUN_HISTORY_DIR, run_id, data_dir=DATA_DIR, **artifact)
                 except Exception:
                     logger.exception("Could not record artifact for run %s", run_id)
-            if error is not None or state.get("status") == "failed":
-                final_status = "failed"
-            elif task_name == 'script' and state.get('_script_published_cleanup_stop'):
-                final_status = 'completed'
-            elif state.get("cancel") or state.get("status") == "cancelled":
-                final_status = "cancelled"
-            else:
-                final_status = "completed"
+            final_status = _run_history_final_status(state, task_name, error)
             try:
                 finish_run(RUN_HISTORY_DIR, run_id, final_status, error=error)
             except Exception:
@@ -1435,6 +1756,31 @@ def _run_claimed_background_task(task_name: str, callback) -> None:
         if direct_claim is not None:
             release_gpu_task_claim(task_name, direct_claim)
 
+
+
+def _run_history_final_status(state, task_name, error):
+    """Map a finished task's terminal status and any children to history vocabulary.
+
+    Only the two child outcomes already used by task state are considered, so
+    unrelated task families keep their existing completed/cancelled/failed
+    semantics instead of being reinterpreted here.
+    """
+    if error is not None or state.get("status") == "failed":
+        return "failed"
+    if task_name == 'script' and state.get('_script_published_cleanup_stop'):
+        return 'completed'
+    if state.get("cancel") or state.get("status") in ("cancelled", "canceled"):
+        return "cancelled"
+    children = state.get("tasks")
+    if isinstance(children, list):
+        child_statuses = {child.get("status") for child in children if isinstance(child, dict)}
+        if "failed" in child_statuses:
+            return "failed"
+        if "incomplete" in child_statuses:
+            return "incomplete"
+    if state.get("status") in ("incomplete", "partial"):
+        return "incomplete"
+    return "completed"
 
 
 def ensure_failed_subprocess_stopped(process, state):
@@ -1494,23 +1840,41 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
     call's own output regardless of any cap-driven truncation of state['logs'],
     so callers can safely scan them for per-run markers (stats, diffs, aliases).
     """
+    retained = _get_retained_windows_controls(state)
+    if retained:
+        raise retained[0].cleanup_error
     log_fh = None
     log_lines_since_flush = 0
     last_flush_time = time.time()
+    task_name = next((name for name, task_state in process_state.items() if task_state is state), 'subprocess')
     if log_file:
         try:
             log_fh = open(log_file, "a", encoding="utf-8")
-        except OSError:
+        except OSError as error:
+            record_failure('worker_log_open_failed', error, task=task_name, resource=log_file)
             log_fh = None
     process = None
     reader = None
+    cancel_directory = None
     try:
-        subprocess_env = get_gpu_task_environment(state, env)
-        process = start_owned_subprocess(
-            command,
+        from review_startup import (worker_environment, WORKER_STDIO_ENCODING,
+                                    event as review_startup_event)
+        subprocess_env = get_gpu_task_environment(state, worker_environment(env))
+        if sys.platform == 'win32' and task_name in ('review', 'batch_review'):
+            cancel_directory = tempfile.TemporaryDirectory(prefix='alexandria-review-cancel-')
+            subprocess_env['ALEXANDRIA_REVIEW_CANCEL_FILE'] = os.path.join(cancel_directory.name, 'cancel')
+        review_startup_event('subprocess_launch')
+        options = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # Decode exactly what worker_environment told the child to write;
+            # the two are one constant so a Windows child's cp1252 stdout
+            # cannot make every non-ANSI line fail or turn into mojibake (#2062).
+            encoding=WORKER_STDIO_ENCODING,
+            # Only for bytes a UTF-8 writer cannot produce (e.g. a tool that
+            # writes binary to stdout); the *_JSON markers are printed
+            # ASCII-safe, so this can never corrupt what the parsers read.
             errors="replace",
             cwd=cwd,
             env=subprocess_env,
@@ -1519,6 +1883,18 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
             # Linux uses a reaper; macOS a private task job; Windows a Job Object.
             start_new_session=True,
         )
+        save_launch = _script_launch_guard.get() if task_name == 'script' else None
+        if save_launch is not None and not save_launch(may_have_launched=True):
+            return 1, []  # The exact admitted worker was already cancelled.
+        try:
+            process = start_owned_subprocess(command, **options)
+        except OSError as error:
+            if save_launch is not None and getattr(error, 'worker_not_launched', False):
+                save_launch(may_have_launched=False)
+            raise
+        review_startup_event('subprocess_started', child_pid=process.pid)
+        if cancel_directory is not None:
+            process._alexandria_cancel_path = subprocess_env['ALEXANDRIA_REVIEW_CANCEL_FILE']
 
         if sys.platform != "win32":
             process._alexandria_pgid = process.pid
@@ -1538,7 +1914,7 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
                     q.put(line)
             except Exception as e:
                 # Log the error so we know why the reader died
-                logger.error(f"Subprocess reader thread failed: {e}")
+                record_failure('worker_reader_failed', e, task=task_name, resource=log_file)
             finally:
                 # Always put None sentinel even if iteration failed
                 try:
@@ -1560,8 +1936,17 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
             # or grandchild ignores SIGTERM and keeps the output pipe open.
             nonlocal terminate_requested_at, kill_sent
             if state.get("cancel"):
+                was_killed = kill_sent
                 terminate_requested_at, kill_sent = apply_cancel_escalation(
                     process, terminate_requested_at, kill_sent)
+                if sys.platform == 'win32' and kill_sent and not was_killed:
+                    message = 'Stopped after it did not respond to cancel; owned process tree force-terminated.'
+                    logger.info(message)
+                    state['logs'].append(message)
+                    own_lines.append(message)
+                    if log_fh is not None:
+                        log_fh.write(message + '\n')
+                        log_fh.flush()
 
         while True:
             try:
@@ -1621,8 +2006,9 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
                                 log_lines_since_flush = 0
                                 last_flush_time = now
                         except OSError as e:
+                            record_failure('worker_log_write_failed', e, task=task_name, resource=log_file)
                             # Log write failed (e.g., disk full). Notify user and close file handle.
-                            log_entries.append(f"WARNING: Log file write failed ({e}). Subsequent logs will only appear in memory.")
+                            log_entries.append(f"WARNING: Log file write failed ({type(e).__name__}). Subsequent logs will only appear in memory.")
                             try:
                                 log_fh.close()
                             except OSError:
@@ -1661,27 +2047,49 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
                 break
             except subprocess.TimeoutExpired:
                 continue
+        review_startup_event('subprocess_finished', exit_code=process.returncode, child_pid=process.pid)
+        if process.returncode and not state.get('cancel'):
+            record_failure('worker_exit_failed', task=task_name, resource=log_file, exit_code=process.returncode)
         return process.returncode, own_lines
 
-    except BaseException:
-        if process is not None:
+    except BaseException as error:
+        from review_startup import event as review_startup_event
+        review_startup_event('subprocess_failed', error=error)
+        if isinstance(error, WindowsOwnerCleanupError):
+            error.owner.cancel_directory = cancel_directory
+            cancel_directory = None
+            _retain_windows_owner_failure(state, error)
+        if not isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            record_failure('worker_stream_failed', error, task=task_name, resource=log_file)
+        if process is not None and not isinstance(error, WindowsOwnerCleanupError):
             try:
                 ensure_failed_subprocess_stopped(process, state)
+            except WindowsOwnerCleanupError as cleanup_error:
+                _retain_windows_owner_failure(state, cleanup_error)
+                raise
             except BaseException:
                 logger.exception("Failed to stop subprocess after stream failure")
         raise
     finally:
         if process is not None:
+            windows_owner = getattr(process, "_alexandria_windows_owner", None)
+            if windows_owner is not None:
+                try:
+                    windows_owner.close()
+                except WindowsOwnerCleanupError as error:
+                    error.owner.cancel_directory = cancel_directory
+                    cancel_directory = None
+                    _retain_windows_owner_failure(state, error)
+                    if log_fh is not None:
+                        log_fh.close()
+                    raise
+                process.wait()
             if "processes" in state and process in state["processes"]:
                 state["processes"].remove(process)
             if state.get("process") is process:
                 state["process"] = None
             if state.get("pid") == process.pid:
                 state["pid"] = None
-            windows_owner = getattr(process, "_alexandria_windows_owner", None)
-            if windows_owner is not None:
-                windows_owner.close()
-                process.wait()
             if reader is not None and reader.is_alive():
                 reader.join(timeout=1)
             if process.stdout is not None and (reader is None or not reader.is_alive()):
@@ -1692,13 +2100,16 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
                 control.close()
         if log_fh is not None:
             log_fh.close()
+        if cancel_directory is not None:
+            cancel_directory.cleanup()
 
 
-_REVIEW_ENTRIES_RE = re.compile(r'Review (?:complete|incomplete):\s*(\d+)\s*->\s*(\d+)\s*entries')
+_REVIEW_ENTRIES_RE = re.compile(r'Review (complete|incomplete):\s*(\d+)\s*->\s*(\d+)\s*entries')
 _REVIEW_SUMMARY_PATTERNS = {
     "text_changed": re.compile(r'Text changed:\s*(\d+)'),
     "speaker_changed": re.compile(r'Speaker changed:\s*(\d+)'),
     "instruct_changed": re.compile(r'Instruct changed:\s*(\d+)'),
+    "annotations_changed": re.compile(r'Annotations changed:\s*(\d+)'),
     "entries_changed": re.compile(r'Entries changed:\s*(\d+)'),
     "entries_added": re.compile(r'Entries added:\s*(\d+)'),
     "entries_removed": re.compile(r'Entries removed:\s*(\d+)'),
@@ -1712,6 +2123,9 @@ _ALIAS_HEADER_RE = re.compile(r'Found \d+ nickname/alias mapping')
 _ALIAS_LINE_RE = re.compile(r"'(.+?)'\s*->\s*'(.+?)'(?:\s*\((.*)\))?\s*$")
 _DIFF_PREVIEW_RE = re.compile(r'DIFF_PREVIEW_JSON:\s*(\{.*\})\s*$')
 _FAILED_SECTIONS_RE = re.compile(r'FAILED_SECTIONS_JSON:\s*(\{.*\})\s*$')
+_REVIEW_FAILURE_RE = re.compile(r'REVIEW_FAILURE_JSON:\s*(\{.*\})\s*$')
+_REVIEW_DISPOSITION_RE = re.compile(r'REVIEW_DISPOSITION_JSON:\s*(\{.*\})\s*$')
+_MAX_REVIEW_FAILURE_MESSAGE_CHARS = 500
 
 
 def _new_review_totals() -> dict:
@@ -1719,7 +2133,30 @@ def _new_review_totals() -> dict:
     totals = {key: 0 for key in _REVIEW_SUMMARY_PATTERNS}
     totals["books_done"] = 0
     totals['accounting_unverified'] = False
+    totals["review_incomplete"] = False
+    totals["review_complete"] = False
+    totals["unreviewed_entries"] = 0
+    totals["post_processing_abort"] = False
+    totals["final_check_aborted"] = 0
+    totals["publication_withheld"] = False
+    totals["resumable_checkpoint"] = False
     return totals
+
+
+def _review_is_incomplete(stats: Optional[dict]) -> bool:
+    """Read the producer's completion marker, falling back to old counter-only output.
+
+    A VRAM abort after the batches (e.g. while deduplicating) leaves both
+    counters at zero, so the marker is authoritative when present. Older stats
+    and persisted batch state may lack it and still rely on the counters.
+    """
+    if not stats:
+        return True
+    if stats.get("review_complete") and not stats.get("review_incomplete"):
+        return False
+    if stats.get("review_incomplete"):
+        return True
+    return bool(stats.get("batches_failed") or stats.get("batches_skipped_vram"))
 
 
 def _extract_review_stats(lines: List[str]) -> Optional[dict]:
@@ -1730,9 +2167,34 @@ def _extract_review_stats(lines: List[str]) -> Optional[dict]:
     if not entries_match:
         return None
     stats = {key: 0 for key in _REVIEW_SUMMARY_PATTERNS}
-    stats["entries_before"] = int(entries_match.group(1))
-    stats["entries_after"] = int(entries_match.group(2))
+    stats["review_incomplete"] = entries_match.group(1) == "incomplete"
+    stats["review_complete"] = entries_match.group(1) == "complete"
+    stats["entries_before"] = int(entries_match.group(2))
+    stats["entries_after"] = int(entries_match.group(3))
+    stats["unreviewed_entries"] = 0
+    stats["post_processing_abort"] = False
+    stats["final_check_aborted"] = 0
+    stats["abort_stage"] = ""
+    stats["retry_offset"] = None
+    stats["publication_withheld"] = False
+    stats["resumable_checkpoint"] = False
     for line in lines:
+        if (match := _REVIEW_DISPOSITION_RE.search(line)) is not None:
+            try:
+                disposition = json.loads(match.group(1))
+                count = disposition['unreviewed_entries']
+                if type(count) is not int or count < 0:
+                    raise ValueError('Invalid unreviewed count')
+                stats["unreviewed_entries"] = count
+                for key in ('post_processing_abort', 'publication_withheld', 'resumable_checkpoint'):
+                    if type(disposition.get(key)) is bool:
+                        stats[key] = disposition[key]
+                stats['final_check_aborted'] = int(stats['post_processing_abort'])
+                stats['abort_stage'] = str(disposition.get('abort_stage') or '')
+                if type(disposition.get('retry_offset')) is int:
+                    stats['retry_offset'] = disposition['retry_offset']
+            except (ValueError, KeyError, TypeError):
+                logger.warning('Malformed review disposition summary; using counters only.')
         if line.startswith('REVIEW_ACCOUNTING_JSON: '):
             try:
                 accounting = json.loads(line.split(': ', 1)[1])
@@ -1765,6 +2227,15 @@ def _combine_pass_stats(*stat_dicts: Optional[dict]) -> dict:
     combined = {key: 0 for key in _REVIEW_SUMMARY_PATTERNS}
     combined["partial"] = False
     combined['accounting_unverified'] = False
+    combined["review_incomplete"] = False
+    combined["review_complete"] = False
+    combined["unreviewed_entries"] = 0
+    combined["post_processing_abort"] = False
+    combined["final_check_aborted"] = 0
+    combined["abort_stage"] = ""
+    combined["retry_offset"] = None
+    combined["publication_withheld"] = False
+    combined["resumable_checkpoint"] = False
     for stats in stat_dicts:
         if not stats:
             combined["partial"] = True
@@ -1774,6 +2245,13 @@ def _combine_pass_stats(*stat_dicts: Optional[dict]) -> dict:
         combined['partial'] = combined['partial'] or bool(stats.get('partial'))
         combined['accounting_unverified'] = (combined['accounting_unverified']
                                             or bool(stats.get('accounting_unverified')))
+        combined["review_incomplete"] = (combined["review_incomplete"]
+                                          or _review_is_incomplete(stats))
+        combined["review_complete"] = combined["review_complete"] or bool(stats.get("review_complete"))
+        combined["unreviewed_entries"] += stats.get("unreviewed_entries") or 0
+        for key in ("post_processing_abort", "publication_withheld", "resumable_checkpoint"):
+            combined[key] = combined[key] or bool(stats.get(key))
+        combined["final_check_aborted"] += int(stats.get("final_check_aborted") or 0)
     combined['accounting_warning'] = get_review_accounting_warning(combined)
     return combined
 
@@ -1849,6 +2327,35 @@ def _extract_failed_sections(lines: List[str]) -> dict:
     return {"sections": []}
 
 
+def _extract_review_failure(lines: List[str]) -> Optional[dict]:
+    """Parse the fatal-error line emitted by review_script.py for the status UI.
+
+    Any fatal review error gets a REVIEW_FAILURE_JSON line with its first line of
+    plain text and, only for the misaligned-resume refusal, a machine-readable
+    kind. This is the one place that redacts and bounds the message before it is
+    stored on the task state; malformed lines are logged and ignored.
+    """
+    for line in reversed(lines):
+        match = _REVIEW_FAILURE_RE.search(line)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                message = data.get("message")
+                if not isinstance(message, str) or not message.strip():
+                    break
+                message = redact_text(message.strip())
+                if len(message) > _MAX_REVIEW_FAILURE_MESSAGE_CHARS:
+                    message = message[:_MAX_REVIEW_FAILURE_MESSAGE_CHARS - 1] + '\u2026'
+                kind = data.get("kind")
+                if not isinstance(kind, str) or not kind:
+                    kind = None
+                return {"message": message, "kind": kind}
+            except (json.JSONDecodeError, AttributeError) as e:
+                logger.warning(f"Malformed REVIEW_FAILURE_JSON line: {e}")
+                break
+    return None
+
+
 def _has_partial_review_labels(failures: Optional[dict]) -> bool:
     return bool(failures and any(isinstance(section, dict)
         and section.get("category") == "review_partial_label_retention"
@@ -1889,6 +2396,8 @@ def _format_book_summary(i: int, total: int, tag: str, name: str, stats: dict) -
             f"{stats['text_changed']} text", f"{stats['speaker_changed']} speaker",
             f"{stats['instruct_changed']} instruct",
             f"+{stats['entries_added']}/-{stats['entries_removed']} entries"]
+    if stats.get("annotations_changed"):
+        bits.append(f"{stats['annotations_changed']} annotation correction(s)")
     if stats["narrators_merged"]:
         bits.append(f"{stats['narrators_merged']} narrators merged")
     if stats["speakers_merged"]:
@@ -1897,6 +2406,12 @@ def _format_book_summary(i: int, total: int, tag: str, name: str, stats: dict) -
         bits.append(f"{stats['batches_failed']} batch(es) failed")
     if stats["batches_skipped_vram"]:
         bits.append(f"{stats['batches_skipped_vram']} batch(es) skipped (VRAM)")
+    if stats.get("review_incomplete"):
+        bits.append("review incomplete")
+        if stats.get("post_processing_abort"):
+            bits.append("all rows reviewed; final checks stopped")
+        elif stats.get("unreviewed_entries"):
+            bits.append(f"{stats['unreviewed_entries']} unreviewed entries")
     if get_review_accounting_warning(stats):
         bits.append(get_review_accounting_warning(stats))
     return f">>> [{i+1}/{total}]{tag} '{name}' done: {', '.join(bits)} <<<"
@@ -1907,10 +2422,25 @@ def _format_pass_summary(label: str, totals: dict, aliases: List[dict], show_ali
     lines = [f"=== {label}: {totals['books_done']} book(s), {totals['total_changes']} total change(s) ===",
              f"  Text: {totals['text_changed']}, Speaker: {totals['speaker_changed']}, "
              f"Instruct: {totals['instruct_changed']}, Entries: +{totals['entries_added']}/-{totals['entries_removed']}"]
+    if totals.get("annotations_changed"):
+        lines.append(f"  Annotations: {totals['annotations_changed']}")
     if totals["narrators_merged"] or totals["speakers_merged"]:
         lines.append(f"  Narrators merged: {totals['narrators_merged']}, Speakers merged: {totals['speakers_merged']}")
     if totals["batches_failed"] or totals["batches_skipped_vram"]:
         lines.append(f"  Batches failed: {totals['batches_failed']}, skipped (VRAM): {totals['batches_skipped_vram']}")
+    if totals.get("review_incomplete"):
+        if totals.get("unreviewed_entries"):
+            stopped = "; final checks stopped" if totals.get("post_processing_abort") else ""
+            lines.append(f"  Review incomplete: {totals['unreviewed_entries']} unreviewed entries{stopped}")
+        elif totals.get("post_processing_abort") and not totals.get("batches_failed"):
+            lines.append("  Review incomplete: all rows reviewed; final checks stopped")
+        elif totals.get("batches_failed"):
+            lines.append(f"  Review incomplete: {totals['batches_failed']} section(s) failed; "
+                         "rows remain unresolved")
+        else:
+            lines.append("  Review incomplete: unresolved rows remain")
+    if totals.get("final_check_aborted"):
+        lines.append(f"  Final checks stopped for {totals['final_check_aborted']} book(s); unreviewed rows: {totals.get('unreviewed_entries', 0)}")
     if get_review_accounting_warning(totals):
         lines.append('  ' + get_review_accounting_warning(totals))
     if show_aliases:
@@ -1929,6 +2459,7 @@ _STAT_LABELS = [
     ("text_changed", "Lines with reworded text"),
     ("speaker_changed", "Lines with a changed speaker"),
     ("instruct_changed", "Lines with updated voice direction"),
+    ("annotations_changed", "Lines with corrected annotations"),
     ("entries_added", "New lines added"),
     ("entries_removed", "Lines removed"),
     ("narrators_merged", "Narration lines merged together for smoother flow"),
@@ -1956,15 +2487,29 @@ def get_review_accounting_warning(stats: dict) -> str:
 def _markdown_heads_up_lines(stats: dict) -> List[str]:
     """Plain-language notes about anything the reviewer couldn't finish."""
     lines = []
+    historical_only = stats.get('review_complete') and not stats.get('review_incomplete')
     if get_review_accounting_warning(stats):
         lines.append('- ' + get_review_accounting_warning(stats))
-    if stats.get("batches_failed"):
+    if stats.get("batches_failed") and not historical_only:
         lines.append(f"- {stats['batches_failed']} section(s) ran into an error and were left "
                       f"unchanged. Running the review again may fix these.")
-    if stats.get("batches_skipped_vram"):
+    if stats.get("batches_skipped_vram") and not historical_only:
         lines.append(f"- {stats['batches_skipped_vram']} section(s) were skipped because the "
                       f"graphics card was running low on memory. Running the review again may "
                       f"catch these.")
+    if stats.get("post_processing_abort") and stats.get("unreviewed_entries"):
+        lines.append(f"- Final checks stopped on some book(s), and {stats['unreviewed_entries']} "
+                     "entries were left unreviewed. Re-run to finish them when a verified "
+                     "checkpoint is available.")
+    elif stats.get("post_processing_abort") and not stats.get("batches_failed"):
+        lines.append("- All entries were reviewed, but the review stopped during final checks. "
+                     "Re-run to finish those checks when a verified checkpoint is available.")
+    elif stats.get("post_processing_abort") or stats.get("final_check_aborted"):
+        lines.append("- Final checks also stopped on some book(s) while other sections failed. "
+                     "Re-run to finish those checks when a verified checkpoint is available.")
+    elif stats.get("review_incomplete") and stats.get("unreviewed_entries"):
+        lines.append(f"- {stats['unreviewed_entries']} entries were left unreviewed. "
+                     "Re-run to finish them when a verified checkpoint is available.")
     return lines
 
 
@@ -2094,17 +2639,27 @@ def _validate_local_llm_base_url(base_url: str) -> None:
     """
     if not base_url:
         return
+    from lmstudio_settings import is_usable_llm_endpoint
+    # The same strict authority/port check the failover predicate and runtime
+    # client use: a parser-valid loopback URL with port 0 is not dialable, and
+    # Setup must not accept what a run would refuse.
+    if not is_usable_llm_endpoint(base_url):
+        raise LLMConfigError(f"LLM base_url '{base_url}' is not local. Only local/trusted LLM endpoints are permitted.")
     if is_local_llm_endpoint(base_url):
         return
     from urllib.parse import urlparse
+    from llm_provider import is_official_openai_endpoint
+    # One OpenAI endpoint decision for validation and implicit-key resolution:
+    # the same normalized spellings are accepted by both (Rule 15).
+    if is_official_openai_endpoint(base_url):
+        return
     parsed = urlparse(base_url)
     hostname = (parsed.hostname or "").lower()
     # Thunder Compute forwards instance ports via *.thundercompute.net, so allow
     # that trusted remote host for running LM Studio on a Thunder GPU instance.
     if hostname == "thundercompute.net" or hostname.endswith(".thundercompute.net"):
         return
-    hosted_paths = {"api.deepseek.com": ("", "/v1"), "api.openai.com": ("/v1",),
-                    "openrouter.ai": ("/api/v1",)}
+    hosted_paths = {"api.deepseek.com": ("", "/v1"), "openrouter.ai": ("/api/v1",)}
     if hostname in hosted_paths:
         try:
             port = parsed.port
@@ -2201,6 +2756,7 @@ def _llm_summarize_report(markdown_body: str) -> Optional[str]:
     Validates that the configured base_url is local/trusted before sending data."""
     from manual_llm_context import ManualRequestCancelled
     try:
+        from llm_provider import get_effective_authorization
         client, model_name = _make_llm_client(timeout=60)
 
         messages = [
@@ -2212,7 +2768,8 @@ def _llm_summarize_report(markdown_body: str) -> Optional[str]:
         status = get_current_status(
             full_cfg.get("llm_mode", "local"), llm_cfg.get("base_url", ""),
             model_name, (full_cfg.get("llm_remote_ssh") or "").strip(), use_cache=True,
-            api_key=llm_cfg.get("api_key"))
+            api_key=llm_cfg.get("api_key"),
+            authorization=get_effective_authorization(llm_cfg), llm_config=llm_cfg)
         response = client.chat.completions.create(
             model=model_name,
             messages=messages,
@@ -2249,7 +2806,18 @@ def _get_deterministic_review_summary(stats: dict, incomplete: bool) -> str:
             details.append(f"{failed} section(s) failed")
         if skipped:
             details.append(f"{skipped} section(s) were skipped for VRAM safety")
-        reason = "; ".join(details) or "some work did not finish"
+        if (stats.get('final_check_aborted', 0) or stats.get('post_processing_abort')) and stats.get('unreviewed_entries', 0):
+            books = stats.get('final_check_aborted', 0) or 1
+            reason = (f"{books} book(s) stopped in final checks and "
+                      f"{stats['unreviewed_entries']} entries were left unreviewed")
+        else:
+            if stats.get('final_check_aborted', 0) or stats.get('post_processing_abort'):
+                books = stats.get('final_check_aborted', 0) or 1
+                details.append(f"{books} book(s) stopped in final checks")
+            reason = ("; ".join(details) or
+                      ("all entries were reviewed but final checks did not finish"
+                       if stats.get("post_processing_abort") else
+                       "the review stopped before all entries were reviewed"))
         return (
             f"This review was incomplete: {reason}. Completed sections reported "
             f"{total_changes} change(s). Check the warnings below before generating audio."
@@ -2306,10 +2874,25 @@ def _write_single_review_report(stats: dict, highlights: Optional[dict] = None,
         f"**{stats['entries_after']}** lines.",
     ]
 
-    if stats.get("batches_skipped_vram"):
+    incomplete = _review_is_incomplete(stats)
+    if incomplete and stats.get("batches_skipped_vram"):
         intro += ["", f"**Note:** this script was only partially reviewed — the GPU ran low "
                        f"on memory and {stats['batches_skipped_vram']} section(s) were skipped. "
                        "Re-run the review to finish the rest."]
+    elif incomplete:
+        if stats.get("post_processing_abort"):
+            reason = "all entries were reviewed but final checks did not finish"
+        elif stats.get("unreviewed_entries"):
+            reason = f"{stats['unreviewed_entries']} entries were left unreviewed"
+        else:
+            reason = "the review stopped before all entries were checked"
+        resume = ("Re-run to resume from its verified checkpoint."
+                  if stats.get("resumable_checkpoint") else
+                  "No resumable checkpoint was verified; re-run the review.")
+        withheld = (" The script and audio were left unchanged."
+                    if stats.get("publication_withheld") else "")
+        intro += ["", f"**Note:** this script was only partially reviewed — {reason}. "
+                      f"{resume}{withheld}"]
 
     lines = list(intro)
     if _has_partial_review_labels(failures):
@@ -2337,7 +2920,6 @@ def _write_single_review_report(stats: dict, highlights: Optional[dict] = None,
         lines += _markdown_failed_sections_lines(failures)
         lines += density_lines
 
-    incomplete = bool(stats.get("batches_failed") or stats.get("batches_skipped_vram"))
     lines = _insert_llm_summary(lines, len(intro), stats, incomplete=incomplete)
 
     try:

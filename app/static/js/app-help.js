@@ -13,6 +13,7 @@
             'roster-split-name': {what: 'Name the new character when splitting one selected identity. Supply a supporting source quote before approval.'},
             'roster-split-new': {what: 'Retire the original identity and allocate two new identities for this split. Leave off to keep the original identity for one character.'},
             'roster-consent': {what: 'Confirm that you reviewed the proposed identities and exact source locations. Edits invalidate this confirmation.'},
+            'setup-expert-toggle': {what: 'Show the advanced Setup categories: limits and retries, audio and timing, generation, script strategy and prompt studio. Switching it off changes no setting and saves nothing.'},
             'setup-settings-category': {what: 'Choose which Setup category to display. Edits in other categories are retained. Save Configuration applies all edited categories.'},
             'setup-settings-search': {what: 'Find available Setup settings by their labels and explanations, then jump to the original control. Does not search field values or save settings.'},
             'setup-ui-locale': {what: "Choose the language of this Setup pane and the app shell: English, Chinese, Japanese, Spanish or the layout-test Pseudo-English. Help text, task logs, safety warnings and other tabs stay English until their phase ships. Preserves counts, config values and book/TTS/transcription language."},
@@ -87,6 +88,7 @@
             'presence-penalty': {what: 'Discourages repeating tokens that already appeared. 0 disables it.'},
             'banned-tokens': {what: 'Comma-separated tokens the model may not produce. To turn reasoning off, use Reasoning effort rather than banning the think tag.'},
             'merge-narrators': {what: 'During review, joins neighbouring NARRATOR lines that share a delivery note into one longer line. Leave off for finer per-line voice control.'},
+            'review-target-chars': {what: 'Size review requests by characters instead of entry count, counting only entry text. 0 keeps the current 25-entry batching. The model rewrites every entry you send it, so its reply grows with this value; if the reply exceeds Max tokens, that batch fails and keeps its original text.'},
 
             // Setup: three-pass annotation
             'tp-chunk-size': {what: 'How much book text Step 1 sends per request when splitting it into lines. Bigger pieces mean fewer requests, but a longer reply that is redone whole if one word comes back wrong.'},
@@ -102,6 +104,9 @@
             'tp-quoted-must-be-spoken': {what: 'Rejects a Step 1 reply that types quoted text as narration.'},
             'tp-unquoted-must-be-narrator': {what: 'Rejects a Step 1 reply that types unquoted text as speech.'},
             'tp-keep-whole-batch': {what: 'Keeps a Step 2 batch whose only problems are names written in lower case in the book or an unnamed quoted line. Those lines are marked for review instead of re-asked.'},
+            'cast-list-incremental': {what: 'Experimental sequential cast discovery with the complete accumulated roster and aliases. Also adds explicit cast alias evidence to Step 2. Off by default; save configuration before building or generating.', source: '#1931'},
+            'cast-list-source-chars': {what: 'Maximum source characters per experimental window, including separators. Whole paragraphs only; wrapped lines stay intact. If one cannot fit, raise the cap or add blank lines (changes source identity). Instructions and roster also need context. Failure preserves the previous cast.'},
+            'cast-list-max-tokens': {what: 'Requested reply tokens per cast window, or for the legacy whole-book request. Profile limits still apply; truncated replies are discarded.'},
             'tp-group-rule': {what: 'Unnamed dialogue from a group on the cast list (e.g. THE GUARDS) is assigned to that group instead of UNKNOWN.'},
             'tp-speaker-traits': {what: 'Also records gender, age group and ageless status for each line. This adds to every Step 2 reply; check the inferred traits against the book.'},
             'tp-segment-temperature': {what: 'Sampling randomness for Step 1 (splitting text into lines).'},
@@ -112,8 +117,20 @@
             'lmstudio-optimize-toggle': {what: 'Reloads LM Studio with tuned settings: locally context 8192 and parallel 1 (kept low for VRAM safety); remotely context 98304 and parallel 2 over SSH. Off restores LM Studio’s defaults.'},
 
             // Setup: prompts
-            'prompt-preset-select': {what: 'How Step 2 asks the model who speaks each line. michel2_full is the default. michel2_spoken labels only the quotes and fills narration in code. If you serve an attribution adapter, keep the prompt it was trained on (usually michel2_full).', recommend: 'michel2_spoken on Qwen3-14B without an adapter: +6.5 points on a local gold set (p = 0.001) with about 3× less Step 2 time. Not yet measured on other models.', source: '#1171 / #1176 A/Bs'},
+            'prompt-preset-select': {what: 'How Step 2 asks the model who speaks each line. michel2_full is the default. michel2_spoken labels only the quotes and fills narration in code. If you serve an attribution adapter, keep the prompt it was trained on (usually michel2_full). Check confirms served path and positive scale only.', recommend: 'michel2_spoken on Qwen3-14B without an adapter: +6.5 points on a local gold set (p = 0.001) with about 3× less Step 2 time. Not yet measured on other models.', source: '#1171 / #1176 A/Bs'},
+            'cast-prompt-preset-select': {what: 'Saved instructions for building the cast list. Each preset includes whole-book and experimental incremental instructions. Save Setup before starting a build.'},
+            'cast-whole-book-prompt': {what: 'Literal instructions for whole-book cast discovery. The builder appends the prepared source. Keep the JSON array of name and aliases objects.'},
+            'cast-incremental-prompt': {what: 'Literal instructions used only with experimental incremental discovery. Every window still receives all validated names and aliases; source coverage and merge validation remain enforced.'},
             'pass1-prompt-preset-select': {what: 'Prompt preset for Step 1 (splitting text into lines). Default uses the checked-in prompt.'},
+            'pass1_compact-system-prompt': {"what":"Compact labels (experimental). These system instructions apply only to this experimental prompt family."},
+            'pass1_compact-user-prompt': {"what":"Used only when Compact labels is selected for Pass 1. Save Setup before generating. Keep one {units} placeholder and the numbered JSON label response. Quote parsing and ordinary fallback still apply."},
+            'pass1_compact-prompt-preset-select': {"what":"Choose a saved preset for compact labels (experimental). Changing this preset does not enable the experiment. Save Setup to use it for future requests."},
+            'pass3_gaps-system-prompt': {"what":"Notes with timed pauses (experimental). These system instructions apply only to this experimental prompt family."},
+            'pass3_gaps-user-prompt': {"what":"Used only for Current notes + timed pauses. Save Setup before generating. Keep one {batch} placeholder and the n, instruct and gap response fields. Use the default ordinary Step 3 preset."},
+            'pass3_gaps-prompt-preset-select': {"what":"Choose a saved preset for notes with timed pauses (experimental). Changing this preset does not enable the experiment. Save Setup to use it for future requests."},
+            'pass3_directed-system-prompt': {"what":"Directed replies and intent only (experimental). These system instructions apply only to this experimental prompt family."},
+            'pass3_directed-user-prompt': {"what":"Shared by Directed replies + timed pauses and Intent only + timed pauses. Save Setup before generating. Keep one {batch} placeholder and the n, answers, action, delivery and gap response fields. Intent only omits delivery when composing notes. Use the default ordinary Step 3 preset."},
+            'pass3_directed-prompt-preset-select': {"what":"Choose a saved preset for directed replies and intent only (experimental). Changing this preset does not enable the experiment. Save Setup to use it for future requests."},
             'pass1-system-prompt': {what: 'Step 1 system prompt. Edit only to customise; the text must still come back word for word.'},
             'pass1-user-prompt': {what: 'Step 1 user prompt template. It must keep {chunk}.'},
             'system-prompt': {what: 'Attribution instruction block. Default-shaped prompts must keep {roster} and {batch}; passage-shaped prompts (michel, michel2…) get the roster and marked passage added around them.'},
@@ -122,8 +139,10 @@
             'pass3-prompt-preset-select': {what: 'Prompt preset for Step 3 (delivery notes). Default uses the checked-in prompt.'},
             'pass3-system-prompt': {what: 'Step 3 system prompt for writing delivery notes.'},
             'pass3-user-prompt': {what: 'Step 3 user prompt template. It must keep {batch}.'},
+            'review-prompt-preset-select': {what: 'Saved review prompts. Default uses the checked-in prompts; a custom user template must keep {context} and {batch}. Labels-only review ignores these prompts. Switching presets changes the prompts saved in Setup, so an already-reviewed book is reviewed again.'},
             'review-system-prompt': {what: 'Instructions for the review pass: which mistakes to fix and how.'},
             'review-user-prompt': {what: 'Template for each review batch. It must keep {context} and {batch}.'},
+            'review-labels-only': {what: "Only correct each line's speaker and delivery labels; the script text is never rewritten, and a custom Review System or User prompt is ignored in favour of its own label prompt. Part of a completed review's identity, so changing it reviews the book again."},
             'persona-system-prompt': {what: 'System instruction for voice-persona generation, shared by basic and advanced modes.'},
             'persona-user-prompt': {what: 'Template for a basic persona. It uses {speaker}, {narrator_context} and {sample_lines}.'},
             'persona-reference-chars': {what: 'How much character evidence the advanced persona compilation may send per request. The model’s context may force smaller requests.'},
@@ -146,10 +165,10 @@
             'script-strip-front-matter': {what: 'Removes known non-story boilerplate (translator’s notes, tables of contents) before the text is sent to the LLM.'},
             'script-literal-source-preserving': {what: 'Keeps the book’s exact words through annotation and review. Numbers and symbols may still be expanded later for speech.'},
             'review-force-rerun': {what: 'Review again even if nothing changed since the last completed review.'},
-            'review-context-window': {what: 'Neighbouring lines shown on each side of every reviewed line, so review can fix boundaries and speakers using the surrounding scene.'},
+            'review-context-window': {what: 'Extra entries sent on each side of every reviewed entry, counted in whole entries (1–100, default 4) or characters of their text (up to 1,000,000). Entries are never split; in Characters mode one neighbour longer than the limit is still sent on its own. More context is slower and costs more.'},
             'review-batch-find-nicknames': {what: 'Before merging names, discovers each book’s nicknames and shares them across the series.'},
             'review-batch-bidirectional': {what: 'Runs nickname discovery forward and then backward, so early books pick up names that are explained later. Needs nickname discovery; about twice the time.'},
-            'review-batch-context-window': {what: '0 runs the standard review. Above 0, each line is reviewed with that many neighbouring lines on each side.'},
+            'review-batch-context-window': {what: '0 runs the standard review. Above 0, each line is reviewed with that many neighbouring lines on each side (1–100 entries).'},
             'speaker-review-source': {what: 'Which speaker labels to check: the current script or an attribution checkpoint.'},
             'speaker-review-reference': {what: 'A saved script to compare the labels against, used as a provisional reference.'},
             'speaker-review-max-pairs': {what: 'Most label pairs sent for review in one run (up to 20).'},
@@ -160,6 +179,7 @@
             'single-voice-source': {what: 'Speaker whose existing voice to review for book-wide use. Preview lists every affected speaker before anything is applied.'},
 
             // Voices tab
+            'voices-show-reviews': {what: 'Show or hide the persona and voice review buttons on every voice card. This display preference is saved in this browser when storage is available; it does not change saved review statuses.'},
             'voices-state-filter': {what: 'Show all characters, or only those with or without state cards (per-state voices, e.g. a time skip).'},
             'voices-hide-ready': {what: 'Hide characters already marked ready.'},
             'narrator-strategy': {what: 'How the narrator voice is chosen: one global voice, or varied by scene focus, chapter, focus character, or the character’s gender and age.'},
@@ -180,7 +200,9 @@
 
             // Editor tab
             'sound-assets-file': {what: 'Choose WAV, FLAC, MP3 or OGG audio to retain in the sound asset library. Import verifies the complete file. It does not change book audio; use the library to audition it first.'},
-            'editor-repair-chapter': {what: 'Choose one detected export chapter, or the entire book, for the audio repair preview. Without headings, each line is a chapter.'},
+            'editor-repair-chapter': {what: 'Choose one detected export chapter, or the entire book, for the audio repair preview. Without headings, the whole script is one chapter.'},
+            'editor-chapter-selection': {what: 'Chapter numbers to render, as in the Result tab’s chapter box: single numbers and ranges separated by commas, for example 1-3, 5.'},
+            'editor-chapter-regenerate': {what: 'Also replace audio for lines in these chapters that already have it. Off by default, so only missing lines are rendered. Asks before replacing.'},
             'editor-repair-speakers': {what: 'Select one or more literal speaker labels to include in the repair preview. Preview shows the exact affected lines before audio replacement.'},
             'editor-quality-filter': {what: 'Filter the take review queue by saved findings, historical speech evidence or missing checks. Compare retained candidates without changing audio; restoration requires an explicit action. Unknown evidence is not a clean result.'},
             'chk-drift-only': {what: 'Show only chunks the drift check flagged as sounding unlike their speaker’s reference voice.'},
@@ -334,7 +356,23 @@
         };
 
         const ACTION_HELP = {
+            'openScriptWorkspace': 'Open Script to choose a source or review its publication status. No generation starts.',
+            'editorWaveformSeek': 'Seek within the selected saved take by clicking or dragging. Left/Right moves five seconds; Home/End moves to the boundaries. This does not regenerate audio.',
+            'openBasicWorkflowControl': 'Open the existing Voices or Result controls. This does not copy settings, save changes or start generation.',
+            'refreshScriptIngestFacts': 'Read the active source, validated roster and script comparison again. Unknown or stale evidence stays unverified; this starts no model task.',
+            'troubleshootLlmConnection': 'Show endpoint troubleshooting beside the connection result. No request is sent and no settings are saved.',
+            'editorToolSoundAssets': 'Show the sound library: import, audition and delete reusable effects. Opening the panel changes nothing.',
+            'editorToolSoundCues': 'Show where effects are cued against script lines. Opening the panel changes no cue.',
+            'editorToolRenditions': 'Show recorded renditions and stems. Opening the panel renders nothing.',
+            'editorToolMixes': 'Show the mixed audio review and its exports. Opening the panel mixes nothing.',
+            'editorToolPronunciation': 'Show pronunciation rules and the preview that applies them. Opening the panel changes no rule.',
+            'editorToolChapters': 'Show chapter-by-chapter script generation. Opening the panel starts nothing.',
+            'editorToolRepair': 'Show the repair panel for regenerating only the audio that is wrong. Opening the panel regenerates nothing.',
             'audiobookshelfApiDocs': 'Open the official Audiobookshelf API documentation. Does not upload audio or send your API key.',
+            'scriptIngestUpload': 'Choose text: focus the upload control. Source facts appear only after the server accepts the text. Focusing starts no transcription.',
+            'scriptIngestExisting': 'Accept text: focus the existing-file picker to reuse a source on the server. No script is generated by this shortcut.',
+            'scriptIngestAnalyze': 'Focus the existing character-roster builder. Build and review speakers here; script generation supplies scene context. This shortcut starts no model task.',
+            'scriptIngestGenerate': 'Generate script: focus the existing Generate Script action. The progress summary compares saved text with its prepared source, not the name of a file. This shortcut starts nothing.',
             'saveAbsConfig': 'Save the selected Audiobookshelf server and its API key in the OS credential store. Does not send the audiobook.',
             'loadAbsLibraries': 'Contact the selected Audiobookshelf server to list accessible libraries and folders. Does not upload audio.',
             'previewAbsSend': 'Check the current export and destination, then display their identity before you confirm sending. Contacts the server to check the destination.',
@@ -380,6 +418,7 @@
             'closeSetupPreview': 'Close the settings preview without saving or changing form values.',
             'openSetupSettingsSection': 'Display this settings category while keeping edits in every category. Jump to this Setup section without changing or saving settings.',
             'openSetupSetting': 'Open the matching setting and move keyboard focus to its original control. Does not change its value.',
+            'reviewLabelsOnlyPointer': 'Shows whether labels-only review is currently on, and opens its saved switch in Setup → Prompt studio. Does not change or save the setting.',
             'clearSetupSettingsSearch': 'Clear the settings search and its results without changing your configuration.',
             'clearSynthesisRecoveryWindows': 'Clear healthy indexed recovery artifacts while tasks are idle. Open Editor first to load the current book. Saved takes and unknown files are kept.',
             'reloadPageAfterConfirmation': 'Reload the page to use the running app’s latest files. Confirm first so unsaved work is not discarded accidentally.',
@@ -389,6 +428,7 @@
             'autoConfigureSettings': 'Inspect the available hardware and fill suggested TTS settings into this form. Review and Save to apply them.',
             'loadConfig': 'Reload saved app settings into this form.',
             'toggleLlmKeyVisibility': 'Show or conceal the API key in this form. This changes its display, not the saved key.',
+            'undoDeleteChunk': 'Restore the last deleted line using its server receipt. Recent deletions can be undone in reverse order for 30 minutes; other revisions or book changes refuse recovery.',
             'testLlmConnection': 'Contact the configured model endpoint to check that it can answer a test request.',
             'loadMissingPromptDefaults': 'Fill missing prompt fields with defaults while keeping existing prompt edits.',
             'savePromptPreset': 'Save the current prompt settings under a preset name for later reuse.',
@@ -448,6 +488,8 @@
             'loadPreparerOutputs': 'Refresh the completed training-dataset downloads.',
             'saveVoicelabConfig': 'Save the pipeline interpreter, model and search-folder settings.',
             'voicelabInspect': 'Inspect the selected input folder and show which voice datasets are available.',
+            'openVoicelabSettings': 'Open the pipeline settings to correct missing dependency paths without starting work.',
+            'copyVoicelabFailureDetails': 'Copy the displayed technical failure details, including private paths. Review and redact before sharing.',
             'startVoicelab': 'Preflight the selected stages and resources, then ask for confirmation before starting the pipeline.',
             'pauseResumeVoicelab': 'Pause or resume the Voice Lab pipeline.',
             'cancelVoicelab': 'Request cancellation of the Voice Lab pipeline.',
@@ -516,11 +558,12 @@
             'removeStatePersona': 'Remove the saved persona for this state.',
             'editPersonaVoiceAudit': 'Edit the recorded link and reasoning between this persona and its assigned voice.',
             'setVoiceApproval': 'Record the selected review status for this persona or voice. This records your decision; it does not generate audio.',
+            'setVoiceSectionsOpen': 'Expand or collapse all persona review sections. Each voice remembers its last state in this browser.',
             'addVoiceVersion': 'Save a named version of this character’s current voice settings.',
             'openVoiceStates': 'Show voice changes across the character’s states or timeline.',
             'suggestMoreVoices': 'Generate additional voice candidates for this character to compare.',
             'uploadCloneVoice': 'Choose a recording to import as this character’s cloning reference.',
-            'playCloneVoice': 'Play this voice’s current reference recording.',
+            'playCloneVoice': 'Play or stop this voice’s current reference recording.',
             'deleteCloneVoice': 'Remove the selected cloning reference.',
             'openVoiceDesignEditor': 'Open this assigned designed voice in the Designer for editing.',
             'applyStableVoiceSeeds': 'Apply stable voice seeds so unchanged settings can produce repeatable takes.',
@@ -603,6 +646,12 @@
         };
 
         const ITEM_HELP = {
+            'skip-main-link': 'Move keyboard focus to the main content, bypassing the navigation menu. No settings change and no task starts.',
+            'editor-line-waveform-retry': 'Try reading the selected take again after a waveform error. This only refreshes the sketch; it does not regenerate or change the audio.',
+            'btn-editor-batch': 'Open the batch actions for the script: regenerate, repair or export several lines at once. Nothing runs until you pick an action.',
+            'editor-tools-toggle': 'Open or close the tool drawer, which keeps the sound, rendition, mix, pronunciation, chapter and repair panels beside the line editor without leaving this tab.',
+            'editor-drawer-scrim': 'Dims the page while the tool drawer is open. Clicking it closes the drawer and returns focus to the Tools button.',
+            'editor-tools-close': 'Close the tool drawer and return focus to the Tools button. Closing changes no setting and discards nothing.',
             'translated-edition-refresh': 'Re-check which language pairs are installed on this machine. Does not download anything.',
             'translated-edition-create': 'Build a reviewable translation proposal for the first 25 saved Script rows. Proposal only: never changes the Script, source, or any language setting, and it refuses rather than download when Argos needs a sentence-splitter model that is not already installed. It belongs to the active book; re-opening the panel with nothing running shows the most recent saved preview for the current book, and another book\'s preview is never shown for this book.',
             'translated-edition-cancel': 'Request a stop for a running preview after the current row. A preview that has not finished building is saved as cancelled, never complete or approved; one already finished keeps its finished status.',
@@ -645,13 +694,19 @@
             'btn-gen-script': 'Generate an annotated script for the current book, using retained progress when available.',
             'btn-gen-script-fresh': 'Discard saved generation progress for this text and start again from its first chunk.',
             'btn-review-script': 'Review the current annotated script with the configured model and review settings.',
+            'btn-review-fresh': 'Discards saved review progress and starts at batch 1 after confirmation. Keeps the current script, source, accepted corrections and user edits.',
+            'btn-review-contextual-fresh': 'Discards saved review progress and starts contextual review at batch 1 after confirmation. Keeps the current script, source, accepted corrections and user edits.',
+            'btn-review-batch-fresh': 'Discards saved review progress for selected books and starts at batch 1 after confirmation. Keeps each current script, source, accepted corrections and user edits.',
             'btn-review-script-contextual': 'Review script entries with surrounding context using the selected context-window setting.',
+            'btn-review-context-mode': 'Switches between Entries and Characters; each keeps its own value. Changing the mode or value counts as a new review: a finished review is not reused and a paused one will not resume under the new setting. The default (4 entries) matches older reviews, so those are not redone.',
             'speaker-review-load': 'Refresh available label-review sources and saved references.',
             'speaker-review-preview': 'Preview speaker-label disagreements and the excerpts that a review would send to the model.',
             'speaker-review-start': 'Start the previewed speaker-label review after the required source/reference consent.',
             'speaker-review-cancel': 'Request cancellation of the current speaker-label review.',
             'speaker-review-cancel-previous': 'Request cancellation of the previous speaker-label review still running.',
             'speaker-review-refresh': 'Refresh the status and result of this speaker-label review.',
+            'editor-chapter-start': 'Render the chosen chapters with the current voices and settings. Other chapters’ audio is left as it is.',
+            'editor-chapter-refresh': 'Reload the chapter progress map from the current lines.',
             'btn-merge': 'Merge generated chunk audio into the combined output using the configured pauses.',
             'chapter-preview-btn': 'Preview chapter boundaries and filenames for the current export settings.',
             'chapter-export-btn': 'Export the selected chapters into individual audio files.',
@@ -813,6 +868,7 @@
         function getItemHelpText(control, locale = getUiLocale()) {
             if (control.type === 'hidden') { return ''; }
             if (control.type === 'file' && (control.hidden || control.style.display === 'none')) { return ''; }
+            if (control.id === 'theme-toggle' && control.getAttribute('aria-label')) { return control.getAttribute('aria-label'); }
             if (getHelpEntry(FIELD_HELP, control.id)) { return getFieldHelpText(FIELD_HELP[control.id], control.id, locale); }
             if (getHelpEntry(ITEM_HELP, control.id)) { return formatHelpText(getHelpCatalogKey('ITEM_HELP', control.id), ITEM_HELP[control.id], locale); }
             if (control.dataset.helpKey && getHelpEntry(ACTION_HELP, control.dataset.helpKey)) { return formatHelpText(getHelpCatalogKey('ACTION_HELP', control.dataset.helpKey), ACTION_HELP[control.dataset.helpKey], locale); }
@@ -917,6 +973,7 @@
         }
 
         function renderItemHelp(control) {
+            captureUiAuthoredAttributes(control);
             const nativeTitle = control.getAttribute('title');
             if (nativeTitle !== null) {
                 helpNativeTitles.set(control, nativeTitle);
@@ -947,6 +1004,7 @@
                         saved[name] = wrapper.getAttribute(name);
                     }
                     helpLabelAttributes.set(wrapper, saved);
+                    captureUiAuthoredAttributes(wrapper);
                     wrapper.removeAttribute('title');
                 } else {
                     wrapper = document.createElement('span');

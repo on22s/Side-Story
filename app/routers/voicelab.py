@@ -14,8 +14,11 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 from pydantic import field_validator
+from windows_subprocess_owner import WindowsOwnerCleanupError
 
 from core import (
+    get_task_lifecycle,
+    mark_expected_probe_response,
     API_LOG_DIR,
     CONFIG_PATH,
     DATA_DIR,
@@ -42,7 +45,7 @@ from core import (
     claim_gpu_task, schedule_claimed_background_task,
     process_state,
 )
-from device_utils import normalize_device
+from device_utils import get_cuda_device_index, normalize_device
 from training_preflight import get_training_vram_error, get_training_disk_error
 from utils import atomic_json_write, file_lock, safe_load_json
 from voicelab_settings import get_profiler_paths, get_voice_lab_script_path
@@ -50,7 +53,7 @@ from run_history import list_runs, update_run
 from runtime_info import get_runtime_info
 from routers.lora import list_adapters_needing_recovery
 from config_settings import load_app_config
-from lmstudio_settings import is_remote_llm
+from lmstudio_settings import get_active_llm_config, is_active_llm_remote
 import diagnostics as diagnostics_module
 
 
@@ -152,26 +155,46 @@ class VoiceLabRequest(BaseModel):
         return normalize_device(value) if value is not None else None
 
 
-def _probe_voicelab_interpreter(rocm_python: str) -> dict:
-    """Read Torch/device/dependency state from the interpreter that will run ML stages."""
+def _probe_voicelab_interpreter(rocm_python: str, device: str = "auto") -> dict:
+    """Read Torch/device/dependency state from the interpreter that will run ML stages.
+
+    An explicit cuda:N is passed to the subprocess as a validated integer argv
+    so mem_get_info and get_device_name both use that GPU. An index at or above
+    device_count is reported rather than raising inside the probe. 'cuda'/'auto'
+    keep the unindexed calls (the current device), exactly as before.
+    """
+    from review_startup import record_failure
+    normalized = normalize_device(device)
+    index = get_cuda_device_index(normalized) if normalized.startswith("cuda:") else -1
     code = (
-        "import importlib.util,json,torch; "
+        "import importlib.util,json,sys,torch; "
+        "idx=int(sys.argv[1]) if len(sys.argv)>1 else -1; "
         "ok=torch.cuda.is_available(); "
+        "index_ok=True if not ok else (idx<0 or idx<torch.cuda.device_count()); "
         "mps=bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()); "
+        "gpu=(torch.cuda.get_device_name(idx if idx>=0 else 0) if index_ok else None) "
+        "if ok else ('Apple MPS' if mps else None); "
+        "vram=((torch.cuda.mem_get_info(idx) if idx>=0 else torch.cuda.mem_get_info()) "
+        "if index_ok else None) if ok else None; "
         "print(json.dumps({'python':__import__('sys').version.split()[0],"
         "'torch':torch.__version__,'hip':getattr(torch.version,'hip',None),"
-        "'cuda_available':ok,'mps_available':mps,"
-        "'gpu':torch.cuda.get_device_name(0) if ok else ('Apple MPS' if mps else None),"
-        "'vram':torch.cuda.mem_get_info() if ok else None,"
+        "'cuda_available':ok,'mps_available':mps,'device_index_ok':index_ok,"
+        "'gpu':gpu,'vram':vram,"
         "'deps':{n:importlib.util.find_spec(n) is not None for n in "
         "['speechbrain','librosa','peft','llama_cpp']}}))")
     try:
-        result = subprocess.run([rocm_python, "-c", code], capture_output=True,
+        result = subprocess.run([rocm_python, "-c", code, str(index)], capture_output=True,
                                 text=True, timeout=20, check=False,
                                 env=_rocm_env(rocm_python))
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        return json.loads(lines[-1]) if result.returncode == 0 and lines else {}
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        if result.returncode != 0 or not lines:
+            record_failure('voicelab_probe_unavailable', task='voicelab', resource=rocm_python,
+                           exit_code=result.returncode, level=logging.WARNING)
+            return {}
+        return json.loads(lines[-1])
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        record_failure('voicelab_probe_failed', error, task='voicelab', resource=rocm_python,
+                       level=logging.WARNING)
         return {}
 
 
@@ -275,7 +298,9 @@ def _build_voicelab_preflight(request: VoiceLabRequest, cfg: dict) -> dict:
     needs_rocm = bool(ml_stages.intersection(stages))
     rocm = cfg.get("rocm_python") or ""
     interpreter_ok = bool(rocm and os.path.isfile(rocm) and os.access(rocm, os.X_OK))
-    probe = _probe_voicelab_interpreter(rocm) if needs_rocm and interpreter_ok else {}
+    requested_device = request.device or "auto"
+    probe = (_probe_voicelab_interpreter(rocm, requested_device)
+             if needs_rocm and interpreter_ok else {})
     if needs_rocm and not interpreter_ok:
         finding(blockers, "interpreter_missing", "Configure an executable ROCm Python interpreter.")
     elif needs_rocm and not probe:
@@ -318,9 +343,9 @@ def _build_voicelab_preflight(request: VoiceLabRequest, cfg: dict) -> dict:
     elif usage.free < 10 * 1024 ** 3:
         finding(warnings, "disk_low", "Less than 10 GB of free disk remains.")
     vram = probe.get("vram") or []
-    free_vram_gb = round(vram[0] / 1024 ** 3, 1) if len(vram) == 2 else None
-    requested_device = request.device or "auto"
+    free_vram_gb = vram[0] / 1024 ** 3 if len(vram) == 2 else None
     cuda_available = probe.get("cuda_available", bool(probe.get("gpu")))
+    device_index_ok = probe.get("device_index_ok", True)
     mps_available = probe.get("mps_available", False)
     available = (requested_device == "cpu" or
                  requested_device == "auto" and (cuda_available or mps_available) or
@@ -330,6 +355,8 @@ def _build_voicelab_preflight(request: VoiceLabRequest, cfg: dict) -> dict:
         free_vram_gb = None
     if needs_rocm and not available:
         finding(blockers, "gpu_unavailable", "The selected interpreter cannot see the requested GPU backend.")
+    elif needs_rocm and not device_index_ok:
+        finding(blockers, "gpu_unavailable", "Selected CUDA/ROCm device index is unavailable")
     elif "train" in stages and get_training_vram_error(requested_device, free_vram_gb):
         finding(blockers, "vram_low", get_training_vram_error(requested_device, free_vram_gb))
     if request.candidate_checkpoints and request.max_epochs == 1:
@@ -342,7 +369,8 @@ def _build_voicelab_preflight(request: VoiceLabRequest, cfg: dict) -> dict:
               "profiler_model_identity": (get_voicelab_file_identity(profiler_model)
                                           if "profile" in stages and profiler_model else None),
               "torch": probe.get("torch"), "hip": probe.get("hip"), "gpu": probe.get("gpu"),
-              "cuda_available": cuda_available, "mps_available": mps_available,
+              "cuda_available": cuda_available, "device_index_ok": device_index_ok,
+              "mps_available": mps_available,
               "missing_deps": missing_deps, "blockers": [item["code"] for item in blockers],
               "profiler_command": (_build_profiler_command(
                   rocm, profiler_model, cfg.get("epub_dirs") or [], request.device)
@@ -358,7 +386,8 @@ def _build_voicelab_preflight(request: VoiceLabRequest, cfg: dict) -> dict:
             "runtime": {"interpreter_configured": interpreter_ok, "python": probe.get("python"),
                         "torch": probe.get("torch"), "hip": probe.get("hip"),
                         "device": requested_device, "gpu": probe.get("gpu"),
-                        "free_vram_gb": free_vram_gb, "free_disk_gb": free_gb,
+                        "free_vram_gb": (round(free_vram_gb, 1) if free_vram_gb is not None else None),
+                        "free_disk_gb": free_gb,
                         "dependencies": deps},
             "outputs": {"datasets": "LoRA datasets library", "models": "LoRA models library",
                         "manifest": "LoRA model manifest"},
@@ -430,7 +459,8 @@ def _build_voicelab_health(state: Optional[dict] = None, history_dir: Optional[s
         logger.exception("Could not scan for pending checkpoint recovery")
         pending_recovery = []
 
-    running = bool(state.get("running"))
+    lifecycle = get_task_lifecycle('voicelab', states={'voicelab': state})
+    running = lifecycle['running']
     paused = bool(state.get("paused"))
     run_id = state.get("run_id")
     active_record = next((r for r in runs if r.get("id") == run_id), None)
@@ -472,7 +502,9 @@ def _build_voicelab_health(state: Optional[dict] = None, history_dir: Optional[s
 
     device = _device(active_record) or (_device(runs[0]) if runs else None)
 
-    if pending_recovery:
+    if lifecycle['ownership_unconfirmed']:
+        status = lifecycle['status']
+    elif pending_recovery:
         status = "recovery_required"
     elif running:
         status = "running"
@@ -482,7 +514,9 @@ def _build_voicelab_health(state: Optional[dict] = None, history_dir: Optional[s
     else:
         status = "idle"
 
-    if pending_recovery:
+    if lifecycle['ownership_unconfirmed']:
+        next_action = '\n'.join(state.get('logs') or [])
+    elif pending_recovery:
         count = len(pending_recovery)
         next_action = (f"Recover {count} interrupted checkpoint operation"
                        f"{'s' if count != 1 else ''} in the LoRA models list "
@@ -497,6 +531,7 @@ def _build_voicelab_health(state: Optional[dict] = None, history_dir: Optional[s
     return {
         "status": status,
         "running": running,
+        "ownership_unconfirmed": lifecycle['ownership_unconfirmed'],
         "paused": paused,
         "active_run": active,
         "device": device,
@@ -521,13 +556,13 @@ def _safe_config_summary() -> dict:
     except Exception:
         logger.exception("Could not load app config for diagnostics")
         return {"available": False}
-    llm = cfg.get("llm") or {}
+    llm = get_active_llm_config(cfg)
     llm_mode = cfg.get("llm_mode", "local")
     return {
         "available": True,
         "llm_mode": llm_mode,
         "model_name": llm.get("model_name"),
-        "is_remote_llm": is_remote_llm(llm_mode, llm.get("base_url", "")),
+        "is_remote_llm": is_active_llm_remote(cfg),
         "remote_ssh_configured": bool((cfg.get("llm_remote_ssh") or "").strip()),
     }
 
@@ -648,7 +683,7 @@ async def voicelab_save_config(request: VoiceLabConfig):
 
             cfg = {**cfg, **updates}
             _validate_voicelab_config_paths(cfg)
-            atomic_json_write(cfg, VOICELAB_CONFIG_PATH)
+            atomic_json_write(cfg, VOICELAB_CONFIG_PATH, allow_nonatomic_fallback=False)
             return {"status": "saved", "config": cfg}
 
     return await asyncio.to_thread(_save)
@@ -674,13 +709,24 @@ async def voicelab_inspect(zips_dir: Optional[str] = None):
     cfg = _load_voicelab_config()
     root = (zips_dir or cfg["zips_dir"]).strip()
     if not root:
-        raise HTTPException(status_code=400, detail="zips_dir is not configured. Set it in Voice Lab settings.")
+        with mark_expected_probe_response(expected=zips_dir is None):
+            raise HTTPException(status_code=400, detail="zips_dir is not configured. Set it in Voice Lab settings.")
     root = _resolve_zips_dir(root)
     # Don't enumerate the app's own upload/generated dirs (consistent with the
     # exec-path guard); an external operator-chosen dataset folder is expected.
     _validate_voicelab_path(root, "zips_dir")
     if not os.path.isdir(root):
-        raise HTTPException(status_code=400, detail=f"Folder not found: {root}")
+        missing_default = False
+        default_root = _resolve_zips_dir(VOICELAB_DEFAULTS["zips_dir"].strip())
+        if os.path.normcase(root) == os.path.normcase(default_root):
+            try:
+                os.lstat(root)
+            except FileNotFoundError:
+                missing_default = True
+            except OSError:
+                pass  # An inaccessible default is still a diagnostic failure.
+        with mark_expected_probe_response(expected=missing_default):
+            raise HTTPException(status_code=400, detail=f"Folder not found: {root}")
 
     narrators = []
     for name in sorted(os.listdir(root)):
@@ -913,6 +959,8 @@ async def voicelab_start(request: VoiceLabRequest, background_tasks: BackgroundT
 
             try:
                 rc, _ = _stream_subprocess_to_logs(cmd, cwd, state, log_prefix=f"[{stage}] ", log_file=log_path, env=env)
+            except WindowsOwnerCleanupError:
+                raise
             except Exception as e:
                 state["logs"].append(f"[{stage}] error launching: {e}")
                 state["tasks"][i]["status"] = "failed"
