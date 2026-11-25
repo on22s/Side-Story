@@ -1,5 +1,6 @@
 /* Manual, explicit delivery of a completed export to Audiobookshelf (#1727).
-   Nothing here touches the network until the user clicks a button; the preview
+   Nothing here contacts the Audiobookshelf server until the user clicks a
+   button; opening the panel only reads the saved local config. The preview
    checks the destination on the server and the send button stays disabled until a fresh preview and
    the right-to-share confirmation are both present. Any book, server,
    library, folder, format, or metadata change invalidates the preview. */
@@ -9,6 +10,15 @@ let absLibraries = [];
 let absSending = false;
 let absSendingPreviewId = null;
 let absProgressTimer = null;
+let absSavedSelection = null;
+let absListingBaseUrl = null;
+let absConfigRequest = null;
+let absServerTouched = false;
+
+function isAbsSameServerUrl(left, right) {
+    const strip = value => String(value || '').replace(/\/+$/, '');
+    return Boolean(left) && Boolean(right) && strip(left) === strip(right);
+}
 
 function getAbsBookToken() {
     return (typeof chunkSnapshotBookToken !== 'undefined' && chunkSnapshotBookToken)
@@ -17,6 +27,68 @@ function getAbsBookToken() {
 
 function absSetStatus(text) {
     document.getElementById('abs-status').textContent = text;
+}
+
+// The saved-config read has its own line so its failure can never write over
+// the safety text in #abs-status, which the app fills at every page load.
+function absSetConfigStatus(text) {
+    document.getElementById('abs-config-status').textContent = text;
+}
+
+function getAbsKeyStatusText(hasKey, keyStatus) {
+    if (keyStatus === 'credential-store-insecure') {
+        return t('abs.server.key-insecure', 'could not be read (the OS credential store backend is not secure; configure a secure OS keyring backend, then retry)');
+    }
+    if (hasKey === null) {
+        return t('abs.server.key-unreadable', 'could not be read (the OS credential store is unavailable)');
+    }
+    return hasKey ? t('abs.server.key-stored', 'is stored') : t('abs.server.key-missing', 'is not stored yet');
+}
+
+function markAbsServerTouched() {
+    absServerTouched = true;
+}
+
+async function loadAbsSavedConfig() {
+    if (absSavedSelection || absConfigRequest) { return absConfigRequest; }
+    absConfigRequest = (async () => {
+        absSetConfigStatus('');
+        let config;
+        try {
+            config = await API.get('/api/abs/config');
+        } catch (error) {
+            absConfigRequest = null;
+            const urlInput = document.getElementById('abs-server-url');
+            // Only a pristine panel may receive this late failure: a typed URL
+            // or a send wins. It goes on the config line, never on #abs-status.
+            if (!absServerTouched && !urlInput.value.trim()) {
+                const permanent = typeof error?.status === 'number' && error.status >= 400 && error.status < 500;
+                absSetConfigStatus(permanent
+                    ? t('abs.error.load-config-invalid', 'The saved server settings are invalid. Enter the server URL and save it to replace them.')
+                    : t('abs.error.load-config', 'Could not read the saved server settings. Reopen the panel to retry.'));
+            }
+            return;
+        }
+        if (!config || typeof config !== 'object' || typeof config.base_url !== 'string' || !config.base_url.trim()) {
+            return;
+        }
+        if (!absSavedSelection) {
+            absSavedSelection = {
+                base_url: config.base_url,
+                library_id: config.library_id || '',
+                folder_id: config.folder_id || '',
+            };
+        }
+        const urlInput = document.getElementById('abs-server-url');
+        if (!absServerTouched && !urlInput.value.trim()) {
+            urlInput.value = config.base_url;
+            absSetStatus(t('abs.config.restored', 'Restored saved server ({url}). API key {key}.', {
+                url: config.base_url,
+                key: getAbsKeyStatusText(config.has_key, config.key_status),
+            }));
+        }
+    })();
+    return absConfigRequest;
 }
 
 function absDeliveryStatusLabel(status) {
@@ -90,16 +162,41 @@ async function saveAbsConfig() {
         absSetStatus(t('abs.error.url-required', 'Enter the server URL first.'));
         return;
     }
+    const savedMatch = absSavedSelection && isAbsSameServerUrl(absSavedSelection.base_url, url);
+    const listingMatch = isAbsSameServerUrl(absListingBaseUrl, url);
+    let libraryId = document.getElementById('abs-library').value || null;
+    let folderId = document.getElementById('abs-folder').value || null;
+    if (!listingMatch) {
+        if (savedMatch) {
+            libraryId = absSavedSelection.library_id || null;
+            folderId = absSavedSelection.folder_id || null;
+        } else if (absListingBaseUrl) {
+            libraryId = null;
+            folderId = null;
+        }
+    }
     try {
         const result = await API.post('/api/abs/config', {
             base_url: url,
             api_key: apiKey || null,
-            library_id: document.getElementById('abs-library').value || null,
-            folder_id: document.getElementById('abs-folder').value || null,
+            library_id: libraryId,
+            folder_id: folderId,
         });
+        absSavedSelection = {
+            base_url: result.base_url,
+            library_id: result.library_id || '',
+            folder_id: result.folder_id || '',
+        };
         if (epoch !== absEpoch) { return; }
+        absSetConfigStatus('');
         document.getElementById('abs-api-key').value = '';
-        absSetStatus(t('abs.server.saved', 'Server saved ({url}). API key {key}{store}.', {url: result.base_url, key: result.has_key ? t('abs.server.key-stored', 'is stored') : t('abs.server.key-missing', 'is not stored yet'), store: result.key_store ? ' ' + t('abs.server.key-store-name', 'in the {store}', {store: result.key_store}) : ''}));
+        // A stored key that cannot be read back is not an unavailable store:
+        // name what happened without claiming the store is gone.
+        const readBackFailed = Boolean(result.key_store) && result.has_key === null;
+        const keyText = readBackFailed
+            ? t('abs.server.key-read-back-failed', 'was stored in the {store}, but could not be read back', {store: result.key_store})
+            : getAbsKeyStatusText(result.has_key, result.key_status);
+        absSetStatus(t('abs.server.saved', 'Server saved ({url}). API key {key}{store}.', {url: result.base_url, key: keyText, store: result.key_store && !readBackFailed ? ' ' + t('abs.server.key-store-name', 'in the {store}', {store: result.key_store}) : ''}));
     } catch (error) {
         if (epoch === absEpoch) {
             absSetStatus(t('abs.error.save-server', 'Could not save the server. The API key was not stored anywhere new.'));
@@ -134,7 +231,9 @@ async function loadAbsLibraries() {
         const result = await API.get(`/api/abs/libraries?base_url=${encodeURIComponent(url)}`);
         if (epoch !== absEpoch) { return; }
         absLibraries = result.libraries || [];
+        absListingBaseUrl = result.base_url;
         const librarySelect = document.getElementById('abs-library');
+        const folderSelect = document.getElementById('abs-folder');
         librarySelect.replaceChildren();
         for (const library of absLibraries) {
             const option = document.createElement('option');
@@ -142,7 +241,17 @@ async function loadAbsLibraries() {
             option.textContent = library.name || library.id;
             librarySelect.appendChild(option);
         }
+        const savedSelection = absSavedSelection;
+        const restoreSaved = Boolean(savedSelection)
+            && savedSelection.base_url === result.base_url
+            && Boolean(savedSelection.library_id);
+        if (restoreSaved) {
+            librarySelect.value = savedSelection.library_id;
+        }
         fillAbsFolders();
+        if (restoreSaved) {
+            folderSelect.value = savedSelection.folder_id;
+        }
         absSetStatus(absLibraries.length === 1 ? t('abs.libraries.loaded.one', 'Loaded {count} library. Choose a library and folder, then preview.', {count: absLibraries.length}) : t('abs.libraries.loaded.many', 'Loaded {count} libraries. Choose a library and folder, then preview.', {count: absLibraries.length}));
     } catch (error) {
         if (epoch === absEpoch) {
@@ -302,13 +411,14 @@ async function loadAbsDeliveries() {
                 note.textContent = entry.error;
                 row.appendChild(note);
             }
-            if (entry.verification_note) {
+            const noteText = entry.discarded_at ? entry.discarded_note : entry.verification_note;
+            if (noteText) {
                 const note = document.createElement('p');
                 note.className = 'mb-1';
-                note.textContent = entry.verification_note;
+                note.textContent = noteText;
                 row.appendChild(note);
             }
-            if (entry.reconciliation) {
+            if (entry.reconciliation && !entry.discarded_at) {
                 const note = document.createElement('p');
                 note.className = 'mb-1';
                 note.textContent = entry.reconciliation;
@@ -321,6 +431,12 @@ async function loadAbsDeliveries() {
                 button.textContent = t('abs.deliveries.verify', 'Verify delivery');
                 button.onclick = () => reconcileAbsDelivery(entry.id);
                 row.appendChild(button);
+                const discard = document.createElement('button');
+                discard.type = 'button';
+                discard.className = 'btn btn-outline-danger btn-sm ms-2';
+                discard.textContent = t('abs.deliveries.discard', 'Abandon this send');
+                discard.onclick = () => discardAbsDelivery(entry.id);
+                row.appendChild(discard);
             }
             container.appendChild(row);
         }
@@ -349,5 +465,19 @@ async function reconcileAbsDelivery(deliveryId) {
         loadAbsDeliveries();
     } catch (error) {
         showActionError(t('abs.error.reconcile', 'Reconciliation failed'), error, t('abs.error.reconcile-recovery', 'Check the server is reachable, then retry.'), 'error');
+    }
+}
+
+async function discardAbsDelivery(deliveryId) {
+    const confirmed = await showConfirm(
+        formatUiSafetyText('safety.abs.discard', 'Abandon this send? Check the server first. If the file did arrive, or arrives late, sending again can create a duplicate library item. The local export is unchanged; only this delivery record is marked failed so a new send is allowed.'),
+        {title: t('abs.discard.title', 'Abandon this send?'), actionLabel: t('abs.discard.action', 'Abandon this send'), danger: true});
+    if (!confirmed) { return; }
+    try {
+        await API.post('/api/abs/discard', {delivery_id: deliveryId, confirm: true});
+        absSetStatus(t('safety.abs.discard.done', 'Send abandoned. Preview and send again if you need to retry; a send that is unknown or already delivered is still blocked by the normal duplicate check.'));
+        loadAbsDeliveries();
+    } catch (error) {
+        showActionError(t('abs.error.discard', 'Could not abandon the send'), error, t('abs.error.discard-recovery', 'Refresh the delivery status, then check the current state.'), 'error');
     }
 }

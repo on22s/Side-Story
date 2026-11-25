@@ -1,7 +1,7 @@
 import argparse
 import hashlib
 import uuid
-from chunk_status_journal import remove_chunk_snapshot
+from chunk_status_journal import is_active_script_output, remove_chunk_snapshot
 from generation_checkpoint_shards import (GenerationCheckpointShards,
     load_generation_shard_checkpoint, remove_generation_shard_checkpoint)
 import os
@@ -14,10 +14,13 @@ from dataclasses import dataclass, field, replace
 from core import AUTO_PAUSE_MARKER, llm_timeout_seconds
 from generation_completion import get_file_sha256, get_generation_input
 from config_settings import load_app_config, get_generation_config
-from llm_provider import make_llm_client, make_run_client, merge_provider_extra_body, get_provider_extra_body
+from llm_provider import (make_llm_client, make_run_client, merge_provider_extra_body,
+                          get_provider_extra_body, get_effective_authorization)
 from llm_provider import classify_llm_error, get_retry_delay, get_run_model_binding, get_run_fingerprint_identity
-from llm_provider import FailoverClient, RunProfileChanged, RunRequestAdmissionError
-from chunk_quality import validate_chunk_quality, is_trigram_only_near_miss, get_chunk_schema_findings
+from llm_provider import (FailoverClient, RunProfileChanged, RunRequestAdmissionError,
+                          is_failover_eligible)
+from chunk_quality import (validate_chunk_quality, is_trigram_only_near_miss, is_segment_near_miss,
+                           get_near_miss_rank, get_chunk_schema_findings)
 from validation_reporting import format_validation_findings
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from dialogue_spans import apply_dialogue_map
@@ -195,7 +198,7 @@ def build_generation_quality_manifest(status, fingerprint, accepted_chunks,
 
 
 def save_generation_quality_manifest(output_path, manifest):
-    atomic_json_write(manifest, get_generation_quality_path(output_path))
+    atomic_json_write(manifest, get_generation_quality_path(output_path), allow_nonatomic_fallback=False)
 
 
 def validate_generation_output_path(input_path, output_path):
@@ -219,11 +222,11 @@ def publish_completed_generation(output_path, entries, manifest, input_path, inp
     # Re-verify the INPUT through the confined digest seam that bound
     # it, not a plain hash: an aliased/hardlinked source must refuse
     # before any output/manifest write, matching binding admission.
-    # (Output artifact hashing below stays generic/plain.)
-    from script_selection_binding import _source_digest
-    if _source_digest(input_path) != input_sha256:
-        raise ValueError('Source input changed during generation; preserving prior output')
-    atomic_json_write(entries, output_path)
+    # (Output artifact hashing below stays generic/plain.) The same guard
+    # protects the three-pass publication boundary.
+    from script_selection_binding import require_unchanged_source
+    require_unchanged_source(input_path, input_sha256)
+    atomic_json_write(entries, output_path, allow_nonatomic_fallback=False)
     save_generation_quality_manifest(output_path, {
         **manifest, 'status': 'complete',
         'completion_artifact': {'version': 1, 'input_sha256': input_sha256,
@@ -821,6 +824,12 @@ class LLMGenParams:
     # Pass 3 delivery-direction mode (#1258, pass_quality.DELIVERY_DIRECTIONS).
     # "off" sends the shipped instruct prompt and output unchanged.
     delivery_direction: str = "off"
+    # Appended so all legacy positional constructors retain their meaning.
+    cast_aliases: bool = False
+    cast_alias_groups: list = None
+    # Experimental compact request instructions, separate from ordinary Pass 1.
+    compact_system_prompt: str = None
+    compact_user_prompt_template: str = None
 
 
 
@@ -1065,7 +1074,7 @@ def _describe_missing_spans(spans):
     message points at specific text instead of only a coverage percentage.
     Returns "" when there are no spans (message unchanged from before)."""
     clauses = [f'the passage beginning "{span["preview"]} ..." '
-               f'(about {span["token_count"]} words)'
+               f'(about {span["token_count"]} {span.get("unit", "words")})'
                for span in spans or [] if span.get("preview")]
     if not clauses:
         return ""
@@ -1105,6 +1114,11 @@ def _build_retry_feedback_message(quality):
                 "text before stopping early. Convert the ENTIRE source chunk "
                 "from beginning to end this time - do not stop partway through "
                 "and do not summarize any part of it." + spans_hint)
+    if "missing_source_run" in codes:
+        return ("Your previous response left out part of the source text."
+                + _describe_missing_spans(quality.get("missing_source_spans"))
+                + " Convert every sentence of the chunk, in order, keeping the author's "
+                  "wording - do not drop or summarize any part of it.")
     formatted = format_validation_findings(findings)
     if formatted:
         return formatted
@@ -1141,6 +1155,19 @@ def retry_line(attempt, max_retries):
     return f"Retrying... (attempt {attempt + 2} of {max_retries + 1})"
 
 
+def get_failover_request_policy(config):
+    """Resolve the request policy used when the secondary provider takes over."""
+    defaults = LLMGenParams()
+    policy = {name: config.get(name, getattr(defaults, name)) for name in (
+        "structured_output", "api_retry_limit", "on_api_exhaustion")}
+    # The config loader can return a float for an explicitly saved integer
+    # default. Keep equivalent values (including signed zero) identical on disk.
+    for name in ("retry_initial_delay_seconds", "retry_multiplier",
+                 "retry_max_delay_seconds", "retry_jitter"):
+        policy[name] = float(config.get(name, getattr(defaults, name))) or 0.0
+    return policy
+
+
 def ensure_run_request_params(client, params):
     """Return parameters bound to the serving profile without changing the input."""
     # Only our explicit wrapper owns runtime-profile switching; ordinary SDK
@@ -1153,11 +1180,8 @@ def ensure_run_request_params(client, params):
     if profile is None:
         return resolver(params) if resolver else params
     config = profile["config"]
-    defaults = LLMGenParams()
-    changes = {name: config.get(name, getattr(defaults, name)) for name in (
-        "provider_extra_body", "structured_output", "api_retry_limit",
-        "retry_initial_delay_seconds", "retry_multiplier", "retry_max_delay_seconds",
-        "retry_jitter", "on_api_exhaustion")}
+    changes = get_failover_request_policy(config)
+    changes["provider_extra_body"] = config.get("provider_extra_body")
     from llm_request_budget import get_request_limits
     limits = get_request_limits(config, profile["context_length"])
     changes["context_length"] = limits["context_length"]
@@ -1542,13 +1566,15 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 continue
             # Order of last resorts: the other profile first (a fresh provider
             # is more likely to answer than the same one later), then the
-            # operator, then giving up.
+            # operator, then giving up. Local sizing/dispatch failures do not
+            # qualify - a second provider cannot fix a prompt that does not
+            # fit, and re-sending the book to a billed endpoint is a leak.
             switch = getattr(client, "failover", None)
-            if switch is not None and switch(error_details):
+            if switch is not None and is_failover_eligible(error_details) and switch(error_details):
                 # The other profile takes this request and the rest of the
                 # run, with a fresh budget: the failure was the provider's.
-                # Content-policy refusals qualify too - that is the case a
-                # second provider exists for.
+                # Content-policy refusals and auth/model errors qualify too - a
+                # different provider may accept the same request.
                 return _retry_same_request()
             if (error_details["retryable"]
                     and getattr(params, "on_api_exhaustion", "fail") == "pause"
@@ -1639,10 +1665,11 @@ def call_llm_for_entries(client, model_name, sys_prompt, user_prompt, params,
                 if not quality["passed"]:
                     if attempt_record is not None and (transformed or {}).get("accepted_metadata"):
                         attempt_record["quality_findings"] = quality.get("findings", [])
-                    if near_miss_sink is not None and is_trigram_only_near_miss(quality):
-                        best = (near_miss_sink[0][1]["metrics"]["ordered_trigram_recall"]
-                                if near_miss_sink else -1.0)
-                        if quality["metrics"]["ordered_trigram_recall"] > best:
+                    # Same as is_trigram_only_near_miss for single-pass reports,
+                    # which never carry pass 1's missing_source_run finding.
+                    if near_miss_sink is not None and is_segment_near_miss(quality):
+                        if (not near_miss_sink
+                                or get_near_miss_rank(quality) > get_near_miss_rank(near_miss_sink[0][1])):
                             near_miss_sink[:] = [(entries, quality)]
                     if attempt_record is not None:
                         attempt_record["outcome"] = "quality_rejected"
@@ -2380,7 +2407,8 @@ def main():
     # processed strictly sequentially), so only the self-heal call applies
     # here - is_remote/lm_status aren't needed for anything else in this file.
     _, lm_status, heal_msg = ensure_ideal_settings(
-        llm_mode, base_url, model_name, ssh_alias=config.get("llm_remote_ssh"), api_key=api_key)
+        llm_mode, base_url, model_name, ssh_alias=config.get("llm_remote_ssh"), api_key=api_key,
+        authorization=get_effective_authorization(llm_config), llm_config=llm_config)
     print(heal_msg)
 
     # Create OpenAI client with custom base URL
@@ -2621,8 +2649,9 @@ def main():
                                  input_file_path, input_sha256)
     clear_generation_checkpoint(output_path)
 
-    # Only clear chunks when writing to the default annotated_script.json location
-    if args.output is None:
+    # Clear chunks whenever publication replaced the active script, including
+    # an explicit spelling of its default path.
+    if is_active_script_output(data_dir, output_path):
         chunks_path = os.path.join(data_dir, "chunks.json")
         if remove_chunk_snapshot(chunks_path):
             print("Cleared old chunks.json")

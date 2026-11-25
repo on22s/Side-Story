@@ -2,6 +2,11 @@
 
 The original artifact revision and generation receipts stay intact. Restoration
 copies encoded bytes; it neither synthesizes speech nor edits authored words.
+
+Restoration stays conditional on the current serving fingerprint, which includes
+loaded module code. A release that changes it makes older saved takes
+audition-only under the existing serving check; no universal cross-version
+restoration is claimed.
 """
 from contextlib import closing
 import copy
@@ -10,11 +15,13 @@ import os
 from pathlib import Path
 
 from audio_generation_owner import (ensure_audio_generation_active,
-    ensure_audio_generation_book_work, get_audio_generation_claim_id,
-    reuse_audio_generation_book)
+    ensure_audio_generation_book_work, ensure_audio_generation_commit_active,
+    get_audio_generation_claim_id, reuse_audio_generation_book)
 from audio_take_history import AudioTakeHistory, _version
 from book_state_transaction import ensure_book_state, get_book_operation_token
-from take_publication import NATIVE_TAKE_KINDS, KEY, _is_current_engine, _read_audio, validate_take_publication
+from take_publication import (NATIVE_TAKE_KINDS, KEY, _is_current_engine, _read_audio,
+    get_legacy_v3_voice_digest, get_receipt_voice_digest, validate_take_publication)
+from timeline_anchors import resolve_timeline_anchors
 from utils import file_lock
 
 
@@ -103,13 +110,27 @@ def _get_matching_request(manager, engine, index, candidate, proof):
     if (settings != get_tts_model_settings(manager._read_config())
             or get_recovery_digest(settings) != proof['dependencies']['model_sha256']):
         raise ValueError('Current model settings differ from this saved performance.')
-    voices = manager.get_voice_config_for_update()
-    speaker = manager._resolve_alias(candidate['speaker'], voices)
-    choices = [manager.get_chunk_render_voice_config(voices, speaker, candidate, index)]
-    batch_seed = manager._load_tts_config().get('batch_seed', -1)
-    if type(batch_seed) is int:
-        choices.append(manager.get_chunk_render_voice_config(
-            voices, speaker, candidate, index, batch_seed=batch_seed))
+    voices = resolve_timeline_anchors(
+        manager.get_voice_config_for_update(), manager.get_saved_chunks())
+    seed = proof.get('seed')
+    legacy = proof['version'] < 3
+    speaker = candidate['speaker']
+    if legacy:
+        speaker = manager._resolve_alias(speaker, voices)
+    if seed is not None:
+        # The publication recorded the exact seed; never re-derive it from
+        # mutable batch settings. The voice digest below still binds it.
+        choices = [manager.get_chunk_render_voice_config(voices, speaker, candidate, index,
+                                                         batch_seed=seed, finalize=not legacy)]
+    else:
+        # Legacy receipts carry no seed: keep their original candidate set and
+        # their original full-config materialization.
+        choices = [manager.get_chunk_render_voice_config(
+            voices, speaker, candidate, index, finalize=not legacy)]
+        batch_seed = manager._load_tts_config().get('batch_seed', -1)
+        if type(batch_seed) is int:
+            choices.append(manager.get_chunk_render_voice_config(
+                voices, speaker, candidate, index, batch_seed=batch_seed, finalize=not legacy))
     category = NATIVE_TAKE_KINDS[proof['kind']]
     projection = get_occurrence_speech_projection(candidate, index, voices, settings)
     preparation = {key:value for key,value in projection.items() if key != 'context'}
@@ -122,8 +143,16 @@ def _get_matching_request(manager, engine, index, candidate, proof):
     request = None
     for choice in choices:
         selected = choice.get(get_resolved_speaker(speaker, choice))
+        if not isinstance(selected, dict):
+            continue
+        digest = get_receipt_voice_digest(proof['version'], selected, proof.get('seed'))
+        # A main-era v3 take hashed an inert description into its digest; the
+        # current entry reproduces that exact value only while the entry itself
+        # is unchanged, so a later edit cannot authorize the same receipt.
+        legacy_digest = (get_legacy_v3_voice_digest(selected, proof.get('seed'))
+                         if proof['version'] >= 3 else None)
         if (voice_category(selected) == category
-                and get_recovery_digest(selected) == proof['dependencies']['voice_sha256']):
+                and proof['dependencies']['voice_sha256'] in (digest, legacy_digest)):
             try:
                 if category == 'custom':
                     request = get_custom_voice_request(choice, get_resolved_speaker(speaker, choice),
@@ -245,9 +274,10 @@ def restore_editor_take(manager, index, request, expected):
                 # existing save admission through selection, without waiting
                 # under the owner mutex. Override inherited worker snapshots so
                 # this check compares the current shared document.
+                lexicon_path = pronunciation.get_pronunciation_path()
                 with manager._ensure_automatic_predecessor(current, required=True), _LOCAL_TTS_LOCK, \
-                        file_lock(pronunciation.DEFAULT_PATH), \
-                        pronunciation.ensure_pronunciation_audition(pronunciation.load_lexicon(force=True)):
+                        file_lock(lexicon_path), \
+                        pronunciation.ensure_pronunciation_audition(pronunciation.load_lexicon(lexicon_path, force=True)):
                     _ensure_claim(claim)
                     native_request, _ = _get_matching_request(manager, engine, index, candidate, proof)
                     _ensure_claim(claim)
@@ -260,6 +290,12 @@ def restore_editor_take(manager, index, request, expected):
                         _get_target(manager, index, request, expected)
                         updated = manager._update_chunk_fields_by_uid(current['uid'], expected_chunk=current,
                             expected_fields={key:current.get(key) for key in ('audio_path','audio_revision','status')},
+                            # The slot copy and the row selection are separate
+                            # writes. Revalidate the live claim/cancel at the
+                            # final selection, after staging I/O and journal
+                            # serialization, so an acknowledged stop cannot
+                            # still install the historical take (F02).
+                            before_update=ensure_audio_generation_commit_active,
                             audio_source=str(path), publication_audio=proof['audio'],
                             restore_speech_receipt=speech is not None,
                             take=candidate['take'], status='done', audio_revision=proof['audio_revision'],

@@ -91,8 +91,10 @@
                 status.textContent = refused
                     ? t('training.dataset.upload.refused', 'Upload refused (HTTP {status}). Keep the ZIP and review the archive validation details before trying again.', {status: String(e.status)})
                     : t('training.dataset.upload.unconfirmed', 'Upload was not confirmed. Keep the ZIP and check the dataset list before uploading again.');
-                showActionError(refused ? 'Dataset upload refused' : 'Upload error', e,
-                    'Keep the ZIP file. Check the dataset list before uploading again, and review any archive validation details.');
+                showActionError(refused
+                    ? t('training.dataset.upload.refused-action', 'Dataset upload refused')
+                    : t('training.dataset.upload.error-action', 'Upload error'), e,
+                    t('training.dataset.upload.error-recovery', 'Keep the ZIP file. Check the dataset list before uploading again, and review any archive validation details.'));
             } finally {
                 loraDatasetUploadPending = false;
                 button.disabled = false;
@@ -107,7 +109,7 @@
                 await API._handleError(res);
                 loadLoraDatasets();
             } catch (e) {
-                showActionError("Error deleting dataset", e, "Refresh the dataset list and check whether the dataset was deleted before trying again.");
+                showActionError(t('training.dataset.delete-failed', 'Error deleting dataset'), e, t('training.dataset.delete-failed-recovery', 'Refresh the dataset list and check whether the dataset was deleted before trying again.'));
             }
         };
 
@@ -141,28 +143,30 @@
                 document.getElementById('lora-train-status').innerHTML = `<span class="text-info">${escapeHtml(t('training.train.in-progress', 'Training in progress...'))}</span>`;
                 pollLoraTraining(request.epochs);
             } catch (e) {
-                showActionError("Failed to start training", e, "Check training status before starting again. If refused, review the selected dataset, adapter name and training settings.");
+                showActionError(t('training.train.start-failed', 'Failed to start training'), e, t('training.train.start-failed-recovery', 'Check training status before starting again. If refused, review the selected dataset, adapter name and training settings.'));
                 btn.disabled = false;
                 document.getElementById('lora-train-status').innerHTML = '';
             }
         };
 
         function applyLoraProgress(progressBar, percentage, epoch, maxEpoch) {
-            progressBar.style.width = `${percentage}%`;
-            progressBar.innerText = `${percentage}%`;
-            progressBar.ariaValueMin = '0';
-            progressBar.ariaValueMax = '100';
-            progressBar.ariaValueNow = String(percentage);
-            progressBar.ariaValueText = Number.isFinite(maxEpoch) && maxEpoch > 0
-                ? t('training.progress.epoch-of', 'Epoch {epoch} of {epochs}', {epoch, epochs: maxEpoch}) : t('training.progress.unreported', 'Epoch progress has not been reported yet.');
+            // Halftone: the LoRA training texture (#2042). The shared renderer
+            // owns the fill width, the aria values and the clamping.
+            renderTexturedProgress(progressBar, {
+                fraction: Number(percentage) / 100,
+                label: '',
+                valueText: Number.isFinite(maxEpoch) && maxEpoch > 0
+                    ? t('training.progress.epoch-of', 'Epoch {epoch} of {epochs}', {epoch, epochs: maxEpoch}) : t('training.progress.unreported', 'Epoch progress has not been reported yet.'),
+            });
         }
 
         function applyLoraProgressState(progressBar, outcome) {
-            progressBar.classList.remove('bg-info', 'bg-success', 'bg-danger', 'bg-warning');
+            // The outcome tints the fill only; the track keeps the theme's dim
+            // ink, so the bar still reads as one object after a theme switch.
+            const fill = progressBar.querySelector?.('.tp-fill') || progressBar;
+            fill.classList.remove('bg-info', 'bg-success', 'bg-danger', 'bg-warning');
             const color = {running: 'bg-info', finished: 'bg-success', failed: 'bg-danger', stopped: 'bg-warning'}[outcome];
-            progressBar.classList.add(color);
-            if (outcome === 'running') { progressBar.classList.add('progress-bar-animated'); }
-            else { progressBar.classList.remove('progress-bar-animated'); }
+            fill.classList.add(color);
         }
 
         function pollLoraTraining(totalEpochs = null) {
@@ -257,7 +261,7 @@
                 document.getElementById('lora-train-status').innerHTML = `<span class="text-warning">${escapeHtml(t('training.train.cancelling', 'Cancellation requested…'))}</span>`;
             } catch (e) {
                 btn.disabled = false;
-                showActionError("Failed to cancel training", e, "Check training status before cancelling again; training may still be running.");
+                showActionError(t('training.train.cancel-failed', 'Failed to cancel training'), e, t('training.train.cancel-failed-recovery', 'Check training status before cancelling again; training may still be running.'));
             }
         };
 
@@ -278,7 +282,7 @@
                     star.querySelector('i').className = `${result.favorite ? 'fas' : 'far'} fa-star`;
                 });
             } catch (e) {
-                showActionError("Could not update favorite", e, "Refresh the adapter list and check the favorite state before changing it again.");
+                showActionError(t('training.adapter.favorite-failed', 'Could not update favorite'), e, t('training.adapter.favorite-failed-recovery', 'Refresh the adapter list and check the favorite state before changing it again.'));
             } finally {
                 if (button) { button.disabled = false; }
             }
@@ -475,7 +479,7 @@
                 panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             } catch (e) {
                 if (!isCurrent()) { return; }
-                panel.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml(getActionErrorMessage("Comparison unavailable", e, "Check the selected adapter and candidate, then reopen Compare."))}</div>`;
+                panel.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml(getActionErrorMessage(t('training.compare.unavailable', 'Comparison unavailable'), e, t('training.compare.unavailable-recovery', 'Check the selected adapter and candidate, then reopen Compare.')))}</div>`;
             }
         };
 
@@ -534,7 +538,7 @@
                 panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             } catch (e) {
                 if (!isCurrent()) { return; }
-                panel.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml(getActionErrorMessage("Blind review unavailable", e, "Check the selected adapter and review candidates, then reopen blind review."))}</div>`;
+                panel.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml(getActionErrorMessage(t('training.blind.unavailable', 'Blind review unavailable'), e, t('training.blind.unavailable-recovery', 'Check the selected adapter and review candidates, then reopen blind review.')))}</div>`;
             }
         };
 
@@ -562,7 +566,7 @@
             } catch (e) {
                 if (!review.isCurrent()) { return; }
                 if (submitBtn) { submitBtn.disabled = false; }
-                showActionError("Could not record review", e, "Keep your rating and notes. Reopen review history to check whether the decision was saved before submitting again.");
+                showActionError(t('training.blind.record-failed', 'Could not record review'), e, t('training.blind.record-failed-recovery', 'Keep your rating and notes. Reopen review history to check whether the decision was saved before submitting again.'));
             }
         };
 
@@ -602,7 +606,7 @@
                 renderLoraReviewHistory(adapterId, data.reviews || []);
             } catch (e) {
                 if (!isCurrent()) { return; }
-                panel.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml(getActionErrorMessage("History unavailable", e, "Check the selected adapter, then reopen review history. An unavailable history is not an empty history."))}</div>`;
+                panel.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml(getActionErrorMessage(t('training.history.unavailable', 'History unavailable'), e, t('training.history.unavailable-recovery', 'Check the selected adapter, then reopen review history. An unavailable history is not an empty history.')))}</div>`;
             }
         };
 
@@ -646,7 +650,7 @@
                 showToast(t('training.history.cleared', 'Cleared {count} review(s), freed {size} KB.', {count: result.removed_count, size: freedKb}), 'success');
                 openLoraReviewHistory(adapterId);
             } catch (e) {
-                showActionError("Could not clear history", e, "Reopen review history to check whether it was cleared before trying again.");
+                showActionError(t('training.history.clear-failed', 'Could not clear history'), e, t('training.history.clear-failed-recovery', 'Reopen review history to check whether it was cleared before trying again.'));
             }
         };
 
@@ -663,7 +667,7 @@
                 showToast(t('training.promote.done', 'Promoted {candidate}. Production backup retained.', {candidate: candidateId}), 'success');
                 await loadLoraModels();
             } catch (e) {
-                showActionError("Promotion failed", e, "Refresh the adapter list and checkpoint history to check production and backup state before promoting again.");
+                showActionError(t('training.promote.failed', 'Promotion failed'), e, t('training.promote.failed-recovery', 'Refresh the adapter list and checkpoint history to check production and backup state before promoting again.'));
             }
         };
 
@@ -676,7 +680,7 @@
                 showToast(t('training.rollback.done', 'Previous production checkpoint restored.'), 'success');
                 await loadLoraModels();
             } catch (e) {
-                showActionError("Rollback failed", e, "Refresh the adapter list and checkpoint history to check production and backup state before rolling back again.");
+                showActionError(t('training.rollback.failed', 'Rollback failed'), e, t('training.rollback.failed-recovery', 'Refresh the adapter list and checkpoint history to check production and backup state before rolling back again.'));
             }
         };
 
@@ -689,7 +693,7 @@
                 showToast(t('training.recover.done', 'Interrupted checkpoint operation recovered.'), 'success');
                 await loadLoraModels();
             } catch (e) {
-                showActionError("Recovery failed", e, "Refresh the adapter list and checkpoint history before recovering again. Review any refusal about changed checkpoint files.");
+                showActionError(t('training.recover.failed', 'Recovery failed'), e, t('training.recover.failed-recovery', 'Refresh the adapter list and checkpoint history before recovering again. Review any refusal about changed checkpoint files.'));
             }
         };
 
@@ -703,7 +707,7 @@
                 showToast(t('training.delete-backup.done', 'Rollback backup deleted.'), 'success');
                 await loadLoraModels();
             } catch (e) {
-                showActionError("Backup deletion failed", e, "Refresh checkpoint history and check whether the rollback backup was deleted before trying again.");
+                showActionError(t('training.delete-backup.failed', 'Backup deletion failed'), e, t('training.delete-backup.failed-recovery', 'Refresh checkpoint history and check whether the rollback backup was deleted before trying again.'));
             }
         };
 
@@ -721,7 +725,7 @@
                 btn.title = t('training.adapter.preview-play-title', 'Play preview');
                 btn.classList.replace('btn-outline-secondary', 'btn-outline-success');
             } catch (e) {
-                showActionError("Preview failed", e, "Check that the adapter has preview audio and that the app connection is available, then play the preview again.");
+                showActionError(t('training.adapter.preview-failed', 'Preview failed'), e, t('training.adapter.preview-failed-recovery', 'Check that the adapter has preview audio and that the app connection is available, then play the preview again.'));
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = origHtml;
@@ -766,7 +770,7 @@
                 const audioDiv = document.getElementById('lora-test-audio');
                 audioDiv.innerHTML = `<audio controls autoplay src="${escapeHtml(result.audio_url)}?t=${Date.now()}"></audio>`;
             } catch (e) {
-                statusEl.innerHTML = `<span class="text-danger">${escapeHtml(getActionErrorMessage('Test audio did not finish', e, 'Check the selected adapter and test task status before generating again. Your test text is retained.'))}</span>`;
+                statusEl.innerHTML = `<span class="text-danger">${escapeHtml(getActionErrorMessage(t('training.test.failed', 'Test audio did not finish'), e, t('training.test.failed-recovery', 'Check the selected adapter and test task status before generating again. Your test text is retained.')))}</span>`;
             } finally {
                 loraTestPending = false;
                 controls.forEach(({field, disabled}) => { field.disabled = disabled; });
@@ -781,7 +785,7 @@
                 await API._handleError(res);
                 loadLoraModels();
             } catch (e) {
-                showActionError("Error deleting adapter", e, "Refresh the adapter list and check whether the adapter was deleted before trying again.");
+                showActionError(t('training.delete-adapter.failed', 'Error deleting adapter'), e, t('training.delete-adapter.failed-recovery', 'Refresh the adapter list and check whether the adapter was deleted before trying again.'));
             }
         };
 
@@ -796,7 +800,7 @@
                 showToast(t('training.adapter.downloaded', 'Adapter downloaded successfully.'), 'success');
                 loadLoraModels();
             } catch (e) {
-                showActionError("Download failed", e, "Refresh the adapter list and check whether the download completed before downloading again.");
+                showActionError(t('training.adapter.download-failed', 'Download failed'), e, t('training.adapter.download-failed-recovery', 'Refresh the adapter list and check whether the download completed before downloading again.'));
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = origHtml;

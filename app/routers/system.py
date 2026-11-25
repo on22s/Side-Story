@@ -2,18 +2,18 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import threading
 import time
-import traceback
 from contextlib import nullcontext
-from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Body, Depends, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field, StrictInt, ValidationError
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from pydantic import BaseModel, Field, StrictBool, StrictInt, ValidationError
+from starlette.requests import ClientDisconnect
 
 from config_settings import (AppConfig, GenerationConfig, LLMConfig, PromptConfig, PromptVariant,
                              TTSConfig, backup_damaged_app_config, load_app_config,
@@ -23,18 +23,24 @@ from external_tts_client import ExternalTTSClient, get_external_tts_urls, get_ex
 from external_tts_capabilities import make_unknown_capability_report, UNAVAILABLE_ERROR
 
 from default_prompts import load_default_prompts, load_instruct_prompts, load_segment_prompts
-from llm_provider import is_api_key_reference
+from llm_provider import (get_effective_authorization, is_api_key_reference,
+                          resolve_probe_api_key)
 from device_utils import get_available_gpu_device, normalize_device
 from review_prompts import load_review_prompts
 from diagnostics import redact_text
+from review_startup import record_failure
 from persona_prompts import load_persona_prompts
 from lmstudio_settings import (get_lmstudio_status, apply_lmstudio_settings, is_remote_llm,
                                get_failover_llm_config,
                                apply_remote_lmstudio_settings, is_local_llm_endpoint,
                                get_active_llm_config, get_current_status,
-                               get_saved_llm_profile)
+                               get_saved_llm_profile, is_active_llm_remote,
+                               get_document_with_retained_cache, is_billed_http_profile,
+                               get_hydrated_profile_source, BENCHMARK_CACHE_KEYS)
+
 
 from core import (
+    get_task_lifecycle,
     API_LOG_DIR,
     CONFIG_PATH,
     DATA_DIR,
@@ -77,7 +83,7 @@ from pronunciation import get_pronunciation_model_context, is_pronunciation_sett
 from synthesis_settings import (get_enabled_synthesis_window_settings, get_enabled_synthesis_recovery_settings,
                                 get_synthesis_execution_policy)
 from project import ProjectManager
-from core import ensure_book_switch_allowed
+from core import ensure_book_switch_allowed, _gpu_lock
 
 
 logger = logging.getLogger("AlexandriaUI")
@@ -179,6 +185,7 @@ def _builtin_prompt_presets() -> list[dict]:
 
 
 class AttributionPreviewRequest(BaseModel):
+    cast_aliases: StrictBool = False
     variant: PromptVariant = "default"
     system_prompt: str = ""
     user_prompt: str = ""
@@ -217,20 +224,84 @@ async def attribution_preview(request: AttributionPreviewRequest):
                 for i in range(len(_PREVIEW_WINDOW))]
     try:
         system_prompt, user_message = build_variant_request(
-            request.variant, _PREVIEW_WINDOW, LLMGenParams(structured_output="off"),
+            request.variant, _PREVIEW_WINDOW, LLMGenParams(
+                structured_output="off", cast_aliases=request.cast_aliases,
+                cast_alias_groups=_PREVIEW_ALIASES),
             _PREVIEW_ROSTER, _PREVIEW_ALIASES, contexts, surround, None, texts)
     except (KeyError, IndexError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Could not render this prompt: {exc}") from exc
     return {
         "system_prompt": system_prompt,
         "user_message": user_message,
-        "note": ("Rendered on a four-line sample window. The ROSTER line, the entry markers "
+        "note": ("Rendered on a four-line sample window using the current editor controls and "
+                 "sample cast aliases. Save Configuration to apply these controls to generation. "
+                 "The ROSTER line, the entry markers "
                  "(|n|\"...\"|n| and [n] or the JSON entries), the previous-window and "
                  "surrounding-text blocks, and the JSON answer schema are added by the "
                  "pipeline; the rest is the text from the boxes."),
     }
 
 _REDACTED_SECRET = "[REDACTED]"
+
+# Every LLM profile section the config holds: the two named profiles the Setup
+# tab edits, plus `llm`, the mirror of whichever one is active (written from it
+# on save). One list for both the GET redaction and the Save restore, so the
+# two cannot drift apart (Rule 15).
+_LLM_PROFILE_SECTIONS = ("llm", "llm_local", "llm_remote")
+
+
+def _redact_provider_headers(headers: dict) -> dict:
+    """Return provider headers with every VALUE masked and every NAME kept.
+
+    All values, not just credential-looking names (#2006): a provider's own
+    auth header (`x-acme-token`, say) carries a credential under a name no
+    pattern can recognise, and masking a non-secret header costs nothing
+    because Save restores it by name. The Setup tab still sees which headers
+    exist, so the user can add, change or remove one.
+    """
+    if not isinstance(headers, dict):
+        return {}
+    return {name: _REDACTED_SECRET for name in headers}
+
+
+def _get_provider_header_lookup(headers: dict) -> dict:
+    """One stored header set, keyed by lowercased name.
+
+    HTTP header names are case-insensitive, so `authorization` echoed by the
+    browser must find the stored `Authorization` (#2006). The first stored
+    spelling of a name wins, which makes a config hand-edited to hold two
+    names differing only by case resolve the same way on every save.
+    """
+    lookup = {}
+    if isinstance(headers, dict):
+        for name, value in headers.items():
+            lookup.setdefault(str(name).lower(), (name, value))
+    return lookup
+
+
+def _restore_provider_headers(incoming: dict, saved: dict) -> dict:
+    """Map the GET sentinel back to the stored value, header by header.
+
+    A header whose incoming value is the sentinel keeps the stored value of
+    that same name; any other value replaces it; a header the client did not
+    send stays removed. Names match case-insensitively and the stored spelling
+    is kept, so an editor that lowercased a name neither loses the credential
+    nor starts a second copy of the same header. A sentinel with no stored
+    counterpart is dropped rather than saved as the literal string: writing
+    "[REDACTED]" to disk would send that placeholder to the provider as a
+    credential, and refusing the save outright would need a new error key for
+    a case the Setup tab cannot produce.
+    """
+    lookup = _get_provider_header_lookup(saved)
+    restored = {}
+    for name, value in (incoming or {}).items():
+        stored = lookup.get(str(name).lower())
+        if value == _REDACTED_SECRET:
+            if stored is not None:
+                restored[stored[0]] = stored[1]
+        else:
+            restored[stored[0] if stored is not None else name] = value
+    return restored
 
 
 def _redact_config_secrets(config: dict) -> dict:
@@ -239,6 +310,9 @@ def _redact_config_secrets(config: dict) -> dict:
     API credentials are needed by the server but never by the setup page's
     read endpoint.  Keep the sentinel stable so save_config() can preserve an
     unchanged credential without putting the plaintext back on the wire.
+    Custom provider headers are credentials too (#2006): they are sent as the
+    OpenAI client's default headers, which is exactly where `Authorization:
+    Bearer ...` and `x-api-key` live.
     """
     # deepcopy, not a JSON round trip: the loaded config carries pydantic
     # objects (e.g. ThreePassModelProfile) that FastAPI serialises on the way
@@ -251,29 +325,121 @@ def _redact_config_secrets(config: dict) -> dict:
             value["api_key_configured"] = True
             if not is_api_key_reference(value["api_key"]):
                 value["api_key"] = _REDACTED_SECRET
+    for section in _LLM_PROFILE_SECTIONS:
+        value = safe.get(section)
+        if isinstance(value, dict) and isinstance(value.get("provider_headers"), dict):
+            value["provider_headers"] = _redact_provider_headers(value["provider_headers"])
     return safe
 
 
 def get_api_key_endpoint(base_url):
-    """Identify the endpoint to which a stored credential belongs."""
-    return (base_url or "").strip().rstrip("/")
+    """Identify the endpoint to which a stored credential belongs.
+
+    The saved profile's `base_url` and the posted one go through the same
+    normalisation the browser's URLs do (`_normalize_openai_base_url`), so a
+    saved `http://host:1234` and a posted `http://host:1234/v1` name one
+    endpoint (Rule 15, #2006).
+    """
+    return _normalize_openai_base_url(base_url) if isinstance(base_url, str) else ""
+
+
+def get_saved_profile_for_endpoint(base_url, existing=None, *, section=None, llm_mode=None):
+    """The stored LLM profile whose endpoint matches `base_url`, or None.
+
+    One answer to "which saved profile does this endpoint belong to?", shared
+    by GET hydration, Preview, Save and the Test / Load-models requests so
+    they cannot disagree about it.
+
+    Two named profiles may share an endpoint with different credentials. A
+    Setup form knows which section it is restoring, so `section` disambiguates
+    a tie by that role; for the `llm` mirror the active role (`llm_mode`) owns
+    the credential. Requests that carry no section (Test / Load-models post a
+    single profile-shaped object, static/js/app-core.js `getEditedLlmProfile`)
+    keep the conservative refusal on a real tie rather than guess.
+    """
+    existing = existing if existing is not None else load_app_config(CONFIG_PATH)
+    wanted = get_api_key_endpoint(base_url)
+    if not wanted:
+        return None
+    existing = existing if isinstance(existing, dict) else {}
+    profiles = {"llm_local": get_config_local_profile(existing),
+                "llm_remote": existing.get("llm_remote"),
+                "llm": existing.get("llm")}
+    matches = {name: profile for name, profile in profiles.items()
+               if isinstance(profile, dict)
+               and get_api_key_endpoint(profile.get("base_url")) == wanted}
+    active = ("llm_remote" if (llm_mode or existing.get("llm_mode")) == "remote" else "llm_local")
+    if "llm" in matches and active in matches:
+        matches.pop("llm")
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if section in matches:
+        return matches[section]
+    if section == "llm" and active in matches:
+        return matches[active]
+    return None
+
+
+def get_endpoint_credential_source(section, endpoint, saved, existing, llm_mode):
+    """The one saved profile whose credentials/headers belong to `endpoint`.
+
+    GET hydration, Preview and Save all use this answer. A neutral named slot
+    has no saved endpoint: Setup filled it from the active runtime profile,
+    which may be the legacy mirror even when another named profile shares that
+    endpoint with its own key and headers. Resolving by role alone cannot tell
+    those apart, so the runtime profile is the provenance in that case.
+    """
+    saved = saved if isinstance(saved, dict) else {}
+    saved_endpoint = get_api_key_endpoint(saved.get("base_url"))
+    if not endpoint or endpoint == saved_endpoint:
+        return saved
+    runtime = get_active_llm_config(existing) if isinstance(existing, dict) else {}
+    runtime_endpoint = get_api_key_endpoint(runtime.get("base_url"))
+    # Persisted pre-Save state is the provenance: a named slot saved without an
+    # endpoint was hydrated from the active runtime profile by GET. A mode
+    # toggle in the form happens after that, so resolving by the NEW mode at
+    # this point would hand the slot another profile's key and headers.
+    if (section in ("llm_local", "llm_remote") and not saved_endpoint
+            and runtime_endpoint == endpoint):
+        return runtime
+    bound = get_saved_profile_for_endpoint(endpoint, existing, section=section, llm_mode=llm_mode)
+    if bound is not None:
+        return bound
+    if section == "llm" and runtime_endpoint == endpoint:
+        return runtime
+    return None
 
 
 def _resolve_redacted_api_key(api_key, base_url, existing=None):
     """The Setup tab's key field holds the GET sentinel for a stored key, and
     the Test / Load-models buttons send that field as-is. Map the sentinel
     back to the stored key of the profile whose base_url matches, so a
-    credential is never inherited by an unrelated endpoint."""
+    credential is never inherited by an unrelated endpoint. An ambiguous
+    match is refused rather than guessed at - the 400 asks for the key
+    explicitly."""
     if api_key != _REDACTED_SECRET:
         return api_key
-    existing = existing if existing is not None else load_app_config(CONFIG_PATH)
-    wanted = get_api_key_endpoint(base_url)
-    candidates = [existing.get(s) for s in ("llm_local", "llm_remote", "llm")]
-    candidates = [c for c in candidates if isinstance(c, dict)]
-    for profile in candidates:
-        if wanted and get_api_key_endpoint(profile.get("base_url")) == wanted and profile.get("api_key"):
-            return profile["api_key"]
+    profile = get_saved_profile_for_endpoint(base_url, existing)
+    if profile is not None and profile.get("api_key"):
+        return profile["api_key"]
     raise HTTPException(status_code=400, detail="Enter an API key for the changed endpoint, or clear the key field.")
+
+
+def _resolve_redacted_provider_headers(headers, base_url, existing=None):
+    """The Setup tab's header editor holds the GET sentinel for each stored
+    header, and the Test / Load-models buttons send that editor as-is. Map each
+    sentinel back to the stored value of the profile whose endpoint matches, so
+    a connection test still sends the real credential - and never inherits
+    another endpoint's. A sentinel with no matching stored header - or an
+    endpoint matching more than one profile, which cannot be attributed - is
+    dropped, never sent as the literal "[REDACTED]"."""
+    if not headers or _REDACTED_SECRET not in headers.values():
+        return dict(headers or {})
+    profile = get_saved_profile_for_endpoint(base_url, existing)
+    saved = profile.get("provider_headers") if isinstance(profile, dict) else None
+    return _restore_provider_headers(headers, saved)
 
 
 def get_config_local_profile(config: dict):
@@ -286,19 +452,48 @@ def _restore_redacted_secrets(config: AppConfig, existing: dict) -> AppConfig:
     updates = {}
     for section in ("llm", "llm_local", "llm_remote", "tts"):
         incoming = getattr(config, section, None)
+        if incoming is None:
+            continue
         saved = (get_config_local_profile(existing or {}) if section == "llm_local"
                  else (existing or {}).get(section))
-        if (incoming is not None
-                and getattr(incoming, "api_key", None) == _REDACTED_SECRET):
-            saved = saved if isinstance(saved, dict) else {}
-            endpoint = get_api_key_endpoint(getattr(incoming, "base_url", None))
-            saved_endpoint = get_api_key_endpoint(saved.get("base_url"))
+        saved = saved if isinstance(saved, dict) else {}
+        endpoint = get_api_key_endpoint(getattr(incoming, "base_url", None))
+        saved_endpoint = get_api_key_endpoint(saved.get("base_url"))
+        # One endpoint-bound provenance decision per section, shared by the
+        # credential and the headers. GET, Preview and Save all call the same
+        # helper, so a neutral slot hydrated from the legacy mirror resolves to
+        # that mirror rather than to another named profile at the endpoint.
+        source = get_endpoint_credential_source(section, endpoint, saved, existing,
+                                                config.llm_mode)
+        changes = {}
+        if getattr(incoming, "api_key", None) == _REDACTED_SECRET:
             inactive = "llm_remote" if config.llm_mode == "local" else "llm_local"
             unchanged_inactive_blank = (section == inactive and not endpoint and not saved_endpoint
                                         and isinstance((existing or {}).get(section), dict))
-            if endpoint != saved_endpoint or (not endpoint and not unchanged_inactive_blank):
+            # A URL-less manual profile has no endpoint to bind a key to; its
+            # sentinel still means "keep this profile's own stored key".
+            unchanged_manual_blank = (saved.get("transport") == "manual" and not endpoint
+                                      and not saved_endpoint and bool(saved.get("api_key")))
+            needs_explicit_key = (
+                (endpoint != saved_endpoint and source is None)
+                or (endpoint == saved_endpoint and not endpoint
+                    and not unchanged_inactive_blank and not unchanged_manual_blank)
+            )
+            if needs_explicit_key:
                 raise HTTPException(status_code=400, detail=f"Enter an API key for the changed {section} endpoint, or clear the key field.")
-            updates[section] = incoming.model_copy(update={"api_key": saved.get("api_key", "")})
+            changes["api_key"] = source.get("api_key", "")
+        if section in _LLM_PROFILE_SECTIONS:
+            # Headers use the same provenance but do not depend on the api_key
+            # field being a sentinel: a typed key or an env reference keeps its
+            # sentinelled headers, and a header with no stored counterpart is
+            # dropped rather than sent as the literal placeholder.
+            restored = _restore_provider_headers(
+                incoming.provider_headers,
+                source.get("provider_headers") if isinstance(source, dict) else None)
+            if restored != incoming.provider_headers:
+                changes["provider_headers"] = restored
+        if changes:
+            updates[section] = incoming.model_copy(update=changes)
     return config.model_copy(update=updates, deep=True) if updates else config
 
 
@@ -519,11 +714,12 @@ async def get_eta_status():
     for key in list(labels) + [key for key in process_state if key not in labels]:
         label = labels.get(key, key.replace("_", " ").title())
         state = process_state.get(key)
-        if state and state.get("running"):
-            eta = _compute_eta(state)
-            eta.update({"running": True, "task": key, "label": label})
+        lifecycle = get_task_lifecycle(key, states=process_state)
+        if state and (lifecycle['running'] or lifecycle['ownership_unconfirmed']):
+            eta = _compute_eta(state) if lifecycle['running'] else {'logs': list(state.get('logs', []))}
+            eta.update({**lifecycle, "task": key, "label": label})
             return eta
-    return {"running": False}
+    return get_task_lifecycle('', states={})
 
 
 class LMStudioOptimizeRequest(BaseModel):
@@ -538,6 +734,11 @@ async def lmstudio_status():
     llm_cfg = get_active_llm_config(full_cfg)
     base_url = llm_cfg.get("base_url", "")
     model_name = llm_cfg.get("model_name")
+    if llm_cfg.get("transport") == "manual":
+        # Manual transport hands every request to the operator; there is no
+        # HTTP endpoint to probe (and a stored URL may be malformed).
+        return {"available": False, "loaded": False, "context_length": None,
+                "parallel": None, "optimized": False, "model": None, "manual": True}
     if not model_name:
         return {"available": False, "loaded": False, "context_length": None,
                 "parallel": None, "optimized": False, "model": None}
@@ -545,7 +746,8 @@ async def lmstudio_status():
     ssh_alias = (full_cfg.get("llm_remote_ssh") or "").strip()
     status = dict(await asyncio.to_thread(
         get_current_status, llm_mode, base_url, model_name, ssh_alias,
-        use_cache=True, api_key=llm_cfg.get("api_key"), cache_local=True,
+        use_cache=True, api_key=resolve_probe_api_key(llm_cfg), cache_local=True,
+        authorization=get_effective_authorization(llm_cfg), llm_config=llm_cfg,
     ))
     status["model"] = model_name
     if is_remote_llm(llm_mode, base_url):
@@ -553,18 +755,45 @@ async def lmstudio_status():
     return status
 
 
-def _log_llm_failure(kind: str, detail: str) -> str:
-    """Write an LLM connection/optimize failure to logs/api/ and return the path."""
-    # Include microseconds so concurrent failures never truncate one another's
-    # diagnostic file (the old second-resolution name was collision-prone).
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = os.path.join(API_LOG_DIR, f"llm_{kind}_{ts}.log")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"[{datetime.now().isoformat()}] LLM {kind} failure\n\n{detail}\n")
-    except OSError:
+def _log_llm_failure(kind: str, error=None, *, operation=None, resource=None) -> str:
+    """Return the legacy log path, retaining only bounded content-free evidence."""
+    if kind not in ('test', 'optimize'):
+        raise ValueError('Invalid LLM diagnostic kind')
+    path = os.path.join(API_LOG_DIR, f"llm_{kind}-latest.log")
+    if not record_failure('llm_test_failed' if kind == 'test' else 'llm_optimize_failed',
+                          error if isinstance(error, BaseException) else None,
+                          task='llm', resource=resource, operation=operation, mirror_path=path):
+        record_failure('llm_log_write_failed', task='llm', resource=path, rate_limit_seconds=60)
         return ""
     return path
+
+
+_BROWSER_FAILURE_STAGES = frozenset(('save_flush_timer', 'save_pagehide'))
+_BROWSER_ERROR_NAMES = frozenset(('Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError',
+                                  'NetworkError', 'SecurityError', 'QuotaExceededError',
+                                  'InvalidStateError', 'UnknownError'))
+
+
+@router.post('/api/logs/browser-failure', status_code=204)
+async def record_browser_failure(request: Request):
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > 256:
+                return Response(status_code=413)
+            body.extend(chunk)
+    except ClientDisconnect:
+        return Response(status_code=400)
+    try:
+        report = json.loads(body)
+    except (ValueError, UnicodeError):
+        return Response(status_code=400)
+    if (not isinstance(report, dict) or set(report) != {'stage', 'error_name'}
+            or not isinstance(report['stage'], str) or report['stage'] not in _BROWSER_FAILURE_STAGES
+            or not isinstance(report['error_name'], str) or report['error_name'] not in _BROWSER_ERROR_NAMES):
+        return Response(status_code=400)
+    record_failure(report['stage'], task='browser', operation=report['error_name'], rate_limit_seconds=60)
+    return Response(status_code=204)
 
 
 @router.post("/api/lmstudio/optimize")
@@ -586,7 +815,8 @@ async def lmstudio_optimize(req: LMStudioOptimizeRequest):
     def _get_reload_response(message):
         status = dict(get_current_status(full_cfg.get("llm_mode", "local"),
             cfg.get("base_url", ""), model_name,
-            (full_cfg.get("llm_remote_ssh") or "").strip(), api_key=cfg.get("api_key")))
+            (full_cfg.get("llm_remote_ssh") or "").strip(), api_key=cfg.get("api_key"),
+            authorization=get_effective_authorization(cfg), llm_config=cfg))
         if (not status.get("management_verified") or not status.get("loaded")
                 or status.get("optimized") is not req.enable):
             raise HTTPException(status_code=502, detail="CLI reported reload, but fresh endpoint status did not verify the requested settings")
@@ -599,7 +829,8 @@ async def lmstudio_optimize(req: LMStudioOptimizeRequest):
     def _apply_settings():
         ownership = get_current_status(full_cfg.get("llm_mode", "local"),
             cfg.get("base_url", ""), model_name,
-            (full_cfg.get("llm_remote_ssh") or "").strip(), api_key=cfg.get("api_key"))
+            (full_cfg.get("llm_remote_ssh") or "").strip(), api_key=cfg.get("api_key"),
+            authorization=get_effective_authorization(cfg), llm_config=cfg)
         if not ownership.get("management_verified"):
             raise HTTPException(status_code=400, detail="Settings were not applied: " + ownership.get(
                 "management_reason", "endpoint management ownership is unverified"))
@@ -617,7 +848,7 @@ async def lmstudio_optimize(req: LMStudioOptimizeRequest):
                 "the Setup tab's Remote LLM settings (run `tnr connect <id>` once first)."))
         ok, msg = apply_remote_lmstudio_settings(ssh_alias, model_name, req.enable, ownership["management_port"])
         if not ok:
-            log_path = _log_llm_failure("optimize", f"alias={ssh_alias} model={model_name}\n\n{msg}")
+            log_path = _log_llm_failure("optimize", operation='reload', resource=ssh_alias)
             raise HTTPException(status_code=502, detail=f"{msg}" + (f" (log: {log_path})" if log_path else ""))
         return _get_reload_response(msg)
 
@@ -637,25 +868,34 @@ def _run_llm_test(profile: dict) -> dict:
     Returns a dict describing each step. On failure, writes a log file and
     includes its path so the user can hand it back for debugging.
     """
-    from llm_provider import make_llm_client
+    from llm_provider import MissingAPIKeyError, make_llm_client
     base_url = profile.get("base_url", "")
-    api_key = profile.get("api_key", "local")
     model_name = profile.get("model_name", "")
     try:
         _validate_local_llm_base_url(base_url)
-    except LLMConfigError as e:
-        return {"ok": False, "step": "validate", "error": str(e)}
+    except LLMConfigError:
+        return {"ok": False, "step": "validate",
+                "error": "The base URL is not valid for this LLM mode. Enter a valid endpoint URL and try again."}
 
-    client = make_llm_client(
-        {**profile, "api_key": api_key or "local"}, timeout=30,
-        respect_profile_timeout=False)
+    # Let make_llm_client resolve omitted and blank keys exactly as generation
+    # does: a blank official-OpenAI key may inherit OPENAI_API_KEY, and nothing
+    # should be forced to "local" before that decision. A configuration error
+    # here happens before any request, so report it as a redacted config step
+    # (no log file, no outbound call) and let the caller release the claim.
+    try:
+        client = make_llm_client(profile, timeout=30, respect_profile_timeout=False)
+    except MissingAPIKeyError:
+        return {"ok": False, "step": "config",
+                "error": "This endpoint needs an API key. Add a key to the LLM profile and try again."}
+    except ValueError as e:
+        return {"ok": False, "step": "config", "error": redact_text(str(e))}
     # Step 1: list models (cheap reachability + model-id check)
     try:
         models = [m.id for m in client.models.list().data]
     except Exception as e:
-        detail = f"base_url={base_url}\nGET /models failed:\n{traceback.format_exc()}"
-        return {"ok": False, "step": "models", "error": str(e),
-                "log_file": _log_llm_failure("test", detail)}
+        return {"ok": False, "step": "models",
+                "error": "Could not read the model list from the endpoint. Check the base URL and credentials, then try again.",
+                "log_file": _log_llm_failure("test", e, operation='models', resource=base_url)}
     model_present = model_name in models if model_name else None
     # Step 2: tiny chat completion
     try:
@@ -666,11 +906,10 @@ def _run_llm_test(profile: dict) -> dict:
         )
         reply = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        detail = (f"base_url={base_url}\nmodel={model_name}\navailable={models}\n"
-                  f"chat completion failed:\n{traceback.format_exc()}")
-        return {"ok": False, "step": "completion", "error": str(e),
+        return {"ok": False, "step": "completion",
+                "error": "The test request did not complete. Check the endpoint and model, then try again.",
                 "models": models, "model_present": model_present,
-                "log_file": _log_llm_failure("test", detail)}
+                "log_file": _log_llm_failure("test", e, operation='completion', resource=base_url)}
     return {"ok": True, "base_url": base_url, "model": model_name,
             "models": models, "model_present": model_present, "reply": reply,
             # Computed from the base_url actually tested (not the saved
@@ -697,12 +936,15 @@ async def llm_models(request: LlmModelsRequest):
         from llm_provider import make_llm_client
         profile = request.model_dump()
         profile["base_url"] = url
-        profile["api_key"] = _resolve_redacted_api_key(request.api_key, url) or "local"
+        profile["api_key"] = _resolve_redacted_api_key(request.api_key, url)
+        profile["provider_headers"] = _resolve_redacted_provider_headers(
+            profile.get("provider_headers"), url)
         client = make_llm_client(profile, timeout=10, respect_profile_timeout=False)
         return sorted({m.id for m in client.models.list().data})
     try:
         return {"models": await asyncio.to_thread(fetch)}
     except Exception as exc:                                    # noqa: BLE001
+        record_failure('llm_models_failed', exc, task='llm', resource=url)
         return {"models": [], "error": redact_text(str(exc))[:200]}
 
 @router.post("/api/llm/test")
@@ -714,6 +956,8 @@ async def llm_test(profile: Optional[LLMConfig] = None):
         profile_data = profile.model_dump()
         profile_data["base_url"] = url
         profile_data["api_key"] = _resolve_redacted_api_key(profile_data.get("api_key"), url)
+        profile_data["provider_headers"] = _resolve_redacted_provider_headers(
+            profile_data.get("provider_headers"), url)
     else:
         cfg = _load_llm_config()
         profile_data = cfg
@@ -895,14 +1139,18 @@ async def get_config():
 
     # Precomputed drift-aware answer to "is the active LLM endpoint remote?"
     # so the frontend doesn't have to re-derive it from llm_mode alone (which
-    # can drift from the actual active base_url) - see lmstudio_settings.is_remote_llm.
-    config["is_remote"] = is_remote_llm(config["llm_mode"], config.get("llm", {}).get("base_url", ""))
+    # can drift from the actual active base_url) - see
+    # lmstudio_settings.is_active_llm_remote. Resolved from the SAME active
+    # profile a run uses, not from the `llm` mirror, which a benchmark's cached
+    # concurrency, a hand edit or a script can leave pointing elsewhere (#2007).
+    config["is_remote"] = is_active_llm_remote(config)
     # Same question for the profile a failover would switch TO, decided here
     # (Rule 15) so the frontend can warn before a run that might land on a
     # billed endpoint without the user having chosen it as active.
     other = get_failover_llm_config(config)
     other_mode = "remote" if config["llm_mode"] == "local" else "local"
-    config["failover_is_remote"] = bool(other) and is_remote_llm(other_mode, other.get("base_url", ""))
+    config["failover_is_remote"] = (is_billed_http_profile(other)
+                                    and is_remote_llm(other_mode, other.get("base_url", "")))
     config["config_warnings"] = [
         {"field": warning.field, "message": warning.message}
         for warning in load_result.warnings
@@ -915,32 +1163,163 @@ async def get_config():
                               "tts_modes": get_tts_capability_modes()}
 
     safe = _redact_config_secrets(config)
-    # The public local placeholder was synthesized, not loaded from storage;
-    # sending a saved-key sentinel here would make first setup unsaveable.
-    if not loaded_config.get("llm"):
+    # Benchmark receipts are machine evidence, not Setup inputs: they are kept
+    # on disk by get_document_with_retained_cache across every save, so sending
+    # them through the form only offers a stale copy a chance to overwrite a
+    # newer measurement. Their raw body values never reach the browser.
+    for section in _LLM_PROFILE_SECTIONS:
+        value = safe.get(section)
+        if isinstance(value, dict):
+            for key in BENCHMARK_CACHE_KEYS:
+                value.pop(key, None)
+            if isinstance(value.get("provider_extra_body"), dict):
+                # Exact text for the browser editor: its JSON.parse cannot hold
+                # integers above 2^53. AppConfig ignores this helper on POST.
+                value["provider_extra_body_json"] = json.dumps(value["provider_extra_body"],
+                                                               indent=2)
+
+    def _has_postable_identity(value):
+        # Blank profiles are valid (an unused inactive slot keeps empty
+        # strings and its own key); only a profile missing the required keys
+        # cannot be POSTed back.
+        return isinstance(value, dict) and all(
+            key in value for key in ("base_url", "api_key", "model_name"))
+
+    def _is_url_less_manual(value):
+        return (isinstance(value, dict) and value.get("transport") == "manual"
+                and not str(value.get("base_url") or "").strip())
+
+    def _has_endpoint(value):
+        return isinstance(value, dict) and bool(str(value.get("base_url") or "").strip())
+
+    def _fill_partial_profile(section, saved, source=None):
+        # An empty, neutral or key-only profile cannot be POSTed back as-is.
+        # Fill the missing required fields from the public template so GET ->
+        # Save round-trips, keeping a stored key only when its endpoint is
+        # identifiable; a key with no endpoint is dropped, never guessed.
+        # `source` supplies browser-safe values from the active runtime profile.
+        template = dict(default_config["llm"])
+        endpoint_bound = _has_endpoint(saved)
+        values = safe.get(section) if source is None else source
+        if isinstance(values, dict):
+            template.update(values)
+        safe[section] = template
+        configured = bool(endpoint_bound and saved.get("api_key")) or (
+            source is not None and source.get("api_key") == _REDACTED_SECRET)
+        safe[section]["api_key_configured"] = configured
+        if not endpoint_bound and source is None:
+            safe[section]["api_key"] = template["api_key"]
+
+    def _is_hydrated(section):
+        value = safe.get(section)
+        if _is_url_less_manual(value):
+            return True
+        # A normalized blank stub has every required key but empty values; it
+        # must be hydrated even though it is postable by key name.
+        return (isinstance(value, dict) and "api_key" in value
+                and bool(str(value.get("base_url") or "").strip())
+                and bool(str(value.get("model_name") or "").strip()))
+
+    # Hydrate the mirror and the active named slot independently: the old early
+    # return for a complete legacy mirror left a neutral active slot blank, so
+    # the Setup form posted an unusable profile back. The inactive slot keeps
+    # its own destination (including a deliberate blank) and only gains missing
+    # required keys when it is a key-only stub.
+    active_section = "llm_remote" if (config.get("llm_mode") or "local") == "remote" else "llm_local"
+    inactive_section = "llm_local" if active_section == "llm_remote" else "llm_remote"
+    runtime = get_active_llm_config(config)
+    runtime_endpoint = get_api_key_endpoint(runtime.get("base_url")) if runtime else None
+    bound_credential = (get_endpoint_credential_source(
+        "llm", runtime_endpoint, loaded_config.get("llm"), loaded_config, config["llm_mode"])
+        if runtime_endpoint else None)
+    # A stored blank key is intentional and must survive hydration; only the
+    # complete absence of a saved source calls for a public placeholder.
+    saved_credential = bound_credential is not None
+    runtime_safe = None
+    if isinstance(runtime, dict):
+        # Strip machine receipts BEFORE building the browser-safe copy. A
+        # pre-digest receipt carried provider body values in plain text, which
+        # otherwise leaked into the hydrated active slot again.
+        public_runtime = {key: value for key, value in runtime.items()
+                          if key not in BENCHMARK_CACHE_KEYS}
+        runtime_safe = _redact_config_secrets({"llm": public_runtime})["llm"]
+        if isinstance(runtime_safe.get("provider_extra_body"), dict):
+            runtime_safe["provider_extra_body_json"] = json.dumps(
+                runtime_safe["provider_extra_body"], indent=2)
+    if runtime_safe is not None and not saved_credential:
+        # Synthesized public placeholder, not a saved credential: a sentinel
+        # here would make first setup unsaveable.
+        runtime_safe["api_key"] = default_config["llm"]["api_key"]
+        runtime_safe["api_key_configured"] = False
+
+    if not _is_url_less_manual(safe.get("llm")) and not _is_hydrated("llm"):
+        saved = loaded_config.get("llm")
+        _fill_partial_profile("llm", saved,
+                              source=runtime_safe if not _has_endpoint(saved) else None)
+    if (isinstance(safe.get("llm"), dict) and not saved_credential
+            and safe["llm"].get("api_key") == _REDACTED_SECRET and runtime_safe is not None):
         safe["llm"]["api_key"] = default_config["llm"]["api_key"]
         safe["llm"]["api_key_configured"] = False
-        if not loaded_config.get("llm_local"):
-            safe["llm_local"]["api_key"] = default_config["llm"]["api_key"]
-            safe["llm_local"]["api_key_configured"] = False
+
+    if (not saved_credential and _has_endpoint(safe.get(active_section))
+            and not _is_url_less_manual(safe.get(active_section))):
+        # The active slot was seeded from the default template, not from a
+        # stored profile; a sentinel here would make first setup unsaveable.
+        safe[active_section]["api_key"] = default_config["llm"]["api_key"]
+        safe[active_section]["api_key_configured"] = False
+
+    if (not _is_url_less_manual(safe.get(active_section))
+            and not _is_hydrated(active_section)):
+        saved = loaded_config.get(active_section)
+        if _has_endpoint(saved):
+            _fill_partial_profile(active_section, saved)
+        elif runtime_safe is not None:
+            # Preview derives its baseline from this same source decision.
+            source_profile = loaded_config.get(
+                get_hydrated_profile_source(loaded_config, active_section)) or runtime
+            _fill_partial_profile(active_section, source_profile, source=runtime_safe)
+        else:
+            _fill_partial_profile(active_section, None)
+
+    inactive = safe.get(inactive_section)
+    if (isinstance(inactive, dict) and not _is_url_less_manual(inactive)
+            and not _has_postable_identity(inactive)):
+        had_endpoint = _has_endpoint(inactive)
+        for key in ("base_url", "api_key", "model_name"):
+            inactive.setdefault(key, default_config["llm"][key])
+        if not had_endpoint:
+            # A key with no endpoint cannot be bound to one: drop it rather
+            # than leave an unresolvable sentinel in a valid Setup form.
+            inactive["api_key"] = default_config["llm"]["api_key"]
+            inactive["api_key_configured"] = False
     return safe
 
 @router.get("/api/default_prompts")
 async def get_default_prompts():
     system_prompt, user_prompt = load_default_prompts()
+    from cast_list import PROMPT as cast_whole_book_prompt, INCREMENTAL_PROMPT as cast_incremental_prompt
     pass1_system_prompt, pass1_user_prompt = load_segment_prompts()
     pass3_system_prompt, pass3_user_prompt = load_instruct_prompts()
     result = {
         "generation": GenerationConfig().model_dump(),
         "persona_reference_chars": PromptConfig().persona_reference_chars,
         "persona_allow_unknown_network_context": PromptConfig().persona_allow_unknown_network_context,
+        "review_labels_only": PromptConfig().review_labels_only,
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
+        "cast_whole_book_prompt": cast_whole_book_prompt,
+        "cast_incremental_prompt": cast_incremental_prompt,
         "pass1_system_prompt": pass1_system_prompt,
         "pass1_user_prompt": pass1_user_prompt,
         "pass3_system_prompt": pass3_system_prompt,
         "pass3_user_prompt": pass3_user_prompt,
     }
+    from compact_pass1 import COMPACT_SYSTEM, COMPACT_USER_TEMPLATE
+    result.update(pass1_compact_system_prompt=COMPACT_SYSTEM, pass1_compact_user_prompt=COMPACT_USER_TEMPLATE)
+    for mode in ("gaps", "directed"):
+        system, user = load_instruct_prompts(mode)
+        result[f"pass3_{mode}_system_prompt"] = system
+        result[f"pass3_{mode}_user_prompt"] = user
     try:
         review_sys, review_usr = load_review_prompts()
         result["review_system_prompt"] = review_sys
@@ -1014,9 +1393,11 @@ def get_config_to_save(config: AppConfig, existing: dict) -> AppConfig:
 
     # Normalize/validate whichever profiles were sent. The local/remote profiles
     # are persisted side-by-side so toggling never loses the other one's settings.
-    if normalized_config.llm_local is not None and normalized_config.llm_local.base_url.strip():
+    if (normalized_config.llm_local is not None and normalized_config.llm_local.base_url.strip()
+            and normalized_config.llm_local.transport != "manual"):
         normalized_config.llm_local = _normalize_and_validate_llm(normalized_config.llm_local)
-    if normalized_config.llm_remote is not None and normalized_config.llm_remote.base_url.strip():
+    if (normalized_config.llm_remote is not None and normalized_config.llm_remote.base_url.strip()
+            and normalized_config.llm_remote.transport != "manual"):
         normalized_config.llm_remote = _normalize_and_validate_llm(normalized_config.llm_remote)
 
     # Pick the active profile from the toggle, then mirror it into `llm` - the
@@ -1029,14 +1410,18 @@ def get_config_to_save(config: AppConfig, existing: dict) -> AppConfig:
             f"profile was provided - refusing to save a config where llm_mode "
             f"and the active llm profile would disagree."))
     # The form mirrors the newly selected profile into llm. Its stored key
-    # belongs to that named profile, not to the previously active mirror.
+    # belongs to that named profile, not to the previously active mirror;
+    # _restore_redacted_secrets resolves a sentinel by endpoint through the
+    # shared resolver when the mirror itself points somewhere else.
     normalized_config.llm = active.model_copy(deep=True)
-    saved_active = existing.get('llm_remote') if normalized_config.llm_mode == 'remote' else get_config_local_profile(existing)
-    normalized_config = _restore_redacted_secrets(
-        normalized_config, {**existing, 'llm': saved_active})
+    normalized_config = _restore_redacted_secrets(normalized_config, existing)
     active = (normalized_config.llm_remote if normalized_config.llm_mode == "remote"
               else normalized_config.llm_local)
-    normalized_config.llm = _normalize_and_validate_llm(active)
+    # Manual transport has no endpoint to normalize or validate: every request
+    # is handed to the operator instead of sent over HTTP, and a URL-less
+    # profile is a deliberate, round-trippable configuration.
+    normalized_config.llm = (active.model_copy(deep=True) if active.transport == "manual"
+                             else _normalize_and_validate_llm(active))
     # The active attribution preset decides the variant the run uses;
     # derive the generation key from it (after the merge, so a preset the
     # client did not resend is still found) so the CLI agrees with Setup,
@@ -1055,11 +1440,63 @@ def get_config_to_save(config: AppConfig, existing: dict) -> AppConfig:
     return normalized_config
 
 
+# Leave room for the config model and profile around a nested provider body.
+_MAX_SETTINGS_JSON_DEPTH = 250
+
+
+def _validate_settings_json(value, depth=0):
+    """Reject depth and number errors before validation can echo input."""
+    if depth > _MAX_SETTINGS_JSON_DEPTH:
+        refuse_invalid_request_body()
+    if isinstance(value, float) and not math.isfinite(value):
+        raise HTTPException(status_code=400, detail="Settings contain a non-finite JSON number; use finite values only.")
+    if isinstance(value, dict):
+        for item in value.values():
+            _validate_settings_json(item, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_settings_json(item, depth + 1)
+
+
+def refuse_invalid_request_body():
+    raise HTTPException(status_code=400, detail="Settings contain invalid request-body JSON; no settings were applied.")
+
+
+def validate_authoritative_raw(profile):
+    """One controlled rule for a declared-authoritative provider-body editor.
+
+    Any invalid shape is refused generically before the submitted model is
+    formatted, so no submitted value can reach an error response. Auxiliary
+    text without the explicit flag is ignored: structured input stays
+    authoritative for ordinary API callers.
+    """
+    if not isinstance(profile, dict) or profile.get("provider_extra_body_raw") is not True:
+        return
+    raw = profile.get("provider_extra_body_json")
+    if not isinstance(raw, str) or not raw.strip():
+        refuse_invalid_request_body()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        refuse_invalid_request_body()
+    if not isinstance(parsed, dict):
+        refuse_invalid_request_body()
+    _validate_settings_json(parsed, depth=2)
+
+
+def validate_submitted_raw_sections(payload):
+    if isinstance(payload, dict):
+        for section in _LLM_PROFILE_SECTIONS:
+            validate_authoritative_raw(payload.get(section))
+
+
 @router.post("/api/config/preview")
 async def preview_config(proposed: Any = Body(...)):
     """Compare supported saved settings with the normalized Save proposal."""
     if not isinstance(proposed, dict):
         raise HTTPException(status_code=400, detail="Preview requires a settings object.")
+    _validate_settings_json(proposed)
+    validate_submitted_raw_sections(proposed)
     try:
         config = AppConfig.model_validate(proposed)
         return await asyncio.to_thread(_get_config_preview_sync, config)
@@ -1087,7 +1524,8 @@ def apply_config_save(existing, normalized_config):
         except OSError as exc:
             raise HTTPException(status_code=500,
                                 detail=f"Could not preserve damaged config before saving: {exc}") from exc
-    atomic_json_write(normalized_config.model_dump(), CONFIG_PATH)
+    document = get_document_with_retained_cache(normalized_config.model_dump(), existing.data)
+    atomic_json_write(document, CONFIG_PATH, allow_nonatomic_fallback=False)
 
 
 def is_pronunciation_config_change(before, after):
@@ -1175,8 +1613,8 @@ def apply_pronunciation_config_change(config, manager):
             manager.reset_engine()
             return True
 
-    with ensure_book_switch_allowed(operation="change synthesis window, recovery, speech verification or conditional pronunciation settings"):
-        with ensure_book_state(root, timeout=0.25, recover=False):
+    with ensure_book_switch_allowed(operation="change synthesis window, recovery, speech verification or conditional pronunciation settings", hold_task_mutex=False):
+        with ensure_book_state(root, timeout=0.25, recover=False), _gpu_lock:
             before = manager.get_pronunciation_preview_settings()["settings"]
             try:
                 with manager._chunks_lock, file_lock(manager.chunks_path), file_lock(CONFIG_PATH):
@@ -1198,7 +1636,22 @@ def apply_pronunciation_config_change(config, manager):
             return True
 
 
-@router.post("/api/config")
+async def ensure_finite_settings_body(request: Request):
+    """Reject non-finite JSON before pydantic embeds it in an error response.
+
+    Raw editor text is a JSON string at this point, so its contents are parsed
+    here too. The refusal is field-independent: no submitted key, header, body
+    value or property name can reach the response or a traceback.
+    """
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return
+    _validate_settings_json(payload)
+    validate_submitted_raw_sections(payload)
+
+
+@router.post("/api/config", dependencies=[Depends(ensure_finite_settings_body)])
 async def save_config(config: AppConfig):
     reset = await asyncio.to_thread(save_config_document, config)
     if not reset:
@@ -1220,8 +1673,8 @@ def _clear_synthesis_recovery_sync(expected_book_token):
     from editor_poll_snapshot import get_snapshot_digest
     from synthesis_recovery_cache import CACHE_DIRECTORY, RecoveryCacheStorage, RecoveryCacheUnavailable
     root = project_manager.root_dir
-    with ensure_book_switch_allowed(operation='clear retained synthesis recovery windows'):
-        with ensure_book_state(root, timeout=0.25):
+    with ensure_book_switch_allowed(operation='clear retained synthesis recovery windows', hold_task_mutex=False):
+        with ensure_book_state(root, timeout=0.25), _gpu_lock:
             if get_snapshot_digest(get_book_operation_identity(root)) != expected_book_token:
                 raise HTTPException(status_code=409, detail='Active book changed; reload Editor before clearing recovery windows.')
             removed = 0

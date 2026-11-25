@@ -14,12 +14,13 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field, StrictBool, StrictInt
 
 import core
-from book_state_transaction import ensure_book_state
+from book_state_transaction import ensure_book_state, get_book_fault_response
 from config_settings import load_app_config
 from generation_checkpoint_deltas import load_generation_delta_checkpoint
 from lmstudio_settings import get_active_llm_config
 from routers.scripts_library import _build_saved_scripts_list, _require_saved_book_name
 from speaker_identity import get_validated_alias_graph
+from alias_registry_apply import alias_task_lease
 from speaker_review import (SCHEMA, SOURCE_REVISION, PROMPT, MODES, MAX_PAIRS, MAX_ATTEMPTS,
     WARNING, digest, validate_entries, get_checkpoint_prefix, get_candidates,
     get_profile_settings, get_native_entries, require_prompt_capacity, review_key, require_alias_pair,
@@ -97,9 +98,17 @@ def _sha(raw):
 
 
 @contextlib.contextmanager
-def _inputs_locked(reference_name=None):
-    """Match native book/saved-book order; hold compare-and-swap through alias write."""
-    with ensure_book_state(core.DATA_DIR), ensure_book_state(core.SCRIPTS_DIR), contextlib.ExitStack() as locks:
+def _inputs_locked(reference_name=None, *, recover=True, pending_detail=None):
+    """Match native book/saved-book order; hold compare-and-swap through alias write.
+
+    Apply passes recover=False: a pending journal must never be recovered (and
+    the workspace mutated) before the busy checks under the GPU mutex run. A
+    well-formed v1 journal still maps to the shared migration guidance; any
+    other pending journal gets pending_detail (Apply's own wording).
+    """
+    with (ensure_book_state(core.DATA_DIR, recover=recover, pending_detail=pending_detail),
+          ensure_book_state(core.SCRIPTS_DIR, recover=recover, pending_detail=pending_detail),
+          contextlib.ExitStack() as locks):
         # Match voice edits: chunks before voices. A checkpoint reader is told it is locked.
         paths = [core.SCRIPT_PATH, core.CHUNKS_PATH, core.VOICE_CONFIG_PATH,
                  core.CHARACTER_ALIASES_PATH, core.CONFIG_PATH, _checkpoint_path()]
@@ -403,6 +412,7 @@ def _require_current(record):
 
 
 def _run_review(run_id, profile):
+    from review_startup import record_failure
     client = None
     record = None
     try:
@@ -432,6 +442,7 @@ def _run_review(run_id, profile):
                             verdict = reviewer(candidate, mode)
                             validate_verdict(verdict)
                         except Exception as exc:
+                            record_failure('speaker_candidate_failed', exc, task=TASK, resource=run_id)
                             # Provider errors can contain credentials and full private payloads.
                             result['error'] = type(exc).__name__
                         else:
@@ -448,6 +459,7 @@ def _run_review(run_id, profile):
         if record is not None:
             record.update(status='stale', error='Book, evidence, model profile, or aliases changed; preview again')
     except Exception as exc:
+        record_failure('speaker_review_failed', exc, task=TASK, resource=run_id)
         if record is not None:
             record.update(status='failed', error=type(exc).__name__)
     finally:
@@ -488,48 +500,56 @@ def _cancel(run_id):
     return {'status': 'interrupted' if record['status'] == 'running' else record['status']}
 
 
+def _refuse_stale_apply():
+    """The one stale applied-review refusal, shared by both pre-write guards."""
+    raise HTTPException(status_code=409, detail='This review changed or is stale; preview and review again')
+
+
 def _apply(run_id, request):
-    with core._gpu_lock:
-        if core.is_task_running(TASK):
-            raise HTTPException(status_code=409, detail='Wait for the speaker review to finish before applying')
-        # Registry changes must not race generation/review or nickname discovery.
-        busy = [name for name in core.LLM_TASKS if core.is_task_running(name)]
-        if busy:
-            raise HTTPException(status_code=409, detail='Wait for model tasks to finish before saving an alias')
-        try:
-            lease = core.acquire_task_lease(core.DATA_DIR, TASK, core.LLM_TASKS)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail='Another app worker owns a model task; wait before saving an alias') from exc
-        with contextlib.closing(lease):
+    reference_name = _read_run(run_id)['selection']['reference_name']
+    # The book admission comes before nested lease/file locks, as in every other
+    # caller that nests them; _inputs_locked owns the native book/saved-book
+    # order. Non-recovering: a pending committed journal is refused with no
+    # mutation before the live-review checks run. A valid v1 journal maps to the
+    # shared migration guidance; other pending states get wording that reflects
+    # Apply rather than a preview. The shared alias lease owns task/GPU
+    # admission, so this path and the native alias editor use one policy.
+    with _inputs_locked(reference_name, recover=False,
+                        pending_detail='Book recovery is required before applying a speaker review'):
+        with alias_task_lease(core.DATA_DIR):
             with file_lock(_run_path(run_id), timeout=0):
                 record = _read_run(run_id)
-                with _inputs_locked(record['selection']['reference_name']):
-                    captured = _capture_locked(record['selection'])
-                    if (request.snapshot != record['snapshot'] or captured['public']['snapshot'] != record['snapshot']
-                            or record['status'] != 'completed' or record.get('applied')):
-                        raise HTTPException(status_code=409, detail='This review changed or is stale; preview and review again')
-                    candidate = next((item for item in captured['public']['candidates']
-                                      if item['id'] == request.candidate_id), None)
-                    if candidate is None:
-                        raise HTTPException(status_code=409, detail='The selected candidate is no longer relevant')
-                    updated = require_alias_pair(candidate, record['reviews'], request.alias,
-                                                 request.canonical, captured['aliases'])
-                    # Same graph validator, registry lock and atomic write as the native alias
-                    # editor, with all book/evidence checks still inside their shared locks.
-                    atomic_json_write(updated, core.CHARACTER_ALIASES_PATH, allow_nonatomic_fallback=False)
-                    record['applied'] = [candidate['id']]
-                    record['status'] = 'stale'
-                    _write_run(record)
-                    return {'status': 'saved', 'alias': request.alias, 'canonical': request.canonical,
-                            'run_id': run_id, 'applied': record['applied']}
+                if record['selection']['reference_name'] != reference_name:
+                    _refuse_stale_apply()
+                captured = _capture_locked(record['selection'])
+                if (request.snapshot != record['snapshot'] or captured['public']['snapshot'] != record['snapshot']
+                        or record['status'] != 'completed' or record.get('applied')):
+                    _refuse_stale_apply()
+                candidate = next((item for item in captured['public']['candidates']
+                                  if item['id'] == request.candidate_id), None)
+                if candidate is None:
+                    raise HTTPException(status_code=409, detail='The selected candidate is no longer relevant')
+                updated = require_alias_pair(candidate, record['reviews'], request.alias,
+                                             request.canonical, captured['aliases'])
+                # Same graph validator, registry lock and atomic write as the native alias
+                # editor, with all book/evidence checks still inside their shared locks.
+                atomic_json_write(updated, core.CHARACTER_ALIASES_PATH, allow_nonatomic_fallback=False)
+                record['applied'] = [candidate['id']]
+                record['status'] = 'stale'
+                _write_run(record)
+                return {'status': 'saved', 'alias': request.alias, 'canonical': request.canonical,
+                        'run_id': run_id, 'applied': record['applied']}
 
 
 async def _dispatch(function, *args):
     try:
         return await asyncio.to_thread(function, *args)
-    except TimeoutError as exc:
-        raise HTTPException(status_code=409, detail='Book or review is busy; retry after the current operation') from exc
-    except (ValueError, OSError) as exc:
+    except (TimeoutError, ValueError, OSError, RecursionError) as exc:
+        fault = get_book_fault_response(exc)
+        if fault is not None:
+            raise HTTPException(status_code=fault.status_code, detail=fault.detail) from exc
+        if isinstance(exc, TimeoutError):
+            raise HTTPException(status_code=409, detail='Book or review is busy; retry after the current operation') from exc
         # Input validation errors are our own bounded messages; I/O paths stay private.
         detail = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else 'Review input is unavailable or invalid'
         raise HTTPException(status_code=409, detail=detail) from exc

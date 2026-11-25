@@ -14,7 +14,48 @@ from pathlib import Path
 
 _DIGEST = re.compile(r'^[0-9a-f]{64}$')
 MAX_BINDING_BYTES = 4096
+MAX_SELECTION_STATE_BYTES = 4 * 1024**2
 BINDING_NAME = 'annotated_script.selection_binding.json'
+STALE_SOURCE_MESSAGE = 'Selected source changed during generation; preserving prior output'
+
+
+class PublicationProof(int):
+    """The moved count plus the exact bytes a publisher committed.
+
+    It is an ``int`` so every existing caller of the publishers keeps seeing a
+    plain count. Review's completion evidence reads only these captured bytes;
+    it never re-reads a mutable output/companion path after publication.
+    """
+
+    def __new__(cls, moved, *, output_raw_sha256, output_entries_sha256, companions):
+        proof = int.__new__(cls, moved)
+        proof.output_raw_sha256 = output_raw_sha256
+        proof.output_entries_sha256 = output_entries_sha256
+        proof.companions = dict(companions)
+        return proof
+
+
+def _committed_identity(path, committed):
+    """Identity of exact committed bytes, including an unchanged companion."""
+    if not path:
+        return None
+    return {'path': os.path.abspath(path),
+            'sha256': hashlib.sha256(committed).hexdigest() if isinstance(committed, bytes) else None}
+
+
+def _output_proof_values(new_script):
+    from completed_review_receipt import get_review_entries_fingerprint
+    try:
+        entries = json.loads(new_script)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError):
+        entries = None
+    return (hashlib.sha256(new_script).hexdigest(),
+            get_review_entries_fingerprint(entries) if isinstance(entries, list) and entries else None)
+
+
+def is_script_selection_pending(state):
+    """Only an absent flag or explicit False permits published-script access."""
+    return 'script_selection_pending' in state and state['script_selection_pending'] is not False
 
 
 def require_published_selection(data_dir):
@@ -25,7 +66,7 @@ def require_published_selection(data_dir):
     root = Path(data_dir)
     with reuse_book_state(data_dir), file_lock(str(root / 'state.json')):
         state = _read_selection_state(data_dir, required=False)
-        if ('script_selection_pending' in state and state['script_selection_pending'] is not False):
+        if is_script_selection_pending(state):
             raise ValueError('The selected source has no published script; previous book files were preserved.')
 
 
@@ -104,10 +145,21 @@ def _source_digest(path, *, owning_root=None):
     return _read_source_snapshot(path, owning_root=owning_root)[0]
 
 
+def require_unchanged_source(source_path, expected_sha256, *, owning_root=None):
+    """Refuse publication when the selected source changed after capture.
+
+    Re-verifies the confined source digest at the publication boundary. Shared
+    by the legacy completion publisher and the three-pass publisher so a source
+    edited or swapped mid-run can never publish a script for stale text.
+    """
+    if _source_digest(source_path, owning_root=owning_root) != _digest(expected_sha256):
+        raise ValueError(STALE_SOURCE_MESSAGE)
+
+
 def _read_selection_state(data_dir, *, required):
     """Read bounded state; the caller is responsible for operation admission."""
     from project_scope_files import capture_scope_file
-    _, raw = capture_scope_file(data_dir, 'state.json', limit=4 * 1024**2, include_bytes=True)
+    _, raw = capture_scope_file(data_dir, 'state.json', limit=MAX_SELECTION_STATE_BYTES, include_bytes=True)
     if raw is None:
         if required:
             raise ValueError('Selected source state is missing')
@@ -161,7 +213,12 @@ def _validated_script_entries(script_bytes, *, require_entries=True):
 
 
 def make_script_selection_binding(book_token, source_sha256, published_script, *, source_path):
-    """Build evidence from the captured run and the exact publication bytes."""
+    """Build evidence from the captured run and the exact publication bytes.
+
+    This is the generic publisher used by generation, edits, save/load and
+    rebinding. It deliberately never derives cut coverage: scope evidence must
+    come from the controlled scope-apply transaction over the parent rows.
+    """
     from completed_review_receipt import get_review_entries_fingerprint
     entries = _validated_script_entries(published_script)
     return {'version': 3, 'book_token': _digest(book_token),
@@ -169,6 +226,75 @@ def make_script_selection_binding(book_token, source_sha256, published_script, *
             'source_path_sha256': _path_digest(source_path),
             'published_entries_sha256': get_review_entries_fingerprint(entries),
             'published_script_sha256': hashlib.sha256(published_script).hexdigest()}
+
+
+_SCOPE_CUT_FIELDS = frozenset(('version', 'source_sha256', 'parent_policy_sha256',
+    'scope_policy_sha256', 'coverage_sha256', 'outer_start', 'outer_end', 'start_word'))
+
+
+def is_scope_cut_evidence(value):
+    """Strict, versioned retained-cut evidence carried by a binding.
+
+    The digest is content-free: it is the ordered coverage of the parent's
+    verified retained raw intervals. The endpoints are the exact raw outer
+    endpoints of that coverage, so any right/left overrun changes them.
+    """
+    if not isinstance(value, dict) or set(value) != _SCOPE_CUT_FIELDS:
+        return False
+    if type(value['version']) is not int or value['version'] != 1:
+        return False
+    if any(not isinstance(value[key], str) or not _DIGEST.fullmatch(value[key])
+           for key in ('source_sha256', 'parent_policy_sha256',
+                       'scope_policy_sha256', 'coverage_sha256')):
+        return False
+    if any(type(value[key]) is not int or value[key] < 0
+           for key in ('outer_start', 'outer_end', 'start_word')):
+        return False
+    return 0 <= value['outer_start'] < value['outer_end']
+
+
+def get_scope_cut_from_binding(binding):
+    """Return verified scope evidence from a parsed binding, else None."""
+    if not isinstance(binding, dict):
+        return None
+    value = binding.get('scope_cut')
+    return value if is_scope_cut_evidence(value) else None
+
+
+def _serialize_binding(binding):
+    return json.dumps(binding, sort_keys=True, separators=(',', ':')).encode()
+
+
+def attach_scope_cut_evidence(binding_bytes, evidence):
+    """Attach producer-derived scope evidence inside the book transaction.
+
+    Only the controlled scope-apply path may call this. It never accepts
+    evidence read from a script (child) - the caller must derive it from the
+    parent rows and prepared source.
+    """
+    if not is_scope_cut_evidence(evidence):
+        raise ValueError('Invalid scope cut evidence')
+    if not isinstance(binding_bytes, bytes):
+        raise ValueError('Invalid binding bytes')
+    binding = parse_script_binding(binding_bytes)
+    binding['scope_cut'] = evidence
+    serialized = _serialize_binding(binding)
+    if len(serialized) > MAX_BINDING_BYTES:
+        raise ValueError('Script binding with scope evidence exceeds its byte limit')
+    return serialized
+
+
+def carry_scope_cut_evidence(old_binding_raw, binding):
+    """Carry valid existing scope evidence onto a generic rebuilt binding."""
+    if not isinstance(old_binding_raw, bytes) or not isinstance(binding, dict):
+        return binding
+    try:
+        evidence = get_scope_cut_from_binding(parse_script_binding(old_binding_raw))
+    except (ValueError, RecursionError):
+        return binding
+    if evidence is not None:
+        binding['scope_cut'] = evidence
+    return binding
 
 
 def parse_script_binding(raw):
@@ -179,9 +305,10 @@ def parse_script_binding(raw):
         binding = json.loads(raw, object_pairs_hook=_unique_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError('Invalid script binding') from error
-    if (not isinstance(binding, dict) or set(binding) != {
-            'version', 'book_token', 'source_sha256', 'source_path_sha256',
+    base = {'version', 'book_token', 'source_sha256', 'source_path_sha256',
             'published_entries_sha256', 'published_script_sha256'}
+    if (not isinstance(binding, dict) or not base <= set(binding)
+            or set(binding) - (base | {'scope_cut'})
             or type(binding['version']) is not int or binding['version'] != 3):
         raise ValueError('Invalid script binding structure')
     _digest(binding['book_token'])
@@ -189,6 +316,8 @@ def parse_script_binding(raw):
     _digest(binding['source_path_sha256'])
     _digest(binding['published_entries_sha256'])
     _digest(binding['published_script_sha256'])
+    if 'scope_cut' in binding and not is_scope_cut_evidence(binding['scope_cut']):
+        raise ValueError('Invalid scope cut evidence in script binding')
     return binding
 
 
@@ -223,7 +352,7 @@ def _binding_for_controlled_edit_locked(data_dir, old_script, new_script):
     from book_state_transaction import get_book_operation_token
 
     state = _read_selection_state(data_dir, required=False)
-    if ('script_selection_pending' in state and state['script_selection_pending'] is not False):
+    if is_script_selection_pending(state):
         raise ValueError('The selected source has no published script; previous book files were preserved.')
     _, raw = capture_scope_file(data_dir, BINDING_NAME, limit=MAX_BINDING_BYTES, include_bytes=True)
     _validated_script_entries(new_script)
@@ -247,6 +376,7 @@ def _binding_for_controlled_edit_locked(data_dir, old_script, new_script):
         raise ValueError('Script binding entry fingerprint is inconsistent')
     binding = make_script_selection_binding(selected['book_token'], selected['source_sha256'],
                                             new_script, source_path=selected['source_path'])
+    binding = carry_scope_cut_evidence(raw, binding)
     return json.dumps(binding, sort_keys=True, separators=(',', ':')).encode()
 
 
@@ -262,10 +392,19 @@ def binding_for_controlled_edit(data_dir, old_script, new_script):
         return _binding_for_controlled_edit_locked(data_dir, old_script, new_script)
 
 
-def _voice_remap_bytes(root, name, mapping, remap):
+def _voice_remap_bytes(root, name, mapping, remap, expected_sha256=None):
+    """Return (exact committed bytes, moved) for the voice companion.
+
+    An unchanged voice config is committed as the bytes read here under the
+    publication lock, so an external edit cannot lend its identity to a fact.
+    Absence is stable only when it was already absent at run start and no remap
+    needs the file; an unexpected removal still refuses.
+    """
     from project_scope_files import capture_scope_file
     _, raw = capture_scope_file(root, name, limit=16 * 1024**2, include_bytes=True)
     if raw is None:
+        if not mapping and expected_sha256 is None:
+            return None, 0
         raise ValueError('Voice configuration disappeared during review; edits were preserved')
     def reject_constant(value):
         raise ValueError('Nonfinite value in voice configuration')
@@ -276,9 +415,11 @@ def _voice_remap_bytes(root, name, mapping, remap):
         raise ValueError('Invalid voice configuration; review was not published') from error
     if not isinstance(config, dict):
         raise ValueError('Invalid voice configuration; review was not published')
-    moved = remap(config, mapping)
+    if not mapping or not callable(remap):
+        return raw, 0
+    config, moved = remap(config, mapping)
     return (json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
-            if moved else None), moved
+            if moved else raw), moved
 
 
 def _staged_registry_path(data_dir, staging):
@@ -314,16 +455,17 @@ def _staged_registry_path(data_dir, staging):
         raise ValueError('Review alias registry collides with a book artifact')
     for key in ('before', 'after'):
         value = staging[key]
-        if value is not None and (not isinstance(value, bytes) or len(value) > 4 * 1024**2):
+        if value is not None and (not isinstance(value, bytes) or len(value) > MAX_SELECTION_STATE_BYTES):
             raise ValueError('Invalid staged alias registry bytes')
     return Path(path)
 
 
 def _add_staged_registry(data_dir, staging, registry, replacements):
+    """Stage an alias registry and return the exact bytes committed for it."""
     if registry is None:
-        return
+        return None
     from project_scope_files import capture_scope_file
-    _, raw = capture_scope_file(data_dir, registry.name, limit=4 * 1024**2, include_bytes=True)
+    _, raw = capture_scope_file(data_dir, registry.name, limit=MAX_SELECTION_STATE_BYTES, include_bytes=True)
     if raw != staging['before']:
         raise ValueError('Alias registry changed during review; edits were preserved')
     from speaker_identity import get_validated_alias_graph
@@ -337,11 +479,41 @@ def _add_staged_registry(data_dir, staging, registry, replacements):
             raise ValueError('Invalid staged alias registry') from error
     if staging['after'] is not None:
         replacements[registry.name] = staging['after']
+        return staging['after']
+    return raw
+
+
+def verify_review_source_identity(data_dir, expected):
+    """Fence captured coordinates while the caller holds publication admission."""
+    if expected is None:
+        return
+    from book_state_transaction import get_book_operation_token
+    from project_scope_files import capture_scope_file
+    from review_startup import record_failure
+
+    try:
+        if expected['book_token'] is not None:
+            state = _read_selection_state(data_dir, required=True)
+            if (is_script_selection_pending(state)
+                    or get_book_operation_token(data_dir, state=state) != expected['book_token']
+                    or state.get('input_file_path') != expected['source_path']):
+                raise ValueError('Review selection differs from its capture')
+        for source in expected['sources']:
+            relative = os.path.relpath(source['binding_path'], data_dir).replace(os.sep, '/')
+            proof, _ = capture_scope_file(data_dir, relative, limit=MAX_BINDING_BYTES)
+            if (proof['sha256'] != source['binding_sha256']
+                    or _source_digest(source['source_path'], owning_root=data_dir) != source['source_sha256']):
+                raise ValueError('Review source differs from its capture')
+    except (OSError, ValueError, TypeError, KeyError):
+        record_failure('review_source_identity_changed', task='review')
+        raise ValueError('Review source identity changed during review; edits were preserved') from None
 
 
 def publish_controlled_script_edit(data_dir, old_script, new_script, *,
                                    voice_config_path=None, voice_mapping=None,
-                                   remap_voice_config=None, registry_staging=None):
+                                   remap_voice_config=None, registry_staging=None,
+                                   alias_registry_path=None, expected_voice_sha256=None,
+                                   expected_source_identity=None):
     """Publish a review edit and its voice remap in one recoverable commit."""
     import contextlib
     from book_state_transaction import apply_book_state_locked, reuse_book_state
@@ -354,40 +526,57 @@ def publish_controlled_script_edit(data_dir, old_script, new_script, *,
     chunks = root / 'chunks.json'
     journal = Path(get_chunk_status_journal_path(chunks))
     registry = _staged_registry_path(data_dir, registry_staging)
+    alias_capture = Path(alias_registry_path) if alias_registry_path else None
+    if (alias_capture is not None and registry is not None
+            and os.path.abspath(alias_capture) != os.path.abspath(registry)):
+        raise ValueError('Review alias registry differs from its staged path')
     voice = root / 'voice_config.json'
+    capture_voice = bool(voice_config_path) and (
+        os.path.abspath(voice_config_path) == os.path.abspath(voice))
     if voice_mapping and not voice_config_path:
         raise ValueError('Voice remap requires the active book voice config')
     if voice_mapping and voice_config_path:
-        if os.path.abspath(voice_config_path) != os.path.abspath(voice):
+        if not capture_voice:
             raise ValueError('Active review voice config must belong to the active book')
         if not callable(remap_voice_config):
             raise ValueError('Voice remap is unavailable')
     with (reuse_book_state(data_dir), contextlib.ExitStack() as locks):
         for path in (root / 'state.json', script, chunks, root / BINDING_NAME):
             locks.enter_context(file_lock(str(path)))
-        if voice_mapping and voice_config_path:
+        if capture_voice:
             locks.enter_context(file_lock(str(voice)))
         if registry is not None:
             locks.enter_context(file_lock(str(registry)))
+        elif alias_capture is not None:
+            locks.enter_context(file_lock(str(alias_capture)))
         _, current = capture_scope_file(data_dir, script.name, limit=512 * 1024**2, include_bytes=True)
         if current != old_script:
             raise ValueError('Active script changed during review; edits were preserved')
+        verify_review_source_identity(data_dir, expected_source_identity)
         binding = _binding_for_controlled_edit_locked(data_dir, old_script, new_script)
         replacements = {script.name: new_script}
         if binding is not None:
             replacements[BINDING_NAME] = binding
-        _add_staged_registry(data_dir, registry_staging, registry, replacements)
+        alias_committed = _add_staged_registry(data_dir, registry_staging, registry, replacements)
+        if alias_committed is None and registry is None and alias_capture is not None:
+            _, alias_committed = capture_scope_file(
+                data_dir, alias_capture.name, limit=MAX_SELECTION_STATE_BYTES, include_bytes=True)
         moved = 0
-        if voice_mapping and voice_config_path:
-            voice_bytes, moved = _voice_remap_bytes(data_dir, voice.name, voice_mapping,
-                                                     remap_voice_config)
-            if voice_bytes is not None:
-                replacements[voice.name] = voice_bytes
+        voice_committed = None
+        if capture_voice:
+            voice_committed, moved = _voice_remap_bytes(data_dir, voice.name, voice_mapping,
+                                                         remap_voice_config, expected_voice_sha256)
+            if moved:
+                replacements[voice.name] = voice_committed
         for old in (chunks, journal):
             if os.path.lexists(old) and (old.is_symlink() or not old.is_file()):
                 raise ValueError('Existing chunk artifact requires inspection')
         apply_book_state_locked(data_dir, replacements, [chunks.name, journal.name])
-        return moved
+        companions = {'aliases': _committed_identity(alias_capture or registry, alias_committed),
+                      'voice': _committed_identity(voice if capture_voice else None, voice_committed)}
+        raw_sha, entries_sha = _output_proof_values(new_script)
+        return PublicationProof(moved, output_raw_sha256=raw_sha,
+                                output_entries_sha256=entries_sha, companions=companions)
 
 
 def updated_saved_binding(raw, old_script, new_script):
@@ -424,7 +613,8 @@ def saved_script_is_active_source(data_dir, script_path):
 
 def publish_saved_script_edit(data_dir, scripts_dir, script_path, old_script, new_script, *,
                               voice_config_path=None, voice_mapping=None, remap_voice_config=None,
-                              registry_staging=None):
+                              registry_staging=None, alias_registry_path=None,
+                              expected_voice_sha256=None, expected_source_identity=None):
     """Commit a saved review and its companions after exact-input validation."""
     import contextlib
     from book_state_transaction import apply_book_state_locked, reuse_book_state, ensure_saved_book_state
@@ -443,42 +633,59 @@ def publish_saved_script_edit(data_dir, scripts_dir, script_path, old_script, ne
     voice = directory / (script.stem + '.voice_config.json')
     publication = Path(get_publication_source_path(str(script)))
     registry = _staged_registry_path(data_dir, registry_staging)
+    alias_capture = Path(alias_registry_path) if alias_registry_path else None
+    if (alias_capture is not None and registry is not None
+            and os.path.abspath(alias_capture) != os.path.abspath(registry)):
+        raise ValueError('Review alias registry differs from its staged path')
+    capture_voice = bool(voice_config_path) and (
+        os.path.abspath(voice_config_path) == os.path.abspath(voice))
     if voice_mapping and not voice_config_path:
         raise ValueError('Voice remap requires this saved book voice config')
     if voice_mapping and voice_config_path:
-        if os.path.abspath(voice_config_path) != os.path.abspath(voice) or not callable(remap_voice_config):
+        if not capture_voice or not callable(remap_voice_config):
             raise ValueError('Saved review voice config must belong to this book')
     with reuse_book_state(data_dir), ensure_saved_book_state(data_dir, scripts_dir), contextlib.ExitStack() as locks:
         locks.enter_context(file_lock(str(root / 'state.json')))
         for path in (script, binding, publication):
             locks.enter_context(file_lock(str(path)))
-        if voice_mapping and voice_config_path:
+        if capture_voice:
             locks.enter_context(file_lock(str(voice)))
         if registry is not None:
             locks.enter_context(file_lock(str(registry)))
+        elif alias_capture is not None:
+            locks.enter_context(file_lock(str(alias_capture)))
         if saved_script_is_active_source(data_dir, str(script)):
             raise ValueError('This saved book is currently loaded; switch books before reviewing it')
         _, current = capture_scope_file(scripts_dir, script.name, limit=512 * 1024**2, include_bytes=True)
         if current != old_script:
             raise ValueError('Saved script changed during review; edits were preserved')
+        verify_review_source_identity(data_dir, expected_source_identity)
         _, raw_binding = capture_scope_file(scripts_dir, binding.name, limit=MAX_BINDING_BYTES, include_bytes=True)
         binding_bytes = updated_saved_binding(raw_binding, old_script, new_script)
         publication_bytes = get_saved_publication_source_bytes(str(script), new_script)
         relative = lambda path: os.path.relpath(path, data_dir).replace(os.sep, '/')
         replacements = {relative(script): new_script}
-        _add_staged_registry(data_dir, registry_staging, registry, replacements)
+        alias_committed = _add_staged_registry(data_dir, registry_staging, registry, replacements)
+        if alias_committed is None and registry is None and alias_capture is not None:
+            _, alias_committed = capture_scope_file(
+                data_dir, alias_capture.name, limit=MAX_SELECTION_STATE_BYTES, include_bytes=True)
         if binding_bytes is not None:
             replacements[relative(binding)] = binding_bytes
         if publication_bytes is not None:
             replacements[relative(publication)] = publication_bytes
         moved = 0
-        if voice_mapping and voice_config_path:
-            voice_bytes, moved = _voice_remap_bytes(scripts_dir, voice.name, voice_mapping,
-                                                     remap_voice_config)
-            if voice_bytes is not None:
-                replacements[relative(voice)] = voice_bytes
+        voice_committed = None
+        if capture_voice:
+            voice_committed, moved = _voice_remap_bytes(scripts_dir, voice.name, voice_mapping,
+                                                         remap_voice_config, expected_voice_sha256)
+            if moved:
+                replacements[relative(voice)] = voice_committed
         apply_book_state_locked(data_dir, replacements, [])
-        return moved
+        companions = {'aliases': _committed_identity(alias_capture or registry, alias_committed),
+                      'voice': _committed_identity(voice if capture_voice else None, voice_committed)}
+        raw_sha, entries_sha = _output_proof_values(new_script)
+        return PublicationProof(moved, output_raw_sha256=raw_sha,
+                                output_entries_sha256=entries_sha, companions=companions)
 
 
 def check_script_selection_binding(raw, book_token, source_sha256, current_script,
@@ -495,7 +702,7 @@ def check_script_selection_binding(raw, book_token, source_sha256, current_scrip
 
 def publish_generated_script(data_dir, expected_token, expected_source_path,
                              expected_source_sha256, script_bytes, *, expected_run_id,
-                             complete_manifest=False):
+                             complete_manifest=False, before_replace=None):
     """Publish a run's output and binding together after checking its selection.
 
     The caller supplies identity and source digest captured before the run, not
@@ -554,7 +761,7 @@ def publish_generated_script(data_dir, expected_token, expected_source_path,
         if current_script['sha256'] != base:
             raise ValueError('Active script changed during generation; edits were preserved')
         if _source_digest(expected_source_path, owning_root=data_dir) != expected_source_sha256:
-            raise ValueError('Selected source changed during script generation')
+            raise ValueError(STALE_SOURCE_MESSAGE)
         binding = make_script_selection_binding(expected_token, expected_source_sha256,
                                                 script_bytes, source_path=expected_source_path)
         journal = Path(get_chunk_status_journal_path(chunks))
@@ -574,18 +781,30 @@ def publish_generated_script(data_dir, expected_token, expected_source_path,
         replacements['state.json'] = json.dumps(state, ensure_ascii=False, indent=2,
                                                  allow_nan=False).encode('utf-8')
         if complete_manifest:
+            from three_pass_generate import get_three_pass_publication_blocker
             _, raw_manifest = capture_scope_file(data_dir, manifest_path.name,
-                                                  limit=16 * 1024**2, include_bytes=True)
+                                                   limit=16 * 1024**2, include_bytes=True)
             if raw_manifest is None:
                 raise ValueError('Generation publication manifest unavailable')
-            manifest = json.loads(raw_manifest, object_pairs_hook=_unique_pairs)
-            if not isinstance(manifest, dict) or manifest.get('status') != 'publishing':
-                raise ValueError('Generation is not awaiting publication')
+            try:
+                manifest = json.loads(
+                    raw_manifest, object_pairs_hook=_unique_pairs,
+                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Invalid numeric constant')))
+                blocker = (get_three_pass_publication_blocker(
+                    manifest, expected_run_id=expected_run_id,
+                    staged_script_bytes=script_bytes, require_publishing=True)
+                    if isinstance(manifest, dict) else 'generation manifest is invalid')
+            except (UnicodeDecodeError, ValueError, RecursionError) as error:
+                raise ValueError('Generation completion evidence is invalid; edits were preserved') from error
+            if blocker:
+                raise ValueError(f'Generation completion evidence is invalid: {blocker}; edits were preserved')
             manifest['status'] = 'complete'
+            manifest['completion']['status'] = 'complete'
             manifest['publication'] = {
                 'run_id': expected_run_id,
                 'script_sha256': hashlib.sha256(script_bytes).hexdigest(),
             }
             replacements[manifest_path.name] = json.dumps(
                 manifest, ensure_ascii=False, indent=2, allow_nan=False).encode()
-        apply_book_state_locked(data_dir, replacements, [chunks.name, journal.name])
+        apply_book_state_locked(data_dir, replacements, [chunks.name, journal.name],
+                                before_replace=before_replace)

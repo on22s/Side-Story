@@ -83,6 +83,15 @@ class WindowsJobClosedError(OSError):
     """The owned job handle has already been released."""
 
 
+class WindowsGracefulTerminationRefused(OSError):
+    """taskkill declined a graceful stop; the job still owns forced cleanup."""
+    def __init__(self, pid, returncode, stderr=None):
+        self.pid = pid
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(f'Windows taskkill failed for job member {pid} (exit {returncode})')
+
+
 def _with_open_job(method):
     """Keep the kernel handle open for an entire operation."""
     @functools.wraps(method)
@@ -124,7 +133,7 @@ class WindowsSubprocessJob:
         return get_windows_job_active_process_count(self.api, self.handle)
 
     @_with_open_job
-    def get_process_ids(self):
+    def get_process_ids(self, *, max_queries=None):
         capacity = 16
         while True:
             class ProcessIds(ctypes.Structure):
@@ -139,6 +148,10 @@ class WindowsSubprocessJob:
                 if information.returned > capacity:
                     raise OSError('Invalid job process membership buffer')
                 return list(information.ids[:information.returned])
+            if max_queries is not None:
+                max_queries -= 1
+                if max_queries <= 0:
+                    raise OSError(234, 'Windows job process membership kept changing during its bounded query')
             capacity = max(capacity * 2, information.assigned)
 
     @_with_open_job
@@ -166,7 +179,9 @@ class WindowsSubprocessJob:
                     try:
                         subprocess.run(['taskkill', '/PID', str(pid)], check=True,
                                        capture_output=True, text=True, timeout=remaining)
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    except subprocess.CalledProcessError as error:
+                        raise WindowsGracefulTerminationRefused(pid, error.returncode, error.stderr) from error
+                    except subprocess.TimeoutExpired as error:
                         raise OSError(f'Windows taskkill failed for job member {pid}') from error
             finally:
                 if not self.api.CloseHandle(process_handle):
@@ -178,10 +193,13 @@ class WindowsSubprocessJob:
         if not self.api.TerminateJobObject(self.handle, exit_code):
             raise_windows_job_error('TerminateJobObject')
 
-    def ensure_stopped(self):
+    def ensure_stopped(self, deadline=None):
         """Wait for kernel-confirmed zero membership before ownership release."""
         while self.get_active_process_count():
-            time.sleep(.05)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise OSError(1460, 'Windows job did not reach zero membership before cleanup deadline')
+            time.sleep(.05 if remaining is None else min(.05, remaining))
 
     def close(self):
         """Close a job handle once; retain it if the kernel rejects close."""

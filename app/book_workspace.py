@@ -8,15 +8,27 @@ import logging
 from collections import Counter
 from pathlib import Path
 
+from workspace_guidance import get_workspace_message, with_workspace_guidance
 from audio_validation import is_audio_file_present
 from book_state_transaction import get_book_operation_token, get_book_snapshot
 from chunk_status_journal import ChunkStatusJournal
 from editor_review_facts import get_editor_review_facts
 from export_quality_session import get_export_input_revision, get_session_evidence
-from project_scope_exports import is_scope_export_historical
+from project_scope_exports import get_historical_export_reason
 from script_recovery_facts import get_saved_script_recovery_manifest, three_pass_manifest_path
 
 logger = logging.getLogger('AlexandriaUI')
+
+WORKSPACE_ENUMS = {
+    'recoveryStatus': ['candidate', 'not_reported'],
+    'recoveryEligibility': ['not_rechecked'],
+    'reviewStatus': ['not_prepared', 'unavailable', 'observed'],
+    'exportStatus': ['unavailable', 'observed'],
+    'exportInputs': ['not_rechecked'],
+    'audioStatus': ['not_started', 'files_present', 'needs_attention', 'unavailable'],
+    'outputStatus': ['present_unverified', 'historical_source_scope', 'not_found', 'unavailable'],
+    'nextTab': ['script', 'voices', 'editor', 'audio'],
+}
 
 
 def _get_audio_review(chunks, get_audio_path, book_token, voices):
@@ -39,6 +51,7 @@ def _get_audio_review(chunks, get_audio_path, book_token, voices):
             'unknown_speakers': sum('unknown' in row['issues'] for row in facts)}
 
 
+@with_workspace_guidance
 def get_book_workspace(data_dir, output_paths, get_voice_rows, get_audio_path, *, export_states=None, include_input_revision=False):
     root = Path(data_dir)
     book_token = get_book_operation_token(data_dir)
@@ -57,7 +70,7 @@ def get_book_workspace(data_dir, output_paths, get_voice_rows, get_audio_path, *
     pending = sum(bool(row.get('persona_pending') or row.get('persona_states_pending'))
                   for row in voice_rows)
     audio = {'status': 'not_started', 'total': 0, 'present': 0, 'failed': 0,
-             'missing': 0, 'generating': 0, 'message': 'Open Editor to prepare audio chunks.',
+             'missing': 0, 'generating': 0, 'message': get_workspace_message('workspace.guidance.open-editor-to-prepare-audio-chunks'),
              'review': {'status': 'not_prepared'}}
     chunks_path = root / 'chunks.json'
     if chunks_path.exists():
@@ -78,19 +91,21 @@ def get_book_workspace(data_dir, output_paths, get_voice_rows, get_audio_path, *
             audio = {'status': 'files_present' if total and present == total else 'needs_attention',
                      'total': total, 'present': present, 'failed': failed, 'missing': missing,
                      'generating': generating, 'review': _get_audio_review(chunks, get_audio_path, book_token, snapshot['voices']),
-                     'message': 'File presence is checked; current script and voice dependencies have not been rechecked. Review existing chunks in Editor before generating missing work; audio quality still needs listening.'}
+                     'message': get_workspace_message('workspace.guidance.file-presence-is-checked-current-script-and-voice-dependencies')}
         except (OSError, ValueError, TypeError):
             audio['status'] = 'unavailable'
             audio['review'] = {'status': 'unavailable'}
-            audio['message'] = 'Saved audio progress could not be read. Open Editor to inspect it; no repair was attempted.'
+            audio['message'] = get_workspace_message('workspace.guidance.saved-audio-progress-could-not-be-read-open-editor')
     outputs = []
     for label, path in output_paths.items():
         try:
             file = Path(path)
             present = file.is_file() and file.stat().st_size > 0
             status = 'present_unverified' if present else 'not_found'
-            if present and is_scope_export_historical(root, path):
-                status = 'historical_source_scope'
+            if present:
+                reason = get_historical_export_reason(root, path)
+                if reason is not None:
+                    status = 'historical_previous_book' if reason == 'book' else 'historical_source_scope'
         except OSError:
             status = 'unavailable'
         outputs.append({'format': label, 'status': status})
@@ -151,20 +166,20 @@ def get_book_workspace(data_dir, output_paths, get_voice_rows, get_audio_path, *
             # receipts describe completed checks, not current script/voice proof.
             'current_inputs': 'not_rechecked'}
     if recovery:
-        next_step = {'tab': 'script', 'label': 'Inspect script recovery',
-                     'reason': 'An interrupted script run has saved recovery evidence. Inspect it in Script; source and settings eligibility must be rechecked before resuming.'}
+        next_step = {'tab': 'script', 'label': get_workspace_message('workspace.guidance.inspect-script-recovery'),
+                     'reason': get_workspace_message('workspace.guidance.an-interrupted-script-run-has-saved-recovery-evidence-inspect')}
     elif not entries:
-        next_step = {'tab': 'script', 'label': 'Continue with Script',
-                     'reason': 'Choose a book or generate its annotated script.'}
+        next_step = {'tab': 'script', 'label': get_workspace_message('workspace.guidance.continue-with-script'),
+                     'reason': get_workspace_message('workspace.guidance.choose-a-book-or-generate-its-annotated-script')}
     elif pending:
-        next_step = {'tab': 'voices', 'label': 'Continue with Voices',
-                     'reason': f'{pending} characters need voice preparation.'}
+        next_step = {'tab': 'voices', 'label': get_workspace_message('workspace.guidance.continue-with-voices'),
+                     'reason': get_workspace_message('workspace.next.voices-pending', count=pending)}
     elif audio['status'] == 'files_present' and any(row['status'] == 'present_unverified' for row in outputs):
-        next_step = {'tab': 'audio', 'label': 'Review output files',
-                     'reason': 'Output files exist; verify their book and content before sharing.'}
+        next_step = {'tab': 'audio', 'label': get_workspace_message('workspace.guidance.review-output-files'),
+                     'reason': get_workspace_message('workspace.guidance.output-files-exist-verify-their-book-and-content-before')}
     else:
-        next_step = {'tab': 'editor', 'label': 'Continue in Editor',
-                     'reason': 'Review, render or merge the book audio in Editor.'}
+        next_step = {'tab': 'editor', 'label': get_workspace_message('workspace.guidance.continue-in-editor'),
+                     'reason': get_workspace_message('workspace.guidance.review-render-or-merge-the-book-audio-in-editor')}
     name = snapshot['identity'].get('active_book_id')
     if name is not None and not isinstance(name, str):
         raise ValueError('Invalid saved book name')
@@ -173,7 +188,8 @@ def get_book_workspace(data_dir, output_paths, get_voice_rows, get_audio_path, *
     name = Path(name.replace('\\', '/')).name if name else ''
     if get_book_operation_token(data_dir) != book_token:
         raise ValueError('Selected book changed while reading workspace facts')
-    return {'book_token': book_token, 'name': name or ('Current book (unnamed)' if entries else 'No book selected'),
+    return {'book_token': book_token, 'name': name or (get_workspace_message('workspace.name.unnamed') if entries else get_workspace_message('workspace.name.no-book-selected')),
+            'enums': WORKSPACE_ENUMS,
             'script': {'status': 'available' if entries else 'not_started', 'entries': len(entries),
                        'recovery': script_recovery,
                        'sha256': snapshot['script_sha256']},

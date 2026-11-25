@@ -18,14 +18,14 @@ import pronunciation
 from audio_validation import validate_generated_audio
 from book_state_transaction import ensure_book_state, get_book_operation_token
 from core import (project_manager, run_claimed_task_worker, process_state, ensure_book_switch_allowed,
-                  is_task_running)
+                  is_task_running, _gpu_lock)
 from routers.editor import (check_chunk_identity, SCRIPT_PATH, _ensure_editor_chunks,
                             get_editor_book_identity, get_snapshot_digest)
 from project import get_speaker, get_occurrence_speech_projection
 from speech_numbers import STATE_KEY as DATE_ORDER_KEY, get_book_date_order_status
 from speech_text import get_prelexicon_speech_normalization
-from tts import (get_resolved_speaker, is_voice_config_present, resolve_narrator_voice_config,
-                 voice_config_for_chunk)
+from tts import (is_voice_config_present, get_chunk_render_voice_selection)
+from timeline_anchors import resolve_timeline_anchors
 from utils import atomic_json_write, file_lock, safe_load_json
 
 router = APIRouter()
@@ -60,10 +60,11 @@ class PronunciationAudition(BaseModel):
     replacement: str | None = Field(default=None, min_length=1, max_length=256)
 
 
-def get_pronunciation_document():
+def get_pronunciation_document(path=None):
     """Strict editor read; malformed data must not be silently replaced on Save."""
+    path = pronunciation.get_pronunciation_path(path)
     try:
-        with open(pronunciation.DEFAULT_PATH, 'rb') as source:
+        with open(path, 'rb') as source:
             raw = source.read(MAX_DOCUMENT_BYTES + 1)
     except FileNotFoundError:
         raw = b''
@@ -99,8 +100,9 @@ async def save_pronunciation_endpoint(request: PronunciationSave):
 
 
 def save_pronunciation_document(request):
-    with file_lock(pronunciation.DEFAULT_PATH):
-        document, current = get_pronunciation_document()
+    path = pronunciation.get_pronunciation_path()
+    with file_lock(path):
+        document, current = get_pronunciation_document(path)
         if request.revision != current['revision']:
             raise HTTPException(status_code=409, detail='Pronunciation rules changed elsewhere. Reload before saving.')
         updated = ({**document, 'names': dict(request.names)}
@@ -108,8 +110,8 @@ def save_pronunciation_document(request):
                    {'names': dict(request.names)} if 'names' in request.names else dict(request.names))
         if len(json.dumps(updated, ensure_ascii=False, indent=2).encode('utf-8')) > MAX_DOCUMENT_BYTES:
             raise HTTPException(status_code=422, detail='Pronunciation file would exceed the 1 MiB editor limit.')
-        atomic_json_write(updated, pronunciation.DEFAULT_PATH, allow_nonatomic_fallback=False)
-        _document, result = get_pronunciation_document()
+        atomic_json_write(updated, path, allow_nonatomic_fallback=False)
+        _document, result = get_pronunciation_document(path)
         return result
 
 
@@ -158,9 +160,10 @@ def generate_pronunciation_audition(request):
                 raise HTTPException(status_code=422, detail='Repair invalid voice configuration before auditioning.') from error
             if not isinstance(voices, dict):
                 raise HTTPException(status_code=422, detail='Voice configuration must contain an object.')
-            speaker = get_resolved_speaker(get_speaker(row), voices)
-            voices = copy.deepcopy(voice_config_for_chunk(
-                resolve_narrator_voice_config(speaker, voices, row), speaker, request.index))
+            voices = resolve_timeline_anchors(voices, chunks)
+            speaker, voices, _ = get_chunk_render_voice_selection(
+                voices, get_speaker(row), row, request.index)
+            voices = copy.deepcopy(voices)
             if not is_voice_config_present(speaker, voices):
                 raise HTTPException(status_code=400, detail='Assign a voice to this line before auditioning.')
         if not request.text.strip() or (request.replacement is not None and not request.replacement.strip()):
@@ -302,7 +305,9 @@ def validate_occurrence_edit(rules, row):
 def get_occurrence_response(request, row, rules, revision, projection, settings_source):
     return {'book_token': request.expected_book_token, 'uid': row['uid'], 'index': request.index,
             'revision': revision, 'rules': rules, 'coordinate_space': pronunciation.OCCURRENCE_COORDINATE_SPACE,
-            'offset_unit': 'unicode_codepoint', 'context': projection['context'],
+            'offset_unit': 'unicode_codepoint',
+            'context': {key: value for key, value in projection['context'].items()
+                        if key != 'voice_sha256_legacy'},
             'context_source': settings_source,
             'preview': {'text': projection['text'],
                         'decisions': projection.get('pronunciation_decisions', [])}}
@@ -315,7 +320,7 @@ def get_occurrence_editor(request):
             row = get_occurrence_target(request, chunks)
             rules, revision = get_occurrence_rule_document(row)
             require_occurrence_revision(request, revision)
-            voices = project_manager.get_voice_config_for_update()
+            voices = resolve_timeline_anchors(project_manager.get_voice_config_for_update(), chunks)
             settings = project_manager.get_pronunciation_preview_settings()
             effective = rules
             if isinstance(request, PronunciationOccurrenceEdit):
@@ -391,13 +396,13 @@ async def get_homograph_candidates_endpoint(request: PronunciationHomographQuery
 
 
 def _save_occurrence_rules_admitted(request):
-    with ensure_book_switch_allowed(operation='save occurrence rules'):
-        with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25):
+    with ensure_book_switch_allowed(operation='save occurrence rules', hold_task_mutex=False):
+        with ensure_book_state(os.path.dirname(SCRIPT_PATH), timeout=0.25), _gpu_lock:
             settings = project_manager.get_pronunciation_preview_settings()
-            voices = project_manager.get_voice_config_for_update()
             with project_manager._chunks_lock, file_lock(project_manager.chunks_path):
                 try:
                     chunks = project_manager._get_saved_chunks_locked()
+                    voices = resolve_timeline_anchors(project_manager.get_voice_config_for_update(), chunks)
                     row = get_occurrence_target(request, chunks)
                     _current_rules, revision = get_occurrence_rule_document(row)
                     require_occurrence_revision(request, revision)

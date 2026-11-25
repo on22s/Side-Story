@@ -9,9 +9,12 @@ punctuation-free token mapping and window planner were re-derived over
 AA2's own normalization. Two deliberate divergences from the donor:
 
 * Times are never clamped, stretched or repaired. A non-monotonic,
-  saturating, zero-length, out-of-bounds or text-mismatched aligner
+  overlapping, saturating, out-of-bounds or text-mismatched aligner
   result raises instead of being made plausible (AA2's 1 ms SMIL
-  quantum rule has the same shape in epub_readaloud).
+  quantum rule has the same shape in epub_readaloud). A zero-length
+  word [t, t] is kept as the point in time the model reported (a known
+  upstream defect, see get_validated_aligner_tokens); a sentence whose
+  words give it no duration still raises.
 * Casefold expansions are tracked per normalized character instead of
   being truncated to the first character.
 
@@ -135,7 +138,8 @@ def split_sentences(text):
             end += 1
         while end < length and text[end] in CLOSERS:
             end += 1
-        if char == "." and _is_abbreviation(text, index):
+        if char == "." and _is_abbreviation(text, index) \
+                and not _is_terminal_acronym(text, index, end):
             index = end
             continue
         if end >= length or text[end].isspace() or char in "。！？":
@@ -170,6 +174,37 @@ def cover_ranges(text, ranges):
     return [(start, end) for start, end in covered if end > start]
 
 
+# Words that, capitalized, open a new sentence far more often than they
+# continue a name (#1872). A dotted acronym ("U.S.") followed by one of
+# them ends its sentence: "in the U.S. He works" splits, while "the U.S.
+# Army" or "U.S. Senator" stays one sentence. Closed and conservative on
+# purpose: a missed split only coarsens highlighting, a wrong one would
+# cut a sentence in two.
+_SENTENCE_STARTERS = frozenset((
+    "I", "He", "She", "It", "We", "They", "You", "His", "Her", "Its", "Our",
+    "Their", "My", "Your", "The", "A", "An", "This", "That", "These",
+    "Those", "There", "Here", "But", "And", "So", "Then", "When", "While",
+    "After", "Before", "Later", "Now", "Yet", "Still", "However", "Meanwhile",
+    "If", "As", "In", "On", "At", "What", "Why", "How", "Who", "Where",
+    "No", "Yes", "Not"))
+
+
+def _is_terminal_acronym(text, dot_index, end):
+    """True when a dotted acronym (U.S., U.K.) ends its sentence (#1872).
+
+    Only capital dotted acronyms of two or more letters qualify; single
+    initials ("J. Smith"), lowercase forms ("e.g.") and listed
+    abbreviations ("Dr. Who") never end a sentence here.
+    """
+    start = dot_index - 1
+    while start >= 0 and (text[start].isalpha() or text[start] == "."):
+        start -= 1
+    if not re.fullmatch(r"(?:[A-Z]\.){2,}", text[start + 1:dot_index + 1]):
+        return False
+    match = re.match(r"\s+([A-Za-z]+)\b", text[end:])
+    return bool(match) and match.group(1) in _SENTENCE_STARTERS
+
+
 def _is_abbreviation(text, dot_index):
     start = dot_index - 1
     while start >= 0 and (text[start].isalnum() or text[start] in ".-"):
@@ -194,7 +229,16 @@ def _is_abbreviation(text, dot_index):
 # may use different apostrophe styles, so apostrophes of every kind are
 # left out of BOTH the expected stream and the token key: letters and
 # digits must still match exactly, only "it's" vs "its" become equal.
+# The underscore is a word character to the regex but not a letter or
+# number to the aligner ("Dark_Knight" reaches us as "DarkKnight"), so it
+# is left out the same way.
 _AA2_WORDS_RE = re.compile(r"\w+(?:['’]\w+)*", re.UNICODE)
+_STREAM_DROPPED = str.maketrans("", "", "'_")
+
+
+def get_stream_chars(word):
+    """A normalized word as it appears in the aligner stream."""
+    return word.translate(_STREAM_DROPPED)
 
 
 def count_units(text):
@@ -286,7 +330,7 @@ def _get_normalized_stream_detailed(text):
     out_chars, out_starts, out_ends = [], [], []
     for match in _AA2_WORDS_RE.finditer(folded):
         for pos in range(match.start(), match.end()):
-            if folded[pos] == "'":
+            if not get_stream_chars(folded[pos]):
                 continue
             out_chars.append(folded[pos])
             out_starts.append(starts[pos])
@@ -314,7 +358,7 @@ def get_token_key(token_text):
         return ""
     folded = unicodedata.normalize("NFKC", token_text)
     folded = folded.casefold().replace("’", "'").replace("‘", "'")
-    return "".join(_AA2_WORDS_RE.findall(folded)).replace("'", "")
+    return get_stream_chars("".join(_AA2_WORDS_RE.findall(folded)))
 
 
 def _map_tokens_internal(text, tokens):
@@ -444,17 +488,28 @@ def get_validated_aligner_tokens(tokens, duration_sec, *, enforce_slice_limit=Tr
                 or not math.isfinite(start) or not math.isfinite(end)):
             raise ValueError("Alignment token %d has invalid times." % position)
         start, end = float(start), float(end)
-        if not 0.0 <= start < end <= duration_sec + _TIME_TOLERANCE_SECONDS:
+        # start == end is accepted as a point in time, never stretched:
+        # qwen-asr 0.0.6 reports [t, t] for real, audible words in about a
+        # third of clips (QwenLM/Qwen3-ASR#197, open; worse for Japanese
+        # and Korean), and refusing them failed whole books. Sentence clips
+        # still take their bounds from real token times and refuse when
+        # they have no duration (derive_fragment_times and the read-aloud
+        # sentence path).
+        if not 0.0 <= start <= end <= duration_sec + _TIME_TOLERANCE_SECONDS:
             raise ValueError(
                 "Alignment token %d is reversed or out of bounds." % position)
         if position and start < previous_start:
             raise ValueError("Alignment tokens are not monotonic; refusing to repair them.")
         if position and start < previous_end:
             raise ValueError("Alignment tokens overlap; refusing to repair them.")
+        # Saturation means two words reported over the same real span: a
+        # failed instrument. Several zero-length points at one instant
+        # (#197, and #55 for Chinese characters) are the known defect above.
         key = (start, end)
-        if key in seen:
-            raise ValueError("Alignment timestamps saturate; refusing to treat them as measured.")
-        seen.add(key)
+        if end > start:
+            if key in seen:
+                raise ValueError("Alignment timestamps saturate; refusing to treat them as measured.")
+            seen.add(key)
         previous_start, previous_end = start, end
         validated.append({"text": label, "start_time": start, "end_time": end})
     return validated

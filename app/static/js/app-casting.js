@@ -10,9 +10,15 @@
                     'collection', 'stars', 'circles'];
     const DEFAULTS = {status: 'unreviewed', priority: 'none', notes: '', tags: [], tag_colors: {}, stars: [],
                       circles: [], collections: []};
-    function statusLabel(value) { return {unreviewed: t('casting.status.unreviewed', 'Unreviewed'), shortlist: t('casting.status.shortlist', 'Shortlist'), callback: t('casting.status.callback', 'Callback'), reject: t('casting.status.reject', 'Reject')}[value]; }
+    function statusLabel(value, live = false) {
+        const message = {unreviewed: uiMessage('casting.status.unreviewed', 'Unreviewed'), shortlist: uiMessage('casting.status.shortlist', 'Shortlist'), callback: uiMessage('casting.status.callback', 'Callback'), reject: uiMessage('casting.status.reject', 'Reject')}[value];
+        return live || message === undefined ? message : String(message);
+    }
     const STATUS_CLASS = {unreviewed: 'bg-secondary', shortlist: 'bg-success', callback: 'bg-warning text-dark', reject: 'bg-danger'};
-    function priorityLabel(value) { return {none: t('casting.priority.none', 'No priority'), low: t('casting.priority.low', 'Low priority'), medium: t('casting.priority.medium', 'Medium priority'), high: t('casting.priority.high', 'High priority')}[value]; }
+    function priorityLabel(value, live = false) {
+        const message = {none: uiMessage('casting.priority.none', 'No priority'), low: uiMessage('casting.priority.low', 'Low priority'), medium: uiMessage('casting.priority.medium', 'Medium priority'), high: uiMessage('casting.priority.high', 'High priority')}[value];
+        return live || message === undefined ? message : String(message);
+    }
     const PRIORITY_CLASS = {none: 'bg-secondary', low: 'bg-info text-dark', medium: 'bg-warning text-dark', high: 'bg-danger'};
     const NEUTRAL_TAG_CLASS = 'casting-tag-neutral';
     const HEALTH = {missing_audio: 'Missing audio', no_description: 'No description', duplicate_names: 'Duplicate names', no_sample: 'No sample line', skipped: 'Skipped folders'};
@@ -171,7 +177,7 @@
     // ---- DOM ----
     function node(tag, text, cls) {
         const n = document.createElement(tag);
-        if (text !== undefined && text !== null) { n.textContent = String(text); }
+        if (text !== undefined && text !== null) { renderUiMessage(n, text); }
         if (cls) { n.className = cls; }
         return n;
     }
@@ -200,19 +206,19 @@
     function visible() {
         return sortVoices(filterVoices(getModeVoices(), s.marks, el('search').value, picks()), s.marks, el('sort').value);
     }
-    function fillSelect(id, values, anyLabel) {
+    function fillSelect(id, values, anyLabel, labelOf = value => value) {
         const sel = el(id), current = sel.value;
         const first = node('option', anyLabel); first.value = '';
         sel.replaceChildren(first);
-        for (const value of values) { const o = node('option', value); o.value = value; sel.append(o); }
+        for (const value of values) { const o = node('option', labelOf(value)); o.value = value; sel.append(o); }
         sel.value = values.includes(current) ? current : '';
     }
     function renderFilters() {
         const modeList = getModeVoices();
         fillSelect('book', [...new Set(modeList.map(v => v.book_id))].sort(), t('casting.filter.all-books', 'All books'));
-        fillSelect('gender', [...new Set(modeList.map(v => v.tags.gender))], t('casting.filter.any', 'Any'));
-        fillSelect('age', [...new Set(modeList.flatMap(v => v.tags.ages))], t('casting.filter.any', 'Any'));
-        fillSelect('status', STATUSES, t('casting.filter.any', 'Any'));
+        fillSelect('gender', [...new Set(modeList.map(v => v.tags.gender))], t('casting.filter.any', 'Any'), value => getCastingTaxonomyLabel(value, true));
+        fillSelect('age', [...new Set(modeList.flatMap(v => v.tags.ages))], t('casting.filter.any', 'Any'), value => getCastingTaxonomyLabel(value, true));
+        fillSelect('status', STATUSES, uiMessage('casting.filter.any', 'Any'), value => statusLabel(value, true));
         const selected = el('health').value;
         const counts = getHealthCounts(modeList, s.skipped);
         el('health').replaceChildren(...[['', t('casting.health.all', 'All data health')], ...Object.keys(HEALTH).map(key =>
@@ -228,7 +234,7 @@
         for (const field of ['gender', 'age']) {
             const {columns, rows} = getCoverage(list, field), table = node('table', undefined, 'table table-sm table-bordered');
             const header = node('tr');
-            for (const label of [field === 'gender' ? t('casting.coverage.book-gender', 'Book / gender') : t('casting.coverage.book-age', 'Book / age'), ...columns]) { header.append(node('th', label)); }
+            for (const label of [field === 'gender' ? t('casting.coverage.book-gender', 'Book / gender') : t('casting.coverage.book-age', 'Book / age'), ...columns.map(value => getCastingTaxonomyLabel(value, true))]) { header.append(node('th', label)); }
             const head = node('thead'); head.append(header); table.append(head);
             const body = node('tbody'), combinations = [];
             for (const row of rows) {
@@ -242,7 +248,11 @@
             combinations.sort((left, right) => left.count - right.count || left.book.localeCompare(right.book) || left.value.localeCompare(right.value));
             wrap.append(node('p', combinations.length ? t('casting.coverage.thinnest', 'Thinnest combinations (up to 12):') : t('casting.coverage.none', 'No matching voices.'), 'small text-muted'));
             for (const combo of combinations.slice(0, 12)) {
-                wrap.append(node('span', combo.book + ' / ' + combo.value + ': ' + combo.count, 'badge bg-light text-dark border me-1 mb-2'));
+                const badge = node('span', undefined, 'badge bg-light text-dark border me-1 mb-2');
+                setUiMessage(badge, 'casting.coverage.combination', '{book} / {value}: {count}', () => ({
+                    book: combo.book, value: getCastingTaxonomyLabel(combo.value), count: combo.count
+                }));
+                wrap.append(badge);
             }
         }
         wrap.append(node('p', formatUiSafetyText('safety.casting.coverage_note', 'Keyword tags, not audio measurements. Ages can overlap; missing combinations count as zero within books in this view.'), 'small text-muted'));
@@ -259,8 +269,9 @@
             el(id).replaceChildren(...shown.map(value => {
                 const key = chipKey(field, value), on = s.chips.has(key);
                 const count = (counts.find(([v]) => v === value) || [value, 0])[1];
-                const chip = button(`${value} ${count}`, 'btn btn-sm ' + (on ? 'btn-secondary' : 'btn-outline-secondary'),
+                const chip = button(`${getCastingTaxonomyLabel(value)} ${count}`, 'btn btn-sm ' + (on ? 'btn-secondary' : 'btn-outline-secondary'),
                     () => { if (on) { s.chips.delete(key); } else { s.chips.add(key); } s.shown = PAGE; render(); });
+                setUiMessage(chip, 'casting.taxonomy.count', '{label} {count}', () => ({label: getCastingTaxonomyLabel(value), count}));
                 chip.setAttribute('aria-pressed', String(on));
                 return chip;
             }));
@@ -272,7 +283,7 @@
         for (const [text, cls] of [[t.gender, 'bg-info text-dark'], ...t.ages.map(a => [a, 'bg-light text-dark border']),
                                    ...t.tones.slice(0, 4).map(x => [x, 'bg-light text-dark border']),
                                    ...t.textures.slice(0, 2).map(x => [x, 'bg-light text-secondary border'])]) {
-            if (text && text !== 'Not specified') { wrap.append(node('span', text, 'badge me-1 ' + cls)); }
+            if (text && text !== 'Not specified') { wrap.append(node('span', getCastingTaxonomyLabel(text, true), 'badge me-1 ' + cls)); }
         }
         for (const tag of (mark && mark.tags) || []) {
             if (typeof tag !== 'string' || !tag) { continue; }
@@ -384,6 +395,14 @@
         c.append(body); col.append(c);
         return col;
     }
+    function renderTaxonomyText(values) {
+        const span = node('span');
+        values.forEach((value, index) => {
+            if (index) { span.append(node('span', ', ')); }
+            span.append(node('span', getCastingTaxonomyLabel(value, true)));
+        });
+        return span;
+    }
     function table(list) {
         const wrap = node('div', undefined, 'table-responsive'), tableNode = node('table', undefined, 'table table-sm table-hover align-middle mb-0');
         const head = node('thead'), hr = node('tr');
@@ -395,8 +414,8 @@
         for (const v of list) {
             const tr = node('tr'), mark = markOf(s.marks, v.id);
             if (s.research) { const pick = node('td'); pick.append(s.research.selectionBox(v)); tr.append(pick); }
-            const cells = [playButton(v), node('strong', v.name), v.book_id, v.tags.gender, v.tags.ages.join(', '),
-                           v.tags.tones.slice(0, 4).join(', ')];
+            const cells = [playButton(v), node('strong', v.name), v.book_id, renderTaxonomyText([v.tags.gender]), renderTaxonomyText(v.tags.ages),
+                           renderTaxonomyText(v.tags.tones.slice(0, 4))];
             for (const cell of cells) { const td = node('td'); if (typeof cell === 'string') { td.textContent = cell; } else { td.append(cell); } tr.append(td); }
             const st = node('td');
             st.dataset.castingStatusPrio = v.id;
@@ -751,7 +770,14 @@
         el('review-notes').value = mark.notes;
         el('review-position').textContent = t('casting.review.position', '{index} of {count}', {index: r.index + 1, count: r.list.length});
         const done = r.list.filter(v => markOf(s.marks, v.id).status !== 'unreviewed').length;
-        el('review-progress').style.width = `${Math.round(100 * done / r.list.length)}%`;
+        // Ticks: the review texture, shared with the Script tab's review bar
+        // (#2042). The renderer owns the fill width and the aria values.
+        const reviewed = r.list.length ? done / r.list.length : 0;
+        renderTexturedProgress(el('review-progress'), {
+            fraction: reviewed,
+            label: '',
+            valueText: `${Math.round(100 * reviewed)}%`,
+        });
         el('review-prev').disabled = r.index === 0;
         el('review-next').disabled = r.index >= r.list.length - 1;
     }

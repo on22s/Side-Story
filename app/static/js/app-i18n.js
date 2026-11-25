@@ -20,6 +20,9 @@ const uiCatalogMisses = [];
 const uiAuthoredText = new WeakMap();
 const uiAuthoredHtml = new WeakMap();
 const uiAuthoredAttrs = new WeakMap();
+const uiRuntimeValues = new WeakMap();
+const uiRuntimeAttributes = new WeakMap();
+const UI_MESSAGE = Symbol();
 let uiLocale = UI_LOCALE_DEFAULT;
 
 function normalizeUiLocale(locale) {
@@ -140,10 +143,7 @@ function applyUiSentenceJoins(root, locale = getUiLocale()) {
 }
 
 function pluralForm(count, locale = getUiLocale()) {
-    if (locale === 'zh-CN' || locale === 'ja') {
-        return 'many';
-    }
-    return count === 1 ? 'one' : 'many';
+    return new Intl.PluralRules(getIntlUiLocale(locale)).select(count) === 'one' ? 'one' : 'many';
 }
 
 function formatUiNumber(value) {
@@ -319,6 +319,13 @@ function renderUiLocaleOptions() {
 }
 
 function readUiMessageValues(node, english) {
+    if (uiRuntimeValues.has(node)) {
+        const values = uiRuntimeValues.get(node);
+        return typeof values === 'function' ? values() : values;
+    }
+    if (node.hasAttribute('data-i18n-values')) {
+        return JSON.parse(node.getAttribute('data-i18n-values'));
+    }
     if (node.hasAttribute('data-i18n-count')) {
         return {count: Number(node.getAttribute('data-i18n-count'))};
     }
@@ -336,14 +343,27 @@ function readUiMessageValues(node, english) {
     return values;
 }
 
-// One repaint function for every keyed node. The authored English is captured
-// on the first sweep and kept here (never in the DOM), so switching back to
-// English restores the source text instead of reusing a translation.
+// Capture keyed attributes before another UI owner moves them (for example,
+// help replaces native titles). Keep the first authored value across locales.
+function captureUiAuthoredAttributes(node) {
+    if (!uiAuthoredAttrs.has(node)) { uiAuthoredAttrs.set(node, new Map()); }
+    const authored = uiAuthoredAttrs.get(node);
+    for (const entry of (node.getAttribute('data-i18n-attr') || '').split(',')) {
+        const [attribute, key] = entry.split(':').map(part => part.trim());
+        if (attribute && key && !authored.has(attribute)) {
+            authored.set(attribute, node.getAttribute(attribute) || '');
+        }
+    }
+    return authored;
+}
+
+// One repaint function for every keyed node. Authored English stays in the
+// capture maps, so switching back restores source text instead of a translation.
 function applyUiCatalog(root = document) {
     const locale = getUiLocale();
     for (const node of root.querySelectorAll('[data-i18n]')) {
         if (!uiAuthoredText.has(node)) {
-            uiAuthoredText.set(node, node.textContent);
+            uiAuthoredText.set(node, node.getAttribute('data-i18n-source') || node.textContent);
         }
         const key = node.getAttribute('data-i18n');
         if (key.startsWith('safety.')) {
@@ -361,17 +381,13 @@ function applyUiCatalog(root = document) {
         node.innerHTML = t(node.getAttribute('data-i18n-html'), uiAuthoredHtml.get(node), readUiMessageValues(node, uiAuthoredHtml.get(node)), locale);
     }
     for (const node of root.querySelectorAll('[data-i18n-attr]')) {
-        if (!uiAuthoredAttrs.has(node)) {
-            uiAuthoredAttrs.set(node, new Map());
-        }
-        const authored = uiAuthoredAttrs.get(node);
+        const authored = captureUiAuthoredAttributes(node);
         for (const entry of node.getAttribute('data-i18n-attr').split(',')) {
             const [attribute, key] = entry.split(':').map(part => part.trim());
             if (!attribute || !key) { continue; }
-            if (!authored.has(attribute)) {
-                authored.set(attribute, node.getAttribute(attribute) || '');
-            }
-            node.setAttribute(attribute, t(key, authored.get(attribute), readUiMessageValues(node, authored.get(attribute)), locale));
+            const runtimeValues = uiRuntimeAttributes.get(node)?.get(attribute);
+            const values = typeof runtimeValues === 'function' ? runtimeValues() : runtimeValues || readUiMessageValues(node, authored.get(attribute));
+            node.setAttribute(attribute, t(key, authored.get(attribute), values, locale));
         }
     }
     applyUiSentenceJoins(root, locale);
@@ -379,6 +395,48 @@ function applyUiCatalog(root = document) {
 
 // A keyed node created by JS (preview headings). The English is registered
 // before painting so the next sweep keeps the source text, not the translation.
+function setUiMessage(node, key, english, values = {}) {
+    node.setAttribute('data-i18n', key);
+    uiAuthoredText.set(node, english);
+    uiRuntimeValues.set(node, typeof values === 'function' ? values : {...values});
+    node.textContent = t(key, english, readUiMessageValues(node, english));
+    return node;
+}
+
+function uiMessage(key, english, values = {}) {
+    return {[UI_MESSAGE]: true, key, english, values, toString() { return t(key, english, typeof values === 'function' ? values() : values); }};
+}
+
+function renderUiMessage(node, message, attribute = null) {
+    if (!message?.[UI_MESSAGE]) {
+        if (attribute) { node.setAttribute(attribute, String(message)); }
+        else {
+            if (uiAuthoredText.has(node)) {
+                node.removeAttribute('data-i18n');
+                uiAuthoredText.delete(node);
+                uiRuntimeValues.delete(node);
+            }
+            node.textContent = String(message);
+        }
+        return;
+    }
+    if (!attribute) {
+        setUiMessage(node, message.key, message.english, message.values);
+        return;
+    }
+    const entries = (node.getAttribute('data-i18n-attr') || '').split(',').filter(entry => entry && !entry.startsWith(attribute + ':'));
+    entries.push(attribute + ':' + message.key);
+    node.setAttribute('data-i18n-attr', entries.join(','));
+    captureUiAuthoredAttributes(node).set(attribute, message.english);
+    if (!uiRuntimeAttributes.has(node)) { uiRuntimeAttributes.set(node, new Map()); }
+    uiRuntimeAttributes.get(node).set(attribute, typeof message.values === 'function' ? message.values : {...message.values});
+    node.setAttribute(attribute, String(message));
+}
+
+function uiMessageMarkup(key, english, values = {}) {
+    return `<span data-i18n="${escapeHtml(key)}" data-i18n-source="${escapeHtml(english)}" data-i18n-values="${escapeHtml(JSON.stringify(values))}">${escapeHtml(t(key, english, values))}</span>`;
+}
+
 function createUiMessageNode(tag, key, english) {
     const node = document.createElement(tag);
     node.setAttribute('data-i18n', key);

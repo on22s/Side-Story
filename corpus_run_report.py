@@ -9,7 +9,8 @@ import subprocess
 import sys
 import tempfile
 
-from alexandria_run_manifest import get_file_identity, write_json_atomic
+from alexandria_run_manifest import (CorpusPairError, get_file_identity,
+                                     validate_corpus_pair, write_json_atomic)
 from alexandria_file_lock import acquire_exclusive_file_lock
 from alexandria_zip_publication import ensure_zip_family_readable
 
@@ -107,9 +108,11 @@ def save_corpus_report(index, output_dir):
     metrics, rates, warnings, failures, attempted = [], [], [], 0, 0
     for row in index['rows']:
         status = row['status']
-        values = [index['run_id'], Path(row['audio']).name, status] + ['-'] * 10
+        audio_name = row['audio'] if isinstance(row['audio'], str) and row['audio'] else None
+        values = [index['run_id'], Path(audio_name).name if audio_name else '-', status] + ['-'] * 10
         if status != 'no source match':
-            attempted += 1
+            if row.get('attempted', True):
+                attempted += 1
             try:
                 if status != 'completed':
                     raise ValueError(status)
@@ -137,8 +140,11 @@ def save_corpus_report(index, output_dir):
                     warnings.append(f"{label}: {counters['realign_events']} realign events; inspect cursor recovery.")
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
                 failures += 1
-                values[2] = 'failed: ' + str(error)
-                print(f"FAILED: {row['audio']}: {error}", file=sys.stderr, flush=True)
+                message = str(error)
+                if not message.startswith('failed: '):
+                    message = 'failed: ' + message
+                values[2] = message
+                print(f"FAILED: {row['audio']}: {message}", file=sys.stderr, flush=True)
         lines.append('| ' + ' | '.join(cell(v) for v in values) + ' |')
     lines += ['', '## Aggregate stats across completed pairs', '',
         f"- Total segments emitted: **{sum(d['totals']['segments_total'] for d in metrics)}**",
@@ -169,6 +175,28 @@ def save_corpus_report(index, output_dir):
     return 1 if failures or not attempted else 0
 
 
+def get_worker_command(repo, audio, source, output, summary, model, fallback):
+    command = [str(repo / 'run_with_restart.sh'), '--audio', str(audio), '--source', str(source),
+        '--model', model, '--output', str(output),
+        '--summary-output', str(summary), '--chunk-size', '10.0', '--lang', 'en']
+    if fallback:
+        command += ['--fallback-model', fallback]
+    if sys.platform == 'win32':
+        app_dir = str(Path(__file__).resolve().parent / 'app')
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from experiments.manifest import _source_probe_shell
+        shell, detail = _source_probe_shell()
+        if shell is None:
+            raise ValueError(f'Bash is required to launch the corpus worker on Windows: {detail}')
+        command[0] = (repo / 'run_with_restart.sh').as_posix()
+        for option, path in (('--audio', audio), ('--source', source),
+                             ('--output', output), ('--summary-output', summary)):
+            command[command.index(option) + 1] = path.as_posix()
+        command.insert(0, shell)
+    return command
+
+
 def run_corpus(repo, pairs_path, output_dir, model, fallback):
     if not isinstance(model, str) or not model.strip():
         raise ValueError('--model is required when running --pairs')
@@ -186,15 +214,23 @@ def run_corpus(repo, pairs_path, output_dir, model, fallback):
         write_json_atomic(index, output_dir / 'corpus_attempts.json')
     save_index()
     for pair in pairs:
-        row = {'audio': pair['audio'], 'source': pair['source'], 'status': 'no source match'}
+        try:
+            row_audio, source_value = validate_corpus_pair(pair)
+        except CorpusPairError as error:
+            index['rows'].append({'audio': error.audio, 'source': None,
+                                  'status': 'failed: ' + str(error), 'attempted': False})
+            print(f"FAILED: {pair!r}: {error}", file=sys.stderr, flush=True)
+            save_index()
+            continue
+        row = {'audio': row_audio, 'source': source_value, 'status': 'no source match'}
         index['rows'].append(row)
-        if not pair['source']:
+        if not source_value:
             save_index()
             continue
         row['status'] = 'pending'
         save_index()
         try:
-            audio, source = Path(pair['audio']).resolve(strict=True), Path(pair['source']).resolve(strict=True)
+            audio, source = Path(row_audio).resolve(strict=True), Path(source_value).resolve(strict=True)
             name = pair['output_name']
             if not isinstance(name, str) or Path(name).name != name or name in ('', '.', '..'):
                 raise ValueError('unsafe pair output name')
@@ -204,11 +240,7 @@ def run_corpus(repo, pairs_path, output_dir, model, fallback):
                 options={'summary_output': str(summary), 'output': str(output), 'model': model,
                          'fallback_model': fallback, 'chunk_size': 10.0, 'lang': 'en'})
             save_index()
-            command = [str(repo / 'run_with_restart.sh'), '--audio', str(audio), '--source', str(source),
-                '--model', model, '--output', str(output),
-                '--summary-output', str(summary), '--chunk-size', '10.0', '--lang', 'en']
-            if fallback:
-                command += ['--fallback-model', fallback]
+            command = get_worker_command(repo, audio, source, output, summary, model, fallback)
             result = subprocess.run(command, cwd=repo)
             row['worker_exit'] = result.returncode
             if result.returncode:

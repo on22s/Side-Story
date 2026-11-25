@@ -11,7 +11,10 @@ import uuid
 import contextlib
 from pathlib import Path
 from book_state_transaction import (ensure_book_state, apply_book_state_locked,
-                                    get_book_operation_token, get_book_snapshot)
+                                    get_book_operation_token, get_book_snapshot,
+                                    get_book_fault_response, BookTransactionError,
+                                    BookJournalMigrationRequired,
+                                    BookJournalPublicationUncertain, BookExchangeDiverged)
 from publication_source import (get_publication_source_path, get_publication_source_capture,
                                 get_saved_publication_source_bytes)
 
@@ -36,6 +39,10 @@ from core import (
     process_state, is_task_running,
 )
 from project import CHAPTER_EXPORT_DIR
+from project_scope_exports import (PUBLICATIONS_FILE,
+                                   get_compacted_publication_receipts,
+                                   get_scope_export_inventory, read_book_state_bounded,
+                                   read_publication_receipts, write_publication_ledger)
 from translated_edition import PROPOSALS_DIR as TRANSLATION_PROPOSALS_DIR
 from review_script import _checkpoint_path, clear_checkpoint
 from completed_review_receipt import get_review_receipt_path
@@ -46,7 +53,8 @@ from script_repair import build_deterministic_repair
 from script_selection_binding import (BINDING_NAME, MAX_BINDING_BYTES,
     capture_generation_selection, check_binding_source, parse_script_binding,
     make_script_selection_binding, saved_binding_matches, updated_saved_binding,
-    _read_selection_state, saved_script_is_active_source)
+    _read_selection_state, saved_script_is_active_source, is_script_selection_pending,
+    carry_scope_cut_evidence)
 from editor_poll_snapshot import get_snapshot_digest
 from completed_review_receipt import get_review_entries_fingerprint
 from speaker_repair import apply_speaker_selections, build_speaker_review
@@ -122,16 +130,36 @@ def _validate_sound_destination(root, relative, *, limit):
             'Sound-design destination requires inspection; existing book files were preserved.')) from None
 
 
+def _raise_book_fault(error, fallback):
+    """One path-free mapping for book faults at admission or publication."""
+    fault = get_book_fault_response(error)
+    raise HTTPException(status_code=fault.status_code if fault else 409,
+                        detail=fault.detail if fault else fallback) from error
+
+
+def _raise_publication_book_fault(error):
+    """Map a dedicated journal outcome, preserving storage/contention contracts."""
+    journal_error = error
+    if type(error) is ValueError and isinstance(error.__cause__, BookExchangeDiverged):
+        # A rollback refusal can wrap the original exchange outcome.
+        journal_error = error.__cause__
+    if isinstance(journal_error, (BookTransactionError, BookJournalMigrationRequired,
+                                  BookJournalPublicationUncertain, BookExchangeDiverged)):
+        fault = get_book_fault_response(journal_error)
+        raise HTTPException(status_code=fault.status_code, detail=fault.detail) from error
+    raise error
+
+
 @contextlib.contextmanager
 def _saved_mutation_admission():
-    """Do not wait for a book lock while holding the task mutex."""
+    """Book locks then the task mutex: never wait on a journal under the GPU lock."""
     with contextlib.ExitStack() as admission:
         try:
-            admission.enter_context(_gpu_lock)
             admission.enter_context(ensure_book_state(DATA_DIR, timeout=0.25))
             admission.enter_context(ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR, timeout=0.25))
-        except TimeoutError as error:
-            raise HTTPException(status_code=409, detail='Book is busy; try again.') from error
+            admission.enter_context(_gpu_lock)
+        except (TimeoutError, OSError, ValueError) as error:
+            _raise_book_fault(error, 'Book is busy; try again.')
         yield
 
 
@@ -436,9 +464,7 @@ def _save_script_sync(request):
         if request.expected_book_token is not None:
             if get_book_operation_token(DATA_DIR, state=active_state) != request.expected_book_token:
                 raise HTTPException(status_code=409, detail="Active book changed; reopen Save Current before saving")
-        if (not isinstance(active_state, dict)
-                or ('script_selection_pending' in active_state
-                    and active_state['script_selection_pending'] is not False)):
+        if not isinstance(active_state, dict) or is_script_selection_pending(active_state):
             raise HTTPException(status_code=409, detail=(
                 'The selected source does not yet have a published script. '
                 'Finish generation or load a saved script before saving.'))
@@ -541,6 +567,7 @@ def _save_script_sync(request):
                     'Saved script identity requires inspection; existing files were preserved.')) from error
             updated = make_script_selection_binding(get_book_operation_token(DATA_DIR, state=active_state),
                 hashlib.sha256(script_bytes).hexdigest(), script_bytes, source_path=source_path)
+            updated = carry_scope_cut_evidence(binding_raw, updated)
             updated_raw = json.dumps(updated, sort_keys=True, separators=(',', ':')).encode()
             replacements[f'{safe_name}.selection_binding.json'] = saved_binding
             relative = lambda path: os.path.relpath(path, DATA_DIR).replace(os.sep, '/')
@@ -568,6 +595,10 @@ class ScriptLoadRequest(BaseModel):
     name: str
     expected_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
+def _refuse_inspection(detail):
+    raise HTTPException(status_code=409, detail=detail)
+
+
 @router.post("/api/scripts/load")
 async def load_script(request: ScriptLoadRequest):
     'Load a saved script, replacing the current annotated_script.json and chunks.'
@@ -585,11 +616,19 @@ def _load_script_sync(request: ScriptLoadRequest):
 
     # The durable book transaction protects the entire switch, including old
     # exports and recovery sidecars, rather than publishing unrelated copies.
-    with (ensure_book_switch_allowed(), ensure_book_state(DATA_DIR, timeout=0.25),
+    # Task admission stays kernel-held (hold_task_mutex=False), but the GPU
+    # mutex is taken only AFTER every book/journal wait: an edit holds the
+    # book journal while waiting for that mutex, so holding it here first
+    # deadlocks the load into a 409 and blocks the editor meanwhile. Release
+    # kernel admission before waking local claimants waiting on the GPU mutex.
+    with (contextlib.ExitStack() as task_mutex,
+          ensure_book_switch_allowed(hold_task_mutex=False),
+          ensure_book_state(DATA_DIR, timeout=0.25),
           ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR, timeout=0.25),
           file_lock(src, timeout=0.25), file_lock(SCRIPT_PATH, timeout=0.25),
           file_lock(VOICE_CONFIG_PATH, timeout=0.25), file_lock(CHUNKS_PATH, timeout=0.25),
           file_lock(os.path.join(DATA_DIR, BINDING_NAME), timeout=0.25)):
+        task_mutex.enter_context(_gpu_lock)
         if not os.path.isfile(src):
             raise HTTPException(status_code=404, detail=f"Saved script '{request.name}' not found.")
         _require_saved_book_idle()
@@ -637,14 +676,27 @@ def _load_script_sync(request: ScriptLoadRequest):
             raise HTTPException(status_code=409, detail='Saved script identity requires inspection; existing files were preserved.') from error
         try:
             capture_scope_file(DATA_DIR, BINDING_NAME, limit=MAX_BINDING_BYTES)
-        except (OSError, ValueError) as error:
-            raise HTTPException(status_code=409, detail='Active script identity requires inspection; existing files were preserved.') from error
+        except (OSError, ValueError):
+            _refuse_inspection('Active script identity requires inspection; existing files were preserved.')
         try:
             get_publication_source_capture(src)
         except (OSError, ValueError) as error:
             raise HTTPException(status_code=409, detail=f'Saved publication provenance requires review: {error}') from error
-        state_path = os.path.join(DATA_DIR, "state.json")
-        state = safe_load_json(state_path, default={})
+        from project_scope_exports import read_publication_journal, read_set_journal
+        if (read_publication_journal(DATA_DIR) is not None
+                or read_set_journal(DATA_DIR) is not None):
+            _refuse_inspection('An export publication is pending; retry the load after recovery.')
+        prior_state_valid = True
+        try:
+            state = read_book_state_bounded(DATA_DIR)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Loading a saved book can replace malformed active JSON. The
+            # prior bytes still belong to the switch's rollback, but they
+            # cannot establish an eligible export receipt.
+            state = {}
+            prior_state_valid = False
+        except (OSError, ValueError):
+            _refuse_inspection('Active book state requires inspection; existing files were preserved.')
         # The previous book's identity, read through the same snapshot the
         # translation preview uses for its book binding. Proposals are kept
         # only when the loaded book is that same book; a different book must
@@ -668,10 +720,15 @@ def _load_script_sync(request: ScriptLoadRequest):
         _capture_sound_companions(DATA_DIR, ACTIVE_CUES, ACTIVE_RENDITIONS, state.get('active_book_id'))
         state.update(active_book_id=book_id, input_file_path=src,
                      book_generation=uuid.uuid4().hex)
+        receipts, _ledger_raw = read_publication_receipts(DATA_DIR, include_bytes=True)
+        if _ledger_raw is not None:
+            write_publication_ledger(DATA_DIR, _ledger_raw)
+            compacted_receipts = get_compacted_publication_receipts(receipts,
+                get_book_operation_token(DATA_DIR, state=state), None)
         state.pop('script_selection_pending', None)
         state.pop('script_binding_required', None)
         state.pop('_source_scope', None)
-        state.pop('_source_scope_exports', None)
+        state['_source_scope_exports'] = get_scope_export_inventory(DATA_DIR)
         # The book's date order travels with it (#1546); absent means auto.
         saved_order = safe_load_json(_saved_book_meta_path(safe_name), default={})
         saved_order = saved_order.get(DATE_ORDER_KEY) if isinstance(saved_order, dict) else None
@@ -681,10 +738,13 @@ def _load_script_sync(request: ScriptLoadRequest):
             state.pop(DATE_ORDER_KEY, None)
         replacements = {os.path.relpath(SCRIPT_PATH, DATA_DIR): script_bytes,
                         "state.json": json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")}
+        if _ledger_raw is not None:
+            replacements[PUBLICATIONS_FILE] = compacted_receipts
         if saved_binding_raw is not None:
             token = get_book_operation_token(DATA_DIR, state=state)
             binding = make_script_selection_binding(token, hashlib.sha256(script_bytes).hexdigest(),
                                                     script_bytes, source_path=src)
+            binding = carry_scope_cut_evidence(saved_binding_raw, binding)
             replacements[BINDING_NAME] = json.dumps(binding, sort_keys=True, separators=(',', ':')).encode()
             state['script_binding_required'] = True
             replacements['state.json'] = json.dumps(state, ensure_ascii=False, indent=2).encode('utf-8')
@@ -726,8 +786,11 @@ def _load_script_sync(request: ScriptLoadRequest):
             replacements[os.path.relpath(VOICE_CONFIG_PATH, DATA_DIR)] = voice_bytes
         else:
             removals.append(VOICE_CONFIG_PATH)
+        if len(replacements['state.json']) > 4 * 1024**2:
+            _refuse_inspection('Loaded book state exceeds the readable bound; existing files were preserved.')
         apply_book_state_locked(DATA_DIR, replacements,
-                                [os.path.relpath(path, DATA_DIR) for path in removals])
+                                [os.path.relpath(path, DATA_DIR) for path in removals],
+                                restore_export_receipts=prior_state_valid and _ledger_raw is not None)
         if discard_another_book_proposals:
             _discard_another_book_proposals()
         # Identity seam for the loading tab (DS3074): derive the response
@@ -1066,7 +1129,10 @@ def _delete_script_sync(name):
         if saved_script_is_active_source(DATA_DIR, filepath):
             raise HTTPException(status_code=409,
                                 detail='This saved book is currently loaded; switch books before deleting it.')
-        apply_book_state_locked(SCRIPTS_DIR, {}, [os.path.basename(path) for path in artifacts])
+        try:
+            apply_book_state_locked(SCRIPTS_DIR, {}, [os.path.basename(path) for path in artifacts])
+        except (TimeoutError, OSError, ValueError) as error:
+            _raise_publication_book_fault(error)
     logger.info(f"Script '{name}' deleted")
     return {"status": "deleted", "name": name}
 

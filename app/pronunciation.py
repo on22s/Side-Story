@@ -32,6 +32,8 @@ raw WER would select for names that are easy to transcribe rather than right.
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
+import hashlib
+import io
 import json
 import logging
 import os
@@ -40,6 +42,34 @@ import threading
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PATH = os.path.join(REPO, "pronunciation.json")
+
+
+def get_pronunciation_path(path=None):
+    """The one call-time resolver for the shared lexicon's location.
+
+    An explicit caller path always wins. Otherwise an isolated
+    ALEXANDRIA_DATA_DIR owns the file, while an unconfigured runtime keeps the
+    legacy install-root default, including standalone imports through an
+    alias. Admit configured data roots before using them and keep DEFAULT_PATH
+    when the admitted spelling is the install directory. A missing configured
+    root keeps its admitted spelling.
+    """
+    if path:
+        return path
+    if not os.environ.get("ALEXANDRIA_DATA_DIR", "").strip():
+        return DEFAULT_PATH
+    from direct_path_admission import get_direct_directory_root, is_plain_path
+    from utils import get_runtime_data_dir
+    root = get_runtime_data_dir(REPO)
+    if not os.path.exists(root):
+        if not is_plain_path(root):
+            raise ValueError('Pronunciation data root must be a direct directory')
+        return os.path.join(root, "pronunciation.json")
+    canonical, _identity = get_direct_directory_root(root)
+    if os.path.normcase(canonical) == os.path.normcase(REPO):
+        return DEFAULT_PATH
+    return os.path.join(str(canonical), "pronunciation.json")
+
 
 _cache = {"path": None, "fingerprint": None, "entries": {}, "pattern": None}
 _cache_lock = threading.RLock()
@@ -62,18 +92,23 @@ def _compile(entries):
 
 
 def load_lexicon(path=None, force=False):
-    """-> {name: respelling}. Cached on file identity, size and timestamps so edits take effect."""
+    """-> {name: respelling}. Cache parsed entries by file identity and content."""
     with _cache_lock:
         return _load_lexicon(path, force)
 
 
 def _load_lexicon(path=None, force=False):
     """Load the cache while the caller holds its lock."""
-    path = path or DEFAULT_PATH
+    path = get_pronunciation_path(path)
     try:
-        stat = os.stat(path)
+        # Windows st_ctime is creation time. Hash the bytes we parse so an
+        # in-place edit with the same size and restored mtime cannot stay cached.
+        with open(path, "rb") as fh:
+            stat = os.fstat(fh.fileno())
+            content = fh.read()
         fingerprint = (stat.st_dev, stat.st_ino, stat.st_size,
-                       stat.st_mtime_ns, stat.st_ctime_ns)
+                       stat.st_mtime_ns, stat.st_ctime_ns,
+                       hashlib.sha256(content).digest())
     except OSError as error:
         if not isinstance(error, FileNotFoundError):
             logger.warning("Pronunciation lexicon unavailable at %s; continuing without substitutions: %s", path, error)
@@ -83,8 +118,7 @@ def _load_lexicon(path=None, force=False):
     if not force and _cache["path"] == path and _cache["fingerprint"] == fingerprint:
         return dict(_cache["entries"])
     try:
-        with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
+        raw = json.load(io.StringIO(content.decode("utf-8")))
     except (ValueError, OSError) as error:
         # Retain nonblocking generation, but make the failed lexicon visible.
         logger.warning("Pronunciation lexicon invalid at %s; continuing without substitutions: %s", path, error)
@@ -442,8 +476,10 @@ def get_occurrence_pronunciation_resolution(text, entries, pattern=None, *, rule
         if rule['id'] in conflicts:
             decision['reason'] = 'overlapping_approved_spans'
             continue
+        accepted_voices = (context.get('voice_sha256'), context.get('voice_sha256_legacy'))
         mismatch = next((key for key, value in rule.get('restrictions', {}).items()
-                         if context.get(key) != value), None)
+                         if context.get(key) != value
+                         and not (key == 'voice_sha256' and value in accepted_voices)), None)
         if mismatch:
             decision['reason'] = 'scope_mismatch:' + mismatch
             continue

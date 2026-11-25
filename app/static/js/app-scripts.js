@@ -5,7 +5,7 @@
                 const container = document.getElementById('saved-scripts-list');
 
                 if (!scripts.length) {
-                    container.innerHTML = `<p class="text-muted mb-0">${escapeHtml(t('script.saved.list-empty', 'No saved scripts yet. Generate a script above, or select Save Current to keep the current script here.'))}</p>`;
+                    container.innerHTML = `<p class="text-muted mb-0">${uiMessageMarkup('script.saved.list-empty', 'No saved scripts yet. Generate a script above, or select Save Current to keep the current script here.')}</p>`;
                     return;
                 }
 
@@ -14,7 +14,7 @@
                         month: 'short', day: 'numeric', year: 'numeric'
                     });
                     const voiceBadge = s.has_voice_config
-                        ? `<span class="badge bg-info ms-2" title="${escapeHtml(t('script.saved.badge-title', 'Includes voice configuration'))}">${escapeHtml(t('script.saved.voices-badge', 'voices'))}</span>`
+                        ? `<span class="badge bg-info ms-2" data-i18n-attr="title:script.saved.badge-title" title="${escapeHtml(t('script.saved.badge-title', 'Includes voice configuration'))}">${uiMessageMarkup('script.saved.voices-badge', 'voices')}</span>`
                         : '';
                     return `
                         <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 py-2 border-bottom">
@@ -23,12 +23,19 @@
                                 <small class="text-muted ms-2">${date}</small>
                             </div>
                             <div class="flex-shrink-0">
-                                <button class="btn btn-sm btn-outline-info me-1" onclick='auditSavedScript(${getInlineStringArgument(s.name)})'><i class="fas fa-stethoscope me-1"></i>${escapeHtml(t('script.saved.audit', 'Audit'))}</button>
-                                <button class="btn btn-sm btn-outline-success me-1" onclick='loadScript(${getInlineStringArgument(s.name)})'><i class="fas fa-upload me-1"></i>${escapeHtml(t('script.saved.load', 'Load'))}</button>
-                                <button class="btn btn-sm btn-outline-danger" aria-label="${escapeHtml(t('script.saved.delete-aria', 'Delete saved script {name}', {name: s.name}))}" onclick='deleteScript(${getInlineStringArgument(s.name)})'><i class="fas fa-trash"></i></button>
+                                <button class="btn btn-sm btn-outline-info me-1" onclick='auditSavedScript(${getInlineStringArgument(s.name)})'><i class="fas fa-stethoscope me-1"></i>${uiMessageMarkup('script.saved.audit', 'Audit')}</button>
+                                <button class="btn btn-sm btn-outline-success me-1" onclick='loadScript(${getInlineStringArgument(s.name)})'><i class="fas fa-upload me-1"></i>${uiMessageMarkup('script.saved.load', 'Load')}</button>
+                                <button class="btn btn-sm btn-outline-danger" data-i18n-attr="aria-label:script.saved.delete-aria" data-i18n-values="${escapeHtml(JSON.stringify({name: s.name}))}" aria-label="${escapeHtml(t('script.saved.delete-aria', 'Delete saved script {name}', {name: s.name}))}" onclick='deleteScript(${getInlineStringArgument(s.name)})'><i class="fas fa-trash"></i></button>
                             </div>
                         </div>`;
                 }).join('');
+                for (const badge of container.querySelectorAll('[data-i18n-attr="title:script.saved.badge-title"]')) {
+                    renderUiMessage(badge, uiMessage('script.saved.badge-title', 'Includes voice configuration'), 'title');
+                }
+                for (const button of container.querySelectorAll('[data-i18n-attr="aria-label:script.saved.delete-aria"]')) {
+                    renderUiMessage(button, uiMessage('script.saved.delete-aria', 'Delete saved script {name}', JSON.parse(button.getAttribute('data-i18n-values'))), 'aria-label');
+                }
+                applyUiCatalog(container);
             });
         }
 
@@ -339,8 +346,10 @@
             const statusEl = document.getElementById('design-status');
             const previewContainer = document.getElementById('design-preview-container');
 
-            if (!description) { showToast(t('designer.preview.needs-description', 'Please enter a voice description.'), 'warning'); return; }
-            if (!sampleText) { showToast(t('designer.preview.needs-sample', 'Please enter sample text.'), 'warning'); return; }
+            setFieldFeedback('design-description');
+            setFieldFeedback('design-sample-text');
+            if (!description) { setFieldFeedback('design-description', createUiMessageNode('span', 'designer.preview.needs-description', 'Please enter a voice description.')); return; }
+            if (!sampleText) { setFieldFeedback('design-sample-text', createUiMessageNode('span', 'designer.preview.needs-sample', 'Please enter sample text.')); return; }
 
             const generation = window._designerGeneration || 0;
             const request = {};
@@ -684,6 +693,7 @@
                 }
                 if (playBtn) playBtn.style.display = 'none';
                 if (deleteBtn) deleteBtn.style.display = 'none';
+                window.stopOrphanedVoicePreview?.();
                 refAudio.focus();
                 return;
             }
@@ -1109,18 +1119,19 @@
             }
         };
 
-        window.playCloneVoice = async (btn) => {
-            const card = btn.closest('.card-body');
-            const refAudio = card.querySelector('.ref-audio').value;
-            if (refAudio) {
-                try {
-                    const audio = new Audio(getLocalAudioUrl(refAudio, Date.now()));
-                    await audio.play();
-                } catch (error) {
-                    showToast(t('clone.play.error', 'Could not play the clone reference. Check that Alexandria is running, then try Play again.'), 'warning');
-                }
-            }
-        };
+        function setClonePlayButton(button, playing) {
+            window.setVoicePreviewButton(button, playing, playing
+                ? t('voice.card.clone-stop-aria', 'Stop reference audio for {name}', {name: button.dataset.label})
+                : t('voice.card.clone-play-aria', 'Play reference audio for {name}', {name: button.dataset.label}), 'secondary');
+        }
+
+        // Play/Stop like a saved candidate, through the one Voices-tab player:
+        // pressing it again stops the recording instead of starting another (#1933).
+        window.playCloneVoice = (btn) => window.toggleVoicePreviewPlayback(btn, () => {
+            const refAudio = btn.closest('.card-body').querySelector('.ref-audio').value;
+            return refAudio ? getLocalAudioUrl(refAudio, Date.now()) : null;
+        }, setClonePlayButton,
+        t('clone.play.error', 'Could not play the clone reference. Check that Alexandria is running, then try Play again.'));
 
         window.deleteCloneVoice = async (btn) => {
             const card = btn.closest('.card-body');

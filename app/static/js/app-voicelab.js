@@ -13,6 +13,28 @@
             }
         }
 
+        const voicelabFailureDetails = {config: '', inspect: ''};
+
+        function renderVoicelabFailureDetails(kind, text) {
+            voicelabFailureDetails[kind] = text;
+            const details = document.querySelector('#voicelab-diagnostics');
+            const preview = document.querySelector('#voicelab-diagnostics-text');
+            const message = Object.values(voicelabFailureDetails).filter(Boolean).join('\n\n');
+            if (preview) { preview.textContent = message; }
+            if (details) { details.hidden = !message; }
+        }
+
+        async function copyVoicelabFailureDetails() {
+            const preview = document.querySelector('#voicelab-diagnostics-text');
+            if (preview?.textContent) {
+                await copyToClipboard(preview.textContent, t('voicelab.diagnostics.label', 'Voice Lab failure details'));
+            }
+        }
+
+        function openVoicelabSettings() {
+            bootstrap.Collapse.getOrCreateInstance(document.getElementById('voicelab-settings'), {toggle: false}).show();
+        }
+
         async function loadVoicelabConfig() {
             try {
                 const res = await API.get('/api/voicelab/config');
@@ -30,10 +52,7 @@
                 // still count toward the issue badge below via res.checks.
                 ['rocm_python','profiler_model','zips_dir','epub_dirs']
                     .forEach(k => _vlSetCheckIcon('chk-' + k, !!ck[k]));
-                const issues = Object.values(ck).filter(v => v === false).length;
-                document.getElementById('voicelab-readiness').innerHTML = issues
-                    ? `<span class="badge bg-warning text-dark">${escapeHtml(issues === 1 ? t('voicelab.readiness.issues.one', '{count} issue', {count: issues}) : t('voicelab.readiness.issues.many', '{count} issues', {count: issues}))}</span>`
-                    : `<span class="badge bg-success">${escapeHtml(t('voicelab.readiness.ready', 'ready'))}</span>`;
+                const profilerErrors = res.profiler_errors || [];
                 const labels = {
                     rocm_python: t('voicelab.settings.rocm.label', 'ROCm Python'),
                     profiler_model: t('voicelab.check.profiler-model', 'Profiler model'),
@@ -44,25 +63,42 @@
                     voice_analysis: t('voicelab.check.analysis-script', 'Voice analysis script'),
                     name_voices: t('voicelab.check.naming-script', 'Voice naming script'),
                     profiler_environment: t('voicelab.check.profiler-env', 'Profiler environment')};
-                const failedLabels = Object.entries(ck).filter(([, ok]) => ok === false)
-                    .map(([key]) => labels[key] || key);
-                const profilerErrors = res.profiler_errors || [];
+                const checksKnown = Object.keys(labels).every(key => typeof ck[key] === 'boolean')
+                    && Object.values(ck).every(value => typeof value === 'boolean');
+                const issues = Math.max(Object.values(ck).filter(v => v === false).length, profilerErrors.length ? 1 : 0);
+                document.getElementById('voicelab-readiness').innerHTML = issues
+                    ? `<span class="badge bg-warning text-dark">${escapeHtml(issues === 1 ? t('voicelab.readiness.issues.one', '{count} issue', {count: issues}) : t('voicelab.readiness.issues.many', '{count} issues', {count: issues}))}</span>`
+                    : checksKnown ? `<span class="badge bg-success">${escapeHtml(t('voicelab.readiness.ready', 'ready'))}</span>`
+                        : `<span class="badge bg-secondary">${escapeHtml(t('voicelab.readiness.config-unavailable', 'config unavailable'))}</span>`;
+                const failedKeys = Object.keys(ck).filter(key => ck[key] === false);
+                if (profilerErrors.length && !failedKeys.includes('profiler_environment')) { failedKeys.push('profiler_environment'); }
+                const failedLabels = failedKeys.map(key => labels[key] || key);
                 const help = document.getElementById('voicelab-readiness-help');
-                const message = [failedLabels.length
-                    ? t('voicelab.readiness.not-ready', 'Not ready: {items}. Check the configured paths in Pipeline settings & environment, then save settings. If an app script is missing, update or repair the installation.', {items: failedLabels.join(', ')}) : '',
-                    ...profilerErrors].filter(Boolean).join('\n');
+                const message = failedLabels.length
+                    ? [t('voicelab.readiness.blocked', 'Not ready. Resolve these dependencies before starting the pipeline:'), ...failedKeys.map(key => {
+                        const dependency = labels[key] || key;
+                        if (key === 'profiler_environment') { return t('voicelab.readiness.fix-environment', '{dependency}: install the profiler dependencies in the configured interpreter, then save settings to check again.', {dependency}); }
+                        if (Object.hasOwn({batch_train_lora: true, voice_profiler: true, voice_analysis: true, name_voices: true}, key)) { return t('voicelab.readiness.fix-script', '{dependency}: update or repair the installation, then save settings to check again.', {dependency}); }
+                        return t('voicelab.readiness.fix-path', '{dependency}: choose an existing path in Pipeline settings & environment, then save settings.', {dependency});
+                    })].join('\n') : checksKnown ? '' : t('voicelab.readiness.unknown', 'Readiness is unknown. Reopen Pipeline settings & environment to check again.');
                 help.textContent = message;
                 help.hidden = !message;
+                renderVoicelabFailureDetails('config', profilerErrors.join('\n'));
+                const recovery = document.querySelector('#voicelab-recovery');
+                if (recovery) { recovery.hidden = !message; }
                 if (message) { document.getElementById('voicelab-readiness').title = message; }
                 else { document.getElementById('voicelab-readiness').removeAttribute('title'); }
             } catch (e) {
                 console.error('Failed to load Voice Lab config:', e);
                 const readiness = document.getElementById('voicelab-readiness');
                 readiness.innerHTML = `<span class="badge bg-secondary">${escapeHtml(t('voicelab.readiness.config-unavailable', 'config unavailable'))}</span>`;
-                readiness.title = getActionErrorMessage('Displayed settings could not be verified', e, 'Your current fields are kept. Reopen Pipeline settings & environment to retry.');
+                readiness.removeAttribute('title');
                 const help = document.getElementById('voicelab-readiness-help');
-                help.textContent = getActionErrorMessage('Settings could not be verified', e, 'Your current fields are kept. Reopen Pipeline settings & environment to retry.');
+                help.textContent = t('voicelab.readiness.unverified', 'Settings could not be verified. Your current fields are kept. Reopen Pipeline settings & environment to retry.');
                 help.hidden = false;
+                renderVoicelabFailureDetails('config', describeApiError(e));
+                const recovery = document.querySelector('#voicelab-recovery');
+                if (recovery) { recovery.hidden = false; }
             }
         }
 
@@ -77,7 +113,7 @@
                 await API.post('/api/voicelab/config', body);
                 showToast(t('voicelab.settings.saved', 'Voice Lab settings saved.'), 'success');
                 await loadVoicelabConfig();
-            } catch (e) { showActionError('Voice Lab settings save is unconfirmed', e, 'Keep your settings. Check the saved Pipeline settings & environment before saving again.'); }
+            } catch (e) { showActionError(t('voicelab.settings.save-unconfirmed', 'Voice Lab settings save is unconfirmed'), e, t('voicelab.settings.save-unconfirmed-recovery', 'Keep your settings. Check the saved Pipeline settings & environment before saving again.')); }
         };
 
         let _voicelabInspectRequest = 0;
@@ -88,6 +124,7 @@
             const isCurrent = () => request === _voicelabInspectRequest &&
                 (runDir !== null || document.getElementById('vl-zips_dir').value.trim() === dir);
             el.innerHTML = `<i class="fas fa-spinner fa-spin me-1"></i>${escapeHtml(t('voicelab.inspect.loading', 'Inspecting…'))}`;
+            renderVoicelabFailureDetails('inspect', '');
             try {
                 const r = await API.get('/api/voicelab/inspect' + (dir ? `?zips_dir=${encodeURIComponent(dir)}` : ''));
                 if (!isCurrent()) { return; }
@@ -105,7 +142,8 @@
                     + `<span class="badge bg-warning text-dark me-1">${escapeHtml(t('voicelab.inspect.unnamed', '{count} unnamed', {count: m.unnamed || 0}))}</span>`;
             } catch (e) {
                 if (!isCurrent()) { return; }
-                el.innerHTML = `<span class="text-danger">${escapeHtml(getActionErrorMessage('Voice Lab inspection failed', e, 'Check the ZIP directory and configured interpreter, then inspect the directory again.'))}</span>`;
+                renderVoicelabFailureDetails('inspect', describeApiError(e));
+                el.innerHTML = `<div class="alert alert-warning mb-0">${escapeHtml(t('voicelab.inspect.failed-short', 'Voice Lab inspection failed. Check the ZIP directory and configured interpreter, then inspect again. Expand Failure details for the technical reason.'))}</div>`;
             }
         };
 
@@ -179,7 +217,7 @@
             try {
                 body = getVoicelabRequest();
             } catch (e) {
-                showActionError('Pipeline settings need attention', e, 'Keep the current settings and correct the field identified below before running the pipeline.', 'warning');
+                showActionError(t('voicelab.start.settings-invalid', 'Pipeline settings need attention'), e, t('voicelab.start.settings-invalid-recovery', 'Keep the current settings and correct the field identified below before running the pipeline.'), 'warning');
                 return;
             }
             if (!body.stages.length) { showToast(t('voicelab.start.no-stages', 'Select at least one stage to run.'), 'warning'); return; }
@@ -210,11 +248,11 @@
                 pollVoicelab(result.zips_dir);
             } catch (e) {
                 if (phase === 'Preflight') {
-                    document.getElementById('voicelab-status').textContent = getActionErrorMessage('Pipeline preflight did not finish', e, 'Keep the current settings. Check the configured paths, stages and numeric fields, then run the pipeline again.');
-                    showActionError('Pipeline preflight failed', e, 'Check the configured paths, stages and numeric fields before running the pipeline again.');
+                    document.getElementById('voicelab-status').textContent = getActionErrorMessage(t('voicelab.start.preflight-unconfirmed', 'Pipeline preflight did not finish'), e, t('voicelab.start.preflight-unconfirmed-recovery', 'Keep the current settings. Check the configured paths, stages and numeric fields, then run the pipeline again.'));
+                    showActionError(t('voicelab.start.preflight-failed', 'Pipeline preflight failed'), e, t('voicelab.start.preflight-failed-recovery', 'Check the configured paths, stages and numeric fields before running the pipeline again.'));
                 } else {
                     document.getElementById('voicelab-status').innerHTML =
-                        `<span class="text-danger">${escapeHtml(getActionErrorMessage('Pipeline start is unconfirmed', e, 'Check the pipeline task status before running again. Review any configuration or stage refusal below.'))}</span>`;
+                        `<span class="text-danger">${escapeHtml(getActionErrorMessage(t('voicelab.start.start-unconfirmed', 'Pipeline start is unconfirmed'), e, t('voicelab.start.start-unconfirmed-recovery', 'Check the pipeline task status before running again. Review any configuration or stage refusal below.')))}</span>`;
                 }
             } finally {
                 startButton.innerHTML = startLabel;
@@ -346,10 +384,10 @@
             try {
                 text = await _fetchVoicelabDiagnostics();
             } catch (e) {
-                showActionError('Could not fetch diagnostics', e, 'Check the app connection, then request the sanitized diagnostics again.');
+                showActionError(t('voicelab.diagnostics.fetch-failed', 'Could not fetch diagnostics'), e, t('voicelab.diagnostics.fetch-failed-recovery', 'Check the app connection, then request the sanitized diagnostics again.'));
                 return;
             }
-            await copyToClipboard(text, 'Sanitized diagnostics');
+            await copyToClipboard(text, t('voicelab.diagnostics.copy-subject', 'Sanitized diagnostics'));
         };
 
         window.downloadVoicelabDiagnostics = async () => {
@@ -366,7 +404,7 @@
                 a.remove();
                 URL.revokeObjectURL(url);
             } catch (e) {
-                showActionError('Could not download diagnostics', e, 'Check the app connection and browser download permissions, then download again or use Copy Diagnostics.');
+                showActionError(t('voicelab.diagnostics.download-failed', 'Could not download diagnostics'), e, t('voicelab.diagnostics.download-failed-recovery', 'Check the app connection and browser download permissions, then download again or use Copy Diagnostics.'));
             }
         };
 
@@ -384,6 +422,17 @@
                     }
                     if (s.zips_dir) { runDir = s.zips_dir; }
                     renderLogs(s);
+                    // Halftone: the training texture, shared with the Training
+                    // tab's LoRA bar (#2042). The status payload already
+                    // embeds the server's estimate.
+                    const progressWrap = document.getElementById('vl-progress');
+                    if (progressWrap) { progressWrap.style.display = ''; }
+                    const progressEta = s.eta || null;
+                    renderTexturedProgress(document.getElementById('vl-progress-bar'), {
+                        fraction: progressEta && Number.isFinite(progressEta.fraction) ? progressEta.fraction : null,
+                        label: getTaskLabel('voicelab'),
+                        task: getTaskLabel('voicelab'),
+                    });
                     if (s.tasks && s.tasks.length) {
                         progEl.style.display = 'flex';
                         progEl.innerHTML = s.tasks.map(task =>
@@ -396,6 +445,8 @@
                 },
                 onDone: s => {
                     _vlSetRunning(false);
+                    const progressWrap = document.getElementById('vl-progress');
+                    if (progressWrap) { progressWrap.style.display = 'none'; }
                     notifyJobDone('voicelab', '', 'finished', s);
                     const cls = s.status === 'done' ? 'text-success'
                               : s.status === 'cancelled' ? 'text-warning' : 'text-danger';

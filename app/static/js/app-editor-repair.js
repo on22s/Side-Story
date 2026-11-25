@@ -5,17 +5,23 @@ let editorRepairOptionsRevision = null;
 let editorRepairRequest = 0;
 let editorRepairBusy = false;
 
+// Keyed so a locale repaint repaints the live announcement instead of the
+// markup's default status; renderUiMessage also clears the key for runtime text.
+function setEditorRepairStatus(message) {
+    renderUiMessage(document.getElementById('editor-repair-status'), message);
+}
+
 function resetEditorRepairPreview() {
     editorRepairRequest++;
     editorRepairPreview = null;
     document.getElementById('editor-repair-start').disabled = true;
     document.getElementById('editor-repair-lines').replaceChildren();
-    document.getElementById('editor-repair-status').textContent = t('editor.repair.selection-changed', 'Selection changed. Preview again before rendering.');
+    setEditorRepairStatus(uiMessage('editor.repair.selection-changed', 'Selection changed. Preview again before rendering.'));
 }
 
 function getEditorRepairFilters() {
     const chapter = document.getElementById('editor-repair-chapter').value;
-    return {chapter: chapter === '' ? null : Number(chapter),
+    return {chapters: chapter === '' ? null : [Number(chapter)],
         speakers: Array.from(document.getElementById('editor-repair-speakers').selectedOptions, option => option.value)};
 }
 
@@ -23,24 +29,31 @@ async function loadEditorRepairOptions() {
     resetEditorRepairPreview();
     const request = editorRepairRequest;
     const book = chunkSnapshotBookToken;
+    const chapters = document.getElementById('editor-repair-chapter');
+    const speakers = document.getElementById('editor-repair-speakers');
     try {
         if (!book || chunkSnapshotBook !== currentBookFilename) { throw new Error(t('editor.repair.refresh-first', 'Refresh Editor first.')); }
         const result = await API.get(`/api/chunks/repair_options?expected_book_token=${encodeURIComponent(book)}`);
         if (request !== editorRepairRequest || book !== chunkSnapshotBookToken || result.book_token !== book) { return; }
         editorRepairBook = book;
         editorRepairOptionsRevision = result.options_revision;
-        const chapters = document.getElementById('editor-repair-chapter');
         chapters.replaceChildren(new Option(t('editor.repair.entire-book', 'Entire book'), ''));
         for (const chapter of result.chapters) {
             chapters.add(new Option(`${chapter.index + 1}. ${chapter.title}`, String(chapter.index)));
         }
-        const speakers = document.getElementById('editor-repair-speakers');
         speakers.replaceChildren();
         for (const speaker of result.speakers) { speakers.add(new Option(speaker || t('editor.repair.unknown-speaker', '(Unknown speaker)'), speaker)); }
         document.getElementById('editor-repair-note').textContent = result.grouping_note;
-        document.getElementById('editor-repair-status').textContent = t('editor.repair.choose', 'Choose speakers and preview. Loading options does not start generation.');
+        setEditorRepairStatus(uiMessage('editor.repair.choose', 'Choose speakers and preview. Loading options does not start generation.'));
     } catch (error) {
-        if (request === editorRepairRequest) { showActionError(t('editor.repair.load-error', 'Could not load repair options'), error, t('editor.repair.load-recovery', 'Refresh Editor and load the current options again.'), 'error'); }
+        if (request === editorRepairRequest) {
+            showActionError(t('editor.repair.load-error', 'Could not load repair options'), error, t('editor.repair.load-recovery', 'Refresh Editor and load the current options again.'), 'error');
+            editorRepairBook = null;
+            editorRepairOptionsRevision = null;
+            chapters.replaceChildren(new Option(t('editor.repair.entire-book', 'Entire book'), ''));
+            speakers.replaceChildren();
+            setEditorRepairStatus(uiMessage('editor.repair.options-load-failed', 'Repair options could not be loaded. The listed chapters and speakers may belong to a previous book; refresh Editor and load options again.'));
+        }
     }
 }
 
@@ -70,18 +83,20 @@ async function previewEditorRepair() {
             list.appendChild(item);
         }
         document.getElementById('editor-repair-start').disabled = !result.rows.length;
-        document.getElementById('editor-repair-status').textContent = t('editor.repair.preview-summary', '{lines} non-empty lines selected; {rendered} have saved audio paths that may be replaced. Review every selected line before continuing.', {lines: result.rows.length, rendered: result.rendered_count});
+        setEditorRepairStatus(uiMessage('editor.repair.preview-summary', '{lines} non-empty lines selected; {rendered} have saved audio paths that may be replaced. Review every selected line before continuing.', {lines: result.rows.length, rendered: result.rendered_count}));
     } catch (error) {
         if (request === editorRepairRequest) {
-            document.getElementById('editor-repair-status').textContent = t('editor.repair.preview-failed', 'Preview failed. Refresh and preview again.');
+            setEditorRepairStatus(uiMessage('editor.repair.preview-failed', 'Preview failed. Refresh and preview again.'));
             showActionError(t('editor.repair.preview-error', 'Could not preview repair'), error, t('editor.repair.preview-recovery', 'Check your selection and refresh Editor.'), 'error');
         }
     } finally { editorRepairBusy = false; }
 }
 
 function getEditorRepairSelection(chunks, preview) {
+    // Each panel's preview carries the reader of its own controls.
+    const getFilters = preview && preview.getFilters ? preview.getFilters : getEditorRepairFilters;
     if (!preview || preview.book_token !== chunkSnapshotBookToken
-            || JSON.stringify(preview.filters) !== JSON.stringify(getEditorRepairFilters())) {
+            || JSON.stringify(preview.filters) !== JSON.stringify(getFilters())) {
         throw new Error(t('editor.repair.selection-changed-again', 'Repair selection changed. Preview again.'));
     }
     const rowsById = new Map(chunks.map(chunk => [chunk.id, chunk]));
@@ -98,6 +113,131 @@ async function generateEditorRepair() {
     if (editorRepairBusy || !editorRepairPreview || isRenderingAll) { return; }
     editorRepairBusy = true;
     document.getElementById('editor-repair-start').disabled = true;
-    try { await startRender(true, editorRepairPreview); }
-    finally { editorRepairBusy = false; resetEditorRepairPreview(); }
+    const request = editorRepairRequest;
+    const book = chunkSnapshotBookToken;
+    const preview = editorRepairPreview;
+    let dispatched = false;
+    try { dispatched = await startRender(true, preview) === true; }
+    finally {
+        editorRepairBusy = false;
+        // A render owned by a previous book/context must not clear this book's
+        // options or overwrite its live status when it finally settles.
+        if (request === editorRepairRequest && book === chunkSnapshotBookToken && preview === editorRepairPreview) {
+            resetEditorRepairPreview();
+            if (!dispatched) {
+                setEditorRepairStatus(uiMessage('editor.repair.render-not-started', 'The repair render did not start. Review the error, then preview the selection again.'));
+            }
+        }
+    }
+}
+
+/* Generate by chapter (#1921): render chosen chapters, skipping lines that
+   already have audio unless Regenerate is ticked. Uses the repair preview for
+   the exact rows, so admission, confirmation and polling are the shared ones. */
+let editorChapterBusy = false;
+let editorChapterMapRequest = 0;
+const getEditorChapterElement = name => document.getElementById('editor-chapter-' + name);
+const EDITOR_CHAPTER_COLORS = {done: 'success', partial: 'warning', pending: 'secondary', failed: 'danger'};
+
+// -> one entry per chapter: lines counted are non-empty ones, as rendering counts them.
+// first/last are list positions; chunk ids equal positions (project.py renumbers
+// them on every insert/delete), the same invariant the batch renderer relies on.
+function getEditorChapterProgress(chapters, chunks) {
+    const byId = new Map(chunks.map(chunk => [chunk.id, chunk]));
+    return chapters.map(chapter => {
+        let total = 0, done = 0, failed = 0;
+        for (let id = chapter.first; id <= chapter.last; id += 1) {
+            const chunk = byId.get(id);
+            if (!chunk || !(chunk.text || '').trim()) { continue; }
+            total += 1;
+            if (chunk.status === 'done') { done += 1; }
+            if (chunk.status === 'error') { failed += 1; }
+        }
+        const state = failed ? 'failed' : (total && done === total ? 'done' : (done ? 'partial' : 'pending'));
+        return {number: chapter.index + 1, title: chapter.title, total, done, failed, state};
+    });
+}
+
+function renderEditorChapterMap(progress) {
+    getEditorChapterElement('map').replaceChildren(...progress.map(chapter => {
+        const square = document.createElement('span');
+        square.className = 'bg-' + EDITOR_CHAPTER_COLORS[chapter.state];
+        square.setAttribute('title', t('editor.chapters.square', 'Chapter {number}: {title} ({done} of {total} lines generated)', chapter));
+        return square;
+    }));
+    // The map is visual only; this text carries the same facts for screen readers.
+    const count = state => progress.filter(chapter => chapter.state === state).length;
+    const failed = progress.filter(chapter => chapter.state === 'failed').map(chapter => chapter.number);
+    getEditorChapterElement('summary').textContent = t('editor.chapters.summary',
+        '{done} of {total} chapters fully generated, {partial} partly generated, {pending} not started, {failed} with failed lines.',
+        {done: count('done'), total: progress.length, partial: count('partial'), pending: count('pending'), failed: failed.length})
+        + (failed.length ? ' ' + t('editor.chapters.failed-list', 'Failed: {chapters}.', {chapters: failed.slice(0, 20).join(', ') + (failed.length > 20 ? ', …' : '')}) : '');
+}
+
+async function getEditorChapterOptions() {
+    const book = chunkSnapshotBookToken;
+    const options = await API.get(`/api/chunks/repair_options?expected_book_token=${encodeURIComponent(book)}`);
+    if (!book || options.book_token !== book || book !== chunkSnapshotBookToken) {
+        throw new Error(t('editor.chapters.book-changed', 'The book changed. Try again.'));
+    }
+    return options;
+}
+
+async function refreshEditorChapterMap() {
+    // A render's completion calls this too; a closed panel reloads on open instead.
+    if (!getEditorChapterElement('panel').open) { return; }
+    const request = ++editorChapterMapRequest;
+    try {
+        const chunks = await ensureEditorRenderSnapshot();
+        const options = await getEditorChapterOptions();
+        if (request !== editorChapterMapRequest) { return; }
+        renderEditorChapterMap(getEditorChapterProgress(options.chapters, chunks));
+    } catch (error) {
+        if (request === editorChapterMapRequest) {
+            getEditorChapterElement('summary').textContent = t('editor.chapters.map-failed', 'Could not load chapter progress. Refresh Editor and open this panel again.');
+        }
+    }
+}
+window.refreshEditorChapterMap = refreshEditorChapterMap;
+
+async function generateEditorChapters() {
+    if (editorChapterBusy || isRenderingAll) { return; }
+    editorChapterBusy = true;
+    const input = getEditorChapterElement('selection');
+    const status = getEditorChapterElement('status');
+    try {
+        const chapters = parseChapterSelection(input.value);
+        if (!chapters) { throw new Error(t('editor.chapters.enter', 'Enter chapter numbers, for example 1-3, 5.')); }
+        await ensureEditorRenderSnapshot();
+        const book = chunkSnapshotBookToken;
+        const options = await getEditorChapterOptions();
+        const missing = chapters.find(number => number >= options.chapters.length);
+        if (missing !== undefined) {
+            throw new Error(t('editor.chapters.out-of-range', 'This book has {count} chapters, so chapter {chapter} does not exist.', {count: options.chapters.length, chapter: missing + 1}));
+        }
+        if (!options.speakers.length) { throw new Error(t('editor.chapters.no-lines', 'This book has no lines to render.')); }
+        const getFilters = () => ({chapters: parseChapterSelection(input.value), speakers: options.speakers});
+        const filters = getFilters();
+        const result = await API.post('/api/chunks/repair_preview', {expected_book_token: book, expected_options_revision: options.options_revision, ...filters});
+        if (result.book_token !== book || book !== chunkSnapshotBookToken) {
+            throw new Error(t('editor.chapters.book-changed', 'The book changed. Try again.'));
+        }
+        const regenerate = getEditorChapterElement('regenerate').checked;
+        const pending = result.rows.filter(row => row.status !== 'done').length;
+        if (!result.rows.length) {
+            status.textContent = t('editor.chapters.empty', 'These chapters have no lines to render.');
+            return;
+        }
+        if (!regenerate && !pending) {
+            status.textContent = t('editor.chapters.all-done', 'Every line in these chapters already has audio. Tick Regenerate to replace it.');
+            return;
+        }
+        status.textContent = t('editor.chapters.starting', 'Rendering {count} lines from {chapters} chapters.', {count: regenerate ? result.rows.length : pending, chapters: new Set(chapters).size});
+        await startRender(regenerate, {...result, filters, getFilters});
+    } catch (error) {
+        status.textContent = t('editor.chapters.failed', 'Chapters were not started.');
+        showActionError(t('editor.chapters.error', 'Could not generate chapters'), error, t('editor.chapters.recovery', 'Check the chapter numbers and refresh Editor, then try again.'), 'error');
+    } finally {
+        editorChapterBusy = false;
+    }
 }

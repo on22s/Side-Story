@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -6,6 +7,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from request_origin import get_request_refusal
 from fastapi.staticfiles import StaticFiles
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import PlainTextResponse
+from review_startup import record_failure
+from book_placeholder import BookSwitchPlaceholderError
 from adapter_static import AdapterStaticFiles
 
 from core import (
@@ -38,7 +44,16 @@ logger = logging.getLogger("AlexandriaUI")
 
 def reset_stuck_chunks():
     """Reset chunks left generating by a prior interrupted server process."""
-    chunks = project_manager.load_chunks()
+    try:
+        chunks = project_manager.load_chunks()
+    except BookSwitchPlaceholderError:
+        raise
+    except (ValueError, OSError) as error:
+        # A stale or torn chunk journal is evidence to preserve. Skipping this
+        # reset keeps the UI reachable after a restart; callers still report
+        # the unreadable book as a conflict when they load its chunks.
+        logger.warning("Preserving chunk state; stuck-chunk reset skipped: %s", error)
+        return 0
     if not chunks:
         return 0
 
@@ -53,28 +68,86 @@ def reset_stuck_chunks():
     return reset_count
 
 
+def is_benign_connection_reset(context):
+    """A browser dropped a connection that asyncio then tried to shut down (#1909).
+
+    On Windows the proactor transport calls ``socket.shutdown`` after the
+    peer has already reset the connection and logs the resulting
+    ConnectionResetError as "Exception in callback ... _call_connection_lost"
+    (CPython issue 83191). Nothing failed; only this exact case is matched.
+    """
+    return (isinstance(context.get("exception"), ConnectionResetError)
+            and "_call_connection_lost" in str(context.get("message", "")))
+
+
+def apply_connection_reset_filter(loop):
+    """Drop only the benign reset log on ``loop``; everything else is reported as before."""
+    previous = loop.get_exception_handler()
+
+    def handler(handler_loop, context):
+        if is_benign_connection_reset(context):
+            return
+        if previous is not None:
+            previous(handler_loop, context)
+        else:
+            handler_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
+def _skip_startup_recovery(operation, error):
+    """Warn and record a bounded diagnostic for a step that cannot prove state."""
+    record_failure('startup_recovery_skipped', error, task='startup',
+                   operation=operation, resource=DATA_DIR, level=logging.WARNING)
+    logger.warning('Preserving state; startup step %s was skipped: %s', operation, error)
+
+
+def _recover_startup_state():
+    """Best-effort cleanup while this process owns the startup recovery fence.
+
+    Each step preserves what it cannot prove. A step that cannot get its lock or
+    read its state is skipped and diagnosed; independent later steps still run.
+    """
+    try:
+        with ensure_book_state(DATA_DIR):
+            from synthesis_workspace import apply_abandoned_synthesis_workspace_cleanup
+            apply_abandoned_synthesis_workspace_cleanup(DATA_DIR)
+            recovery = reclaim_export_staging((DATA_DIR, os.path.join(DATA_DIR, 'chapter_exports'),
+                                               os.path.join(DATA_DIR, 'voicelines')))
+            for error in recovery['errors']:
+                logger.warning('Export staging recovery: %s', error)
+            reset_stuck_chunks()
+    except (TimeoutError, BookSwitchPlaceholderError, OSError) as error:
+        _skip_startup_recovery('book_recovery', error)
+    try:
+        interrupted = mark_interrupted_runs(RUN_HISTORY_DIR)
+    except (TimeoutError, OSError, ValueError) as error:
+        _skip_startup_recovery('run_history_recovery', error)
+    else:
+        if interrupted:
+            logger.warning("Marked %d unfinished run(s) interrupted", len(interrupted))
+    # Blind-review sessions carry no task lease, so pruning belongs inside the
+    # ownership fence: another worker may still be serving a long-open session.
+    try:
+        pruned = evaluation_reviews.prune_sessions(EVALUATION_REVIEWS_DIR)
+    except (evaluation_reviews.ReviewError, OSError) as error:
+        _skip_startup_recovery('review_session_prune', error)
+    else:
+        if pruned:
+            logger.info("Pruned %d abandoned review session(s)", len(pruned))
+
+
 @asynccontextmanager
 async def lifespan(_app):
-    with ensure_startup_recovery(DATA_DIR) as recovery_allowed:
-        if recovery_allowed:
-            with ensure_book_state(DATA_DIR):
-                from synthesis_workspace import apply_abandoned_synthesis_workspace_cleanup
-                apply_abandoned_synthesis_workspace_cleanup(DATA_DIR)
-                recovery = reclaim_export_staging((DATA_DIR, os.path.join(DATA_DIR, 'chapter_exports'),
-                                                   os.path.join(DATA_DIR, 'voicelines')))
-                for error in recovery['errors']:
-                    logger.warning('Export staging recovery: %s', error)
-                reset_stuck_chunks()
-            interrupted = mark_interrupted_runs(RUN_HISTORY_DIR)
-            if interrupted:
-                logger.warning("Marked %d unfinished run(s) interrupted", len(interrupted))
-        else:
-            logger.info("Preserving active chunks and histories owned by another worker")
-    # Clear blind-review sessions abandoned by a prior process; otherwise they
-    # only get pruned when the next session is opened.
-    pruned = evaluation_reviews.prune_sessions(EVALUATION_REVIEWS_DIR)
-    if pruned:
-        logger.info("Pruned %d abandoned review session(s)", len(pruned))
+    apply_connection_reset_filter(asyncio.get_running_loop())
+    try:
+        with ensure_startup_recovery(DATA_DIR) as recovery_allowed:
+            if recovery_allowed:
+                _recover_startup_state()
+            else:
+                logger.info("Preserving active chunks, histories and review sessions owned by another worker")
+    except (TimeoutError, OSError) as error:
+        _skip_startup_recovery('startup_admission_lock', error)
     try:
         yield
     finally:
@@ -82,7 +155,62 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Alexandria Audiobook", lifespan=lifespan)
-app.add_exception_handler(AppError, handle_app_error)
+
+# Baseline headers for every HTTP response. The CSP is report-only so it cannot
+# break the vanilla-JS SPA: the inline anti-flash block, inline event handlers
+# and inline <style> are all still in normal use, and every fetch() targets
+# /api/... on this origin. No X-Frame-Options / frame-ancestors by owner
+# decision — Pinokio embeds this app in a frame, and a framing restriction would
+# blank it.
+_REPORT_ONLY_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "media-src 'self' blob: data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy-Report-Only": _REPORT_ONLY_CSP,
+}
+
+
+def apply_security_headers(response):
+    """Add the baseline headers without overwriting a header a route already set."""
+    for name, value in SECURITY_HEADERS.items():
+        if name not in response.headers:
+            response.headers[name] = value
+    return response
+
+
+async def handle_http_failure(request, error):
+    if error.status_code >= 500 or not getattr(error, 'expected_probe_response', False):
+        record_failure('http_request_refused', error, task='http', resource=request.url.path,
+                       operation=getattr(request.scope.get('route'), 'name', 'unmatched'),
+                       status_code=error.status_code, level=logging.WARNING if error.status_code < 500 else logging.ERROR)
+    if isinstance(error, AppError):
+        return await handle_app_error(request, error)
+    return await http_exception_handler(request, error)
+
+
+async def handle_request_failure(request, error):
+    record_failure('http_request_failed', error, task='http', resource=request.url.path,
+                   operation=getattr(request.scope.get('route'), 'name', 'unmatched'), status_code=500)
+    # This handler is also Starlette's outer ServerErrorMiddleware handler, so
+    # 500s produced there never pass through the user-middleware stack.
+    return apply_security_headers(PlainTextResponse('Internal Server Error', status_code=500))
+
+
+app.add_exception_handler(AppError, handle_http_failure)
+app.add_exception_handler(StarletteHTTPException, handle_http_failure)
+app.add_exception_handler(Exception, handle_request_failure)
 app.add_middleware(TaskClaimMiddleware)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -124,6 +252,7 @@ if _AUTH_PASSWORD:
         if check_basic_auth(request.headers.get("Authorization", ""),
                              _AUTH_USERNAME, _AUTH_PASSWORD):
             return await call_next(request)
+        record_failure('http_auth_refused', task='http', status_code=401, rate_limit_seconds=60)
         return _StarletteResponse(
             "Authentication required", status_code=401,
             headers={"WWW-Authenticate": 'Basic realm="Alexandria"'})
@@ -148,6 +277,8 @@ async def _request_origin_gate(request, call_next):
     if refusal:
         from starlette.responses import PlainTextResponse
         kind, reason = refusal
+        record_failure('http_host_refused' if kind == 'host' else 'http_origin_refused',
+                       task='http', status_code=400 if kind == 'host' else 403, rate_limit_seconds=60)
         return PlainTextResponse(reason, status_code=400 if kind == "host" else 403)
     return await call_next(request)
 
@@ -159,6 +290,14 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["WWW-Authenticate"],
 )
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request, call_next):
+    # Registered last, so it is the outermost user middleware and also labels
+    # responses short-circuited by the origin/auth gates above.
+    return apply_security_headers(await call_next(request))
+
 
 from routers.system import router as system_router
 

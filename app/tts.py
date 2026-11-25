@@ -46,6 +46,7 @@ from synthesis_input import (ensure_speech_input_capture, is_speech_input_captur
 from synthesis_recovery_serving import (ensure_native_recovery_serving_current,
                                         SynthesisRecoveryDependencyChanged)
 from pronunciation import ensure_occurrence_pronunciation_context, get_pronunciation_model_context
+from timeline_anchors import get_style_timeline_index, resolve_timeline_anchors
 from pydub import AudioSegment
 from audio_assembly import AudioSegmentBuilder
 from export_limits import ensure_pause_allowed
@@ -72,6 +73,27 @@ _EXTERNAL_RUNTIME_LOCK = threading.Lock()
 
 def create_external_client(url, timeout):
     return ExternalTTSClient(url, timeout)
+
+
+class _PeakVramAccumulator:
+    """Fold local GPU peak samples into one result, or None when none were taken.
+
+    A batch can finish with no GPU reading at all: a CPU-only runtime, or a
+    LoRA batch whose every adapter group failed to load. In those cases no
+    sample reaches ``record`` and ``get_result`` is None — never a measured-looking
+    0.0 GB that a benchmark would score as a successful fit. Sampling stays at
+    the caller's existing reset/max-memory sites; this helper only folds values.
+    """
+
+    def __init__(self):
+        self._peak = None
+
+    def record(self, peak_gb):
+        if self._peak is None or peak_gb > self._peak:
+            self._peak = peak_gb
+
+    def get_result(self):
+        return None if self._peak is None else round(self._peak, 2)
 
 
 def _close_external_runtime(lock, calls, clients, executor):
@@ -233,18 +255,6 @@ DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
 
 
-def get_style_timeline_index(point):
-    """Read a nonnegative integer timeline position, rejecting malformed data."""
-    value = point.get("from_index", 0)
-    try:
-        index = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("style_timeline from_index must be a nonnegative integer") from exc
-    if isinstance(value, bool) or index < 0 or (not isinstance(value, str) and value != index):
-        raise ValueError("style_timeline from_index must be a nonnegative integer")
-    return index
-
-
 def active_character_style(voice_data, chunk_index=None):
     """The identity anchor in force at a line: the entry's `character_style`,
     replaced by the last `style_timeline` point at or before `chunk_index`.
@@ -255,8 +265,10 @@ def active_character_style(voice_data, chunk_index=None):
     style = (data.get("character_style") or data.get("default_style") or "").strip()
     if chunk_index is None:
         return style
+    timeline = data.get("style_timeline")
     points = [(get_style_timeline_index(point), point)
-              for point in data.get("style_timeline") or [] if isinstance(point, dict)]
+              for point in (timeline if isinstance(timeline, (list, tuple)) else [])
+              if isinstance(point, dict)]
     for index, point in sorted(points, key=lambda item: item[0]):
         if index <= chunk_index:
             style = (point.get("character_style") or "").strip()
@@ -275,10 +287,17 @@ def get_version_fields(voice_data, version_id):
     """-> the fields one of a character's voice versions puts over its entry,
     or None when the version does not exist. One overlay for the whole-book
     select route and the per-chunk version timeline (Rule 15)."""
-    version = ((voice_data or {}).get("versions") or {}).get(version_id)
+    versions = (voice_data or {}).get("versions")
+    version = versions.get(version_id) if isinstance(versions, dict) else None
     if not isinstance(version, dict):
         return None
     return {key: value for key, value in version.items() if key not in VERSION_OVERLAY_EXCLUDED}
+
+
+def get_voice_config_for_version(voice_data, version_id):
+    """Resolve a version over its base voice, preserving explicit overrides."""
+    fields = get_version_fields(voice_data, version_id) if version_id is not None else None
+    return {**voice_data, **fields} if fields else voice_data
 
 
 def active_version_id(voice_data, chunk_index):
@@ -288,91 +307,468 @@ def active_version_id(voice_data, chunk_index):
     if chunk_index is None:
         return None
     current = None
+    timeline = (voice_data or {}).get("version_timeline")
     points = [(get_style_timeline_index(point), point)
-              for point in (voice_data or {}).get("version_timeline") or [] if isinstance(point, dict)]
+              for point in (timeline if isinstance(timeline, (list, tuple)) else [])
+              if isinstance(point, dict)]
     for index, point in sorted(points, key=lambda item: item[0]):
         if index <= chunk_index:
             current = point.get("version_id")
     return current
 
 
+def get_voice_alias(entry):
+    # A persisted non-object entry is malformed data, not an alias; readers
+    # (including the narrator fallback) treat it as "none" instead of raising.
+    if not isinstance(entry, dict):
+        return None
+    alias = entry.get("alias_of") or entry.get("alias")
+    return alias if isinstance(alias, str) and alias.strip() else None
+
+
+class VoiceAliasResolutionError(ValueError):
+    """An alias chain is cyclic or exceeds the supported depth."""
+
+
 def get_resolved_speaker(speaker, voice_config):
-    """Follow speaker aliases, refusing cycles or an excessive chain."""
+    """Follow speaker aliases, refusing cycles or an excessive chain.
+
+    A truthy non-object target is a malformed entry. Raising the row-scoped
+    alias error (rather than an AttributeError) lets a reached row settle and
+    lets an optional fallback treat the edge as unavailable (#2170 R2).
+    """
     name, seen = speaker, set()
     for _ in range(16):
         if name in seen:
-            raise ValueError(f"Alias cycle detected for speaker '{speaker}'")
+            raise VoiceAliasResolutionError(f"Alias cycle detected for speaker '{speaker}'")
         seen.add(name)
-        entry = voice_config.get(name) or {}
-        alias = entry.get("alias_of") or entry.get("alias")
-        if not isinstance(alias, str) or not alias.strip():
+        entry = (voice_config or {}).get(name)
+        if not entry:
+            return name
+        if not isinstance(entry, dict):
+            raise VoiceAliasResolutionError(
+                f"Voice configuration for speaker '{name}' is malformed")
+        alias = get_voice_alias(entry)
+        if alias is None:
             return name
         name = alias
-    raise ValueError(f"Alias chain for '{speaker}' exceeded 16 iterations")
+    raise VoiceAliasResolutionError(f"Alias chain for '{speaker}' exceeded 16 iterations")
+
+
+def get_ensemble_member_names(voice_data):
+    """The member names a saved ensemble config offers to dispatch (Rule 15).
+
+    A list/tuple is canonical; a mapping (which the version route accepts)
+    offers its keys; a bare string is one name. Any other shape is malformed
+    and offers nothing, so a corrupt entry settles as "no members configured"
+    instead of iterating an int (#2170 R2).
+
+    Every consumer (walker, projection, version route and dispatch) reads this
+    one function, so a persisted collection is normalized identically: order is
+    preserved and non-text entries are ignored rather than erroring in one
+    consumer and disappearing in another (#2170 F4). New writes reject such
+    collections at the public version/candidate/save seam.
+    """
+    members = (voice_data or {}).get("members")
+    if isinstance(members, dict):
+        names = list(members)
+    elif isinstance(members, (list, tuple)):
+        names = list(members)
+    elif isinstance(members, str):
+        return [members]
+    else:
+        return []
+    return [name for name in names if isinstance(name, str)]
+
+
+def validate_ensemble_members(members):
+    """Refuse an ordered member collection carrying a non-text name (#2170 F4).
+
+    Runtime normalization ignores such entries for already-persisted data, but
+    a new write must not silently discard part of what the client submitted.
+    Scalars keep the established "no members configured" settlement.
+    """
+    if isinstance(members, dict):
+        names = list(members)
+    elif isinstance(members, (list, tuple)):
+        names = list(members)
+    else:
+        return
+    if any(not isinstance(name, str) for name in names):
+        raise ValueError(
+            "Ensemble members must be an ordered list or object of speaker names; "
+            "every name must be text.")
+
+
+def get_materialized_voice_entry(voice_config, name, chunk_index):
+    """One saved entry with its active version and style timeline applied.
+
+    The single entry-level materialization shared by the row walker, narrator
+    resolution and projection, so every consumer reads the same overlay
+    (#2170 R7)."""
+    data = (voice_config or {}).get(name)
+    if not isinstance(data, dict):
+        return None
+    version_id = active_version_id(data, chunk_index) if data.get("version_timeline") else None
+    versioned = get_voice_config_for_version(data, version_id or None)
+    if versioned is not data:
+        data = versioned
+    if data.get("style_timeline"):
+        data = {**data, "character_style": active_character_style(data, chunk_index)}
+    return data
+
+
+def iter_dispatch_voice_names(voice_config, speaker, chunk_index):
+    """The ordered ``(name, is_member)`` entries dispatch reads for one row.
+
+    Dispatch follows a selected alias exclusively and renders only the root
+    ensemble's members: a member that is itself an ensemble is refused before
+    its descendants are read. Mirroring those boundaries keeps a malformed
+    entry behind a mask or in a rejected nested ensemble unread (#2170 R1/R3).
+    Order follows the saved member order, never hash iteration order (#2170 R7).
+    """
+    pending, seen, result = [(speaker, False)], set(), []
+    while pending:
+        name, is_member = pending.pop(0)
+        if name in seen or not isinstance(name, str):
+            continue
+        seen.add(name)
+        result.append((name, is_member))
+        entry = get_materialized_voice_entry(voice_config, name, chunk_index)
+        if not isinstance(entry, dict):
+            continue
+        alias = get_voice_alias(entry)
+        if alias is not None:
+            pending.append((alias, is_member))
+            continue
+        if not is_member and voice_category(entry) == "ensemble":
+            pending.extend((member, True) for member in get_ensemble_member_names(entry)
+                           if isinstance(member, str))
+    return result
 
 
 def voice_config_for_chunk(voice_config, speaker, chunk_index):
-    """Apply selected versions before walking their members and aliases.
-    Every reachable voice uses the containing line's source index."""
+    """Materialize every entry dispatch can read for one row.
+
+    Every reachable voice uses the containing line's source index. A selected
+    alias masks its members and only the root ensemble's members are expanded,
+    so the walk matches dispatch instead of over-consuming an unused member
+    (#2170 R1/R3)."""
     if not isinstance((voice_config or {}).get(speaker), dict):
         return voice_config
-    pending, seen, updates = [speaker], set(), {}
-    while pending:
-        name = pending.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        data = voice_config.get(name)
-        if not isinstance(data, dict):
-            continue
-        version_id = active_version_id(data, chunk_index) if data.get("version_timeline") else None
-        fields = get_version_fields(data, version_id) if version_id else None
-        if fields:
-            data = {**data, **fields}
-            updates[name] = data
-        if data.get("style_timeline"):
-            data = {**data, "character_style": active_character_style(data, chunk_index)}
-            updates[name] = data
-        alias = data.get("alias_of") or data.get("alias")
-        if isinstance(alias, str) and alias.strip():
-            pending.append(alias)
-        if voice_category(data) == "ensemble" and isinstance(data.get("members"), list):
-            pending.extend(member for member in data["members"] if isinstance(member, str))
+    updates = {}
+    for name, _ in iter_dispatch_voice_names(voice_config, speaker, chunk_index):
+        entry = get_materialized_voice_entry(voice_config, name, chunk_index)
+        if entry is not None and entry is not voice_config.get(name):
+            updates[name] = entry
     return {**voice_config, **updates} if updates else voice_config
 
 
-def get_chunk_voice_inputs(voices, chunk, index, resolve_alias=None):
-    """Read effective inputs with the selected root first, then member voices."""
+VOICE_RENDER_IDENTITY_FIELDS = ("type", "voice", "character_style", "default_style", "seed",
+    "ref_audio", "ref_text", "description", "adapter_id", "adapter_path",
+    "adapter_generation_sha256", "members")
+VOICE_PRONUNCIATION_EXCLUSIONS = frozenset(("character_style", "default_style", "seed"))
+
+
+def get_voice_render_identity(config, *, canonical=True):
+    """The render-affecting fields of one voice entry, per backend (Rule 15).
+
+    Only VoiceDesign turns `description` into speech instructions; custom,
+    clone, LoRA and ensemble renders never receive it. Replacing an inert
+    description with None keeps a cosmetic edit from reinterpreting finished
+    audio, pronunciation scope or a saved take. `canonical=False` rebuilds the
+    pre-#2170 projection verbatim, which existing scoped rules were written
+    with; only that compatibility path may ask for it.
+    """
+    identity = {field: copy.deepcopy((config or {}).get(field))
+                for field in VOICE_RENDER_IDENTITY_FIELDS}
+    if canonical and voice_category(config) != "design":
+        identity["description"] = None
+    return identity
+
+
+NARRATOR_SPELLINGS = ("NARRATOR", "Narrator")
+
+
+def is_narrator_name(name):
+    """Whether a spelling is a narrator key the strategy resolver recognizes."""
+    return isinstance(name, str) and name.upper() == "NARRATOR"
+
+
+def get_saved_voice_alias(voice_config, name):
+    """The explicit alias saved on a name, or None (never raises on a null entry)."""
+    entry = (voice_config or {}).get(name)
+    return get_voice_alias(entry) if isinstance(entry, dict) else None
+
+
+def get_effective_saved_alias(voice_config, name, chunk_index):
+    """The alias a name actually uses after its active version is applied."""
+    entry = get_materialized_voice_entry(voice_config, name, chunk_index)
+    return get_voice_alias(entry) if isinstance(entry, dict) else None
+
+
+def get_configured_narrator_spelling(voice_config):
+    """The spelling the narrator resolver reads first, or None (Rule 15).
+
+    `resolve_narrator_voice_config` consults NARRATOR, then Narrator. Every
+    alias-precedence decision must consult that same entry, or the reached
+    spelling and the resolver disagree across mixed spellings (#2170 R1).
+    """
+    for key in NARRATOR_SPELLINGS:
+        if (voice_config or {}).get(key):
+            return key
+    return None
+
+
+def finalize_resolved_voice_config(resolved, speaker=None, names=None):
+    """Strip a row-resolved narrator strategy so the engine cannot re-resolve it.
+
+    Dynamic selection happens once per row in `resolve_row_narrators`; leaving
+    `narrator_strategy` on a canonical narrator spelling lets the engine
+    re-apply it without this row's chunk context (#2170). Every canonical
+    spelling is finalized because the engine reads NARRATOR before Narrator
+    regardless of which spelling the row reached.
+    """
+    targets = [key for key in resolved if key in NARRATOR_SPELLINGS]
+    if names:
+        targets.extend(name for name in names if name not in targets)
+    if isinstance(speaker, str) and is_narrator_name(speaker) and speaker not in targets:
+        targets.append(speaker)
+    final = None
+    for name in targets:
+        entry = resolved.get(name)
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('narrator_strategy') in (None, 'global'):
+            continue
+        if final is None:
+            final = dict(resolved)
+        final[name] = {key: value for key, value in entry.items() if key != 'narrator_strategy'}
+    return resolved if final is None else final
+
+
+def get_row_narrator_selection(voice_config, chunk, chunk_index):
+    """The one row-effective narrator choice, or None when nothing overrides.
+
+    A configured alias is the fallback for the sibling spelling; otherwise a
+    dynamic strategy resolves from this row's context. Computed once per row so
+    two reached spellings cannot overwrite each other in traversal order
+    (#2170 R3/R7/R8).
+    """
+    spelling = get_configured_narrator_spelling(voice_config)
+    if spelling is None:
+        return None
+    if not isinstance((voice_config or {}).get(spelling), dict):
+        # A persisted non-object spelling is an unavailable fallback, never a
+        # fatal error for a row that merely reaches a sibling (#2170 N1).
+        return None
+    chain = voice_config_for_chunk(voice_config, spelling, chunk_index)
+    if get_effective_saved_alias(chain, spelling, chunk_index) is not None:
+        target = get_resolved_speaker(spelling, chain)
+        selected = chain.get(target) if isinstance(chain, dict) else None
+        return (target, selected, chain) if isinstance(selected, dict) else None
+    selection = resolve_narrator_voice_config(spelling, voice_config, chunk)
+    if selection is voice_config:
+        # A global strategy with no alias leaves the saved entry authoritative;
+        # it must not overwrite a distinct sibling spelling.
+        return None
+    materialized = voice_config_for_chunk(selection, spelling, chunk_index)
+    target = get_resolved_speaker(spelling, materialized)
+    selected = materialized.get(target) if isinstance(materialized, dict) else None
+    return (target, selected, materialized) if isinstance(selected, dict) else None
+
+
+def refuses_nested_ensemble(voice_config, speaker):
+    """Whether dispatch refuses this row's root as a nested ensemble (#2170 N2).
+
+    Runs the engine's flat-ensemble rule over the materialized row from its
+    root, so the fallback decision reaches the same verdict as generation
+    (Rule 15) instead of re-walking members with a second, partial rule.
+    """
+    try:
+        root = get_resolved_speaker(speaker, voice_config)
+        voice_data = (voice_config or {}).get(root)
+        if voice_category(voice_data) != "ensemble":
+            return False
+        resolve_flat_ensemble_members(voice_config, voice_data)
+        return False
+    except ValueError:
+        return True
+
+
+def _apply_narrator_selection(resolved, name, selection, chain, target, chunk_index):
+    """A copy of the row with one narrator selection and its overlays applied."""
+    applied = dict(resolved)
+    if chain is not None:
+        for descendant, _ in iter_dispatch_voice_names(chain, target, chunk_index):
+            value = chain.get(descendant)
+            if isinstance(value, dict):
+                applied[descendant] = value
+    applied[name] = selection
+    return applied
+
+
+def resolve_row_narrators(voices, effective, speaker, chunk, chunk_index, root_speaker=None):
+    """Settle every narrator dispatch can reach with this row's context.
+
+    Deterministic: reachable names come from ordered casts, and one
+    row-effective narrator selection is computed before it is applied, so two
+    reached spellings cannot overwrite each other (#2170 R7). A reached
+    spelling's own effective alias always wins over the sibling fallback
+    (#2170 R3/R5); an unreached configured spelling's malformed alias is only
+    an unavailable fallback (#2170 R2), while a reached one still raises.
+    """
+    root_speaker = speaker if root_speaker is None else root_speaker
+    reachable = iter_dispatch_voice_names(effective, speaker, chunk_index)
+    reached = []
+    for name, _ in reachable:
+        if is_narrator_name(name) and name not in reached:
+            reached.append(name)
+    paths = [name for name in reached if name in NARRATOR_SPELLINGS]
+    if not paths:
+        return effective, reached
+    spelling = get_configured_narrator_spelling(voices)
+    selection = selection_target = selection_chain = None
+    if spelling is not None:
+        try:
+            selected = get_row_narrator_selection(voices, chunk, chunk_index)
+        except VoiceAliasResolutionError as error:
+            if spelling in reached:
+                if "cycle" in str(error).lower():
+                    # Attribute the reached cycle to the row's own speaker, as
+                    # the root alias walk and the engine do (#2170 R3).
+                    raise VoiceAliasResolutionError(
+                        f"Alias cycle detected for speaker '{root_speaker}'") from error
+                raise
+            # The configured spelling is not rendered by this row; its broken
+            # alias cannot affect a sibling spelling's own resolution.
+            selected = None
+        if selected is not None:
+            selection_target, selection, selection_chain = selected
+    resolved = effective
+    for name in paths:
+        entry = get_materialized_voice_entry(resolved, name, chunk_index)
+        if isinstance(entry, dict) and get_voice_alias(entry) is not None:
+            # An explicit alias (raw or from the active version) is what
+            # dispatch follows; never replace it with the sibling's target.
+            continue
+        if not isinstance(selection, dict):
+            continue
+        applied = _apply_narrator_selection(
+            resolved, name, selection, selection_chain, selection_target, chunk_index)
+        if voice_category(selection) == "ensemble" and (
+                refuses_nested_ensemble(resolved, speaker)
+                or refuses_nested_ensemble(applied, speaker)):
+            # Keep the spelling's own saved voice: a fallback that would nest an
+            # ensemble, or a row that already refuses, must not gain a new
+            # row-scoped refusal and must not replace a refusal silently (#2170 N2).
+            continue
+        resolved = applied
+    return resolved, reached
+
+
+def native_batch_matches_resolved(voices, name, index, resolved):
+    """Whether native batching's saved-config re-read is this row's selection.
+
+    Native batch consumers (`_local_batch_custom`/clone/LoRA/design) re-derive
+    the canonical entry with `voice_config_for_chunk(voices, name, index)`
+    instead of using the row-resolved voices. That re-read is only equivalent
+    when the render identity agrees, including whether a field is absent versus
+    explicitly null: the two produce different provider requests through the
+    category defaults (#2170 F1/R4).
+    """
+    entry = resolved.get(name)
+    expected = voice_config_for_chunk(voices, name, index).get(name)
+    if not isinstance(entry, dict) or not isinstance(expected, dict):
+        return entry == expected
+    for field in VOICE_RENDER_IDENTITY_FIELDS:
+        if (field in entry, entry.get(field)) != (field in expected, expected.get(field)):
+            return False
+    return True
+
+
+def get_chunk_render_voice_selection(voices, speaker, chunk, index):
+    """Return the row's canonical speaker, materialized voices and native-batch eligibility."""
+    name, aliases = speaker, {}
+    native_batch = True
+    narrator_names = set()
+    for _ in range(16):
+        if name in aliases:
+            raise VoiceAliasResolutionError(f"Alias cycle detected for speaker '{speaker}'")
+        entry = voices.get(name)
+        if is_narrator_name(name) and entry and not isinstance(entry, dict):
+            # A malformed narrator entry that this row actually renders is a
+            # row-scoped error; a sibling-only fallback resolves it as "no
+            # selection" in get_row_narrator_selection (#2170 N1).
+            raise VoiceAliasResolutionError(
+                f"Voice configuration for speaker '{name}' is malformed")
+        saved_alias = get_voice_alias(entry or {})
+        selected = voices if saved_alias else resolve_narrator_voice_config(name, voices, chunk)
+        effective = voice_config_for_chunk(selected, name, index)
+        effective, reached = resolve_row_narrators(
+            voices, effective, name, chunk, index, root_speaker=speaker)
+        narrator_names.update(reached)
+        alias = get_voice_alias(effective.get(name) or {})
+        native_batch = native_batch and selected is voices and alias == saved_alias
+        if alias is None:
+            if aliases:
+                effective = {**effective, **aliases}
+            effective = finalize_resolved_voice_config(effective, name, narrator_names)
+            if native_batch:
+                native_batch = native_batch_matches_resolved(voices, name, index, effective)
+            return name, effective, native_batch
+        aliases[name] = effective[name]
+        name = alias
+    raise VoiceAliasResolutionError(f"Alias chain for '{speaker}' exceeded 16 iterations")
+
+
+def get_chunk_voice_inputs(voices, chunk, index, resolve_alias=None, *, canonical=True):
+    """Read effective inputs with the selected root first, then member voices.
+
+    Only the root ensemble's members are read; a member that is itself an
+    ensemble is refused by dispatch, so its descendants are not projected
+    (#2170 R1).
+    """
     resolve_alias = resolve_alias or get_resolved_speaker
-    speaker = resolve_alias(chunk.get("speaker"), voices)
-    effective = voice_config_for_chunk(
-        resolve_narrator_voice_config(speaker, voices, chunk), speaker, index)
-    fields = ("type", "voice", "character_style", "default_style", "seed",
-              "ref_audio", "ref_text", "description", "adapter_id", "adapter_path",
-              "adapter_generation_sha256", "members")
-    inputs, pending = {}, [speaker]
+    speaker, effective, _ = get_chunk_render_voice_selection(voices, chunk.get("speaker"), chunk, index)
+    inputs, pending, seen = {}, [(speaker, False)], set()
     while pending:
-        name = resolve_alias(pending.pop(), effective)
+        name, is_member = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        name = resolve_alias(name, effective)
         if name in inputs:
             continue
-        config = effective.get(name) or {}
-        inputs[name] = {field: copy.deepcopy(config.get(field)) for field in fields}
-        if voice_category(config) == "ensemble":
-            pending.extend(member for member in config.get("members") or [] if isinstance(member, str))
+        config = effective.get(name)
+        config = config if isinstance(config, dict) else {}
+        inputs[name] = get_voice_render_identity(config, canonical=canonical)
+        if not is_member and voice_category(config) == "ensemble":
+            pending.extend((member, True) for member in get_ensemble_member_names(config)
+                           if isinstance(member, str))
     return inputs
+
+
+def _get_pronunciation_voice_sha256(voices, chunk, index, *, canonical):
+    inputs = get_chunk_voice_inputs(voices, chunk, index, canonical=canonical)
+    identity = {name: {key: value for key, value in fields.items()
+                        if key not in VOICE_PRONUNCIATION_EXCLUSIONS}
+                 for name, fields in inputs.items()}
+    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def get_pronunciation_render_context(voices, chunk, index, model_settings, *, source_speaker=None):
     """Identify the selected root/group assignment and actual speech mode."""
-    inputs = get_chunk_voice_inputs(voices, chunk, index)
-    identity = {name: {key: value for key, value in fields.items()
-                       if key not in {"character_style", "default_style", "seed"}}
-                for name, fields in inputs.items()}
-    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False,
-                         separators=(",", ":"), allow_nan=False).encode("utf-8", errors="surrogatepass")
+    voice_sha256 = _get_pronunciation_voice_sha256(voices, chunk, index, canonical=True)
     context = {"speaker": chunk.get("speaker") if source_speaker is None else source_speaker,
-               "voice_sha256": hashlib.sha256(encoded).hexdigest(),
+               "voice_sha256": voice_sha256,
                **get_pronunciation_model_context(model_settings)}
+    legacy_sha256 = _get_pronunciation_voice_sha256(voices, chunk, index, canonical=False)
+    if legacy_sha256 != voice_sha256:
+        # Rules approved before #2170 were scoped with the raw description.
+        context["voice_sha256_legacy"] = legacy_sha256
     return {key: value if isinstance(value, str) and len(value) <= 256 else None
             for key, value in context.items()}
 
@@ -409,6 +805,11 @@ def get_reproducible_voice_config(resolved, seed, *, take=0):
 def get_batch_voice_config(voice_config, speaker, chunk_index, batch_seed):
     """Override seeds after timeline selection without mutating stored voices."""
     resolved = voice_config_for_chunk(voice_config, speaker, chunk_index)
+    return get_seeded_batch_voice_config(resolved, batch_seed)
+
+
+def get_seeded_batch_voice_config(resolved, batch_seed):
+    """Apply a batch seed to an already materialized selection."""
     if batch_seed < 0:
         return resolved
     return {name: {**data, "seed": batch_seed} if isinstance(data, dict) else data
@@ -527,7 +928,7 @@ def voice_category(voice_data):
     the membership test isn't duplicated at every call site. Returns one of
     "clone", "lora", "design", "ensemble", or "custom".
     """
-    voice_type = (voice_data or {}).get("type", "custom")
+    voice_type = voice_data.get("type", "custom") if isinstance(voice_data, dict) else "custom"
     if voice_type == "clone":
         return "clone"
     if voice_type in ("lora", "builtin_lora"):
@@ -539,6 +940,31 @@ def voice_category(voice_data):
     return "custom"
 
 
+def resolve_flat_ensemble_members(voice_config, voice_data):
+    """Resolved member names dispatch renders for a one-level ensemble.
+
+    The single flat-ensemble rule (Rule 15): at least one member, and every
+    member resolves to a present, non-ensemble entry. Dispatch's own member
+    check reads this function, and so does the narrator fallback's nesting
+    decision, so readiness and generation cannot disagree (#2170 N2).
+    """
+    members = get_ensemble_member_names(voice_data)
+    if not members:
+        raise ValueError("Ensemble voice has no members configured.")
+    resolved = []
+    for member in members:
+        name = get_resolved_speaker(member, voice_config)
+        entry = (voice_config or {}).get(name)
+        if not entry:
+            raise ValueError(f"Ensemble member '{name}' has no voice configuration.")
+        if voice_category(entry) == "ensemble":
+            raise ValueError(
+                f"Ensemble member '{name}' is itself an ensemble; "
+                f"ensembles cannot be nested.")
+        resolved.append(name)
+    return resolved
+
+
 def resolve_narrator_voice_config(speaker, voice_config, chunk=None):
     """Resolve an optional dynamic narrator strategy for one chunk.
 
@@ -548,13 +974,22 @@ def resolve_narrator_voice_config(speaker, voice_config, chunk=None):
     if str(speaker or "").upper() != "NARRATOR":
         return voice_config
     narrator = voice_config.get("NARRATOR") or voice_config.get("Narrator") or {}
+    if not isinstance(narrator, dict):
+        # A malformed optional strategy is "no override", not an error for an
+        # unrelated row; the reached root spelling is rejected earlier (#2170 N1).
+        return voice_config
     strategy = narrator.get("narrator_strategy", "global")
+    if not isinstance(strategy, str):
+        strategy = "global"
+    versions = narrator.get("versions")
+    if not isinstance(versions, dict):
+        versions = {}
     chunk = chunk or {}
     selected = None
     if strategy in {"focus", "character", "character_gender", "character_age", "character_gender_age"}:
         focus = chunk.get("focus_speaker") or chunk.get("character_focus")
-        if focus and focus in voice_config:
-            focus_voice = voice_config[focus]
+        focus_voice = voice_config.get(focus) if isinstance(focus, str) and focus in voice_config else None
+        if isinstance(focus_voice, dict):
             wanted_gender = chunk.get("narrator_gender") or chunk.get("focus_gender")
             wanted_age = chunk.get("narrator_age_group") or chunk.get("focus_age_group")
             gender_ok = strategy not in {"character_gender", "character_gender_age"} or not wanted_gender or focus_voice.get("gender") == wanted_gender
@@ -563,7 +998,7 @@ def resolve_narrator_voice_config(speaker, voice_config, chunk=None):
                 selected = focus_voice
     elif strategy == "chapter":
         version_id = chunk.get("narrator_version") or chunk.get("chapter_narrator_version")
-        selected = (narrator.get("versions") or {}).get(version_id) if version_id else None
+        selected = versions.get(version_id) if isinstance(version_id, str) and version_id else None
         if selected is None:
             selected = narrator
     elif strategy not in {"gender", "age", "gender_age"}:
@@ -571,7 +1006,7 @@ def resolve_narrator_voice_config(speaker, voice_config, chunk=None):
     if selected is None and strategy in {"gender", "age", "gender_age"}:
         wanted_gender = chunk.get("narrator_gender") or chunk.get("focus_gender")
         wanted_age = chunk.get("narrator_age_group") or chunk.get("focus_age_group")
-        for version in (narrator.get("versions") or {}).values():
+        for version in versions.values():
             if not isinstance(version, dict):
                 continue
             gender_ok = strategy == "age" or not wanted_gender or version.get("gender") == wanted_gender
@@ -2469,22 +2904,9 @@ class TTSEngine:
             prepared["text"], prepared["instruct"], voice_data, voice_config, output_path)
 
     def _get_ensemble_members(self, voice_data, voice_config):
-        members = voice_data.get("members") or []
-        if not members:
-            raise ValueError("Ensemble voice has no members configured.")
-
-        resolved_members = [get_resolved_speaker(member, voice_config) for member in members]
+        resolved_members = resolve_flat_ensemble_members(voice_config, voice_data)
         for member in resolved_members:
-            member_data = voice_config.get(member)
-            if not member_data:
-                raise ValueError(
-                    f"Ensemble member '{member}' has no voice configuration.")
-            # One level only: an ensemble of ensembles would recurse forever.
-            if voice_category(member_data) == "ensemble":
-                raise ValueError(
-                    f"Ensemble member '{member}' is itself an ensemble; "
-                    f"ensembles cannot be nested.")
-            self.get_voice_backend(voice_category(member_data))
+            self.get_voice_backend(voice_category(voice_config[member]))
         return resolved_members
 
     def _generate_ensemble_voice_prepared(self, text, instruct_text, voice_data, voice_config, output_path):
@@ -2495,7 +2917,7 @@ class TTSEngine:
             voice_data=voice_data, voice_config=voice_config)
         if windowed is not None:
             return windowed
-        members = voice_data.get("members") or []
+        members = get_ensemble_member_names(voice_data)
         from synthesis_workspace import ensure_synthesis_workspace, get_synthesis_workspace_parent
         from synthesis_recovery_context import get_synthesis_recovery_parent
         from contextlib import ExitStack
@@ -2846,12 +3268,18 @@ class TTSEngine:
     def _generate_prepared_batch_parent(self, chunk, voice_config, output_dir, batch_seed):
         idx = chunk["index"]
         output_path = get_synthesis_batch_output_path(output_dir, idx)
-        resolved = get_batch_voice_config(voice_config, chunk.get("speaker"), idx, batch_seed)
-        with (ensure_synthesis_recovery_batch_parent(chunk.get("uid")),
-              ensure_synthesis_receipts() as receipts):
-            success = self._dispatch_prepared_voice(
-                chunk["text"], chunk.get("instruct", ""), chunk.get("speaker"), resolved, output_path)
-        return success, receipts[-1] if success and receipts else None
+        resolved = get_seeded_batch_voice_config(voice_config, batch_seed)
+        failures = []
+        token = _TTS_FAILURES.set(failures)
+        try:
+            with (ensure_synthesis_recovery_batch_parent(chunk.get("uid")),
+                  ensure_synthesis_receipts() as receipts):
+                success = self._dispatch_prepared_voice(
+                    chunk["text"], chunk.get("instruct", ""), chunk.get("speaker"), resolved, output_path)
+        finally:
+            _TTS_FAILURES.reset(token)
+        return (success, receipts[-1] if success and receipts else None,
+                failures[0] if failures else None)
 
     # ── Batch generation ─────────────────────────────────────────
 
@@ -2877,57 +3305,59 @@ class TTSEngine:
         if not chunks or is_audio_generation_cancelled():
             return results
 
+        # Materialize timeline anchors against the submitted row list once, so
+        # native, external and fallback dispatch all select the same voice. A
+        # batch may hold only the pending rows, so anchors outside its range keep
+        # their recorded index instead of being treated as removed.
+        voice_config = resolve_timeline_anchors(voice_config, chunks, sparse=True)
+
         # Resolve each row before its one canonical speech preparation. Stable
         # UID/rules remain on copies through native, external and fallback paths.
         dynamic_chunks = []
+        native_chunks = []
+        row_voices = {}
         for chunk in chunks:
-            source_speaker = chunk.get("_source_speaker", chunk.get("speaker"))
+            requested_speaker = chunk.get("speaker")
+            source_speaker = chunk.get("_source_speaker", requested_speaker)
             try:
-                speaker = get_resolved_speaker(chunk.get("speaker"), voice_config)
-                chunk = {**chunk, "speaker": speaker, "_source_speaker": source_speaker}
-                resolved = resolve_narrator_voice_config(speaker, voice_config, chunk)
+                speaker, resolved, native_batch = get_chunk_render_voice_selection(
+                    voice_config, requested_speaker, chunk, chunk["index"])
                 if not is_voice_config_present(speaker, resolved):
                     results["failed"].append((chunk["index"],
                         f"No voice configuration for '{speaker}'."))
                     continue
-                effective_config = voice_config_for_chunk(resolved, speaker, chunk["index"])
-                self.get_voice_backend(voice_category(effective_config.get(speaker)))
+                self.get_voice_backend(voice_category(resolved.get(speaker)))
+                context = (get_pronunciation_render_context(
+                    voice_config, chunk, chunk["index"],
+                    {"mode": self._mode, "language": self._language}, source_speaker=source_speaker)
+                    if chunk.get("pronunciation_rules") else None)
             except (UnsupportedVoiceBackendError, ValueError, TypeError, OverflowError) as error:
                 results["failed"].append((chunk["index"], str(error)))
                 continue
-            context = (get_pronunciation_render_context(
-                voice_config, chunk, chunk["index"],
-                {"mode": self._mode, "language": self._language},
-                source_speaker=chunk.get("_source_speaker", chunk.get("speaker")))
-                if chunk.get("pronunciation_rules") else None)
             with ensure_occurrence_pronunciation_context(chunk, context):
                 prepared = get_speech_preparation(chunk.get("text"), chunk.get("instruct", ""))
-            dynamic_chunks.append(({**chunk, **prepared}, resolved))
-        chunks = [chunk for chunk, _ in dynamic_chunks]
+            chunk = {**chunk, **prepared, "speaker": speaker, "_source_speaker": source_speaker}
+            row_voices[chunk["index"]] = resolved
+            (native_chunks if native_batch else dynamic_chunks).append(chunk)
+        # Row-dependent selections use the settled config directly. Keep native
+        # batching where its own timeline, speaker and seed inputs still match.
+        for chunk in dynamic_chunks:
+            if is_audio_generation_cancelled():
+                return results
+            idx = chunk["index"]
+            try:
+                success, receipt, _ = self._generate_prepared_batch_parent(chunk, row_voices[idx], output_dir, batch_seed)
+                if success:
+                    results["completed"].append(idx)
+                    if receipt is not None:
+                        results.setdefault("synthesis_receipts", {})[idx] = receipt
+                else:
+                    results["failed"].append((idx, "Row voice generation failed"))
+            except Exception as e:
+                results["failed"].append((idx, str(e)))
+        chunks = native_chunks
         if not chunks:
             return results
-        if any(resolved is not voice_config for _, resolved in dynamic_chunks):
-            # A dynamic narrator may use different configs per chunk; keep those
-            # chunks on the established single-item path to avoid mixing voices.
-            for chunk, resolved in dynamic_chunks:
-                if is_audio_generation_cancelled():
-                    return results
-                if resolved is voice_config:
-                    continue
-                idx = chunk["index"]
-                try:
-                    success, receipt = self._generate_prepared_batch_parent(chunk, resolved, output_dir, batch_seed)
-                    if success:
-                        results["completed"].append(idx)
-                        if receipt is not None:
-                            results.setdefault("synthesis_receipts", {})[idx] = receipt
-                    else:
-                        results["failed"].append((idx, "Narrator voice generation failed"))
-                except Exception as e:
-                    results["failed"].append((idx, str(e)))
-            chunks = [chunk for chunk, resolved in dynamic_chunks if resolved is voice_config]
-            if not chunks:
-                return results
 
         # Reset torch.compile state to prevent progressive slowdown
         # from dynamo guard accumulation across batches
@@ -2943,19 +3373,20 @@ class TTSEngine:
                     return results
                 idx, speaker = chunk["index"], chunk.get("speaker")
                 try:
-                    effective = get_batch_voice_config(voice_config, speaker, idx, batch_seed)
+                    effective = row_voices[idx]
                     data = effective.get(speaker, {})
                     plan = self._get_synthesis_window_plan(chunk["text"], voice_category(data), data, effective)
                     if plan is None:
                         native_chunks.append(chunk)
                         continue
-                    success, receipt = self._generate_prepared_batch_parent(chunk, voice_config, output_dir, batch_seed)
+                    success, receipt, failure = self._generate_prepared_batch_parent(chunk, effective, output_dir, batch_seed)
                     if success:
                         results["completed"].append(idx)
                         if receipt is not None:
                             results.setdefault("synthesis_receipts", {})[idx] = receipt
                     else:
-                        results["failed"].append((idx, "Internal synthesis window generation failed"))
+                        results["failed"].append((idx, failure.detail if failure
+                                                  else "Internal synthesis window generation failed"))
                 except Exception as error:
                     results["failed"].append((idx, str(error)))
             chunks = native_chunks
@@ -2971,7 +3402,7 @@ class TTSEngine:
 
         for chunk in chunks:
             speaker = chunk.get("speaker")
-            voice_data = voice_config_for_chunk(voice_config, speaker, chunk["index"]).get(speaker, {})
+            voice_data = row_voices[chunk["index"]].get(speaker, {})
             category = voice_category(voice_data)
 
             if category == "clone":
@@ -2990,7 +3421,7 @@ class TTSEngine:
         if ensemble_chunks:
             if is_audio_generation_cancelled():
                 return results
-            batch_results = self._sequential_ensemble(ensemble_chunks, voice_config, output_dir, batch_seed)
+            batch_results = self._sequential_ensemble(ensemble_chunks, row_voices, output_dir, batch_seed)
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
             self._clear_gpu_cache()
@@ -3264,7 +3695,7 @@ class TTSEngine:
         import time
 
         results = {"completed": [], "failed": []}
-        batch_peak_vram_gb = 0.0
+        peak_vram = _PeakVramAccumulator()
 
         texts = []
         speakers = []
@@ -3351,7 +3782,7 @@ class TTSEngine:
                 gen_time = time.time() - t_start
                 if measure_gpu_peak:
                     peak_gb = torch.cuda.max_memory_allocated(self.get_memory_device(model)) / 1e9
-                    batch_peak_vram_gb = max(batch_peak_vram_gb, peak_gb)
+                    peak_vram.record(peak_gb)
                     print(f"  Peak VRAM sub-batch {sb_idx+1}: {peak_gb:.2f} GB")
 
                 if wavs_list is None:
@@ -3382,7 +3813,7 @@ class TTSEngine:
 
 
 
-        results["peak_vram_gb"] = round(batch_peak_vram_gb, 2)
+        results["peak_vram_gb"] = peak_vram.get_result()
         return results
 
     @ensure_local_tts_serialized
@@ -3397,7 +3828,7 @@ class TTSEngine:
         import time
 
         results = {"completed": [], "failed": []}
-        batch_peak_vram_gb = 0.0
+        peak_vram = _PeakVramAccumulator()
 
         # Group only chunks that resolve to the same speaker and clone reference.
         speaker_groups = {}
@@ -3475,7 +3906,7 @@ class TTSEngine:
                     gen_time = time.time() - t_start
                     if measure_gpu_peak:
                         peak_gb = torch.cuda.max_memory_allocated(self.get_memory_device(model)) / 1e9
-                        batch_peak_vram_gb = max(batch_peak_vram_gb, peak_gb)
+                        peak_vram.record(peak_gb)
                         print(f"  Peak VRAM clone sub-batch {sb_idx+1}: {peak_gb:.2f} GB")
 
                     if wavs_list is None:
@@ -3505,7 +3936,7 @@ class TTSEngine:
 
 
 
-        results["peak_vram_gb"] = round(batch_peak_vram_gb, 2)
+        results["peak_vram_gb"] = peak_vram.get_result()
         return results
 
     @ensure_local_tts_serialized
@@ -3520,6 +3951,7 @@ class TTSEngine:
         import time
 
         results = {"completed": [], "failed": []}
+        peak_vram = _PeakVramAccumulator()
 
         # Group chunks by adapter_path (resolved to absolute). Two different
         # speakers can share the same adapter (e.g. aliases, or one trained
@@ -3579,6 +4011,7 @@ class TTSEngine:
             model = prompt = None
             try:
                 model, prompt = self._ensure_local_lora_generation(adapter_path, expected_generation)
+                measure_gpu_peak = torch.cuda.is_available() and self.get_memory_device(model) is not None
             except Exception as e:
                 print(f"  Error loading LoRA adapter {os.path.basename(adapter_path)}: {e}")
                 for chunk in group:
@@ -3639,6 +4072,8 @@ class TTSEngine:
                     if any(iid is not None for iid in instruct_ids):
                         gen_extra["instruct_ids"] = instruct_ids
 
+                    if measure_gpu_peak:
+                        torch.cuda.reset_peak_memory_stats(self.get_memory_device(model))
                     t_start = time.time()
                     with measure_tts_stage_time("inference_decode"):
                         wavs_list, sr = model.generate_voice_clone(
@@ -3650,6 +4085,10 @@ class TTSEngine:
                             **gen_extra,
                         )
                     gen_time = time.time() - t_start
+                    if measure_gpu_peak:
+                        peak_gb = torch.cuda.max_memory_allocated(self.get_memory_device(model)) / 1e9
+                        peak_vram.record(peak_gb)
+                        print(f"  Peak VRAM lora sub-batch {sb_idx+1}: {peak_gb:.2f} GB")
 
                     if wavs_list is None:
                         for idx in sb_indices:
@@ -3675,6 +4114,8 @@ class TTSEngine:
         total_time = time.time() - t_total_start
         rtf = total_audio_duration / total_time if total_time > 0 else 0
         print(f"Batch [lora] total: {total_time:.1f}s -> {total_audio_duration:.1f}s audio ({rtf:.2f}x real-time)")
+
+        results["peak_vram_gb"] = peak_vram.get_result()
 
 
 
@@ -3846,23 +4287,15 @@ class TTSEngine:
             apply_tts_failure(e)
             return False
 
-    def _sequential_ensemble(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def _sequential_ensemble(self, chunks, row_voices, output_dir, batch_seed=-1):
         """Render ensemble chunks one at a time (each needs several voices)."""
         results = {"completed": [], "failed": []}
 
         for chunk in chunks:
             idx = chunk["index"]
-            output_path = get_synthesis_batch_output_path(output_dir, idx)
             try:
-                from synthesis_recovery_context import ensure_synthesis_recovery_batch_parent
-                with ensure_synthesis_recovery_batch_parent(chunk.get("uid")):
-                    success = self._dispatch_prepared_voice(
-                        chunk.get("text", ""),
-                        chunk.get("instruct", ""),
-                        chunk.get("speaker"),
-                        get_batch_voice_config(voice_config, chunk.get("speaker"), idx, batch_seed),
-                        output_path,
-                    )
+                success, _, _ = self._generate_prepared_batch_parent(
+                    chunk, row_voices[idx], output_dir, batch_seed)
                 if success:
                     results["completed"].append(idx)
                 else:
@@ -3875,14 +4308,16 @@ class TTSEngine:
     def _external_batch(self, chunks, voice_config, output_dir, kind, batch_seed=-1):
         """External-mode batch submits up to `parallel_workers` lines per
         pool endpoint. Each worker serializes requests through its client
-        lock, with deadlines measured from submission. Same result shape as local batches.
+        lock, with deadlines measured from submission. Same keys as local
+        batches, except peak_vram_gb is None: external synthesis has no local
+        VRAM reading to report.
 
         One engine pool serves all calls. SDK I/O runs in cached owned clients
         and is stopped at the request deadline; queued cancellation removes work
         without adding application threads or publishing late audio."""
         from concurrent.futures import TimeoutError as FutureTimeout
         import time
-        results = {"completed": [], "failed": []}
+        results = {"completed": [], "failed": [], "peak_vram_gb": None}
         if not chunks or is_audio_generation_cancelled():
             return results
         generate = {
@@ -3924,7 +4359,7 @@ class TTSEngine:
                     cancel_pending()
                     return results
                 idx = chunk["index"]
-                output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+                output_path = get_synthesis_batch_output_path(output_dir, idx)
                 staging_path = f"{output_path}.pending.{uuid.uuid4().hex}"
                 cancelled = threading.Event()
                 deadline = time.monotonic() + self._external_timeout

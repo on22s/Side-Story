@@ -1,16 +1,25 @@
-from book_state_transaction import ensure_saved_book_state
+from book_state_transaction import ensure_saved_book_state, reuse_book_state
+from script_recovery_guard import RECOVERY_CAST_INVALIDATED, get_fenced_recovery_status
 from script_recovery_facts import get_saved_script_recovery_manifest
 from review_report import save_review_report
 from book_state_transaction import (ensure_book_state, apply_book_input_selection,
-                                    apply_book_state_locked, get_book_operation_token)
+                                     apply_book_state_locked, get_book_operation_token,
+                                     book_operator_locked, cancel_book_worker_handoff_locked,
+                                     finish_book_worker_handoff, get_book_fault_response,
+                                     get_script_startup_cancel_locked, recover_book_state_locked,
+                                     save_script_restart_launch, SCRIPT_LAST_ADMITTED_RUN_ID)
+
 import asyncio
 import contextlib
+import errno
 import copy
 import difflib
+from functools import partial
 import hashlib
 import json
 import io
 import logging
+import math
 import os
 import posixpath
 import re
@@ -23,7 +32,8 @@ import unicodedata
 import zipfile
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -33,45 +43,72 @@ from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from review_startup import ReviewStartupTrace, CURRENT as REVIEW_STARTUP, read_trace, get_failure_log_path
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from speaker_identity import get_validated_alias_graph
+from speaker_identity import get_saveable_alias_graph
+from alias_registry_apply import alias_registry_admission
 from diagnostics import redact_text
-from llm_provider import manual_llm_dir, is_manual_request_owner_alive
+from llm_provider import (MANUAL_DATA_DIR_ENV, manual_llm_dir, is_manual_request_owner_alive,
+                          get_effective_authorization, read_manual_pending_locked)
 from generation_checkpoint_deltas import load_generation_delta_checkpoint
 from generation_checkpoint_shards import (get_generation_checkpoint_artifacts,
                                            remove_generation_shard_checkpoint)
 from config_settings import load_app_config
 from generate_script import fix_mojibake
 from lmstudio_settings import (ensure_ideal_settings, get_active_llm_config,
-                               get_planned_request_context)
+                                get_failover_llm_config, get_planned_request_context)
+from llm_provider import get_run_fingerprint_identity
 from narrator_prompt import get_valid_narrator_name, is_narrator_attested
 from script_preflight import audit_unicode_text
 from source_normalization import normalize_known_source_corruptions
-from three_pass_generate import (build_attribute_request,
-                                 build_instruct_request,
+from three_pass_generate import (_load_three_pass_checkpoint,
+                                  build_attribute_request,
+                                  build_instruct_request,
                                  build_three_pass_request_preflight,
-                                 get_three_pass_preflight_capacity,
-                                 get_context_rescue_windows,
-                                 is_three_pass_context_required,
-                                 LARGE_CONTEXT_CHARS,
-                                 validate_instruct_context_chars,
-                                 apply_segment_gate_controls,
-                                 default_instruct,
-                                 read_source_text,
-                                 resolve_three_pass_generation_settings,
-                                 three_pass_checkpoint_path,
-                                 three_pass_manifest_path)
-from merge_integrity import get_source_integrity
+                                  get_three_pass_preflight_capacity,
+                                  get_three_pass_unchecked_count,
+                                  get_context_rescue_settings,
+                                  get_context_rescue_windows,
+                                  get_deterministic_named_entry,
+                                  get_initial_three_pass_artifacts,
+                                  get_three_pass_manifest_snapshot,
+                                  get_attribution_prompt_params,
+                                  get_native_three_pass_fingerprint,
+                                  is_speaker_traits_prompt,
+                                  get_receipt_checkpoint_fingerprint,
+                                  get_named_from_answer,
+                                  get_segment_chunk_records,
+                                  get_prepared_source,
+                                  is_checkpoint_bound_to_spec,
+                                  is_three_pass_context_required,
+                                  is_valid_three_pass_segment_cursor,
+                                  LARGE_CONTEXT_CHARS,
+                                  validate_instruct_context_chars,
+                                  apply_segment_gate_controls,
+                                  default_instruct,
+                                  get_directed_entry,
+                                  read_source_text,
+                                  get_three_pass_run_params,
+                                  resolve_three_pass_generation_settings,
+                                  three_pass_checkpoint_path,
+                                  three_pass_fingerprint,
+                                  three_pass_manifest_path,
+                                  validate_three_pass_checkpoint)
+from merge_integrity import get_source_integrity, get_source_preparation
+from script_selection_binding import _read_selection_state, capture_generation_selection
+import run_spec_receipt
+import three_pass_run_spec
 from cast_list import get_cast_list_path, save_cast_list
 from default_prompts import (load_segment_prompts, load_attribute_prompts,
                              load_instruct_prompts)
-from pass_quality import (split_outer_quote_regions, validate_attribution,
-                          validate_instruct, validate_segment_quality)
+from pass_quality import (index_head_check, split_outer_quote_regions, validate_attribution,
+                           validate_instruct, validate_segment_quality)
 from speaker_identity import stabilize_speaker_identities
 from generate_script import LLMGenParams
 from utils import file_lock, is_path_inside
+from ruby_text import RUBY_FALLBACK_TAG, RUBY_READING_TAG, RUBY_TAG, RubyCollector
 from alexandria_alignment import validate_epub_archive
 from epub_package import get_epub_package
 from epub_publication import get_epub_publication_candidate, get_epub_publication_origin
@@ -90,11 +127,14 @@ from publication_source import (PublicationSourceLimit, get_upload_publication_u
 
 from core import (
     AppError,
+    mark_expected_probe_response,
     _saved_book_meta_path,
     is_task_running,
+    get_task_lifecycle,
     get_active_book_id,
     BASE_DIR,
     _compute_eta,
+    SPEAKER_MERGE_MARKER,
     CHARACTER_ALIASES_PATH,
     CONFIG_PATH,
     DATA_DIR,
@@ -111,6 +151,7 @@ from core import (
     _extract_diff_highlights,
     _extract_failed_sections,
     _extract_new_aliases,
+    _extract_review_failure,
     _extract_review_stats,
     _format_book_summary,
     _format_pass_summary,
@@ -123,6 +164,7 @@ from core import (
     _markdown_heads_up_lines,
     _markdown_stats_table,
     _new_review_totals,
+    _review_is_incomplete,
     _pause_task,
     _require_safe_filename,
     _resume_task,
@@ -133,12 +175,15 @@ from core import (
     _warn_corrupted_json,
     check_global_gpu_lock,
     claim_gpu_task, schedule_claimed_background_task, ensure_book_switch_allowed,
-    ensure_saved_book_destination_available,
+    ensure_saved_book_destination_available, get_saved_book_destination_path,
     reserve_background_task, register_claimed_background_task, release_gpu_task_claim,
+    guard_script_worker_launch,
     process_state,
     run_process,
 )
-from review_script import clear_checkpoint
+from review_script import (get_review_batching, get_review_entry_windows,
+                           get_validated_context_setting, CONTEXT_MODE_CHARS, CONTEXT_MODE_ENTRIES,
+                           DEFAULT_CONTEXT_ENTRIES)
 from utils import atomic_json_write, backup_file_with_timestamp, safe_load_json, secure_filename
 
 
@@ -168,13 +213,16 @@ _HELD_UPLOAD_DETAIL = (
 class ReviewRequest(BaseModel):
     dedupe_speakers: bool = True
     force_review: bool = False
+    start_over: bool = False
+    book_token: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{64}$')
 
-class ContextualReviewRequest(BaseModel):
+class ContextualReviewRequest(ReviewRequest):
     window_size: int = 4
+    context_mode: Literal['entries', 'chars'] = 'entries'
     dedupe_speakers: bool = True
     force_review: bool = False
 
-class BatchReviewRequest(BaseModel):
+class BatchReviewRequest(ReviewRequest):
     script_names: List[str] = Field(max_length=MAX_SCRIPT_BATCH_ITEMS)  # library names without .json
     context_window: int = 0            # >0 enables contextual review
     dedupe_speakers: bool = True       # merge same-character aliases, consistent across the batch
@@ -184,10 +232,43 @@ class BatchReviewRequest(BaseModel):
                                        # discovery seeded with full-series hindsight (requires find_nicknames)
 
 
+def _resolve_batch_review_options(request):
+    """Resolve effective batch flags, refusing only explicitly contradictory input.
+
+    Omitted fields keep their legacy defaults and their legacy reduction: with
+    ``dedupe_speakers=False`` and discovery omitted, discovery stays off rather
+    than becoming a contradiction the caller never asked for.
+    """
+    sent = getattr(request, 'model_fields_set', set())
+    dedupe = bool(request.dedupe_speakers)
+    find = bool(request.find_nicknames)
+    two_pass = bool(request.bidirectional)
+    if find and not dedupe and 'find_nicknames' in sent and 'dedupe_speakers' in sent:
+        raise AppError(422,
+            'Nickname discovery requires character-name merging. Enable merging or turn off discovery.',
+            key='error.review.batch.discover_requires_dedupe')
+    discover = find and dedupe
+    if two_pass and not discover:
+        raise AppError(422,
+            'Two-pass review requires nickname discovery and character-name merging. '
+            'Enable both or turn off the two-pass option.',
+            key='error.review.batch.two_pass_requires_discover')
+    return dedupe, discover, two_pass and discover
+
 
 def get_review_force_args(force_review, backward=False):
-    """Intentional backward passes always rerun a completed review."""
-    return ["--force-review"] if force_review or backward else []
+    """Build the review-child flags.
+
+    Direction is part of the child's execution identity, so a backward pass has
+    its own completion proof. It is not forced unconditionally: an ordinary
+    retry of the same batch must be able to honour a verified backward receipt
+    for a book that already finished. An explicit force or Start over still
+    reruns both directions.
+    """
+    args = ["--force-review"] if force_review else []
+    if backward:
+        args += ["--review-pass", "backward"]
+    return args
 
 
 def get_batch_review_highlights(pool: dict) -> dict:
@@ -403,6 +484,9 @@ class _HTMLTextExtractor(HTMLParser):
         'li', 'blockquote', 'br', 'hr', 'tr', 'td', 'th', 'section', 'article',
     })
     SKIP_TAGS = frozenset({'style', 'script', 'title'})
+    # In text/html these are RCDATA: their content is literal text, so markup
+    # that looks like a skipped element inside them is not an element at all.
+    RCDATA_TAGS = frozenset({'title', 'textarea'})
 
     # A paragraph ends with a BLANK LINE, not a single newline. `br` is a line
     # break inside one paragraph and stays single.
@@ -420,8 +504,17 @@ class _HTMLTextExtractor(HTMLParser):
         'li', 'blockquote', 'hr', 'tr', 'section', 'article',
     })
 
-    def __init__(self, anchor_ids=None):
+    def __init__(self, anchor_ids=None, *, html_rcdata=False):
         super().__init__()
+        if html_rcdata:
+            # HTMLParser only treats <script>/<style> as raw text by default.
+            # In text/html, <title>/<textarea> are RCDATA too: adding them here
+            # makes the tokenizer keep their contents literal until the
+            # matching end tag, instead of opening skipped elements from
+            # markup-looking text. XHTML keeps the default element semantics;
+            # its structure is already owned by the XML pass above.
+            self.CDATA_CONTENT_ELEMENTS = (HTMLParser.CDATA_CONTENT_ELEMENTS
+                                           + tuple(sorted(self.RCDATA_TAGS)))
         self.parts = []
         self._pending_newline = 0
         # Skipped-element names are kept on a stack only so the EOF
@@ -430,15 +523,22 @@ class _HTMLTextExtractor(HTMLParser):
         # parsers a skipped close is only delivered for the open skipped
         # element, and XHTML structure is owned by the XML parser before
         # this extractor runs, so no name-mismatch policy is needed here.
-        # HTMLParser itself treats <script>/<style> as raw text and
-        # <title> as RCDATA, so markup inside them is data, never a
-        # nested start/end tag here.
         self._skip_stack = []
         self._anchor_ids = frozenset(anchor_ids or ())
         self.anchor_counts = {}
+        # Ruby is narrated by ruby_text's rule (a kana reading replaces its
+        # base), the same rule the read-aloud mapper applies.
+        self._ruby = None
+        self._ruby_fallback_depth = 0
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
+        if tag == RUBY_TAG and self._ruby is None and not self._skip_stack:
+            self._ruby = RubyCollector()
+        elif tag == RUBY_READING_TAG and self._ruby is not None:
+            self._ruby.start_reading()
+        elif tag == RUBY_FALLBACK_TAG and self._ruby is not None:
+            self._ruby_fallback_depth += 1
         if tag in self.SKIP_TAGS:
             self._skip_stack.append(tag)
         elif tag in self.BLOCK_TAGS:
@@ -456,14 +556,51 @@ class _HTMLTextExtractor(HTMLParser):
         tag = tag.lower()
         if tag in self.SKIP_TAGS and self._skip_stack:
             self._skip_stack.pop()
+        if self._ruby is not None:
+            if tag == RUBY_READING_TAG:
+                self._ruby.end_reading()
+            elif tag == RUBY_FALLBACK_TAG and self._ruby_fallback_depth:
+                self._ruby_fallback_depth -= 1
+            elif tag == RUBY_TAG:
+                spoken, self._ruby, self._ruby_fallback_depth = self._ruby.get_spoken_text(), None, 0
+                if spoken:
+                    self._append_text(spoken)
 
     def handle_data(self, data):
-        if self._skip_stack:
+        if self._skip_stack or self._ruby_fallback_depth:
             return
+        if self.cdata_elem == 'textarea':
+            # RCDATA decodes character references; HTMLParser suppresses its
+            # own unescape in raw-text mode (script/style stay raw), so apply
+            # it here for the one RCDATA element whose text is narration.
+            # Decode before any consuming collector (ruby below) sees it.
+            data = unescape(data)
+        if self._ruby is not None:
+            self._ruby.add(data)
+            return
+        self._append_text(data)
+
+    def _append_text(self, data):
         if self._pending_newline and self.parts:
             self.parts.append('\n' * self._pending_newline)
         self._pending_newline = 0
         self.parts.append(data)
+
+    def _finalize_pending_rcdata(self):
+        # html.parser buffers RCDATA that is still open at EOF and its close()
+        # intentionally will not flush it while cdata_elem is set. Finalise
+        # ONLY that buffer, through handle_data so entities are decoded once
+        # and the same dispatch applies. Without this, a readable <textarea>
+        # left open at EOF silently loses its whole suffix. Unrelated
+        # incomplete EOF tags (no cdata_elem) and genuinely unclosed skipped
+        # elements (title/script/style) keep their feed-only contracts.
+        if self.cdata_elem != 'textarea':
+            return
+        pending = self.rawdata
+        self.rawdata = ''
+        if pending:
+            self.handle_data(pending)
+        self.cdata_elem = None
 
     def _ensure_skipped_elements_closed(self):
         # Balance is validated here, in the text accessors, rather than by
@@ -478,11 +615,13 @@ class _HTMLTextExtractor(HTMLParser):
                 'skipped content would hide the rest of the resource')
 
     def get_text(self):
+        self._finalize_pending_rcdata()
         self._ensure_skipped_elements_closed()
         return ''.join(part for part in self.parts if isinstance(part, str))
 
     def get_text_with_anchor_positions(self):
         """Return extracted text and character offsets for requested anchors."""
+        self._finalize_pending_rcdata()
         self._ensure_skipped_elements_closed()
         text_parts = []
         positions = {}
@@ -990,7 +1129,11 @@ def extract_epub_text(epub_path: str, *, archive_bytes: bytes | None = None, inc
             html_content = get_epub_xhtml_text(html_bytes)
             targets = toc_by_path.get(href, [])
             anchor_ids = {fragment for fragment, _ in targets if fragment}
-            extractor = _HTMLTextExtractor(anchor_ids)
+            # text/html RCDATA (<title>, <textarea>) keeps literal markup as
+            # text; XHTML stays on the strict XML path with element semantics.
+            extractor = _HTMLTextExtractor(
+                anchor_ids,
+                html_rcdata=media_type != 'application/xhtml+xml')
             try:
                 # XHTML resources are XML: omit true ignored subtrees via
                 # the strict XML path. Ordinary HTML media keeps the
@@ -1085,8 +1228,8 @@ def _get_fresh_upload_hash(path: str) -> str:
     restored mtime keeps its cached digest, so destructive dedupe must
     confirm the candidate's current bytes here before reusing it. Raises
     FileNotFoundError, ValueError or OSError when the file is missing,
-    changed while reading, oversized, or otherwise unverifiable; callers
-    fail closed by skipping the candidate.
+    changed while reading, oversized, or otherwise unverifiable. Callers
+    skip invalid candidates and abort publication on storage faults.
     """
     absolute = os.path.abspath(path)
     proof, _raw = capture_scope_file(os.path.dirname(absolute),
@@ -1115,6 +1258,13 @@ def _evict_disproven_upload_hash_hint(candidate_path: str, cached_entry) -> None
             _upload_hash_cache.pop(candidate_path, None)
 
 
+def _reraise_fresh_io_error(error):
+    """Abort on storage faults while keeping legacy unreadable candidates skippable."""
+    if isinstance(error, OSError) and error.errno not in (
+            None, errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.EPERM):
+        raise error
+
+
 def _is_candidate_upload_hash_match(candidate_path: str, digest: str) -> bool:
     """Return True only when a candidate matches digest on both hashes.
 
@@ -1123,17 +1273,17 @@ def _is_candidate_upload_hash_match(candidate_path: str, digest: str) -> bool:
     the bounded fresh read in _get_fresh_upload_hash. When the advisory
     digest matches but the fresh read succeeds with a different digest,
     just that disproven cached hint is evicted so later checks do not
-    repeat the fresh scan. An unverifiable candidate (ValueError/OSError
-    from either read, including a permission/lock failure on the advisory
-    or fresh read) is always a conservative non-match without eviction,
-    so callers skip it and retain the incoming bytes. Control-flow
+    repeat the fresh scan. Missing, invalid or inaccessible candidates are
+    conservative non-matches without eviction. Unexpected storage errors
+    abort publication before a different candidate can be selected. Control-flow
     exceptions such as CancelledError (a BaseException, not
     ValueError/OSError) always propagate exactly.
     """
     try:
         if _get_upload_hash(candidate_path) != digest:
             return False
-    except (ValueError, OSError):
+    except (ValueError, OSError) as error:
+        _reraise_fresh_io_error(error)
         return False
     # Capture the exact advisory tuple that matched, then release the lock
     # before any fresh I/O. If the hint is absent or its digest differs
@@ -1144,7 +1294,8 @@ def _is_candidate_upload_hash_match(candidate_path: str, digest: str) -> bool:
             cached_entry = None
     try:
         fresh_digest = _get_fresh_upload_hash(candidate_path)
-    except (ValueError, OSError):
+    except (ValueError, OSError) as error:
+        _reraise_fresh_io_error(error)
         return False
     if fresh_digest == digest:
         return True
@@ -1193,7 +1344,8 @@ def _reuse_duplicate_upload(path: str) -> tuple[str, bool]:
                     # considered. Failure retains it.
                     try:
                         digest = _get_fresh_upload_hash(path)
-                    except (ValueError, OSError):
+                    except (ValueError, OSError) as error:
+                        _reraise_fresh_io_error(error)
                         return path, False
                 # Advisory cache pre-filter only: confirm current bytes
                 # before the destructive removal below.
@@ -1296,7 +1448,7 @@ async def select_existing_upload(request: ExistingUploadRequest):
 SINGLE_NARRATOR_PREVIEW_CHARS = 4000
 
 
-def _get_single_narrator_source_preview():
+def _get_single_narrator_source_preview(*, include_metrics=False, probe=False):
     """Bounded, book-bound source preview for the single-narrator guide (#1724).
 
     Read-only: takes no path input, reads only the active book's recorded
@@ -1315,6 +1467,7 @@ def _get_single_narrator_source_preview():
     from docx_publication import capture_docx_group
     from project_scope_files import capture_scope_file
     from source_encoding import get_decoded_source_text
+    from script_selection_binding import is_script_selection_pending
 
     def load_book_state():
         # Bounded strict selection-state reader shared with script
@@ -1336,7 +1489,8 @@ def _get_single_narrator_source_preview():
         state = load_book_state()
         source_path = state.get("input_file_path")
         if not isinstance(source_path, str) or not source_path:
-            raise AppError(400, 'No input file selected for the active book.', key='error.upload.no_input_active')
+            with mark_expected_probe_response(expected=probe and (source_path is None or source_path == '')):
+                raise AppError(400, 'No input file selected for the active book.', key='error.upload.no_input_active')
         # Resolve exactly like the shared generation/source capture
         # resolver (_capture_raw_source): relative spellings resolve
         # against the process CWD, never silently against DATA_DIR, so
@@ -1394,11 +1548,12 @@ def _get_single_narrator_source_preview():
                 # verified prose link survives as readable original text,
                 # and the annotated JSON is not original prose. No
                 # provenance read is attempted here (DS3077).
-                raise HTTPException(status_code=409, detail=(
-                    "Source preview is unavailable for this saved book: no retained "
-                    "original prose is linked to its saved script, and the annotated "
-                    "JSON is not original prose. Inspect the saved script in Script "
-                    "instead."))
+                with mark_expected_probe_response(expected=probe):
+                    raise HTTPException(status_code=409, detail=(
+                        "Source preview is unavailable for this saved book: no retained "
+                        "original prose is linked to its saved script, and the annotated "
+                        "JSON is not original prose. Inspect the saved script in Script "
+                        "instead."))
             if extension not in SELECTABLE_SOURCE_EXTENSIONS:
                 raise HTTPException(status_code=409, detail=(
                     "Source preview is unavailable for this file format; inspect the "
@@ -1484,11 +1639,67 @@ def _get_single_narrator_source_preview():
                 "Active book could not be verified while reading the preview.")) from exc
         if token_after != book_token:
             raise AppError(409, 'Active book changed while reading the preview.', key='safety.book.changed_while_preview')
-        return {"book_token": book_token, "source_name": source_name,
+        result = {"book_token": book_token, "source_name": source_name,
                 "imported_source_name": imported_source_name,
                 "source_sha256": source_sha256, "encoding": encoding,
                 "total_chars": len(text), "truncated": len(text) > SINGLE_NARRATOR_PREVIEW_CHARS,
                 "text_start": text[:SINGLE_NARRATOR_PREVIEW_CHARS]}
+        if include_metrics:
+            from project import get_chapter_heading_offsets
+            words = sum(1 for _ in re.finditer(r'\S+', text))
+            result.update(word_count=words, chapter_count=len(get_chapter_heading_offsets(text)),
+                          estimated_minutes=round(words / 150, 1))
+            result['selection_pending'] = is_script_selection_pending(state)
+        return result
+
+
+def _get_script_ingest_status(expected_book_token=None):
+    """Saved facts only, bounded by the existing descriptor-confined source read.
+
+    No completed stage is inferred from a filename. A matching script is a
+    source comparison, not proof that any particular model task ran.
+    """
+    from three_pass_generate import get_cast_from_data
+    source = _get_single_narrator_source_preview(include_metrics=True, probe=True)
+    if expected_book_token is not None and source['book_token'] != expected_book_token:
+        raise HTTPException(409, 'Selected book changed; refresh ingest status.')
+    cast = {'status': 'not_built', 'count': 0}
+    relative = f'cast_lists/{source["source_sha256"]}.json'
+    try:
+        proof, raw = capture_scope_file(DATA_DIR, relative, limit=4 * 1024 * 1024, include_bytes=True)
+        if proof.get('exists'):
+            document = json.loads(raw)
+            get_cast_from_data(document['cast'])
+            cast = {'status': 'available', 'count': len(document['cast'])}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError):
+        cast = {'status': 'unavailable', 'count': 0}
+    # Accepted source is usable for discovery before script publication. Never
+    # inspect the previous book's saved script while this selection is pending.
+    diff = {'status': 'not_built'} if source['selection_pending'] else _read_annotated_script_comparison(
+        expected_source_sha256=source['source_sha256'])
+    script = {'status': diff['status']}
+    if diff.get('reason'):
+        script['reason'] = diff['reason']
+    # Include the source hash as well as selection identity: editing bytes
+    # in place need not change the book operation token.
+    after = _get_single_narrator_source_preview()
+    if any(source[key] != after[key] for key in ('book_token', 'source_sha256')):
+        raise HTTPException(409, 'Source changed while reading ingest facts; refresh.')
+    return {'book_token': source['book_token'],
+            'source': {key: value for key, value in source.items() if key not in {'text_start', 'selection_pending'}},
+            'cast': cast, 'script': script}
+
+
+@router.get('/api/script/ingest-status')
+async def get_script_ingest_status(expected_book_token: Optional[str] = None):
+    try:
+        return await asyncio.to_thread(_get_script_ingest_status, expected_book_token)
+    except TimeoutError:
+        raise HTTPException(503, 'Book state is busy; retry ingest status.') from None
+    except (ValueError, OSError) as error:
+        raise HTTPException(409, 'Saved ingest facts could not be verified; refresh.') from error
 
 
 @router.get("/api/single-narrator/source-preview")
@@ -2307,10 +2518,18 @@ class GenerateScriptRequest(BaseModel):
     # stopped - by design (a crash or Cancel loses nothing), but there was no
     # way to ask for a fresh run short of changing a setting (#597).
     start_over: bool = False
+    # Automatic replacement after a scoped Cancel. An explicit idle Start
+    # Over keeps the existing request shape.
+    expected_restart_claim_id: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{32}$')
     # Explicit acknowledgment for a checkpoint predating selection identity.
     # Both tokens must still match the checkpoint and selected book at retry.
     legacy_checkpoint_token: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{64}$')
     legacy_book_token: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{64}$')
+
+
+class ScriptGenerationAdmission(BaseModel):
+    status: Literal["started", "resuming"]
+    task_claim_id: str = Field(pattern=r'^[0-9a-f]{32}$')
 
 
 def get_book_preflight_result(job_id):
@@ -2395,7 +2614,7 @@ def start_book_preflight(background_tasks, request):
             source_copy = os.path.join(private.name, "source" + Path(source_path).suffix)
             Path(source_copy).write_bytes(source_bytes)
             config = load_app_config(CONFIG_PATH)
-            atomic_json_write(config, os.path.join(private.name, "config.json"))
+            atomic_json_write(config, os.path.join(private.name, "config.json"), allow_nonatomic_fallback=False)
             source_book = get_active_book_id()
         output = os.path.join(private.name, "sample.json")
         command = build_generate_script_command(
@@ -2419,7 +2638,10 @@ def start_book_preflight(background_tasks, request):
                 if state.get("cancel"):
                     result["status"] = "cancelled"
                     return
-                child_env = dict(os.environ, ALEXANDRIA_DATA_DIR=private.name)
+                # Private data for the samples, but a Manual LLM's requests go
+                # where the Script tab shows and answers them (#1920).
+                child_env = dict(os.environ, ALEXANDRIA_DATA_DIR=private.name,
+                                 **{MANUAL_DATA_DIR_ENV: DATA_DIR})
                 code, _ = _stream_subprocess_to_logs(command, BASE_DIR, state, env=child_env)
                 if state.get("cancel"):
                     result["status"] = "cancelled"
@@ -2433,14 +2655,14 @@ def start_book_preflight(background_tasks, request):
             finally:
                 state["status"] = result["status"]
                 try:
-                    atomic_json_write(result, receipt_path)
+                    atomic_json_write(result, receipt_path, allow_nonatomic_fallback=False)
                 finally:
                     private.cleanup()
 
         claim = schedule_claimed_background_task(background_tasks, "script",
                                                  _run_claimed_background_task, "script", run)
         receipt["claim_id"] = claim
-        atomic_json_write(receipt, receipt_path)
+        atomic_json_write(receipt, receipt_path, allow_nonatomic_fallback=False)
         return {key: value for key, value in receipt.items() if not key.startswith("_")}
     except BaseException:
         if claim is not None:
@@ -2515,7 +2737,8 @@ def build_generate_script_command(input_file: str, output_path: Optional[str] = 
                                   reasoning_effort: Optional[str] = None,
                                   cast_file: Optional[str] = None,
                                   literal_source_preserving: bool = False,
-                                  selection_binding: Optional[dict] = None) -> List[str]:
+                                  selection_binding: Optional[dict] = None,
+                                  cast_aliases: Optional[bool] = None) -> List[str]:
     """Build the one production command used by single and batch generation.
 
     `reasoning_effort` is passed explicitly so three_pass_generate records it
@@ -2534,6 +2757,8 @@ def build_generate_script_command(input_file: str, output_path: Optional[str] = 
         command.extend(["--first-person-narrator", narrator])
     if cast_file:
         command.extend(["--cast-file", cast_file])
+    if cast_aliases is not None:
+        command.append("--cast-aliases" if cast_aliases else "--no-cast-aliases")
     if type(literal_source_preserving) is not bool:
         raise ValueError("literal_source_preserving must be a boolean")
     if literal_source_preserving:
@@ -2563,10 +2788,25 @@ def get_script_recovery_manifest() -> Optional[dict]:
     return get_saved_script_recovery_manifest(DATA_DIR, three_pass_manifest_path(SCRIPT_PATH))
 
 
-def ensure_script_recovery_manifest():
-    """Recover interrupted book publication before reading recovery metadata."""
-    with ensure_book_state(DATA_DIR):
-        return get_script_recovery_manifest()
+def get_recovery_admission():
+    """The one book+checkpoint-locked admission decision for recovery readers.
+
+    Use outside an existing critical section so every surface decides from the
+    same snapshot, whether or not a manifest exists.
+    """
+    with ensure_book_state(DATA_DIR), file_lock(three_pass_checkpoint_path(SCRIPT_PATH)):
+        fenced = get_fenced_recovery_status(DATA_DIR)
+        return fenced, None if fenced is not None else _load_failed_checkpoint(locked=True)
+
+
+def _refuse_cast_invalidated_recovery():
+    """The one 409 for every admission point that refuses a fenced run."""
+    raise AppError(
+        409,
+        'The approved cast changed since this run started, so it cannot resume; '
+        'start a new run. The saved checkpoint was preserved.',
+        key='script.recovery.cast-changed-detail',
+    )
 
 
 def completed_script_prefix(checkpoint):
@@ -2714,13 +2954,18 @@ def require_whole_source_generation(state):
             'A shortened source scope is active. Undo it or select the full source again before whole-book generation or recovery.'))
 
 
+_SCRIPT_RESTART_GRANT = 'script_generation_restart_after_cancel'
+def _refuse_script_restart(error=None):
+    raise AppError(409, 'The cancelled script run or its selected source changed before automatic restart. '
+                   'Saved progress was preserved. Review the Script task and selected source before starting over.',
+                   key='safety.generation.restart_selection_changed') from error
+
+
 def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
                             request: Optional[GenerateScriptRequest],
-                            require_recovery: bool = False):
+                            require_recovery: bool = False, *, defer_start_over_cleanup=False):
     """Queue the one production generation command, optionally from a checkpoint."""
     require_whole_source_generation(safe_load_json(os.path.join(DATA_DIR, 'state.json'), {}))
-    if require_recovery and ensure_script_recovery_manifest() is None:
-        raise AppError(409, 'No failed or incomplete three-pass generation is available to resume.', key='error.generation.no_recovery')
     check_global_gpu_lock("script")
     try:
         options = {
@@ -2748,47 +2993,99 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if refusal:
             raise HTTPException(status_code=400, detail=refusal)
-    if require_recovery:
-        stored = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
-        stored = (stored.get("script_generation_options") or {}) if isinstance(stored, dict) else {}
-        if stored.get("literal_source_preserving") is True:
-            options["literal_source_preserving"] = True
-        options["cast_sha256"] = stored.get("cast_sha256")
-        if options["cast_sha256"] and get_file_sha256(get_run_cast_path()) != options["cast_sha256"]:
-            raise HTTPException(status_code=409, detail=(
-                "The cast list this run started with is missing or changed, so it cannot "
-                "resume; start a new run."))
-        cast_source = None
-    else:
-        cast_source = get_existing_cast_list(input_file)
-    uses_cast = bool(options.get("cast_sha256") if require_recovery else cast_source)
-    try:
-        command = build_generate_script_command(
-            input_file,
-            strip_front_matter=options["strip_front_matter"],
-            first_person_narrator=options["first_person_narrator"],
-            reasoning_effort=get_active_reasoning_effort(),
-            cast_file=get_run_cast_path() if uses_cast else None,
-            **({"literal_source_preserving": True} if options.get("literal_source_preserving") else {}),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     claim_id = None
+    start_over_admission = None
+    start_over_worker = None
     try:
         with ensure_book_state(DATA_DIR), file_lock(three_pass_checkpoint_path(SCRIPT_PATH)):
+            starts_over = request is not None and request.start_over
+            explicit_discard = starts_over and not require_recovery
+            resumes_checkpoint = os.path.lexists(three_pass_checkpoint_path(SCRIPT_PATH)) and not explicit_discard
+            # A fenced checkpoint must never be replayed by any launcher path
+            # that can reuse it, not just explicit Retry. Ordinary Generate
+            # with Start Over off resumes the same checkpoint the worker loads
+            # at three_pass_generate.py's _load_three_pass_checkpoint, so it is
+            # fenced here under the same book/checkpoint admission. An explicit
+            # Start Over discards progress and a truly new baseline has no
+            # checkpoint, so neither is blocked and both still clear the marker.
+            if (require_recovery or resumes_checkpoint) and get_fenced_recovery_status(DATA_DIR) is not None:
+                _refuse_cast_invalidated_recovery()
             current_state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
+            has_active_recovery = (
+                not explicit_discard
+                and current_state.get("script_generation_input_file") == input_file
+                and (_get_recovery_attempt_id(current_state) or _has_saved_receipt_identity(current_state))
+                and (run_spec_receipt.STATE_DIGEST in current_state
+                     or os.path.lexists(run_spec_receipt.receipt_path(DATA_DIR))
+                     or os.path.lexists(three_pass_manifest_path(SCRIPT_PATH))))
+            reads_recovery = resumes_checkpoint or require_recovery or has_active_recovery
+            saved_receipt = _load_recovery_receipt(get_recovery_state()) if reads_recovery else None
+            if require_recovery:
+                stored = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
+                stored = (stored.get("script_generation_options") or {}) if isinstance(stored, dict) else {}
+                if stored.get("literal_source_preserving") is True:
+                    options["literal_source_preserving"] = True
+                options["cast_sha256"] = stored.get("cast_sha256")
+                if "cast_sha256" not in stored and saved_receipt is not None:
+                    admitted_options = saved_receipt.get("options")
+                    if not isinstance(admitted_options, dict):
+                        _refuse_recovery_identity()
+                    options["cast_sha256"] = admitted_options.get("cast_sha256")
+                if options["cast_sha256"] and get_file_sha256(get_run_cast_path()) != options["cast_sha256"]:
+                    raise HTTPException(status_code=409, detail=(
+                        "The cast list this run started with is missing or changed, so it cannot "
+                        "resume; start a new run."))
+                cast_source = None
+            else:
+                cast_source = get_existing_cast_list(input_file)
+            uses_cast = bool(options.get("cast_sha256") if require_recovery else cast_source)
+            try:
+                command = build_generate_script_command(
+                    input_file,
+                    strip_front_matter=options["strip_front_matter"],
+                    first_person_narrator=options["first_person_narrator"],
+                    reasoning_effort=get_active_reasoning_effort(),
+                    cast_file=get_run_cast_path() if uses_cast else None,
+                    **({"literal_source_preserving": True} if options.get("literal_source_preserving") else {}),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            current_state = (get_recovery_state() if reads_recovery
+                             else safe_load_json(os.path.join(DATA_DIR, "state.json"), {}))
             require_whole_source_generation(current_state)
             if current_state.get("input_file_path") != input_file:
                 raise AppError(409, 'Selected source changed before generation started.', key='safety.generation.source_changed_before_start')
-            if require_recovery and get_script_recovery_manifest() is None:
-                raise AppError(409, 'Recovery checkpoint changed before start.', key='safety.generation.recovery_changed')
-            from script_selection_binding import capture_generation_selection
+            saved_manifest = get_script_recovery_manifest() if reads_recovery else None
+            if saved_receipt is not None and not resumes_checkpoint:
+                _get_recovery_provenance(None, saved_manifest, current_state, saved_receipt)
+                if require_recovery:
+                    _refuse_recovery_identity()
+                saved_receipt = None
+            if require_recovery and saved_manifest is None and saved_receipt is None:
+                raise AppError(409, 'No failed or incomplete three-pass generation is available to resume.',
+                               key='error.generation.no_recovery')
+            saved_checkpoint = (get_current_generation_checkpoint(locked=True)
+                                if resumes_checkpoint and saved_receipt is None else None)
+            if saved_receipt is None and reads_recovery:
+                _get_recovery_provenance(saved_checkpoint, saved_manifest, current_state, saved_receipt)
+            from script_selection_binding import capture_generation_selection, require_unchanged_source
             try:
                 captured = capture_generation_selection(DATA_DIR, input_file)
             except (OSError, ValueError) as error:
                 raise HTTPException(status_code=409, detail=(
                     'The selected source or book could not be verified. '
                     'Check the selection and try again; saved progress was preserved.')) from error
+            expected_restart = request.expected_restart_claim_id if request is not None else None
+            if expected_restart is not None:
+                if not starts_over or require_recovery:
+                    _refuse_script_restart()
+                startup_cancel = get_script_startup_cancel_locked(DATA_DIR, current_state, captured)
+                grant = current_state.get(_SCRIPT_RESTART_GRANT)
+                if startup_cancel is not None:
+                    grant = ({'claim_id': startup_cancel['claim_id'], 'selection': startup_cancel['selection']}
+                             if startup_cancel['allows_restart'] else None)
+                if grant != {'claim_id': expected_restart, 'selection': captured}:
+                    _refuse_script_restart()
             if (not require_recovery and not (request is not None and request.start_over)
                     and os.path.isfile(three_pass_checkpoint_path(SCRIPT_PATH))
                     and current_state.get('script_generation_selection') != captured):
@@ -2831,30 +3128,73 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
                         _refuse_checkpoint_replay_over_edited_publication(SCRIPT_PATH)
                     except RuntimeError as error:
                         raise HTTPException(status_code=409, detail=str(error)) from error
-            claim_id = reserve_background_task("script")
+            def verify_restart_source():
+                try:
+                    require_unchanged_source(input_file, captured['source_sha256'], owning_root=DATA_DIR)
+                except (OSError, ValueError) as error:
+                    _refuse_script_restart(error)
+            claim_id = reserve_background_task("script", defer_process_state=True)
+            import core
+
+            def require_admission_claim():
+                if (core._task_claims.get('script') or {}).get('id') != claim_id:
+                    raise AppError(409, 'Task reservation is no longer active; no worker was started.',
+                                   key='safety.generation.reservation_expired')
+
+            require_admission_claim()
+            if expected_restart is not None:
+                verify_restart_source()
             if original is not None:
                 command.extend(['--active-book-token', original['book_token'],
                                 '--active-source-sha256', original['source_sha256'],
                                 '--active-run-id', claim_id])
-                if require_recovery:
+                if require_recovery or resumes_checkpoint:
                     command.append('--require-matching-checkpoint')
-            if request is not None and request.start_over and not require_recovery:
-                discard_script_progress(locked=True)
+            cast_publication = None
             if not require_recovery:
                 if cast_source:
                     cast_bytes = Path(cast_source).read_bytes()
-                    temporary = get_run_cast_path() + ".tmp"
-                    Path(temporary).write_bytes(cast_bytes)
-                    os.replace(temporary, get_run_cast_path())
+                    cast_publication = (get_run_cast_path(), cast_bytes)
                     options["cast_sha256"] = hashlib.sha256(cast_bytes).hexdigest()
                 else:
-                    Path(get_run_cast_path()).unlink(missing_ok=True)
+                    cast_publication = (get_run_cast_path(), None)
                     options["cast_sha256"] = None
             state_path = os.path.join(DATA_DIR, "state.json")
+            prior_state = Path(state_path).read_bytes() if Path(state_path).exists() else None
+            prior_receipt_path = Path(run_spec_receipt.receipt_path(DATA_DIR))
+            prior_receipt = prior_receipt_path.read_bytes() if prior_receipt_path.exists() else None
+            prior_cast_path = Path(get_run_cast_path())
+            prior_cast = prior_cast_path.read_bytes() if prior_cast_path.is_file() else None
+            manifest_path = three_pass_manifest_path(SCRIPT_PATH)
+            prior_admission_manifest = None
+
+            def rollback_admission():
+                restore = {}
+                drop = []
+                for name, value in (
+                        (os.path.relpath(state_path, DATA_DIR), prior_state),
+                        (run_spec_receipt.RECEIPT_NAME, prior_receipt),
+                        (os.path.relpath(get_run_cast_path(), DATA_DIR), prior_cast)):
+                    if value is None:
+                        drop.append(name)
+                    else:
+                        restore[name] = value
+                if prior_admission_manifest is not None:
+                    restore[os.path.relpath(manifest_path, DATA_DIR)] = prior_admission_manifest
+                apply_book_state_locked(DATA_DIR, restore, drop)
+
             state = safe_load_json(state_path, {})
             if isinstance(state, dict):
                 # Retry reads these instead of the current form. Otherwise a
                 # changed checkbox would invalidate the resume fingerprint.
+                # A fresh run establishes a new cast baseline, clearing any
+                # stale-recovery flag left by a roster approval.
+                if not require_recovery and (
+                        starts_over
+                        or not os.path.isfile(three_pass_checkpoint_path(SCRIPT_PATH))):
+                    state.pop(RECOVERY_CAST_INVALIDATED, None)
+                state.pop(_SCRIPT_RESTART_GRANT, None)
+                state[SCRIPT_LAST_ADMITTED_RUN_ID] = claim_id
                 state["script_generation_options"] = options
                 state["script_generation_input_file"] = input_file
                 if original is not None:
@@ -2862,16 +3202,270 @@ def start_script_generation(background_tasks: BackgroundTasks, input_file: str,
                     state.pop('script_generation_cancel_requested_run_id', None)
                     state['script_generation_run_id'] = claim_id
                     state['script_generation_base_sha256'] = base['sha256']
-                atomic_json_write(state, state_path)
-            register_claimed_background_task(background_tasks, "script", claim_id, run_process, command, "script")
+                try:
+                    prepared_text, _ = get_prepared_source(
+                        input_file, options['strip_front_matter'], owning_root=DATA_DIR)
+                except (OSError, ValueError, UnicodeError):
+                    raise AppError(409, 'The source could not be prepared for this run; saved progress was preserved.',
+                                   key='safety.generation.recovery_source_preparation_failed')
+                prior_manifest_sha256 = None
+                legacy_checkpoint_sha256 = None
+                pending_manifest_recovery = False
+                absent_manifest = False
+                if (saved_receipt is not None
+                        and isinstance(state.get('script_generation_selection'), dict)):
+                    saved_checkpoint = get_current_generation_checkpoint(locked=True)
+                    if saved_checkpoint is None:
+                        raise AppError(409, 'Recovery checkpoint changed before start.',
+                                       key='safety.generation.recovery_changed')
+                    provenance = _get_recovery_provenance(
+                        saved_checkpoint, saved_manifest, current_state, saved_receipt)
+                    absent_manifest = provenance == 'pending' and saved_manifest is None
+                    if saved_manifest is not None and provenance == 'pending':
+                        prior_admission_manifest = Path(manifest_path).read_bytes()
+                    if isinstance(saved_checkpoint.get('failed'), dict):
+                        ensure_recovery_identity_pair(
+                            saved_checkpoint, saved_manifest, current_state, allow_retry_only=True)
+                        pending_manifest_recovery = absent_manifest
+                    elif absent_manifest and _can_retry_pending_checkpoint(
+                            saved_checkpoint, current_state, saved_receipt):
+                        pending_manifest_recovery = True
+                    elif require_recovery and saved_manifest is None:
+                        raise AppError(409, 'No failed or incomplete three-pass generation is available to resume.',
+                                       key='error.generation.no_recovery')
+                    if saved_manifest is not None and provenance in ('current', 'predecessor'):
+                        prior_manifest_sha256 = three_pass_run_spec.spec_digest(saved_manifest)
+                        if run_spec_receipt.CHECKPOINT_DIGEST not in saved_checkpoint:
+                            legacy_checkpoint_sha256 = saved_receipt.get('legacy_checkpoint_sha256')
+                    saved_segments = saved_checkpoint.get('segmented')
+                    if (saved_checkpoint.get('failed') is None
+                            and isinstance(saved_checkpoint.get('fingerprint'), dict)):
+                        try:
+                            _ensure_committed_segmentation(
+                                saved_checkpoint, _admitted_chunk_texts(
+                                    prepared_text, saved_receipt['spec']))
+                        except HTTPException:
+                            raise
+                        except (OSError, ValueError, TypeError, KeyError):
+                            raise AppError(409, 'Saved progress could not be verified against the source.',
+                                           key='safety.generation.recovery_source_mismatch')
+                    progress = (saved_manifest or {}).get('progress')
+                    if (provenance != 'predecessor' and isinstance(progress, dict)
+                            and isinstance(saved_segments, list)):
+                        if progress.get('segmented_entries') != len(saved_segments):
+                            raise AppError(409, 'Saved progress and its manifest disagree; the checkpoint was preserved.',
+                                           key='safety.generation.recovery_manifest_mismatch')
+                upgrade_legacy = saved_receipt is None and _can_upgrade_failed_legacy(
+                    saved_checkpoint, saved_manifest, current_state)
+                if upgrade_legacy:
+                    ensure_recovery_identity_pair(saved_checkpoint, saved_manifest, current_state)
+                    legacy_checkpoint_sha256 = three_pass_run_spec.spec_digest(saved_checkpoint)
+                    prior_manifest_sha256 = three_pass_run_spec.spec_digest(saved_manifest)
+                legacy_resume = ((require_recovery or resumes_checkpoint) and saved_receipt is None
+                                 and not upgrade_legacy)
+                config_sha256 = (_get_regular_file_sha256(CONFIG_PATH)
+                                 if saved_receipt is not None or upgrade_legacy else None)
+                legacy_runtime = (upgrade_legacy or (
+                    saved_receipt is not None and saved_receipt['spec'].get('legacy_runtime')))
+                try:
+                    receipt = None if legacy_resume else resolve_authoritative_run_spec(
+                        prepared_text, input_file, options, captured,
+                        saved_receipt.get('run_id') if saved_receipt is not None else claim_id,
+                        legacy_runtime=legacy_runtime, saved_receipt=saved_receipt, verify_runtime=True)
+                except (OSError, ValueError) as error:
+                    if saved_receipt is not None or upgrade_legacy:
+                        _refuse_recovery_identity(error)
+                    raise
+                if saved_receipt is not None:
+                    if (not run_spec_receipt.has_same_attempt_inputs(saved_receipt, receipt)
+                            or saved_receipt.get('run_id') != _get_recovery_attempt_id(current_state, saved_receipt)):
+                        _refuse_recovery_identity()
+                    receipt = saved_receipt
+                if upgrade_legacy:
+                    if get_run_fingerprint_identity(saved_checkpoint['fingerprint']) != (
+                            get_run_fingerprint_identity(get_receipt_checkpoint_fingerprint(receipt))):
+                        _refuse_recovery_identity()
+                    if '--require-matching-checkpoint' not in command:
+                        command.append('--require-matching-checkpoint')
+                startup_manifest_digest = None
+                if receipt is not None:
+                    if not explicit_discard:
+                        try:
+                            startup_manifest_digest, _ = get_three_pass_manifest_snapshot(SCRIPT_PATH)
+                        except (OSError, ValueError) as error:
+                            _refuse_recovery_identity(error)
+                    receipt = run_spec_receipt.rebind_attempt(
+                        receipt, claim_id, prior_manifest_sha256=prior_manifest_sha256,
+                        legacy_checkpoint_sha256=legacy_checkpoint_sha256,
+                        pending_manifest_recovery=pending_manifest_recovery,
+                        start_over=explicit_discard,
+                        manifest_at_start=('marker' if explicit_discard or prior_admission_manifest is not None
+                                           else startup_manifest_digest))
+                    state[run_spec_receipt.STATE_DIGEST] = receipt['sha256']
+
+                def guard_admission_source():
+                    require_admission_claim()
+                    if _get_regular_file_sha256(input_file) != captured['source_sha256']:
+                        raise AppError(409, 'The selected source changed during admission; no worker was started.',
+                                       key='safety.generation.admission_source_changed')
+                    if ((saved_receipt is not None or upgrade_legacy)
+                            and _get_regular_file_sha256(CONFIG_PATH) != config_sha256):
+                        _refuse_recovery_identity()
+                    if (prior_manifest_sha256 is not None
+                            and _strict_artifact(manifest_path) != saved_manifest):
+                        _refuse_recovery_identity()
+                    if receipt is not None and not explicit_discard:
+                        try:
+                            live_manifest_digest, _ = get_three_pass_manifest_snapshot(SCRIPT_PATH)
+                        except (OSError, ValueError) as error:
+                            _refuse_recovery_identity(error)
+                        if live_manifest_digest != startup_manifest_digest:
+                            published_marker = (prior_admission_manifest is not None
+                                                and live_manifest_digest == replacement_marker_digest
+                                                and _get_regular_file_sha256(prior_receipt_path)
+                                                == replacement_receipt_digest)
+                            if not published_marker:
+                                _refuse_recovery_identity()
+                        if absent_manifest and live_manifest_digest is not None:
+                            _refuse_recovery_identity()
+                    if legacy_checkpoint_sha256 is not None:
+                        current = get_current_generation_checkpoint(locked=True)
+                        if three_pass_run_spec.spec_digest(current) != legacy_checkpoint_sha256:
+                            _refuse_recovery_identity()
+                replacements = {
+                    os.path.relpath(state_path, DATA_DIR): json.dumps(
+                        state, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8'),
+                }
+                if receipt is not None:
+                    replacements[run_spec_receipt.RECEIPT_NAME] = run_spec_receipt.receipt_bytes(receipt)
+                removals = []
+                if prior_admission_manifest is not None:
+                    _, manifest = get_initial_three_pass_artifacts(receipt)
+                    marker_bytes = json.dumps(
+                        manifest, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+                    replacement_marker_digest = hashlib.sha256(marker_bytes).hexdigest()
+                    replacement_receipt_digest = hashlib.sha256(
+                        replacements[run_spec_receipt.RECEIPT_NAME]).hexdigest()
+                    replacements[os.path.relpath(manifest_path, DATA_DIR)] = marker_bytes
+                if explicit_discard:
+                    checkpoint_path = three_pass_checkpoint_path(SCRIPT_PATH)
+                    checkpoint, manifest = get_initial_three_pass_artifacts(receipt)
+                    for path, document in ((checkpoint_path, checkpoint), (manifest_path, manifest)):
+                        replacements[os.path.relpath(path, DATA_DIR)] = json.dumps(
+                            document, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+                    removals.extend(os.path.relpath(path, DATA_DIR) for path in
+                                    get_generation_checkpoint_artifacts(checkpoint_path)[1:])
+                if cast_publication is not None:
+                    cast_path, cast_value = cast_publication
+                    if cast_value is None:
+                        removals.append(os.path.relpath(cast_path, DATA_DIR))
+                    else:
+                        replacements[os.path.relpath(cast_path, DATA_DIR)] = cast_value
+                if receipt is not None:
+                    command.extend(['--run-spec-receipt',
+                                    run_spec_receipt.receipt_path(DATA_DIR),
+                                    '--run-spec-digest', receipt['sha256']])
+                if explicit_discard:
+                    # Pending request cleanup can revoke an ASGI callback.
+                    # Adopt the owner in a live thread before retiring any
+                    # recovery, and gate its subprocess on the book commit.
+                    start_over_admission = Future()
+                    dispatch_claim = claim_id if defer_start_over_cleanup else None
+
+                    def run_after_admission():
+                        if not start_over_admission.result():
+                            return
+                        if expected_restart is None or dispatch_claim is None:
+                            result = run_process(command, 'script')
+                        else:
+                            save_launch = partial(save_script_restart_launch, DATA_DIR,
+                                                  dispatch_claim, expected_restart)
+                            with guard_script_worker_launch(save_launch):
+                                result = run_process(command, 'script')
+                        if dispatch_claim is not None and result == 0 and not process_state['script'].get('cancel'):
+                            finish_book_worker_handoff(DATA_DIR, dispatch_claim)
+
+                    start_over_worker = core.start_claimed_task_thread(
+                        'script', claim_id, run_after_admission)
+
+                    def report_recovered_commit(error):
+                        guard_admission_source()
+                        with reuse_book_state(DATA_DIR, recover=False) as root:
+                            for name, value in replacements.items():
+                                path = root / name
+                                if path.is_symlink() or path.read_bytes() != value:
+                                    raise error
+                            if any(os.path.lexists(root / name) for name in removals):
+                                raise error
+                        logger.warning('Start Over committed and recovered after cleanup error (errno %s).',
+                                       error.errno)
+
+                    committed = False
+
+                    def mark_committed():
+                        nonlocal committed
+                        committed = True
+
+                    try:
+                        apply_book_state_locked(
+                            DATA_DIR, replacements, removals, before_replace=guard_admission_source,
+                            before_commit=verify_restart_source if expected_restart is not None else None,
+                            on_commit=mark_committed if dispatch_claim is not None else None,
+                            dispatch_claim=dispatch_claim,
+                            on_recovered_commit_error=report_recovered_commit)
+                    except (OSError, ValueError):
+                        if not committed:
+                            raise
+                        logger.exception('Script admission committed; book transaction cleanup failed')
+                    core.activate_background_task_claim('script', claim_id)
+                    start_over_admission.set_result(True)
+                    return {'status': 'started', 'task_claim_id': claim_id}
+                apply_book_state_locked(DATA_DIR, replacements, removals,
+                                        before_replace=guard_admission_source)
+            try:
+                require_admission_claim()
+                register_claimed_background_task(
+                    background_tasks, "script", claim_id, run_process, command, "script")
+                core.activate_background_task_claim('script', claim_id)
+            except BaseException:
+                if isinstance(state, dict):
+                    rollback_admission()
+                raise
     except BaseException:
+        if start_over_admission is not None and not start_over_admission.done():
+            start_over_admission.set_result(False)
+            if start_over_worker is not None:
+                start_over_worker.join()
         if claim_id is not None:
             release_gpu_task_claim("script", claim_id, pending_only=True)
         raise
-    return {"status": "resuming" if require_recovery else "started"}
+    return {"status": "resuming" if require_recovery else "started", "task_claim_id": claim_id}
 
 
-@router.post("/api/generate_script")
+def _raise_script_book_fault(error):
+    fault = get_book_fault_response(error)
+    if fault is not None:
+        raise AppError(fault.status_code, f'{fault.detail}', key='safety.generation.book_recovery_detail',
+                       values={'detail': fault.detail}) from error
+
+
+async def _start_script_generation_for_route(background_tasks, input_file, request,
+                                             require_recovery=False):
+    """Report every book recovery class like the Editor, without local paths."""
+    try:
+        if require_recovery:
+            return await asyncio.to_thread(
+                start_script_generation, background_tasks, input_file, request,
+                require_recovery=True)
+        return await asyncio.to_thread(
+            start_script_generation, background_tasks, input_file, request,
+            defer_start_over_cleanup=True)
+    except (TimeoutError, OSError, ValueError) as error:
+        _raise_script_book_fault(error)
+        raise
+
+
+@router.post("/api/generate_script", response_model=ScriptGenerationAdmission)
 async def generate_script(background_tasks: BackgroundTasks,
                            request: Optional[GenerateScriptRequest] = None):
     # Get input file from state.json
@@ -2885,64 +3479,161 @@ async def generate_script(background_tasks: BackgroundTasks,
     if not input_file:
          raise HTTPException(status_code=400, detail="No input file found in state")
 
-    return await asyncio.to_thread(start_script_generation, background_tasks, input_file, request)
+    return await _start_script_generation_for_route(background_tasks, input_file, request)
 
 
 def ensure_script_recovery_response(include_detail=False):
     """Read metadata and optional failed-unit detail under one book guard."""
-    with ensure_book_state(DATA_DIR):
+    with ensure_book_state(DATA_DIR), file_lock(three_pass_checkpoint_path(SCRIPT_PATH)):
+        # The shared decision fences first, even when a manifest holds failed
+        # work, so summary and detail never disagree on the Start Over action.
+        fenced = get_fenced_recovery_status(DATA_DIR)
+        if fenced is not None:
+            return fenced
         manifest = get_script_recovery_manifest()
+        state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), {})
+        has_receipt_binding = (run_spec_receipt.STATE_DIGEST in state
+                               or os.path.lexists(run_spec_receipt.receipt_path(DATA_DIR))
+                               or 'run_spec_sha256' in (manifest or {}))
+        failed = None
+        if include_detail or manifest is None or has_receipt_binding:
+            evidence = _read_failure_admission(manifest, locked=True, allow_retry_only=True)
+            if evidence is not None:
+                checkpoint, retry_only = evidence
+                # A missing manifest is a read-only Retry candidate. The
+                # worker still owns publication of the real failure evidence.
+                if manifest is None:
+                    manifest = {'status': 'incomplete'}
+                if not retry_only:
+                    failed = checkpoint
         if manifest is None:
             return {"recoverable": False}
         failures = manifest.get("diagnostic_failures") or []
+        try:
+            unchecked_count = get_three_pass_unchecked_count(manifest)
+            unchecked_count_valid = True
+        except ValueError:
+            unchecked_count = None
+            unchecked_count_valid = False
         response = {
             "recoverable": True,
             "status": manifest["status"],
             "failed_pass": manifest.get("failed_pass"),
             "failed_chunk": manifest.get("failed_chunk"),
             "failure_count": len(failures),
+            "unchecked_count": unchecked_count,
+            "unchecked_count_valid": unchecked_count_valid,
         }
-        state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), {})
         if isinstance(state, dict) and state.get('script_generation_selection') is None:
-            with file_lock(three_pass_checkpoint_path(SCRIPT_PATH)):
-                try:
-                    checkpoint = get_current_generation_checkpoint(locked=True)
-                except HTTPException:
-                    # Metadata remains useful when the checkpoint is corrupt;
-                    # do not offer confirmation without a readable checkpoint.
-                    checkpoint = None
-                if isinstance(checkpoint, dict):
-                    from book_state_transaction import get_book_operation_token
-                    response['legacy_confirmation'] = {
-                        'checkpoint_token': get_script_recovery_token(checkpoint),
-                        'book_token': get_book_operation_token(DATA_DIR),
-                    }
+            try:
+                checkpoint = get_current_generation_checkpoint(locked=True)
+            except HTTPException:
+                # Metadata remains useful when the checkpoint is corrupt;
+                # do not offer confirmation without a readable checkpoint.
+                checkpoint = None
+            if isinstance(checkpoint, dict):
+                from book_state_transaction import get_book_operation_token
+                response['legacy_confirmation'] = {
+                    'checkpoint_token': get_script_recovery_token(checkpoint),
+                    'book_token': get_book_operation_token(DATA_DIR),
+                }
         if include_detail:
-            checkpoint = _load_failed_checkpoint()
-            response["detail"] = ({"recoverable": True, **build_recovery_detail(checkpoint)}
-                                  if checkpoint is not None else None)
+            response["detail"] = ({"recoverable": True, **build_recovery_detail(failed)}
+                                  if failed is not None else None)
         return response
 
 
 @router.get("/api/generate_script/recovery")
 async def generate_script_recovery(include_detail: bool = False):
     """Return metadata by default; opt in to the validated failed-unit detail."""
-    return await asyncio.to_thread(ensure_script_recovery_response, include_detail)
+    try:
+        return await asyncio.to_thread(ensure_script_recovery_response, include_detail)
+    except (TimeoutError, OSError, ValueError) as error:
+        _raise_script_book_fault(error)
+        raise
 
 
-def _load_failed_checkpoint(*, locked=False):
-    """The checkpoint of a pass-1 fail-fast, or None. The `failed` block is
-    written only on that path (three_pass_generate._save_three_pass_checkpoint)."""
-    if get_script_recovery_manifest() is None:
-        return None
+def _ensure_failed_unit_shape(checkpoint):
+    """All recovery surfaces share one bounded saved-evidence contract."""
+    failed = checkpoint["failed"]
+    if "chunk" in failed and (type(failed["chunk"]) is not int or failed["chunk"] < 1):
+        _refuse_recovery_evidence()
+    if failed.get("pass") not in ("segment", "attribute", "instruct"):
+        _refuse_recovery_evidence()
+    if failed["pass"] != "segment" and "chunk" in failed:
+        _refuse_recovery_evidence()
+    if failed["pass"] == "segment":
+        chunks_done = checkpoint.get('chunks_done')
+        if (not isinstance(failed.get("source"), str) or not failed["source"]
+                or type(failed.get("chunk")) is not int or failed["chunk"] < 1
+                or (type(chunks_done) is int
+                    and failed["chunk"] > chunks_done + 1)):
+            _refuse_recovery_evidence()
+        return
+    entries = failed.get("entries")
+    if (not isinstance(entries, list) or not entries
+            or any(not isinstance(row, dict) or not isinstance(row.get("text"), str)
+                   or not row["text"] for row in entries)):
+        _refuse_recovery_evidence()
+    for row in entries:
+        if failed["pass"] == "attribute" and row.get("type") not in ("SPOKEN", "NARRATOR"):
+            _refuse_recovery_evidence()
+        if failed["pass"] == "instruct" and not isinstance(row.get("speaker"), str):
+            _refuse_recovery_evidence()
+    if "roster" in failed:
+        roster = failed["roster"]
+        if not isinstance(roster, list) or any(
+                not isinstance(name, str) or not name.strip() for name in roster):
+            _refuse_recovery_evidence()
+    if "indices" in failed:
+        indices = failed["indices"]
+        if (not isinstance(indices, list) or len(indices) != len(entries)
+                or any(type(index) is not int or index < 0 for index in indices)
+                or len(set(indices)) != len(indices)):
+            _refuse_recovery_evidence()
+
+
+def _read_failure_admission(manifest, *, locked=False, allow_retry_only=False):
+    """Return a validated failed checkpoint and whether only Retry is safe."""
+    if manifest is None:
+        state = safe_load_json(os.path.join(DATA_DIR, 'state.json'), {})
+        if (not isinstance(state, dict)
+                or not (_get_recovery_attempt_id(state) or _has_saved_receipt_identity(state))
+                or state.get('script_generation_input_file') != state.get('input_file_path')
+                or '_source_scope' in state):
+            return None
+        if (run_spec_receipt.STATE_DIGEST not in state
+                and (os.path.lexists(three_pass_manifest_path(SCRIPT_PATH))
+                     or not os.path.lexists(run_spec_receipt.receipt_path(DATA_DIR)))):
+            return None
     checkpoint = get_current_generation_checkpoint(locked=locked)
-    if not isinstance(checkpoint, dict) or checkpoint.get("stage") not in (
-            "segment_failed", "attribute_failed", "instruct_failed"):
+    state = get_recovery_state()
+    receipt = _load_recovery_receipt(state)
+    if not isinstance(checkpoint, dict):
+        _get_recovery_provenance(checkpoint, manifest, state, receipt)
+        return None
+    stage = checkpoint.get('stage')
+    if not isinstance(stage, str) and stage is not None:
+        _refuse_recovery_identity()
+    if stage not in _FAILED_STAGE_PASSES:
+        provenance = _get_recovery_provenance(checkpoint, manifest, state, receipt)
+        if (allow_retry_only and provenance == 'pending' and manifest is None
+                and _can_retry_pending_checkpoint(checkpoint, state, receipt)):
+            return checkpoint, True
         return None
     failed = checkpoint.get("failed")
     if not isinstance(failed, dict) or not (failed.get("source") or failed.get("entries")):
+        _get_recovery_provenance(checkpoint, manifest, state, receipt)
         return None
-    return checkpoint
+    _ensure_failed_unit_shape(checkpoint)
+    _, _, retry_only = ensure_recovery_identity_pair(
+        checkpoint, manifest, state, allow_retry_only=allow_retry_only)
+    return checkpoint, retry_only
+
+
+def _load_failed_checkpoint(*, locked=False):
+    evidence = _read_failure_admission(get_script_recovery_manifest(), locked=locked)
+    return evidence[0] if evidence is not None else None
 
 
 def ensure_failed_checkpoint():
@@ -2972,7 +3663,8 @@ def build_recovery_detail(checkpoint):
                 entries, LLMGenParams(), failed.get("roster") or [])
             label = lambda e: e.get("type")
         else:
-            sys_prompt, user_prompt = build_instruct_request(entries, LLMGenParams())
+            sys_prompt, user_prompt = build_instruct_request(
+                entries, LLMGenParams(delivery_direction=failed.get("delivery_direction", "off")))
             # API-error attempts retain the actual dispatched request, including
             # custom templates, surround and retry feedback. Do not reconstruct
             # that request using today's settings or default prompts.
@@ -3023,13 +3715,900 @@ def build_recovery_detail(checkpoint):
     }
 
 
-def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
+def _refuse_recovery_proof(cause=None):
+    raise AppError(409,
+                   'The failed batch source could not be verified; the checkpoint was preserved. '
+                   'Start a new run.',
+                   key='safety.generation.recovery_proof_refusal') from cause
+
+
+def _refuse_recovery_destination(cause=None):
+    raise AppError(409,
+                   'The failed batch does not map to unique saved rows; the checkpoint was preserved. '
+                   'Start a new run.',
+                   key='safety.generation.recovery_destination_refusal') from cause
+
+
+def _refuse_recovery_shape(cause=None):
+    raise AppError(409,
+                   'The recovered checkpoint does not match the saved run shape; '
+                   'the checkpoint was preserved. Start a new run.',
+                   key='safety.generation.recovery_shape_refusal') from cause
+
+
+def _refuse_recovery_identity(cause=None):
+    raise AppError(409,
+                   'The recovery artifacts do not belong to the same saved run; '
+                   'the checkpoint was preserved. Start a new run.',
+                   key='safety.generation.recovery_identity_refusal') from cause
+
+
+def _refuse_recovery_evidence(cause=None):
+    raise AppError(409,
+                   'The failed batch evidence is malformed; the checkpoint was preserved. '
+                   'Start a new run.',
+                   key='safety.generation.recovery_evidence_refusal') from cause
+
+
+def _strict_json(raw):
+    """Reject duplicate keys and non-finite constants in persisted artifacts."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate JSON key in generation artifact')
+            result[key] = value
+        return result
+    return json.loads(raw.decode('utf-8'), object_pairs_hook=unique,
+                      parse_constant=lambda _: (_ for _ in ()).throw(
+                          ValueError('invalid numeric constant')))
+
+
+def _strict_artifact(path):
+    try:
+        return _strict_json(Path(path).read_bytes())
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        _refuse_recovery_identity()
+
+
+def _admitted_chunk_texts(prepared_text, spec=None):
+    """The worker's chunk texts under either the receipt spec or live settings."""
+    if spec is not None:
+        params = LLMGenParams(**spec['params'])
+        chunk_size = spec['chunk_size']
+    else:
+        config = load_app_config(CONFIG_PATH)
+        settings = resolve_three_pass_generation_settings(config)
+        llm = get_active_llm_config(config)
+        chunk_size = settings['chunk_size']
+        params = get_three_pass_run_params(
+            config, {'context_length': llm.get('context_length')},
+            get_active_reasoning_effort(), settings)
+    return [record['text'] for record in get_segment_chunk_records(
+        prepared_text, chunk_size, params)]
+
+
+def _source_words(text):
+    return re.sub(r'["\u201c\u201d]', '', text).split()
+
+
+def _completed_prefix_matches(segmented, admitted_chunks, chunks_done):
+    """A valid saved prefix covers exactly the committed chunks, no more."""
+    if not isinstance(segmented, list) or type(chunks_done) is not int:
+        return False
+    saved = _source_words(' '.join(row.get('text', '') for row in segmented
+                                   if isinstance(row, dict)))
+    committed = _source_words(' '.join(admitted_chunks[:chunks_done]))
+    return saved == committed
+
+
+def _ensure_committed_segmentation(checkpoint, admitted_chunks):
+    chunks_done = checkpoint.get('chunks_done')
+    if (not is_valid_three_pass_segment_cursor(
+            checkpoint.get('stage'), chunks_done, len(admitted_chunks))
+            or not _completed_prefix_matches(
+                checkpoint.get('segmented'), admitted_chunks, chunks_done)):
+        _refuse_recovery_evidence()
+
+
+def _ensure_checkpoint_admission_shape(checkpoint):
+    if not isinstance(checkpoint, dict):
+        _refuse_recovery_identity()
+    stage = checkpoint.get('stage')
+    if not isinstance(stage, str) and stage is not None:
+        _refuse_recovery_identity()
+    failed = checkpoint.get('failed')
+    if failed is not None or stage in _FAILED_STAGE_PASSES:
+        expected_pass = _FAILED_STAGE_PASSES.get(stage)
+        if expected_pass is None or not isinstance(failed, dict) or failed.get('pass') != expected_pass:
+            _refuse_recovery_identity()
+        _ensure_failed_unit_shape(checkpoint)
+
+
+def _recovery_fingerprint_identity(fingerprint):
+    """Runtime model binding is execution history, not saved-run identity."""
+    value = get_run_fingerprint_identity(fingerprint)
+    if isinstance(value, dict):
+        value.pop('model_binding', None)
+    return value
+
+
+def _digest_is_sha256(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _get_regular_file_sha256(path):
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None
+        return get_file_sha256(path)
+    except OSError:
+        return None
+
+
+def get_recovery_state():
+    """Read current book state with the selection reader's strict JSON policy."""
+    try:
+        return _read_selection_state(DATA_DIR, required=True)
+    except (OSError, ValueError, RecursionError, UnicodeError):
+        _refuse_recovery_proof()
+
+
+def _worker_reopens(checkpoint, fingerprint, chunk_count):
+    """Reopen a staged candidate with the worker's own loader and identity."""
+    with tempfile.TemporaryDirectory() as tmp:
+        output = os.path.join(tmp, os.path.basename(SCRIPT_PATH))
+        candidate = dict(checkpoint)
+        candidate_fp = candidate.get('fingerprint')
+        if isinstance(candidate_fp, dict):
+            candidate_fp = dict(candidate_fp)
+            candidate_fp.pop('model_binding', None)
+            candidate['fingerprint'] = candidate_fp
+        identity = fingerprint
+        if isinstance(identity, dict):
+            identity = dict(identity)
+            identity.pop('model_binding', None)
+        atomic_json_write(candidate, three_pass_checkpoint_path(output),
+                          allow_nonatomic_fallback=False)
+        try:
+            return _load_three_pass_checkpoint(output, identity, chunk_count) is not None
+        except (RuntimeError, OSError, ValueError, TypeError):
+            return False
+
+
+def ensure_recovered_checkpoint_shape(checkpoint, fingerprint, chunk_count):
+    """A 200 is possible only when the worker reopens the exact candidate."""
+    if not _worker_reopens(checkpoint, fingerprint, chunk_count):
+        _refuse_recovery_shape()
+
+
+def get_authoritative_chunk_total(prepared_text):
+    """Worker chunking of the prepared book under the saved profile context."""
+    config = load_app_config(CONFIG_PATH)
+    settings = resolve_three_pass_generation_settings(config)
+    llm = get_active_llm_config(config)
+    params = LLMGenParams(context_length=llm.get('context_length')
+                          or settings.get('profile_context_length'))
+    return len(get_segment_chunk_records(prepared_text, settings['chunk_size'], params))
+
+
+def resolve_authoritative_run_spec(prepared_text, input_file, options, captured, run_id, *,
+                                   legacy_runtime=False, saved_receipt=None, verify_runtime=False):
+    """Rebuild the run identity from source + saved settings, not artifacts."""
+    config = load_app_config(CONFIG_PATH)
+    settings = resolve_three_pass_generation_settings(config)
+    llm = get_active_llm_config(config)
+    reasoning_effort = get_active_reasoning_effort()
+    effective_context = llm.get('context_length')
+    if legacy_runtime or saved_receipt is None or verify_runtime:
+        observed = get_planned_request_context(config)
+        if observed['known']:
+            effective_context = observed['context']
+    if saved_receipt is not None and not legacy_runtime:
+        # A larger loaded context still serves the admitted chunks. Never
+        # shrink their plan in place, or switch to newly discovered limits.
+        admitted_context = saved_receipt['spec']['params'].get('context_length')
+        if verify_runtime and effective_context is not None and (
+                admitted_context is None or effective_context < admitted_context):
+            raise ValueError('The loaded context cannot serve the admitted chunk plan.')
+        effective_context = admitted_context
+    params = get_three_pass_run_params(
+        config, {'context_length': effective_context}, reasoning_effort, settings)
+    context_windows, rescue_retries = get_context_rescue_settings(config.get('generation') or {})
+    from three_pass_generate import load_cast, resolve_attribute_prompt
+    attribute_variant, attribute_texts = resolve_attribute_prompt(config)
+    keep_scope = settings.get('keep_scope') or 'line'
+    cast_sha256 = options.get('cast_sha256')
+    fingerprint_controls = {
+        'on_exhaustion': 'keep', 'context_windows': context_windows,
+        'context_rescue_retries': rescue_retries, 'endpoint': llm.get('base_url', 'http://localhost:1234/v1'),
+        'attribute_prompt_variant': attribute_variant, 'attribute_prompt_texts': attribute_texts,
+        'cast_sha256': cast_sha256, 'keep_scope': keep_scope,
+    }
+    if legacy_runtime:
+        from dataclasses import replace
+        narrator = options.get('first_person_narrator')
+        cast = load_cast(get_run_cast_path()) if params.cast_aliases and cast_sha256 else {}
+        identity_params = replace(
+            params, literal_source_preserving=options.get('literal_source_preserving', False),
+            cast_alias_groups=cast.get('alias_groups'))
+        identity_params, identity_texts = get_attribution_prompt_params(
+            identity_params, attribute_variant, attribute_texts, narrator)
+        native_fingerprint = get_native_three_pass_fingerprint(
+            prepared_text, llm.get('model_name'), settings['chunk_size'], identity_params, settings,
+            **dict(fingerprint_controls, attribute_prompt_texts=identity_texts,
+                   first_person_narrator=narrator, speaker_traits=is_speaker_traits_prompt(attribute_texts)))
+    else:
+        native_fingerprint = three_pass_fingerprint(
+            prepared_text, llm.get('model_name'), settings['chunk_size'], params,
+            attribute_batch_size=settings['attribute_batch_size'],
+            attribute_context_chars=settings['attribute_context_chars'],
+            instruct_context_chars=settings['instruct_context_chars'],
+            **fingerprint_controls)
+    secondary = get_failover_llm_config(config) or {}
+    resolved = three_pass_run_spec.canonical_spec(
+        prepared_text=prepared_text, model_name=llm.get('model_name'),
+        chunk_size=settings['chunk_size'], params=params, options=options,
+        settings=settings, llm_profile=llm,
+        fingerprint=native_fingerprint,
+        prompts={'segment_system': getattr(params, 'segment_system_prompt', None),
+                 'segment_user': getattr(params, 'segment_user_prompt_template', None),
+                 'instruct_system': getattr(params, 'instruct_system_prompt', None),
+                 'instruct_user': getattr(params, 'instruct_user_prompt_template', None)},
+        binding=getattr(params, 'model_binding', None),
+        cast_sha256=options.get('cast_sha256'),
+        keep_scope=settings.get('keep_scope') or 'line',
+        overrides={'reasoning_effort': reasoning_effort,
+                   'strip_front_matter': options.get('strip_front_matter'),
+                   'literal_source_preserving': options.get('literal_source_preserving')},
+        source_path=input_file, source_sha256=captured['source_sha256'],
+        book_token=captured['book_token'], run_id=run_id,
+        secondary_model=secondary.get('model_name'),
+        secondary_endpoint=secondary.get('base_url'),
+        provider_request_sha256=three_pass_run_spec.get_provider_request_digest(llm, secondary),
+        legacy_runtime=legacy_runtime,
+        context_rescue={key: value for key, value in (
+            ('context_rescue_windows', context_windows),
+            ('context_rescue_retries', rescue_retries),
+        ) if value is not None},
+        attribution={
+            'attribute_batch_size': settings['attribute_batch_size'],
+            'attribute_context_chars': settings['attribute_context_chars'],
+            'attribute_target_chars': settings['attribute_target_chars'],
+            'instruct_target_chars': settings['instruct_target_chars'],
+            'instruct_context_chars': settings['instruct_context_chars'],
+            'attribute_prompt_variant': attribute_variant,
+            'attribute_prompt_texts': attribute_texts,
+            'delivery_direction': settings['delivery_direction']})
+    spec = resolved['spec']
+    return run_spec_receipt.build_receipt(
+        book_token=captured['book_token'], source_path=input_file,
+        source_sha256=captured['source_sha256'],
+        prepared_sha256=hashlib.sha256(prepared_text.encode('utf-8')).hexdigest(),
+        options=options, settings={'digest': three_pass_run_spec.spec_digest(spec),
+                                   'chunk_size': settings['chunk_size'],
+                                   'context_length': llm.get('context_length')},
+        fingerprint=resolved['fingerprint'],
+        chunk_count=resolved['chunk_count'], run_id=run_id, spec=spec)
+
+
+def _is_legacy_recovery_shape(checkpoint, manifest, state):
+    """Positive historical shape only; modern leftovers never downgrade."""
+    fingerprint = checkpoint.get("fingerprint")
+    manifest_fingerprint = manifest.get("fingerprint")
+    if isinstance(fingerprint, bool) or isinstance(manifest_fingerprint, bool):
+        return False
+    if fingerprint is not None and not (isinstance(fingerprint, str) and fingerprint):
+        return False
+    if manifest_fingerprint != fingerprint:
+        return False
+    if (checkpoint.get("failed") or {}).get("cast_sha256") is not None:
+        return False
+    if (manifest.get("progress") is not None or manifest.get("telemetry") is not None
+            or manifest.get("model_binding") is not None
+            or checkpoint.get("model_binding") is not None):
+        return False
+    return (isinstance(fingerprint, str) and bool(fingerprint)
+            or (fingerprint is None and "script_generation_selection" not in state))
+
+
+def _has_nonfinite(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    if isinstance(value, dict):
+        return any(_has_nonfinite(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_nonfinite(item) for item in value)
+    return False
+
+
+def _is_admission_manifest(manifest, receipt):
+    """Only the exact, current attempt's admission marker permits a manifest gap."""
+    if receipt is None:
+        return False
+    try:
+        return manifest == get_initial_three_pass_artifacts(receipt)[1]
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def _load_recovery_receipt(state):
+    """A receipt committed in book state remains required if its file is lost."""
+    try:
+        receipt = run_spec_receipt.load_receipt(DATA_DIR)
+    except (OSError, ValueError) as error:
+        _refuse_recovery_identity(error)
+    if run_spec_receipt.STATE_DIGEST in state and (
+            receipt is None or state[run_spec_receipt.STATE_DIGEST] != receipt['sha256']):
+        _refuse_recovery_identity()
+    return receipt
+
+
+def _has_saved_receipt_identity(state):
+    return (run_spec_receipt.STATE_DIGEST in state
+            and 'script_generation_base_sha256' in state)
+
+
+def _get_recovery_attempt_id(state, receipt=None):
+    """A cancelled attempt loses worker ownership and retains recovery identity."""
+    if 'script_generation_run_id' in state:
+        return state['script_generation_run_id']
+    revoked_run_id = state.get('script_generation_cancel_requested_run_id')
+    if revoked_run_id is not None:
+        return revoked_run_id
+    # Older cancellations removed both IDs. Book state still binds the
+    # receipt, and the starting script identity is removed on publication.
+    if (receipt is not None and _has_saved_receipt_identity(state)
+            and state[run_spec_receipt.STATE_DIGEST] == receipt['sha256']
+            and state.get('script_generation_published_run_id') != receipt.get('run_id')):
+        return receipt.get('run_id')
+    return None
+
+
+def _can_retry_pending_checkpoint(checkpoint, state, receipt):
+    """Keep a proven saved prefix resumable across cancellation and re-admission."""
+    return (receipt is not None and checkpoint['chunks_done'] > 0
+            and ('script_generation_run_id' not in state
+                 or receipt.get('pending_manifest_recovery') is True))
+
+
+def _can_upgrade_failed_legacy(checkpoint, manifest, state):
+    """Only a native legacy failure with its original worker manifest can migrate."""
+    run_id = _get_recovery_attempt_id(state)
+    return (isinstance(checkpoint, dict) and isinstance(checkpoint.get('fingerprint'), dict)
+            and isinstance(checkpoint.get('failed'), dict) and isinstance(manifest, dict)
+            and isinstance(manifest.get('progress'), dict)
+            and isinstance(run_id, str) and re.fullmatch(r'[0-9a-f]{32}', run_id) is not None
+            and manifest.get('run_id') == run_id)
+
+
+def _get_recovery_provenance(checkpoint, manifest, state, receipt):
+    """Verify the checkpoint and identify its manifest under the admitted attempt."""
+    run_id = _get_recovery_attempt_id(state, receipt)
+    manifest_id = manifest.get('run_id') if manifest is not None else None
+    if receipt is None:
+        if (manifest is not None and 'run_spec_sha256' in manifest
+                or checkpoint is not None and not is_checkpoint_bound_to_spec(checkpoint, None)
+                or isinstance(run_id, str) and isinstance(manifest_id, str) and run_id != manifest_id):
+            _refuse_recovery_identity()
+        return 'legacy'
+    if (run_spec_receipt.STATE_DIGEST in state
+            and state[run_spec_receipt.STATE_DIGEST] != receipt['sha256']):
+        _refuse_recovery_identity()
+
+    path = three_pass_manifest_path(SCRIPT_PATH)
+    if manifest is None and os.path.lexists(path):
+        _refuse_recovery_identity()
+    if manifest is not None and (_strict_artifact(path) != manifest or _has_nonfinite(manifest)):
+        _refuse_recovery_identity()
+    if (not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id)
+            or run_id != receipt.get('run_id')):
+        _refuse_recovery_identity()
+
+    pin = receipt.get('prior_manifest_sha256')
+    if pin is not None and not _digest_is_sha256(pin):
+        _refuse_recovery_identity()
+    checkpoint_path = three_pass_checkpoint_path(SCRIPT_PATH)
+    if checkpoint is None:
+        if (manifest is not None or pin is not None or receipt.get('manifest_at_start') is not None
+                or os.path.lexists(checkpoint_path)
+                or get_generation_checkpoint_artifacts(checkpoint_path)[1:]):
+            _refuse_recovery_identity()
+        return 'pending'
+    _strict_artifact(checkpoint_path)
+    _ensure_checkpoint_admission_shape(checkpoint)
+    try:
+        expected_fingerprint = get_receipt_checkpoint_fingerprint(receipt)
+        bound = is_checkpoint_bound_to_spec(checkpoint, receipt, manifest)
+    except (KeyError, TypeError, AttributeError, ValueError) as error:
+        _refuse_recovery_identity(error)
+    if not bound or get_run_fingerprint_identity(
+            checkpoint.get('fingerprint')) != get_run_fingerprint_identity(expected_fingerprint):
+        _refuse_recovery_identity()
+    if checkpoint.get('stage') not in _FAILED_STAGE_PASSES:
+        try:
+            validate_three_pass_checkpoint(checkpoint, receipt['chunk_count'])
+        except (ValueError, TypeError) as error:
+            _refuse_recovery_identity(error)
+    if manifest is None or (manifest.get('status') == 'incomplete' and 'progress' not in manifest):
+        expected_start = 'marker' if manifest is not None else None
+        if (pin is not None
+                or ('manifest_at_start' in receipt and receipt['manifest_at_start'] != expected_start)
+                or (manifest is not None and not _is_admission_manifest(manifest, receipt))):
+            _refuse_recovery_identity()
+        return 'pending'
+    if manifest_id == run_id and manifest.get('run_spec_sha256') == receipt['sha256']:
+        return 'current'
+    if (pin is not None and isinstance(manifest_id, str) and re.fullmatch(r'[0-9a-f]{32}', manifest_id)
+            and pin == three_pass_run_spec.spec_digest(manifest)):
+        return 'predecessor'
+    _refuse_recovery_identity()
+
+
+_FAILED_STAGE_PASSES = {
+    "segment_failed": "segment",
+    "attribute_failed": "attribute",
+    "instruct_failed": "instruct",
+}
+
+
+def ensure_recovery_identity_pair(checkpoint, manifest, state, *, allow_retry_only=False):
+    """Validate failure evidence and distinguish a pending manifest from manual recovery."""
+    if _has_nonfinite(checkpoint) or _has_nonfinite(manifest) or _has_nonfinite(state):
+        _refuse_recovery_identity()
+    _strict_artifact(three_pass_checkpoint_path(SCRIPT_PATH))
+    receipt = _load_recovery_receipt(state)
+    provenance = _get_recovery_provenance(checkpoint, manifest, state, receipt)
+    if receipt is None and (manifest is None
+                            or _strict_artifact(three_pass_manifest_path(SCRIPT_PATH)) != manifest):
+        _refuse_recovery_identity()
+    manifest = manifest or {}
+    failed = checkpoint.get("failed")
+    if not isinstance(failed, dict):
+        _refuse_recovery_identity()
+    expected_pass = _FAILED_STAGE_PASSES.get(checkpoint.get("stage"))
+    if expected_pass is None or failed.get("pass") != expected_pass:
+        _refuse_recovery_identity()
+    if manifest.get("failed_pass") not in (None, expected_pass):
+        _refuse_recovery_identity()
+    if manifest.get("failed_chunk") not in (None, failed.get("chunk")):
+        _refuse_recovery_identity()
+    legacy = receipt is None
+    if legacy and not (_is_legacy_recovery_shape(checkpoint, manifest, state)
+                       or isinstance(checkpoint.get('fingerprint'), dict)):
+        _refuse_recovery_identity()
+    source_path = state.get('input_file_path')
+    selection = state.get('script_generation_selection')
+    source_sha256 = selection.get('source_sha256') if isinstance(selection, dict) else None
+    book_token = selection.get('book_token') if isinstance(selection, dict) else None
+    if (not isinstance(source_path, str) or not _digest_is_sha256(source_sha256)
+            or not isinstance(book_token, str) or not book_token):
+        _refuse_recovery_identity()
+    options = state.get('script_generation_options')
+    if not isinstance(options, dict):
+        _refuse_recovery_identity()
+    try:
+        prepared_text, _ = get_prepared_source(
+            source_path, options.get('strip_front_matter'), owning_root=DATA_DIR)
+        recomputed = resolve_authoritative_run_spec(
+            prepared_text, source_path, options, captured={
+                'book_token': book_token, 'source_sha256': source_sha256},
+            run_id=_get_recovery_attempt_id(state, receipt), saved_receipt=receipt,
+            legacy_runtime=(isinstance(checkpoint.get('fingerprint'), dict) if legacy
+                            else receipt['spec'].get('legacy_runtime', False)))
+    except (OSError, ValueError, TypeError):
+        _refuse_recovery_identity()
+    if not legacy and not run_spec_receipt.verify_receipt(
+            receipt, book_token=book_token, source_path=source_path,
+            source_sha256=source_sha256,
+            prepared_sha256=hashlib.sha256(prepared_text.encode('utf-8')).hexdigest(),
+            options=options, fingerprint=recomputed['fingerprint'],
+            chunk_count=recomputed['chunk_count'], spec=recomputed['spec']):
+        _refuse_recovery_identity()
+    fingerprint = recomputed['fingerprint'] if legacy else receipt['fingerprint']
+    chunk_count = recomputed['chunk_count'] if legacy else receipt['chunk_count']
+    checkpoint_fingerprint = checkpoint.get("fingerprint")
+    pending_manifest = provenance == 'pending'
+    retry_only = provenance in ('pending', 'predecessor')
+    if retry_only:
+        if not allow_retry_only or legacy or not isinstance(checkpoint_fingerprint, dict):
+            _refuse_recovery_identity()
+        try:
+            validate_three_pass_checkpoint(checkpoint, chunk_count)
+            live_selection = capture_generation_selection(DATA_DIR, source_path)
+        except (OSError, ValueError) as error:
+            _refuse_recovery_identity(error)
+        if live_selection != selection:
+            _refuse_recovery_identity()
+    spec = recomputed['spec']
+    if isinstance(checkpoint_fingerprint, str) and checkpoint_fingerprint:
+        fingerprint = checkpoint_fingerprint
+    if isinstance(checkpoint_fingerprint, dict):
+        if _recovery_fingerprint_identity(checkpoint_fingerprint) != _recovery_fingerprint_identity(
+                fingerprint):
+            _refuse_recovery_identity()
+    elif checkpoint_fingerprint is not None and not (
+            isinstance(checkpoint_fingerprint, str) and checkpoint_fingerprint):
+        _refuse_recovery_identity()
+    if isinstance(fingerprint, dict):
+        if (not _digest_is_sha256(fingerprint.get("source_sha256"))
+                or not _digest_is_sha256(fingerprint.get("settings_sha256"))
+                or not isinstance(fingerprint.get("model_name"), str)
+                or not fingerprint["model_name"]):
+            _refuse_recovery_identity()
+        model = fingerprint["model_name"]
+        nested_binding = fingerprint.get("model_binding")
+        if isinstance(nested_binding, dict) and nested_binding.get("primary_model") != model:
+            _refuse_recovery_identity()
+        if isinstance(checkpoint_fingerprint, dict):
+            saved_binding = checkpoint_fingerprint.get("model_binding")
+            if (saved_binding is not None
+                    and (not isinstance(saved_binding, dict)
+                         or saved_binding.get("primary_model") != model)):
+                _refuse_recovery_identity()
+        binding = checkpoint.get("model_binding")
+        if binding is not None and (
+                not isinstance(binding, dict) or binding.get("primary_model") != model
+                or binding.get("failover_model") != spec.get('secondary_model')):
+            _refuse_recovery_identity()
+        telemetry = manifest.get("telemetry")
+        if isinstance(telemetry, dict) and telemetry.get("model_name") not in (None, model):
+            _refuse_recovery_identity()
+        if manifest.get("primary_model") not in (None, model):
+            _refuse_recovery_identity()
+        failed_cast = failed.get("cast_sha256")
+        if failed_cast is not None and not _digest_is_sha256(failed_cast):
+            _refuse_recovery_identity()
+        cast = telemetry.get("cast") if isinstance(telemetry, dict) else None
+        if cast is not None and not isinstance(cast, dict):
+            _refuse_recovery_identity()
+        manifest_cast = cast.get("sha256") if isinstance(cast, dict) else None
+        if manifest_cast is not None and not _digest_is_sha256(manifest_cast):
+            _refuse_recovery_identity()
+        if expected_pass == "attribute" and not pending_manifest:
+            if (failed_cast is None) != (manifest_cast is None) or (
+                    failed_cast is not None and failed_cast != manifest_cast):
+                _refuse_recovery_identity()
+            if failed_cast is None and get_file_sha256(get_run_cast_path()) is not None:
+                _refuse_recovery_identity()
+    progress = manifest.get("progress")
+    if not pending_manifest and (isinstance(checkpoint_fingerprint, dict) or progress is not None):
+        if (not isinstance(progress, dict) or progress.get("chunks_total") != chunk_count
+                or progress.get("chunks_attempted") != checkpoint.get("chunks_done")):
+            _refuse_recovery_identity()
+
+    manifest_fingerprint = manifest.get("fingerprint")
+    if isinstance(manifest_fingerprint, dict) and _recovery_fingerprint_identity(
+            manifest_fingerprint) != _recovery_fingerprint_identity(fingerprint):
+        _refuse_recovery_identity()
+    recovered = manifest.get("recovered_units")
+    if recovered is not None and (not isinstance(recovered, list)
+                                  or any(not isinstance(row, dict) or not row
+                                         for row in recovered)):
+        _refuse_recovery_identity()
+    if "attempts" in failed and (not isinstance(failed["attempts"], list)
+                                 or any(not isinstance(row, dict) for row in failed["attempts"])):
+        _refuse_recovery_evidence()
+
+    if isinstance(checkpoint.get("fingerprint"), dict):
+        # The failed unit must be derived from the admitted source and cursor, not
+        # from editable text in the checkpoint. The worker's own chunker is the
+        # authority for both the cursor and the exact pass-1 chunk text.
+        spec = recomputed['spec']
+        segmented = checkpoint.get('segmented')
+        named = checkpoint.get('named') or []
+        annotated = checkpoint.get('annotated') or []
+        admitted_chunks = _admitted_chunk_texts(prepared_text, spec)
+        _ensure_committed_segmentation(checkpoint, admitted_chunks)
+        if expected_pass == 'segment':
+            chunk = failed.get('chunk')
+            if type(chunk) is not int or not 1 <= chunk <= chunk_count:
+                _refuse_recovery_evidence()
+            if (chunk != checkpoint.get('chunks_done', 0) + 1
+                    or failed.get('source') != admitted_chunks[chunk - 1]):
+                _refuse_recovery_evidence()
+        else:
+            entries = failed.get('entries')
+            indices = failed.get('indices')
+            if (not isinstance(segmented, list) or not isinstance(entries, list)
+                    or not isinstance(indices, list) or len(indices) != len(entries)):
+                _refuse_recovery_evidence()
+            for index, entry in zip(indices, entries):
+                if (type(index) is not int or not 0 <= index < len(segmented)
+                        or not isinstance(entry, dict)):
+                    _refuse_recovery_evidence()
+                retained = segmented[index]
+                if (not isinstance(retained, dict) or retained.get('text') != entry.get('text')
+                        or (expected_pass == 'attribute'
+                            and retained.get('type') != entry.get('type'))):
+                    _refuse_recovery_evidence()
+            if not isinstance(named, list) or len(named) != len(segmented):
+                _refuse_recovery_evidence()
+            if expected_pass == 'instruct':
+                if not isinstance(annotated, list) or len(annotated) > len(named):
+                    _refuse_recovery_evidence()
+                if any(type(index) is not int or not 0 <= index < len(named) for index in indices):
+                    _refuse_recovery_evidence()
+                for position, index in enumerate(indices):
+                    retained = named[index]
+                    frozen_entry = entries[position]
+                    if retained is not None and (
+                            not isinstance(retained, dict)
+                            or retained.get('speaker') != frozen_entry.get('speaker')
+                            or retained.get('text') != frozen_entry.get('text')):
+                        _refuse_recovery_evidence()
+
+
+        # The admitted cast is part of run identity. A replaced cast file cannot
+        # silently change the roster a recovered batch is validated against.
+        admitted_cast = spec.get('cast_sha256')
+        if (failed.get('cast_sha256') is not None
+                and failed.get('cast_sha256') != admitted_cast):
+            _refuse_recovery_identity()
+        cast_path = get_run_cast_path()
+        live_cast = _get_regular_file_sha256(cast_path)
+        if live_cast != admitted_cast:
+            _refuse_recovery_identity()
+
+        # Manifest settlement: every representation of committed progress must
+        # agree with the checkpoint that is about to be advanced.
+        if isinstance(progress, dict):
+            expected_counts = {
+                'segmented_entries': len(segmented or []),
+                'attributed_entries': sum(isinstance(row, dict) for row in named),
+                'instructed_entries': sum(isinstance(row, dict) for row in annotated),
+            }
+            for key, actual in expected_counts.items():
+                if key in progress and progress[key] != actual:
+                    _refuse_recovery_identity()
+            if ('chunks_completed' in progress
+                    and (type(progress['chunks_completed']) is not int
+                         or progress['chunks_completed'] != checkpoint.get('chunks_done'))):
+                _refuse_recovery_identity()
+            chunks = manifest.get('chunks')
+            resolutions = checkpoint.get('resolutions') or []
+            if isinstance(chunks, list):
+                if len(chunks) != len(resolutions) or any(
+                        not isinstance(row, dict) or (
+                            row.get('resolution') != value
+                            and row.get('resolution') != 'pending')
+                        for row, value in zip(chunks, resolutions)):
+                    _refuse_recovery_identity()
+    return fingerprint, chunk_count, retry_only
+
+
+def ensure_pass2_evidence_shape(frozen, entries):
+    """No malformed saved row may reach the attribution gate as an AttributeError."""
+    if (not isinstance(frozen, list) or not frozen
+            or any(not isinstance(row, dict) or row.get("type") not in ("SPOKEN", "NARRATOR")
+                   or not isinstance(row.get("text"), str) or not row["text"] for row in frozen)
+            or not isinstance(entries, list) or len(entries) != len(frozen)
+            or any(not isinstance(row, dict) or type(row.get("n")) is not int
+                   or not isinstance(row.get("speaker"), str) for row in entries)):
+        _refuse_recovery_evidence()
+
+
+def ensure_recovery_selection_unchanged(admission_selection=None):
+    """Compare the saved selection with the one captured at initial admission.
+
+    Re-capturing at the write boundary would let an out-of-band generation
+    change replace both the book generation and the saved selection together.
+    A genuine legacy run has no selection at either point.
+    """
+    state = get_recovery_state()
+    saved = state.get("script_generation_selection")
+    if admission_selection is None:
+        if saved is None:
+            return
+        try:
+            admission_selection = capture_generation_selection(
+                DATA_DIR, state.get("input_file_path"))
+        except (OSError, ValueError):
+            _refuse_recovery_identity()
+    if saved != admission_selection:
+        raise AppError(409, 'The source or book selection changed since this recovery started; the checkpoint was preserved.',
+                       key='safety.generation.recovery_selection_changed')
+
+
+def get_pass2_recovery_source(checkpoint):
+    """Recover the full prepared source the live pass-2 gate read.
+
+    A fingerprinted checkpoint proves its source by the prepared-text digest in
+    its fingerprint. Rebuild that text through the run's own admitted source and
+    saved preparation options; the digest passed to get_prepared_source is the
+    RAW upload hash from the run's selection, not the prepared hash, so the
+    prepared digest is compared separately. Any mismatch, malformed evidence or
+    unsafe source is a stable 409 - never a silent downgrade. Only a checkpoint
+    with no fingerprint source digest uses the older segmented-slice evidence.
+    """
+    fingerprint = checkpoint.get("fingerprint")
+    if isinstance(fingerprint, dict) and "source_sha256" in fingerprint:
+        expected = fingerprint["source_sha256"]
+        if not _digest_is_sha256(expected):
+            _refuse_recovery_proof()
+        try:
+            state = get_recovery_state()
+            path, strip_front_matter = get_source_preparation(state)
+            raw = None
+            if "script_generation_selection" in state:
+                selection = state["script_generation_selection"]
+                raw = selection.get("source_sha256") if isinstance(selection, dict) else None
+                if (not _digest_is_sha256(raw)
+                        or selection.get("source_path") != path
+                        or not isinstance(selection.get("book_token"), str)
+                        or not selection["book_token"]):
+                    raise ValueError('incomplete run selection')
+            prepared, _report = get_prepared_source(
+                path, strip_front_matter, report=lambda message: None,
+                owning_root=DATA_DIR,
+                **({'expected_source_sha256': raw} if raw is not None else {}))
+            actual = hashlib.sha256(prepared.encode('utf-8')).hexdigest()
+        except (ValueError, OSError, UnicodeError, RecursionError, TypeError):
+            _refuse_recovery_proof()
+        if actual != expected:
+            _refuse_recovery_proof()
+        return prepared
+    failed = checkpoint["failed"]
+    segmented = checkpoint.get("segmented")
+    indices = failed.get("indices")
+    texts = None
+    if (isinstance(indices, list) and indices and isinstance(segmented, list)
+            and all(type(i) is int and 0 <= i < len(segmented)
+                    and isinstance(segmented[i], dict)
+                    and isinstance(segmented[i].get("text"), str)
+                    and segmented[i]["text"] for i in indices)):
+        texts = [segmented[i]["text"] for i in indices]
+    else:
+        entries = failed.get("entries")
+        if (isinstance(entries, list) and entries
+                and all(isinstance(entry, dict)
+                        and isinstance(entry.get("text"), str)
+                        and entry["text"] for entry in entries)):
+            texts = [entry["text"] for entry in entries]
+    if not texts:
+        _refuse_recovery_proof()
+    return "\n".join(texts)
+
+
+def get_pass2_recovery_destination(checkpoint, frozen, cast=None):
+    """The unique, in-range saved rows this batch may replace, checked before
+    any failed evidence is retired. A missing `indices` key is the one explicit
+    legacy shape: an all-empty named prefix maps consecutively from zero. A
+    present but partial, duplicated, boolean or out-of-range index is refused.
+    Where segmentation is present every destination must be covered by it and
+    retain the frozen text/type; a truncated or altered segmentation cannot make
+    those checks fall away. An occupied row is refused unless it is exactly the
+    writer's deterministic prefill for that entry.
+    """
+    failed = checkpoint["failed"]
+    named = checkpoint.get("named")
+    has_segmented = "segmented" in checkpoint
+    segmented = checkpoint.get("segmented")
+    if not isinstance(named, list) or (has_segmented and not isinstance(segmented, list)):
+        _refuse_recovery_destination()
+    if "indices" in failed:
+        indices = failed["indices"]
+        if (not isinstance(indices, list) or len(indices) != len(frozen)
+                or any(type(i) is not int or not 0 <= i < len(named) for i in indices)
+                or len(set(indices)) != len(indices)):
+            _refuse_recovery_destination()
+        destinations = list(indices)
+    else:
+        # The only shape supported without saved indices is a genuinely old
+        # run: no prepared-source proof, no segmentation to prove rows against,
+        # and an all-empty destination prefix. A fingerprinted or damaged
+        # checkpoint cannot fall into it by simply losing its indices.
+        fingerprint = checkpoint.get("fingerprint")
+        if ((isinstance(fingerprint, dict) and "source_sha256" in fingerprint)
+                or named and (len(named) != len(frozen)
+                              or any(row is not None for row in named))):
+            _refuse_recovery_destination()
+        destinations = list(range(len(frozen)))
+    for index, entry in zip(destinations, frozen):
+        retained = None
+        if has_segmented:
+            if not 0 <= index < len(segmented):
+                _refuse_recovery_destination()
+            retained = segmented[index]
+            if (not isinstance(retained, dict)
+                    or retained.get("text") != entry.get("text")
+                    or retained.get("type") != entry.get("type")):
+                _refuse_recovery_destination()
+        occupied = named[index] if index < len(named) else None
+        if occupied is not None:
+            allowed = (get_deterministic_named_entry(retained, cast)
+                       if has_segmented else None)
+            if occupied != allowed:
+                _refuse_recovery_destination()
+    return destinations
+
+
+def get_pass2_recovery_evidence(checkpoint):
+    """The live gate's source and cast inputs, recovered from the failed run.
+
+    The roster is established identity evidence, but only the cast the writer
+    bound to this failed batch supplies names/aliases that bypass the source
+    check. Current state alone is not run evidence: a missing, stale or replaced
+    cast never confers an exemption, and an unproven legacy cast cannot either.
+    """
+    failed = checkpoint["failed"]
+    raw_roster = failed.get("roster") or []
+    if not isinstance(raw_roster, list) or any(not isinstance(name, str) for name in raw_roster):
+        _refuse_recovery_evidence()
+    roster = [name for name in raw_roster if name]
+    cast = None
+    expected = failed.get("cast_sha256")
+    cast_path = get_run_cast_path()
+    if _digest_is_sha256(expected) and expected == _get_regular_file_sha256(cast_path):
+        try:
+            from three_pass_generate import load_cast
+            parsed = load_cast(cast_path)
+        except (OSError, ValueError, UnicodeError):
+            parsed = None
+        # Bind the parsed aliases to the bytes actually read; a replacement
+        # between the hash and the reread cannot confer an exemption.
+        if parsed is not None and parsed.get("sha256") == expected:
+            cast = parsed
+    return {"source_text": get_pass2_recovery_source(checkpoint),
+            "known_names": set((cast or {}).get("known_names") or ()),
+            "established_names": roster,
+            "speaker_aliases": dict((cast or {}).get("alias_to_name") or {}),
+            "cast": cast}
+
+
+def _recovery_boundary_guard(snapshot):
+    """Read-only, idempotent publication guard over the admission snapshot."""
+    def guard():
+        if not isinstance(snapshot, dict):
+            return
+        state = get_recovery_state()
+        receipt = _load_recovery_receipt(state)
+        if snapshot.get('receipt_sha256') is None:
+            if receipt is not None:
+                _refuse_recovery_identity()
+        elif receipt is None or receipt.get('sha256') != snapshot['receipt_sha256']:
+            _refuse_recovery_identity()
+        if state.get('book_generation') != snapshot.get('book_generation'):
+            _refuse_recovery_identity()
+        if state.get('script_generation_selection') != snapshot.get('selection'):
+            _refuse_recovery_identity()
+        source_path = state.get('input_file_path')
+        if source_path != snapshot.get('source_path'):
+            _refuse_recovery_identity()
+        if ('options' in snapshot
+                and state.get('script_generation_options') != snapshot['options']):
+            _refuse_recovery_identity()
+        if 'config_sha256' in snapshot:
+            try:
+                config_digest = hashlib.sha256(
+                    Path(CONFIG_PATH).read_bytes()).hexdigest()
+            except OSError:
+                config_digest = None
+            if config_digest != snapshot['config_sha256']:
+                _refuse_recovery_identity()
+        if 'source_sha256' in snapshot and _get_regular_file_sha256(source_path) != snapshot['source_sha256']:
+            _refuse_recovery_identity()
+        if 'cast_sha256' in snapshot and _get_regular_file_sha256(
+                get_run_cast_path()) != snapshot['cast_sha256']:
+            _refuse_recovery_identity()
+        if 'task_running' in snapshot and is_task_running('script', process_state) != snapshot['task_running']:
+            _refuse_recovery_identity()
+    return guard
+
+
+def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None,
+                          *, pass_fallback=False, admission_selection=None,
+                          admission_snapshot=None):
     """Accept hand-supplied output for the failed unit through the SAME gate
     the pass uses - pass 1: a [{type, text}] segmentation of the chunk;
     pass 2: [{n, speaker}] for the batch - and advance the checkpoint past it
     so Retry resumes at the next unit. Returns the gate report on refusal
-    (caller -> 422)."""
+    (caller -> 422). `pass_fallback` marks the Skip route's direction-less
+    default-instruct rows, which are validated and stored in off mode even for
+    a directed run; an injected row always uses the failed run's direction."""
     with ensure_book_state(DATA_DIR), file_lock(three_pass_checkpoint_path(SCRIPT_PATH)):
+        if get_fenced_recovery_status(DATA_DIR) is not None:
+            _refuse_cast_invalidated_recovery()
         if is_task_running("script", process_state):
             raise HTTPException(status_code=409, detail="Script generation is running.")
         checkpoint = _load_failed_checkpoint(locked=True)
@@ -3040,27 +4619,52 @@ def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
                 and get_script_recovery_token(checkpoint) != expected_checkpoint_token):
             raise HTTPException(status_code=409,
                                 detail="The failed generation unit changed; reload recovery before applying a decision.")
+        manifest = get_script_recovery_manifest()
+        if manifest is None:
+            raise AppError(409, 'Recovery manifest changed; reload recovery.',
+                           key='safety.generation.recovery_manifest_changed')
+        fingerprint, chunk_count, _ = ensure_recovery_identity_pair(
+            checkpoint, manifest, get_recovery_state())
+        ensure_recovery_selection_unchanged(admission_selection)
         failed = checkpoint["failed"]
         if failed.get("pass") == "attribute":
             frozen = failed.get("entries") or []
-            report = validate_attribution(frozen, entries, None)
+            ensure_pass2_evidence_shape(frozen, entries)
+            evidence = get_pass2_recovery_evidence(checkpoint)
+            report = validate_attribution(
+                frozen, entries, evidence["source_text"],
+                known_names=evidence["known_names"],
+                established_names=evidence["established_names"],
+                speaker_aliases=evidence["speaker_aliases"])
             if not report.get("passed"):
                 return {"accepted": False, "report": report}
-            by_n = {int(e["n"]): e for e in entries}
-            bound = [{k: v for k, v in f.items() if k != "type"} | {"speaker": by_n[i]["speaker"]}
-                     for i, f in enumerate(frozen)]
-            bound = stabilize_speaker_identities(bound, established_speakers=failed.get("roster") or [])["entries"]
+            destinations = get_pass2_recovery_destination(checkpoint, frozen, cast=evidence["cast"])
+            ordered = index_head_check(frozen, entries)[2]
+            bound = get_named_from_answer(frozen, ordered, cast=evidence["cast"],
+                                          speaker_traits=False)
+            bound = stabilize_speaker_identities(
+                bound, established_speakers=evidence["established_names"])["entries"]
+            segmented = checkpoint.get("segmented")
+            if isinstance(segmented, list):
+                for position, index in enumerate(destinations):
+                    if 0 <= index < len(segmented) and isinstance(segmented[index], dict):
+                        deterministic = get_deterministic_named_entry(
+                            segmented[index], evidence["cast"])
+                        if deterministic is not None:
+                            bound[position] = deterministic
             named = list(checkpoint.get("named") or [])
-            for index, entry in zip(failed.get("indices") or [], bound):
+            for index, entry in zip(destinations, bound):
                 while len(named) <= index:
                     named.append(None)
                 named[index] = entry
             checkpoint["named"] = named
             checkpoint["stage"] = "attribute"
-            unit = {"batch_indices": failed.get("indices") or []}
+            ensure_recovered_checkpoint_shape(checkpoint, fingerprint, chunk_count)
+            unit = {"batch_indices": destinations}
         elif failed.get("pass") == "instruct":
             frozen = failed.get("entries") or []
-            report = validate_instruct(frozen, entries)
+            direction = "off" if pass_fallback else failed.get("delivery_direction", "off")
+            report = validate_instruct(frozen, entries, delivery_direction=direction)
             if not report.get("passed"):
                 return {"accepted": False, "report": report}
             by_n = {int(e["n"]): e for e in entries}
@@ -3070,7 +4674,7 @@ def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
                 while len(annotated) <= index:
                     annotated.append(None)
                 base = named[index] if index < len(named) and isinstance(named[index], dict) else frozen[position]
-                annotated[index] = {**base, "instruct": by_n[position]["instruct"]}
+                annotated[index] = get_directed_entry(base, by_n[position], direction)
             checkpoint["annotated"] = annotated
             checkpoint["stage"] = "instruct"
             unit = {"batch_indices": failed.get("indices") or []}
@@ -3079,7 +4683,10 @@ def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
                 failed["source"], entries,
                 quoted_must_be_spoken=failed.get("quoted_must_be_spoken", True),
                 unquoted_must_be_narrator=failed.get("unquoted_must_be_narrator", True))
-            if not report.get("passed"):
+            # A dropped run of words (#1921) triggers retries during generation;
+            # a pasted recovery reply with only that finding is accepted as before.
+            if not report.get("passed") and {
+                    finding.get("code") for finding in report.get("findings") or []} != {"missing_source_run"}:
                 return {"accepted": False, "report": report}
             checkpoint["segmented"] = list(checkpoint.get("segmented") or []) + [
                 {"type": e["type"], "text": e["text"]} for e in entries]
@@ -3094,11 +4701,36 @@ def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
             unit = {"chunk": failed["chunk"]}
         checkpoint["failed"] = None
         manifest_path = three_pass_manifest_path(SCRIPT_PATH)
-        manifest = get_script_recovery_manifest()
-        if manifest is None:
-            raise HTTPException(status_code=409, detail="Recovery manifest changed; reload recovery.")
         manifest["status"] = "incomplete"
         manifest.pop("failed_chunk", None)
+        manifest.pop("failed_pass", None)
+        progress = manifest.get("progress")
+        if isinstance(progress, dict):
+            progress["segmented_entries"] = len(checkpoint.get("segmented") or [])
+            progress["attributed_entries"] = sum(
+                isinstance(row, dict) for row in checkpoint.get("named") or [])
+            progress["instructed_entries"] = sum(
+                isinstance(row, dict) for row in checkpoint.get("annotated") or [])
+            progress["chunks_attempted"] = checkpoint["chunks_done"]
+            progress["chunks_completed"] = checkpoint["chunks_done"]
+            resolutions_now = checkpoint.get("resolutions") or []
+            chunks_now = manifest.get("chunks")
+            if isinstance(chunks_now, list):
+                for position, resolution_value in enumerate(resolutions_now, start=1):
+                    if position <= len(chunks_now) and isinstance(chunks_now[position - 1], dict):
+                        chunks_now[position - 1]["resolution"] = resolution_value
+            try:
+                live_state = get_recovery_state()
+                source_path_now, strip_now = get_source_preparation(live_state)
+                prepared_now, _ = get_prepared_source(
+                    source_path_now, strip_now, owning_root=DATA_DIR)
+                admitted_chunks = _admitted_chunk_texts(prepared_now)
+                progress['source_words_completed'] = sum(
+                    len(_source_words(admitted_chunks[index]))
+                    for index, resolution_value in enumerate(resolutions_now)
+                    if resolution_value != 'fail' and index < len(admitted_chunks))
+            except (OSError, ValueError, TypeError, RecursionError):
+                pass
         manifest["recovered_units"] = (manifest.get("recovered_units") or []) + [
             {**unit, "pass": failed.get("pass"), "resolution": resolution}]
         replacements = {
@@ -3108,7 +4740,18 @@ def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
                                 (manifest_path, manifest))}
         removals = [os.path.relpath(path, DATA_DIR) for path in
                     get_generation_checkpoint_artifacts(three_pass_checkpoint_path(SCRIPT_PATH))[1:]]
-        apply_book_state_locked(DATA_DIR, replacements, removals)
+        ensure_recovery_selection_unchanged(admission_selection)
+        if admission_selection is not None:
+            live_state = get_recovery_state()
+            try:
+                live_selection = capture_generation_selection(
+                    DATA_DIR, live_state.get("input_file_path"))
+            except (OSError, ValueError):
+                _refuse_recovery_identity()
+            if live_selection != admission_selection:
+                _refuse_recovery_identity()
+        apply_book_state_locked(DATA_DIR, replacements, removals,
+                                before_replace=_recovery_boundary_guard(admission_snapshot))
     return {"accepted": True, **unit, "chunks_done": checkpoint["chunks_done"],
             "resolution": resolution}
 
@@ -3116,7 +4759,7 @@ def apply_manual_recovery(entries, resolution, expected_checkpoint_token=None):
 class InjectSegmentationRequest(BaseModel):
     # pass 1: `chunk` + entries [{type, text}]; pass 2: entries [{n, speaker}]
     chunk: Optional[int] = None
-    entries: List[Dict]
+    entries: List[Any]
 
 
 class SkipChunkRequest(BaseModel):
@@ -3124,7 +4767,10 @@ class SkipChunkRequest(BaseModel):
 
 
 def _require_failed_unit(chunk):
-    checkpoint = ensure_failed_checkpoint()
+    """Capture checkpoint, manifest and live selection in one book-locked cut."""
+    fenced, checkpoint = get_recovery_admission()
+    if fenced is not None:
+        _refuse_cast_invalidated_recovery()
     if checkpoint is None:
         raise HTTPException(status_code=409,
                             detail="No failed generation unit is waiting for recovery.")
@@ -3132,13 +4778,37 @@ def _require_failed_unit(chunk):
     if failed.get("pass") == "segment" and int(failed["chunk"]) != int(chunk or -1):
         raise HTTPException(status_code=409,
                             detail=f"The failed chunk is {failed['chunk']}, not {chunk}.")
-    return checkpoint
+    state = get_recovery_state()
+    admission_selection = None
+    if "script_generation_selection" in state:
+        try:
+            admission_selection = capture_generation_selection(
+                DATA_DIR, state.get("input_file_path"))
+        except (OSError, ValueError):
+            _refuse_recovery_identity()
+    receipt = _load_recovery_receipt(state)
+    try:
+        config_digest = hashlib.sha256(Path(CONFIG_PATH).read_bytes()).hexdigest()
+    except OSError:
+        config_digest = None
+    snapshot = {'receipt_sha256': receipt['sha256'] if receipt else None,
+                'book_generation': state.get('book_generation'),
+                'source_path': state.get('input_file_path'),
+                'selection': admission_selection,
+                'options': state.get('script_generation_options'),
+                'config_sha256': config_digest,
+                'source_sha256': _get_regular_file_sha256(state.get('input_file_path')),
+                'cast_sha256': _get_regular_file_sha256(get_run_cast_path()),
+                'task_running': is_task_running('script', process_state)}
+    return checkpoint, admission_selection, snapshot
 
 
 @router.get("/api/generate_script/recovery/detail")
 async def generate_script_recovery_detail():
     """The failed chunk in full: attempts, source, prompt, retry profile."""
-    checkpoint = await asyncio.to_thread(ensure_failed_checkpoint)
+    fenced, checkpoint = await asyncio.to_thread(get_recovery_admission)
+    if fenced is not None:
+        return fenced
     if checkpoint is None:
         return {"recoverable": False}
     return {"recoverable": True, **build_recovery_detail(checkpoint)}
@@ -3149,21 +4819,36 @@ async def generate_script_inject(request: InjectSegmentationRequest):
     """Manual output injection (#522 s4.4): a pasted [{type, text}]
     segmentation for a failed pass-1 chunk, or [{n, speaker}] for a failed
     pass-2 batch, validated by the pass's own gate."""
-    checkpoint = await asyncio.to_thread(_require_failed_unit, request.chunk)
+    checkpoint, admission_selection, admission_snapshot = await asyncio.to_thread(_require_failed_unit, request.chunk)
     entries = []
     failed_pass = checkpoint["failed"].get("pass")
     if failed_pass in ("attribute", "instruct"):
         field = "speaker" if failed_pass == "attribute" else "instruct"
+        direction = (checkpoint["failed"].get("delivery_direction", "off")
+                     if failed_pass == "instruct" else "off")
+        needs_field = direction not in ("directed", "action_only")
         for i, e in enumerate(request.entries):
-            value = (str(e.get(field) or "")).strip()
-            if not isinstance(e.get("n"), int) or not value:
+            if (not isinstance(e, dict) or type(e.get("n")) is not int
+                    or e.get(field) is not None and not isinstance(e.get(field), str)):
+                _refuse_recovery_evidence()
+            value = (e.get(field) or "").strip()
+            if needs_field and not value:
                 raise HTTPException(status_code=422,
                                     detail=f"Entry {i + 1}: needs an integer n and a non-empty {field}.")
-            entries.append({"n": e["n"], field: value})
+            entry = {"n": e["n"]}
+            if value or needs_field:
+                entry[field] = value
+            if failed_pass == "instruct":
+                entry.update({key: e[key] for key in ("gap", "action", "delivery", "answers")
+                              if key in e})
+            entries.append(entry)
     else:
         for i, e in enumerate(request.entries):
-            kind = (str(e.get("type") or "")).strip().upper()
-            text = (str(e.get("text") or "")).strip()
+            if (not isinstance(e, dict) or not isinstance(e.get("type"), str)
+                    or not isinstance(e.get("text"), str)):
+                _refuse_recovery_evidence()
+            kind = e["type"].strip().upper()
+            text = e["text"].strip()
             if kind not in ("NARRATOR", "SPOKEN") or not text:
                 raise HTTPException(status_code=422,
                                     detail=f"Entry {i + 1}: type must be NARRATOR or SPOKEN and text non-empty.")
@@ -3171,7 +4856,8 @@ async def generate_script_inject(request: InjectSegmentationRequest):
     if not entries:
         raise HTTPException(status_code=422, detail="No entries supplied.")
     result = await asyncio.to_thread(apply_manual_recovery, entries, "manual",
-                                     get_script_recovery_token(checkpoint))
+                                     get_script_recovery_token(checkpoint), admission_selection=admission_selection,
+                                     admission_snapshot=admission_snapshot)
     if not result["accepted"]:
         raise HTTPException(status_code=422, detail={
             "message": "The segmentation does not pass the fidelity gate.",
@@ -3187,7 +4873,7 @@ async def generate_script_skip(request: SkipChunkRequest):
     so every word stays and quoted lines are still SPOKEN. Pass 2: the batch's
     spoken lines are labelled UNKNOWN - the fallback the run refused to apply
     on its own because the LLM was unavailable, now applied by the user."""
-    checkpoint = await asyncio.to_thread(_require_failed_unit, request.chunk)
+    checkpoint, admission_selection, admission_snapshot = await asyncio.to_thread(_require_failed_unit, request.chunk)
     failed = checkpoint["failed"]
     if failed.get("pass") == "attribute":
         entries = [{"n": i, "speaker": "NARRATOR" if e.get("type") == "NARRATOR" else "UNKNOWN"}
@@ -3201,7 +4887,9 @@ async def generate_script_skip(request: SkipChunkRequest):
                    for r in split_outer_quote_regions(failed["source"])
                    if r.get("text", "").strip()]
     result = await asyncio.to_thread(apply_manual_recovery, entries, "narrated_as_is",
-                                     get_script_recovery_token(checkpoint))
+                                     get_script_recovery_token(checkpoint), pass_fallback=True,
+                                      admission_selection=admission_selection,
+                                      admission_snapshot=admission_snapshot)
     if not result["accepted"]:
         raise HTTPException(status_code=422, detail={
             "message": "Even the deterministic split does not pass the fidelity gate; "
@@ -3210,11 +4898,20 @@ async def generate_script_skip(request: SkipChunkRequest):
     return result
 
 
-@router.post("/api/generate_script/retry")
+def _read_script_retry_state():
+    with ensure_book_state(DATA_DIR):
+        return safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
+
+
+@router.post("/api/generate_script/retry", response_model=ScriptGenerationAdmission)
 async def retry_generate_script(background_tasks: BackgroundTasks,
                                 request: Optional[GenerateScriptRequest] = None):
     """Resume the current failed three-pass run from its durable checkpoint."""
-    state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
+    try:
+        state = await asyncio.to_thread(_read_script_retry_state)
+    except (TimeoutError, OSError, ValueError) as error:
+        _raise_script_book_fault(error)
+        raise
     input_file = state.get("input_file_path") if isinstance(state, dict) else None
     if not input_file:
         raise HTTPException(status_code=400, detail="No input file found for recovery")
@@ -3229,77 +4926,116 @@ async def retry_generate_script(background_tasks: BackgroundTasks,
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=409,
                                 detail="Saved recovery settings are invalid; start a new run.") from exc
-    return await asyncio.to_thread(start_script_generation, background_tasks, input_file, request,
-                                   require_recovery=True)
+    return await _start_script_generation_for_route(background_tasks, input_file, request,
+                                                    require_recovery=True)
+
+class CancelScriptRequest(BaseModel):
+    expected_claim_id: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{32}$')
+
 
 @router.post("/api/generate_script/cancel")
-async def generate_script_cancel():
-    return await asyncio.to_thread(_cancel_script_generation_sync)
+async def generate_script_cancel(request: Optional[CancelScriptRequest] = None):
+    return await asyncio.to_thread(_cancel_script_generation_sync,
+                                   request.expected_claim_id if request else None)
 
 
-def _cancel_script_generation_sync():
+def _refuse_script_cancel_owner_changed():
+    raise AppError(409, 'This task is not the current script generation; check its activity before cancelling.',
+                   key='safety.generation.cancel_owner_changed')
+
+
+def _cancel_script_generation_sync(expected_claim_id=None):
     """Revoke this generation before signalling its worker, or report commit."""
     import core
     state_path = os.path.join(DATA_DIR, 'state.json')
     try:
-        with ensure_book_state(DATA_DIR), file_lock(state_path), core._gpu_lock:
-            task = process_state['script']
-            if not task.get('running'):
-                raise HTTPException(status_code=400, detail='No script generation is currently running.')
-            owner = core._task_claims.get('script')
-            state = safe_load_json(state_path, default={})
-            if not isinstance(state, dict):
-                raise ValueError('Book state is invalid')
-            if owner is None and not state.get('script_generation_run_id'):
-                # Compatibility for a legacy in-memory task without a claim.
-                return _cancel_task('script', 'No script generation is currently running.',
-                                    'Script generation process already exited.')
-            owner_id = owner.get('id') if owner else None
-            if owner_id and state.get('script_generation_published_run_id') == owner_id:
-                # Publication won, but the child or its descendants may still
-                # be running. Stop their cleanup without calling the committed
-                # script cancelled in the task's final status.
-                task['_script_published_cleanup_stop'] = True
-                try:
-                    stopped = _cancel_task('script', 'No script generation is currently running.',
-                                           'Script generation process already exited.')
-                except HTTPException as error:
-                    process = task.get('process')
-                    if (error.status_code != 400 or error.detail != 'Script generation process already exited.'
-                            or sys.platform != 'win32' or process is None
-                            or getattr(process, '_alexandria_windows_owner', None) is None):
-                        raise HTTPException(status_code=409, detail=(
-                            'The script was already published, but stopping its worker was not confirmed. '
-                            'Check task activity.')) from error
-                    from windows_subprocess_job import WindowsJobClosedError
-                    try:
-                        core.terminate_windows_process_tree(process, force=True)
-                    except WindowsJobClosedError:
-                        # A published owner is exposed only after admission;
-                        # its normal close waits for zero job membership.
-                        return {'status': 'published_cleanup_stop', 'worker': 'already stopped'}
-                    except OSError as force_error:
-                        raise HTTPException(status_code=409, detail=(
-                            'The script was already published, but stopping its worker was not confirmed. '
-                            'Check task activity.')) from force_error
-                    # The owner retains the job until the kernel confirms exit.
-                    return {'status': 'published_cleanup_stop_requested',
-                            'worker': 'force stop requested'}
-                return {'status':'published_cleanup_stop', 'worker':stopped['status']}
-            if not owner_id or state.get('script_generation_run_id') != owner_id:
-                raise HTTPException(status_code=409, detail=(
-                    'This task is not the current script generation; check its activity before cancelling.'))
-            state['script_generation_cancel_requested_run_id'] = owner_id
-            atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
-            stopped = _cancel_task('script', 'No script generation is currently running.',
-                                   'Script generation process already exited.')
-            state.pop('script_generation_run_id', None)
-            state.pop('script_generation_cancel_requested_run_id', None)
-            atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
-            return stopped
+        with book_operator_locked(DATA_DIR) as (root, identity):
+            with core._gpu_lock:
+                owner = core._task_claims.get('script')
+                owner_id = owner['id'] if owner else None
+                if expected_claim_id is not None and expected_claim_id != owner_id:
+                    _refuse_script_cancel_owner_changed()
+                if owner_id and process_state['script'].get('running') and cancel_book_worker_handoff_locked(
+                        root, owner_id, for_restart=expected_claim_id is not None):
+                    return _cancel_task('script', 'No script generation is currently running.',
+                                        'Script generation process already exited.')
+            recover_book_state_locked(root, expected_root=root, expected_root_identity=identity)
+            with file_lock(state_path), core._gpu_lock:
+                return _cancel_admitted_script(expected_claim_id, state_path)
     except (OSError, ValueError, TimeoutError) as error:
         raise HTTPException(status_code=409, detail=(
             'Cancellation could not be safely recorded; check the task state before trying again.')) from error
+
+
+def _cancel_admitted_script(expected_claim_id, state_path):
+    import core
+    task = process_state['script']
+    owner = core._task_claims.get('script')
+    owner_id = owner.get('id') if owner else None
+    if expected_claim_id is not None and expected_claim_id != owner_id:
+        _refuse_script_cancel_owner_changed()
+    if not task.get('running'):
+        raise HTTPException(status_code=400, detail='No script generation is currently running.')
+    state = safe_load_json(state_path, default={})
+    if not isinstance(state, dict):
+        raise ValueError('Book state is invalid')
+    # Bind consent to the admitted source, before or after publication.
+    # Legacy tasks without selection proof can still be cancelled.
+    selection = state.get('script_generation_selection')
+    restart_grant = {'claim_id': owner_id, 'selection': selection} if (
+        expected_claim_id is not None and isinstance(selection, dict)) else None
+    if owner is None and not state.get('script_generation_run_id'):
+        # Compatibility for a legacy in-memory task without a claim.
+        return _cancel_task('script', 'No script generation is currently running.',
+                            'Script generation process already exited.')
+    if owner_id and state.get('script_generation_published_run_id') == owner_id:
+        # Publication won, but the child or its descendants may still
+        # be running. Stop their cleanup without calling the committed
+        # script cancelled in the task's final status.
+        task['_script_published_cleanup_stop'] = True
+        try:
+            stopped = _cancel_task('script', 'No script generation is currently running.',
+                                   'Script generation process already exited.')
+        except HTTPException as error:
+            process = task.get('process')
+            if (error.status_code != 400 or error.detail != 'Script generation process already exited.'
+                    or sys.platform != 'win32' or process is None
+                    or getattr(process, '_alexandria_windows_owner', None) is None):
+                raise HTTPException(status_code=409, detail=(
+                    'The script was already published, but stopping its worker was not confirmed. '
+                    'Check task activity.')) from error
+            from windows_subprocess_job import WindowsJobClosedError
+            try:
+                core.terminate_windows_process_tree(process, force=True)
+            except WindowsJobClosedError:
+                # A published owner is exposed only after admission;
+                # its normal close waits for zero job membership.
+                stopped = {'status': 'published_cleanup_stop', 'worker': 'already stopped'}
+            except OSError as force_error:
+                raise HTTPException(status_code=409, detail=(
+                    'The script was already published, but stopping its worker was not confirmed. '
+                    'Check task activity.')) from force_error
+            else:
+                # The owner retains the job until the kernel confirms exit.
+                stopped = {'status': 'published_cleanup_stop_requested',
+                           'worker': 'force stop requested'}
+        else:
+            stopped = {'status': 'published_cleanup_stop', 'worker': stopped['status']}
+        if restart_grant is not None:
+            state[_SCRIPT_RESTART_GRANT] = restart_grant
+            atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
+        return stopped
+    if not owner_id or state.get('script_generation_run_id') != owner_id:
+        _refuse_script_cancel_owner_changed()
+    state['script_generation_cancel_requested_run_id'] = owner_id
+    atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
+    stopped = _cancel_task('script', 'No script generation is currently running.',
+                           'Script generation process already exited.')
+    state.pop('script_generation_run_id', None)
+    if restart_grant is not None:
+        state[_SCRIPT_RESTART_GRANT] = restart_grant
+    atomic_json_write(state, state_path, allow_nonatomic_fallback=False)
+    return stopped
 
 
 
@@ -3318,7 +5054,26 @@ async def generate_script_resume():
 @router.post("/api/review_script")
 async def review_script(background_tasks: BackgroundTasks, request: Optional[ReviewRequest] = None):
     """Review the current annotated script. Accepts empty POST or JSON body."""
-    return await asyncio.to_thread(_with_published_script, _start_review_script, background_tasks, request)
+    return await asyncio.to_thread(_with_review_startup, "review", _with_review_admission, _start_review_script, background_tasks, request)
+
+
+def _get_review_startup_path(task_name):
+    return os.path.join(os.path.dirname(_task_log_path(task_name)), task_name + '-startup.log')
+
+
+def _with_review_startup(task_name, callback, *args):
+    path = _get_review_startup_path(task_name)
+    return ReviewStartupTrace(path).call('admission', callback, *args)
+
+
+def _with_review_admission(callback, *args):
+    check_global_gpu_lock('review')
+    claim_id = reserve_background_task('review')
+    try:
+        return _with_published_script(callback, *args, claim_id)
+    except BaseException:
+        release_gpu_task_claim('review', claim_id, pending_only=True)
+        raise
 
 
 def _with_published_script(callback, *args):
@@ -3327,7 +5082,8 @@ def _with_published_script(callback, *args):
 
 
 def _require_published_script():
-    with ensure_book_state(DATA_DIR):
+    from book_state_transaction import reuse_book_state
+    with reuse_book_state(DATA_DIR):
         _require_published_selection()
         if not os.path.exists(SCRIPT_PATH):
             raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
@@ -3341,6 +5097,12 @@ def _require_published_selection():
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+def _run_review_worker(command, task_name, trace):
+    if trace is None:
+        return _run_published_script_process(command, task_name)
+    return trace.call('worker', _run_published_script_process, command, task_name)
+
+
 def _run_published_script_process(command, task_name):
     # Recheck after task ownership is claimed to close the admission race.
     try:
@@ -3350,65 +5112,138 @@ def _run_published_script_process(command, task_name):
         state['status'] = 'failed'
         state['return_code'] = 1
         state['logs'] = [f"Task {task_name} could not start: {error.detail}"]
+        from review_startup import event
+        event('publication_recheck_failed', error=error)
         return 1
     return run_process(command, task_name)
 
 
-def _start_review_script(background_tasks, request):
+def _start_review_script(background_tasks, request, claim_id):
     if request is None:
         request = ReviewRequest()  # Use defaults
 
-    check_global_gpu_lock("review")
-
     cmd = [sys.executable, "-u", "review_script.py"]
-    cmd += get_review_force_args(request.force_review)
+    cmd += get_review_force_args(request.force_review or request.start_over)
     if request.dedupe_speakers:
         cmd += ["--dedupe-speakers", "--remap-voice-config", VOICE_CONFIG_PATH,
                 "--alias-registry", CHARACTER_ALIASES_PATH]
-    schedule_claimed_background_task(background_tasks, "review", _run_published_script_process, cmd, "review")
+    _schedule_review_start(background_tasks, request, cmd, claim_id)
     return {"status": "started", "dedupe_speakers": request.dedupe_speakers}
+
+
+def _require_review_restart_book(request):
+    from book_state_transaction import get_book_operation_token
+    if not request.book_token or request.book_token != get_book_operation_token(DATA_DIR):
+        raise AppError(409, (
+            'The book changed or Start over was not confirmed. '
+            'Review the current book and confirm again; saved progress was preserved.'),
+            key='safety.review.restart_book_changed')
+
+
+def discard_review_progress(output_path):
+    """Retire review-owned progress only; never rewrite the current script."""
+    from completed_review_receipt import get_review_progress_paths, remove_completed_review_receipt
+    from review_startup import event
+    checkpoint_path = get_review_progress_paths(output_path)[0]
+    checkpoint_discarded = False
+    try:
+        with file_lock(checkpoint_path):
+            remove_generation_shard_checkpoint(checkpoint_path, locked=True)
+            checkpoint_discarded = True
+            remove_completed_review_receipt(output_path)
+    except Exception as error:
+        event('checkpoint_discard_failed', error=error)
+        if checkpoint_discarded:
+            raise AppError(409, (
+                "The review checkpoint was discarded, but the completed-review receipt was kept "
+                "because it could not be removed; the new review didn't start. The script and edits "
+                "were kept. Enable the option to review again even if nothing changed, then "
+                "Start Review to begin from batch 1."), key='error.review.restart_receipt_discard_failed') from error
+        raise AppError(409, (
+            "Review checkpoint cleanup failed; some progress may already have been discarded. "
+            "The completed-review receipt, script and edits were kept, and the new review didn't "
+            "start. Check the review log before retrying; progress may need further cleanup "
+            "before starting from batch 1."),
+            key='error.review.restart_discard_failed') from error
+    event('checkpoint_discarded')
+
+
+def _schedule_review_start(background_tasks, request, command, claim_id):
+    if not request.start_over:
+        return register_claimed_background_task(background_tasks, 'review', claim_id,
+            _run_review_worker, command, 'review', REVIEW_STARTUP.get())
+    progress_discarded = False
+    try:
+        with ensure_book_state(DATA_DIR):
+            _require_review_restart_book(request)
+            _require_published_script()
+            discard_review_progress(SCRIPT_PATH)
+            progress_discarded = True
+            return register_claimed_background_task(background_tasks, 'review', claim_id,
+                _run_review_worker, command, 'review', REVIEW_STARTUP.get())
+    except BaseException as error:
+        if progress_discarded and isinstance(error, Exception):
+            from review_startup import event
+            event('restart_registration_failed', error=error)
+            if isinstance(error, HTTPException) and error.detail == 'Task reservation is no longer active':
+                raise AppError(error.status_code, (
+                    "Review progress (checkpoint and completed-review receipt) was discarded, but "
+                    "the new review didn't start because its task reservation is no longer active. "
+                    "The script and edits were kept. Start Review to begin from batch 1."),
+                    key='error.review.restart_reservation_lost') from error
+            raise AppError(error.status_code if isinstance(error, HTTPException) else 500, (
+                "Review progress (checkpoint and completed-review receipt) was discarded, but the "
+                "new review didn't start because its background task could not be registered. "
+                "The script and edits were kept. Check the review log, then Start Review to begin "
+                "from batch 1."), key='error.review.restart_start_failed') from error
+        raise
 
 @router.post("/api/review_script_contextual")
 async def review_script_contextual(request: ContextualReviewRequest, background_tasks: BackgroundTasks):
-    return await asyncio.to_thread(_with_published_script, _start_contextual_review, request, background_tasks)
+    return await asyncio.to_thread(_with_review_startup, "review", _with_review_admission, _start_contextual_review, request, background_tasks)
 
 
-def _start_contextual_review(request, background_tasks):
+def _start_contextual_review(request, background_tasks, claim_id):
 
-    check_global_gpu_lock("review")
-
-    window_size = max(1, min(int(request.window_size or 4), 12))
+    context_mode, window_size = get_validated_context_setting(
+        request.context_mode, request.window_size, DEFAULT_CONTEXT_ENTRIES)
+    entries = []
     total_entries = 0
     try:
         with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
-            total_entries = len(json.load(f))
+            loaded_entries = json.load(f)
+        if isinstance(loaded_entries, list):
+            entries = loaded_entries
+        total_entries = len(loaded_entries)
     except (json.JSONDecodeError, ValueError, OSError) as e:
         _warn_corrupted_json("script", SCRIPT_PATH, "estimated_calls will read 0", e)
         total_entries = 0
 
     review_batch_size = 25
+    estimated_calls = ceil(total_entries / review_batch_size) if total_entries else 0
     try:
         cfg = load_app_config(CONFIG_PATH)
         generation = cfg.get("generation") or {}
-        review_batch_size = max(1, int(generation.get("review_batch_size", 25)))
+        review_batch_size, _ = get_review_batching(generation)
+        if entries:
+            estimated_calls = len(get_review_entry_windows(entries, generation))
     except (ValueError, TypeError) as e:
-        _warn_corrupted_json("config", CONFIG_PATH, "using default review_batch_size", e)
-
-    estimated_calls = ceil(total_entries / review_batch_size) if total_entries else 0
-    cmd = [sys.executable, "-u", "review_script.py", "--context-window", str(window_size)]
-    cmd += get_review_force_args(request.force_review)
+        _warn_corrupted_json("config", CONFIG_PATH, "using default review batching", e)
+    cmd = [sys.executable, "-u", "review_script.py"]
+    if context_mode == CONTEXT_MODE_CHARS:
+        cmd += ["--context-chars", str(window_size)]
+    else:
+        cmd += ["--context-window", str(window_size)]
+    cmd += get_review_force_args(request.force_review or request.start_over)
     if request.dedupe_speakers:
         cmd += ["--dedupe-speakers", "--remap-voice-config", VOICE_CONFIG_PATH,
                 "--alias-registry", CHARACTER_ALIASES_PATH]
-    schedule_claimed_background_task(background_tasks, "review",
-        _run_published_script_process,
-        cmd,
-        "review"
-    )
+    _schedule_review_start(background_tasks, request, cmd, claim_id)
     return {
         "status": "started",
         "mode": "contextual",
         "window_size": window_size,
+        "context_mode": context_mode,
         "batch_size": review_batch_size,
         "total_entries": total_entries,
         "estimated_calls": estimated_calls,
@@ -3482,18 +5317,39 @@ async def get_character_aliases():
 @router.post("/api/character_aliases")
 async def save_character_aliases(aliases: Dict[str, str]):
     """Overwrite the alias map (lets the user correct discovered nicknames before review)."""
-    cleaned = {k: v for k, v in aliases.items() if k.strip() and v.strip()}
-    try:
-        cleaned = get_validated_alias_graph(cleaned)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    with file_lock(CHARACTER_ALIASES_PATH):
-        atomic_json_write(cleaned, CHARACTER_ALIASES_PATH)
+    with alias_registry_admission(DATA_DIR):
+        cleaned = {k: v for k, v in aliases.items() if k.strip() and v.strip()}
+        try:
+            cleaned = get_saveable_alias_graph(cleaned)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        with file_lock(CHARACTER_ALIASES_PATH):
+            atomic_json_write(cleaned, CHARACTER_ALIASES_PATH, allow_nonatomic_fallback=False)
     return {"status": "saved", "count": len(cleaned)}
 
 
 class CastListBuildRequest(BaseModel):
     strip_front_matter: bool = True
+    incremental: Optional[StrictBool] = None
+    source_chars: Optional[int] = Field(default=None, ge=1, le=1200000, strict=True)
+    max_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
+
+
+def resolve_cast_build_settings(request=None, config=None):
+    from cast_list_settings import get_cast_list_settings
+    config = load_app_config(CONFIG_PATH) if config is None else config
+    return get_cast_list_settings(config, **{
+        name: getattr(request, name, None) for name in ("incremental", "source_chars", "max_tokens")})
+
+
+def build_cast_list_command(input_file, path, settings, strip_front_matter=True):
+    from cast_list_settings import get_cast_list_cli_args
+    # path was keyed by captured source bytes; the child refuses a later edit.
+    command = [sys.executable, "-u", "cast_list.py", input_file, "--out", path,
+               "--source-sha256", Path(path).stem, *get_cast_list_cli_args(settings)]
+    if not strip_front_matter:
+        command.append("--no-strip-front-matter")
+    return command
 
 
 class CastListUpdate(BaseModel):
@@ -3515,9 +5371,9 @@ async def build_cast_list_endpoint(background_tasks: BackgroundTasks,
     """Ask the model for everyone who speaks in the selected book, unnamed people
     included, and save it where generation will find it (#653)."""
     input_file, path = await asyncio.to_thread(get_current_cast_list_target)
-    cmd = [sys.executable, "-u", "cast_list.py", input_file, "--out", path]
-    if request is not None and not request.strip_front_matter:
-        cmd.append("--no-strip-front-matter")
+    settings = await asyncio.to_thread(resolve_cast_build_settings, request)
+    cmd = build_cast_list_command(input_file, path, settings,
+                                  request.strip_front_matter if request is not None else True)
     schedule_claimed_background_task(background_tasks, "cast_list", run_process, cmd, "cast_list")
     return {"status": "started"}
 
@@ -3585,19 +5441,51 @@ async def delete_cast_list():
 async def review_script_batch_start(request: BatchReviewRequest, background_tasks: BackgroundTasks):
     """Review multiple saved scripts from the Scripts library, in place.
     A shared alias registry keeps merged character names consistent across the batch."""
+    return await asyncio.to_thread(_with_review_startup, "batch_review", _start_batch_review, request, background_tasks)
+
+
+def get_unique_batch_script_names(names):
+    """Deduplicate requested books by their canonical saved destination.
+
+    ``secure_filename`` and platform case/inode aliasing can map several names
+    onto one saved-book file. Counting them separately would review the same
+    file twice and double-count its changes. The first spelling is kept so
+    user-facing messages do not change.
+    """
+    unique = []
+    seen = set()
+    for name in dict.fromkeys(names):
+        safe_name = secure_filename(name)
+        destination = (get_saved_book_destination_path(os.path.join(SCRIPTS_DIR, f"{safe_name}.json"))
+                       if safe_name else None)
+        if destination is not None and destination in seen:
+            continue
+        if destination is not None:
+            seen.add(destination)
+        unique.append(name)
+    return unique
+
+
+def _start_batch_review(request, background_tasks):
+    dedupe, discover, bidirectional = _resolve_batch_review_options(request)
+    effective_options = {"bidirectional": bidirectional,
+                         "find_nicknames": discover, "dedupe_speakers": dedupe}
     check_global_gpu_lock("batch_review")
     if not request.script_names:
         raise HTTPException(status_code=400, detail="No scripts selected.")
 
-    window = max(0, min(int(request.context_window or 0), 12))
-    dedupe = bool(request.dedupe_speakers)
-    discover = bool(request.find_nicknames) and dedupe
-    # A backward pass only adds value when discovery is on (it re-scans early books with the
-    # now-complete registry as hindsight context). With discovery off it would be a pure re-apply.
-    bidirectional = bool(request.bidirectional) and discover
+    _, window = get_validated_context_setting(
+        CONTEXT_MODE_ENTRIES, request.context_window, 0, minimum=0)
 
-    names = list(request.script_names)
+    names = get_unique_batch_script_names(request.script_names)
     total = len(names)
+    pending = {
+        "tasks": [{"name": name, "status": "pending"} for name in names],
+        "current_task_idx": -1, "current_pass": None,
+        "totals_fwd": _new_review_totals(), "totals_bwd": _new_review_totals(),
+        "aliases_fwd": [], "aliases_bwd": [], "diff_pool": {"text": [], "speaker": []},
+        "logs": [], "artifacts": [], "start_time": None, "run_id": None,
+    }
 
     def _run():
         with ensure_saved_book_state(DATA_DIR, SCRIPTS_DIR):
@@ -3606,13 +5494,7 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
         prefix = "bidirectional " if bidirectional else ""
         _init_batch_state(state,
                           [f"Starting {prefix}batch review of {total} script(s)..."],
-                          [{"name": n, "status": "pending"} for n in names])
-        state["bidirectional"] = bidirectional
-        state["totals_fwd"] = _new_review_totals()
-        state["totals_bwd"] = _new_review_totals()
-        state["aliases_fwd"] = []
-        state["aliases_bwd"] = []
-        state["diff_pool"] = {"text": [], "speaker": []}
+                          pending["tasks"])
 
         # One full on-disk log for the whole batch (in-memory list is a capped tail)
         log_path = _init_task_log("batch_review")
@@ -3626,6 +5508,8 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
             state["current_task_idx"] = i
             orig_status = state["tasks"][i].get("status")
             state["tasks"][i]["status"] = "running"
+            state["tasks"][i].pop("failure_message", None)
+            state["tasks"][i].pop("failure_kind", None)
 
             safe_name = secure_filename(name)
             if not safe_name:
@@ -3688,22 +5572,12 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
                         ", ".join(f"'{a['variant']}' -> '{a['canonical']}'" for a in new_aliases)
                     )
 
-            # Only clear checkpoint at the start of the first pass (forward).
-            # For bidirectional reviews, preserve the forward pass checkpoint
-            # so if the backward pass crashes, we can resume from where forward left off.
-            should_clear = True
-            if state.get("bidirectional") and state.get("current_pass") == "bwd":
-                # Don't clear checkpoint during backward pass - preserve forward progress
-                should_clear = False
-                if orig_status == "incomplete":
-                    # The forward pass on this book was VRAM-aborted and left behind
-                    # its own partial checkpoint (forward-pass progress/aliases). That
-                    # checkpoint isn't valid for the backward pass - reusing it would
-                    # silently splice forward-pass output into the backward result.
-                    should_clear = True
-
-            if should_clear:
-                clear_checkpoint(script_path)
+            # Ordinary retries keep their checkpoint: the child validates its
+            # execution and input identity (including --review-pass) before
+            # resuming, and discards a checkpoint it cannot bind. Only an
+            # explicit Start over retires progress before model work.
+            if request.start_over and tag != " [bwd]":
+                discard_review_progress(script_path)
 
             cmd = [
                 sys.executable, "-u",
@@ -3713,7 +5587,7 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
             ]
             if window > 0:
                 cmd += ["--context-window", str(window)]
-            cmd += get_review_force_args(request.force_review, backward=tag == " [bwd]")
+            cmd += get_review_force_args(request.force_review or request.start_over, backward=tag == " [bwd]")
             if dedupe:
                 cmd += ["--dedupe-speakers", "--alias-registry", registry_path]
                 companion = os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json")
@@ -3737,8 +5611,7 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
                     # or hit a VRAM abort with no recorded summary. Treat as
                     # incomplete rather than silently calling it "done".
                     state["tasks"][i]["status"] = "incomplete"
-                elif (stats.get("batches_failed", 0) > 0 or
-                      stats.get("batches_skipped_vram", 0) > 0):
+                elif _review_is_incomplete(stats):
                     # The reviewer bailed out early to avoid an OOM; entries past the
                     # abort point or failed batches were left unreviewed, and a checkpoint
                     # may remain on disk for a future resume. Don't report this book as done.
@@ -3776,6 +5649,11 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
                     })
             else:
                 state["tasks"][i]["status"] = "failed"
+                failure = _extract_review_failure(own_lines)
+                if failure:
+                    state["tasks"][i]["failure_message"] = failure["message"]
+                    if failure["kind"]:
+                        state["tasks"][i]["failure_kind"] = failure["kind"]
                 state["logs"].append(f"[{i+1}]{tag} Failed (exit {rc}): {name}")
             return True
 
@@ -3809,6 +5687,11 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
                 if state["cancel"]:
                     state["logs"].append("Batch review cancelled.")
                     break
+                forward_task = state["tasks"][i]
+                if (forward_task.get("status") != "done" or not forward_task.get("stats_fwd")):
+                    state["logs"].append(
+                        f"[{i+1}/{total}] [bwd] Skipping hindsight pass: {names[i]} has no verified complete forward review.")
+                    continue
                 if not _process_book(i, names[i], tag=" [bwd]"):
                     break
 
@@ -3830,13 +5713,34 @@ async def review_script_batch_start(request: BatchReviewRequest, background_task
             state["logs"].append(f"Wrote batch review report: {os.path.relpath(report_path, ROOT_DIR)}")
 
         state["running"] = False
-        state["logs"].append("Batch review finished.")
+        incomplete_count = sum(1 for task in state["tasks"] if task.get("status") == "incomplete")
+        if incomplete_count:
+            state["logs"].append(
+                f"Batch review finished with {incomplete_count} incomplete "
+                f"book(s); re-run those reviews to finish them.")
+        else:
+            state["logs"].append("Batch review finished.")
 
     destinations = [os.path.join(SCRIPTS_DIR, f"{secure_filename(name)}.json")
                     for name in names if secure_filename(name)]
-    schedule_claimed_background_task(background_tasks, "batch_review", _run_claimed_background_task,
-                                    "batch_review", _run, saved_destinations=destinations)
-    return {"status": "started", "task_count": total, "bidirectional": bidirectional}
+    trace = REVIEW_STARTUP.get()
+    def traced_run():
+        return trace.call('worker', _run) if trace else _run()
+    claim_id = reserve_background_task('batch_review', saved_destinations=destinations)
+    try:
+        with contextlib.ExitStack() as admission:
+            if request.start_over:
+                admission.enter_context(ensure_book_state(DATA_DIR))
+                _require_review_restart_book(request)
+            register_claimed_background_task(background_tasks, 'batch_review', claim_id,
+                                            _run_claimed_background_task, 'batch_review', traced_run)
+    except BaseException:
+        release_gpu_task_claim('batch_review', claim_id, pending_only=True)
+        raise
+    # BackgroundTasks starts after the response. Publish one coherent new-run
+    # view here so polling cannot pair new options with the previous tasks.
+    process_state["batch_review"].update(pending, **effective_options)
+    return {"status": "started", "task_count": total, **effective_options}
 
 
 
@@ -3871,6 +5775,7 @@ class BatchScriptRequest(BaseModel):
     # Build a whole-book cast list for each book that has none before
     # generating it (#653). Off by default: one extra request per book.
     build_cast_lists: bool = False
+    cast_list_settings: Optional[CastListBuildRequest] = None
 
 
 def _get_versioned_script_path(path: str) -> str:
@@ -4045,6 +5950,11 @@ def get_batch_script_sizing_identity(text, settings, context_windows, context_le
               "context_windows": get_context_rescue_windows(context_windows),
               "prompts": [load_segment_prompts(), load_attribute_prompts(),
                           load_instruct_prompts()]}
+    if settings.get("pass1_format") == "compact":
+        from compact_pass1 import COMPACT_SYSTEM, COMPACT_USER_TEMPLATE
+        inputs["compact_prompts"] = [COMPACT_SYSTEM, COMPACT_USER_TEMPLATE]
+    if settings.get("delivery_direction", "off") != "off":
+        inputs["delivery_prompts"] = load_instruct_prompts(settings["delivery_direction"])
     if is_three_pass_context_required(
             settings.get("chunk_size", 0), settings.get("attribute_context_chars", 0),
             settings.get("attribute_target_chars", 0), settings.get("instruct_target_chars", 0),
@@ -4054,10 +5964,29 @@ def get_batch_script_sizing_identity(text, settings, context_windows, context_le
                                     allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def get_cast_sizing_settings(settings, input_path, cast_settings=None):
+    """Bind discovery controls and known alias evidence to preflight identity."""
+    if cast_settings is not None:
+        settings = {key: value for key, value in settings.items() if key not in ("cast_aliases", "cast_discovery_settings")}
+        if cast_settings["incremental"]:
+            settings.update(cast_aliases=True, cast_discovery_settings=cast_settings)
+    if not settings.get("cast_aliases"):
+        return settings
+    if not input_path:
+        raise ValueError("Alias-aware sizing requires a source path")
+    path = get_existing_cast_list(input_path)
+    if not path:
+        return settings  # Discovery has not happened yet; runtime sizes the actual roster.
+    from three_pass_generate import load_cast
+    cast = load_cast(path)
+    return {**settings, "cast": {key: cast[key] for key in ("names", "alias_groups", "sha256")}}
+
+
 def get_batch_script_source_preflight(job, text, settings, context, context_windows):
     """Reuse this request's sizing summary only while its inputs still match."""
     if job.get("literal_source_preserving"):
         settings = {**settings, "literal_source_preserving": True}
+    settings = get_cast_sizing_settings(settings, job.get("input_path"), job.get("cast_list_settings"))
     receipt = (job.get("prepared_source") or {}).get("preflight")
     if receipt and receipt["identity"] == get_batch_script_sizing_identity(
             text, settings, context_windows, context):
@@ -4238,7 +6167,10 @@ def ensure_batch_script_output(job, state):
                 state["logs"].append(
                     f"[{job['index'] + 1}] Skipping — saved script "
                     f"'{os.path.basename(candidate)}' now exists.")
-                yield None
+                # "skipped" tells the worker the policy skipped the book; None
+                # stays reserved for a cancellation, which the worker maps to
+                # its own status (#2201).
+                yield "skipped"
                 return
             if resolved == candidate:
                 if action == "backup":
@@ -4254,12 +6186,41 @@ def ensure_batch_script_output(job, state):
 
 
 def _run_batch_script_job(job, state, log_path, total):
-    with ensure_batch_script_output(job, state) as prepared:
-        if prepared is None:
-            state["tasks"][job["index"]]["status"] = (
-                "cancelled" if state.get("cancel") else "failed")
-            return
-        _run_claimed_batch_script_job(prepared, state, log_path, total)
+    index = job["index"]
+    try:
+        with ensure_batch_script_output(job, state) as prepared:
+            if prepared is None:
+                state["tasks"][index]["status"] = (
+                    "cancelled" if state.get("cancel") else "failed")
+                return
+            if prepared == "skipped":
+                # The collision policy skipped this book before generation; it was
+                # never attempted, so it is not a failure (#2201).
+                state["tasks"][index]["status"] = "skipped"
+                return
+            _run_claimed_batch_script_job(prepared, state, log_path, total)
+    except Exception as error:
+        # A worker that raises (e.g. the subprocess could not be started) left
+        # its row "running" forever and only the first future's error reached
+        # the log, because the loop stops at the first future.result() raise
+        # (#2271). Terminal state and a per-book log line belong to the worker
+        # itself so every failure is reported and the book is never left live.
+        task = state["tasks"][index]
+        if task.get("status") == "done":
+            # The book was already generated and saved; a later cleanup failure
+            # must not deny that published success, but it must not vanish
+            # either. Keep the row and report the error for the run.
+            state["logs"].append(
+                f"[{index + 1}] Cleanup failed after "
+                f"'{task.get('saved_as', job['safe_stem'])}' was saved: {error}")
+        else:
+            # A real exception is a failure even while a cancel is in flight:
+            # the run history records the error as failed, so the row must
+            # agree, and the error is always logged (#2271).
+            task["status"] = "failed"
+            state["logs"].append(
+                f"[{index + 1}] Failed: {job['filename']} — {error}")
+        raise
 
 
 def _run_claimed_batch_script_job(job, state, log_path, total):
@@ -4273,10 +6234,10 @@ def _run_claimed_batch_script_job(job, state, log_path, total):
     if state.get("run_id"):
         env["ALEXANDRIA_RUN_ID"] = state["run_id"]
     if job.get("build_cast_list") and not get_existing_cast_list(job["input_path"]):
-        cast_command = [sys.executable, "-u", "cast_list.py", job["input_path"],
-                        "--out", get_cast_list_path(job["input_path"], DATA_DIR)]
-        if not job.get("strip_front_matter", True):
-            cast_command.append("--no-strip-front-matter")
+        cast_command = build_cast_list_command(
+            job["input_path"], get_cast_list_path(job["input_path"], DATA_DIR),
+            job.get("cast_list_settings") or resolve_cast_build_settings(),
+            job.get("strip_front_matter", True))
         cast_rc, _ = _stream_subprocess_to_logs(
             cast_command, BASE_DIR, state, log_prefix=f"[{index + 1}] ",
             log_file=log_path, env=env)
@@ -4294,6 +6255,7 @@ def _run_claimed_batch_script_job(job, state, log_path, total):
         first_person_narrator=job.get("first_person_narrator"),
         reasoning_effort=get_active_reasoning_effort(),
         cast_file=get_existing_cast_list(job["input_path"]),
+        cast_aliases=(job.get("cast_list_settings") or {}).get("incremental"),
         **({"literal_source_preserving": True} if job.get("literal_source_preserving") else {}),
     )
     rc, _ = _stream_subprocess_to_logs(
@@ -4323,6 +6285,8 @@ def get_prepared_batch_script_jobs(request):
         if getattr(request, "literal_source_preserving", False):
             jobs = [{**job, "literal_source_preserving": True} for job in jobs]
         config = load_app_config(CONFIG_PATH)
+        cast_settings = resolve_cast_build_settings(getattr(request, "cast_list_settings", None), config)
+        jobs = [{**job, "cast_list_settings": cast_settings} for job in jobs]
         settings = resolve_three_pass_generation_settings(config)
         if getattr(request, "literal_source_preserving", False):
             settings["literal_source_preserving"] = True
@@ -4341,9 +6305,10 @@ def get_prepared_batch_script_jobs(request):
             text, normalizations, identity = _capture_and_validate_batch_script_source(job)
             if get_batch_script_source_identity(job["input_path"]) != identity:
                 raise ValueError(f"Source changed while preparing: {job['filename']}")
-            sizing_identity = get_batch_script_sizing_identity(text, settings, context_windows, context)
+            book_settings = get_cast_sizing_settings(settings, job["input_path"], job.get("cast_list_settings"))
+            sizing_identity = get_batch_script_sizing_identity(text, book_settings, context_windows, context)
             report = build_three_pass_request_preflight(
-                text, settings, context, 1, context_windows=context_windows)
+                text, book_settings, context, 1, context_windows=context_windows)
             prepared.append({**job, "prepared_source": {
                 "identity": identity, "text": text, "normalizations": normalizations,
                 "preflight": {
@@ -4402,7 +6367,11 @@ async def generate_script_batch_start(request: BatchScriptRequest, background_ta
                 state["logs"].append(
                     f"[{i+1}] Skipping — saved script '{safe_stem}' already exists. "
                     "Choose version or replace explicitly.")
-                state["tasks"][i]["status"] = "failed"
+                # A policy skip never attempted the book, so it is neither a
+                # failure nor a cancellation (#2201); reporting it as failed
+                # made a re-run of a finished batch read as N failures with
+                # checkpoints that do not exist.
+                state["tasks"][i]["status"] = "skipped"
                 continue
             if action == "version":
                 if was_reserved and request.collision_policy == "replace":
@@ -4417,6 +6386,7 @@ async def generate_script_batch_start(request: BatchScriptRequest, background_ta
                          "output_path": output_path, "safe_stem": safe_stem,
                          "strip_front_matter": request.strip_front_matter,
                          "build_cast_list": request.build_cast_lists,
+                         "cast_list_settings": prepared_jobs[i]["cast_list_settings"],
                          **({"literal_source_preserving": True} if getattr(request, "literal_source_preserving", False) else {}),
                          "first_person_narrator": prepared_jobs[i]["first_person_narrator"],
                          "prepared_source": prepared_jobs[i]["prepared_source"],
@@ -4430,7 +6400,8 @@ async def generate_script_batch_start(request: BatchScriptRequest, background_ta
             llm = get_active_llm_config(config)
             _, _, settings_message = ensure_ideal_settings(
                 config.get("llm_mode", "local"), llm.get("base_url", ""),
-                llm.get("model_name", ""), config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
+                llm.get("model_name", ""), config.get("llm_remote_ssh"), api_key=llm.get("api_key"),
+                authorization=get_effective_authorization(llm), llm_config=llm)
             state["logs"].append(f"Batch LM Studio preflight: {settings_message}")
             workers, worst, context = _get_batch_script_workers(jobs)
             state["workers"] = workers
@@ -4490,40 +6461,77 @@ async def get_annotated_script_diff():
     return await asyncio.to_thread(_ensure_annotated_script_diff)
 
 
-def _ensure_annotated_script_diff():
+def _ensure_annotated_script_diff(*, expected_source_sha256=None):
     """Compare annotation with the same source policy as editor merge admission."""
+    result = _read_annotated_script_comparison(expected_source_sha256=expected_source_sha256)
+    if result['status'] == 'not_built':
+        raise HTTPException(status_code=404, detail="No annotated script found")
+    if result['status'] == 'unavailable':
+        raise HTTPException(status_code=404, detail=result['reason'])
+    return result
+
+
+def _read_annotated_script_comparison(*, expected_source_sha256=None):
     with ensure_book_state(DATA_DIR):
         _require_published_selection()
         if not os.path.exists(SCRIPT_PATH):
-            raise HTTPException(status_code=404, detail="No annotated script found")
+            return {'status': 'not_built'}
         state = safe_load_json(os.path.join(DATA_DIR, "state.json"), {})
         with open(SCRIPT_PATH, "rb") as stream:
             script_bytes = stream.read()
         entries = json.loads(script_bytes)
         if not isinstance(entries, list):
             raise HTTPException(status_code=400, detail="Script is not a list of entries")
-        result = get_source_integrity(state, script_bytes, entries, comparison="annotated script")
-        if result["status"] == "unavailable":
-            raise HTTPException(status_code=404, detail=result["reason"])
+        binding = {} if expected_source_sha256 is None else {'expected_source_sha256': expected_source_sha256}
+        result = get_source_integrity(state, script_bytes, entries, comparison="annotated script", **binding)
         return result
 
 
 @router.get("/api/status")
 async def get_task_statuses():
-    """Discover registered tasks without serializing logs or live process handles."""
-    return {name: {"running": is_task_running(name, states=process_state)}
-            for name, state in process_state.items()}
+    """Discover registered tasks without serializing logs or live process handles.
+
+    ``start_time`` is surfaced per task here, and only for tasks whose entry
+    actually carries the key, so a client can tell "no run started since boot"
+    (present null) apart from "unknown" (absent). It is deliberately not added
+    to ``get_task_lifecycle``, which other routes spread into richer payloads.
+    """
+    statuses = {}
+    for name in process_state:
+        lifecycle = get_task_lifecycle(name, states=process_state)
+        state = process_state.get(name) or {}
+        if 'start_time' in state:
+            lifecycle['start_time'] = state.get('start_time')
+        statuses[name] = lifecycle
+    return statuses
 
 
 @router.get("/api/status/{task_name}")
 async def get_status(task_name: str, include_health: bool = False):
     if task_name not in process_state:
         raise HTTPException(status_code=404, detail="Task not found")
-    state = dict(process_state[task_name])
+    def get_snapshot():
+        import core
+        with (core._gpu_lock if task_name == 'script' else contextlib.nullcontext()):
+            status = dict(process_state[task_name])
+            lifecycle = get_task_lifecycle(task_name, states={task_name: status})
+            if task_name == 'script':
+                owner = core._task_claims.get(task_name, {})
+                if lifecycle.get('worker_pending'):
+                    # A reservation is busy, but has no worker activity yet.
+                    cancelled = not owner.get('defer_process_state') and status.get('cancel', False)
+                    status = {'logs': [], 'start_time': None, 'cancel': cancelled,
+                              'paused': False, 'cpu_only': owner.get('cpu_only', False),
+                              'accepts_manual_requests': False}
+                status['task_claim_id'] = owner.get('id')
+            status.update(lifecycle)
+            return status
+
+    state = await asyncio.to_thread(get_snapshot) if task_name == 'script' else get_snapshot()
     # Export evidence has its own book-token gate and bounded explicit view.
     for key in ('export_quality_reports', 'export_quality_rejections', 'export_quality_attempt'):
         state.pop(key, None)
-    state["running"] = is_task_running(task_name, states={task_name: state})
+    state.pop('_windows_cleanup_failed', None)
     state.pop("process", None)
     state.pop("processes", None)
     if task_name == "batch_review":
@@ -4547,7 +6555,10 @@ async def get_status(task_name: str, include_health: bool = False):
     return state
 
 
-_STAGE_HINT_RE = re.compile(r"^(Step \d \([a-z]+\): .*|Retrying\.\.\..*|Warning: .*)$")
+_BATCH_LOG_PREFIX_RE = re.compile(r"^\[\d+\] ")
+_STAGE_HINT_RE = re.compile(r"^(Step \d \([a-z]+\): .*|Reviewing batch(?:es)? \d.*|"
+                            + re.escape(SPEAKER_MERGE_MARKER) +
+                            r" .*|Retrying\.\.\..*|Warning: .*)$")
 
 
 def _stage_hint(logs):
@@ -4556,19 +6567,29 @@ def _stage_hint(logs):
     'Step 2 (speakers): window 2 of 4 · Retrying... (attempt 2 of 4)'."""
     hints = []
     for line in reversed(logs[-40:]):
-        if _STAGE_HINT_RE.match(line.strip()):
-            hints.append(line.strip())
-            if line.strip().startswith("Step"):
+        # Batch review prefixes each book's output with "[2] "; strip it so a
+        # per-book stage (including the alias-merge stage, #2037) is still
+        # recognised in the batch task's log.
+        text = _BATCH_LOG_PREFIX_RE.sub("", line.strip())
+        if _STAGE_HINT_RE.match(text):
+            hints.append(text)
+            if text.startswith(("Step", "Reviewing batch", SPEAKER_MERGE_MARKER)):
                 break
     return " · ".join(reversed(hints))
+
+
+def _read_manual_pending_locked(path):
+    data = read_manual_pending_locked(path)
+    return data if data is not None and is_manual_request_owner_alive(data) else None
 
 
 def read_manual_pending():
     """The request a live manual-transport owner is waiting on, or None."""
     path = os.path.join(manual_llm_dir(DATA_DIR), "pending.json")
-    data = safe_load_json(path, None)
-    return (data if isinstance(data, dict) and data.get("id")
-            and is_manual_request_owner_alive(data) else None)
+    if not os.path.isdir(os.path.dirname(path)):
+        return None
+    with file_lock(path):
+        return _read_manual_pending_locked(path)
 
 
 class ManualReply(BaseModel):
@@ -4593,23 +6614,48 @@ async def manual_llm_response(reply: ManualReply):
     """The user's (or their script's) answer to the pending request. Whether
     the content is acceptable is the pipeline's call - a rejected paste comes
     back as the next pending request, carrying the retry prompt."""
-    pending = await asyncio.to_thread(read_manual_pending)
-    if not pending:
-        raise HTTPException(status_code=409, detail="No request is waiting for a reply.")
-    if reply.id != pending["id"]:
-        raise HTTPException(status_code=409, detail="That request is no longer the one waiting; reload the prompt.")
-    atomic_json_write({"id": reply.id, "content": reply.content, "received": time.time()},
-                      os.path.join(manual_llm_dir(DATA_DIR), "response.json"))
-    return {"accepted": True, "sequence": pending["sequence"]}
+    def save_reply():
+        directory = manual_llm_dir(DATA_DIR)
+        if os.path.isdir(directory):
+            with file_lock(os.path.join(directory, "pending.json")):
+                pending = _read_manual_pending_locked(os.path.join(directory, "pending.json"))
+                if pending:
+                    if reply.id != pending["id"]:
+                        raise HTTPException(status_code=409, detail="That request is no longer the one waiting; reload the prompt.")
+                    atomic_json_write({"id": reply.id, "content": reply.content, "received": time.time()},
+                                      os.path.join(directory, "response.json"), allow_nonatomic_fallback=False)
+                    return {"accepted": True, "sequence": pending["sequence"]}
+        raise AppError(409, "No request is waiting for a reply.", key="error.manual_llm.no_pending_request")
+    return await asyncio.to_thread(save_reply)
 
 
 @router.get("/api/logs/{task_name}")
 async def get_task_log(task_name: str, download: bool = False):
     """Serve the complete on-disk log for a task (the in-memory status only keeps a
     capped tail). Use ?download=true to download the file."""
+    if task_name == 'diagnostics':
+        trace = await asyncio.to_thread(read_trace, get_failure_log_path())
+        headers = {'Content-Disposition': 'attachment; filename="diagnostics.log"'} if download else None
+        return StreamingResponse(iter((trace or b'# No failure diagnostics recorded yet.\n',)),
+                                 media_type='text/plain', headers=headers)
     if task_name not in process_state:
         raise HTTPException(status_code=404, detail="Task not found")
     log_path = _task_log_path(task_name)
+    trace_path = _get_review_startup_path(task_name)
+    trace = await asyncio.to_thread(read_trace, trace_path) if task_name in ('review', 'batch_review') else b''
+    if task_name in ('review', 'batch_review') and not trace and not os.path.exists(log_path):
+        trace = b'# No review startup events yet. Start a review, then download again.\n'
+    if trace:
+        def content():
+            yield b'# Review startup trace (correlate by id; worker log follows)\n'
+            yield trace
+            if os.path.exists(log_path):
+                yield b'\n# Worker log\n'
+                with open(log_path, 'rb') as stream:
+                    while chunk := stream.read(65536):
+                        yield chunk
+        headers = {'Content-Disposition': f'attachment; filename="{task_name}.log"'} if download else None
+        return StreamingResponse(content(), media_type='text/plain', headers=headers)
     if not os.path.exists(log_path):
         raise HTTPException(status_code=404, detail="No log file for this task yet.")
     filename = f"{task_name}.log"
@@ -4700,7 +6746,8 @@ def start_delivery_retry(background_tasks, request):
             model = llm.get("model_name", "")
             _, status, message = ensure_ideal_settings(
                 config.get("llm_mode", "local"), llm.get("base_url", "http://localhost:1234/v1"),
-                model, ssh_alias=config.get("llm_remote_ssh"), api_key=llm.get("api_key"))
+                model, ssh_alias=config.get("llm_remote_ssh"), api_key=llm.get("api_key"),
+                authorization=get_effective_authorization(llm), llm_config=llm)
             state["logs"].append(message)
             check_cancel()
             generation_settings = resolve_three_pass_generation_settings(config)
@@ -4758,6 +6805,7 @@ async def get_delivery_retry_status(claim_id: str):
     import core
     with core._gpu_lock:
         owner = core._task_claims.get("script")
-        running = owner is not None and owner["id"] == claim_id
-        return {"running": running,
-                "logs": list(process_state["script"].get("logs", []))[-20:] if running else []}
+        matches = owner is not None and owner["id"] == claim_id
+        lifecycle = get_task_lifecycle('script', states=process_state) if matches else get_task_lifecycle('', states={})
+        return {**lifecycle,
+                "logs": list(process_state["script"].get("logs", []))[-20:] if matches else []}

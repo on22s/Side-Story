@@ -1046,7 +1046,11 @@ def get_validated_word_segments(word_segments, audio_duration):
             if not isinstance(value, Real) or isinstance(value, bool):
                 raise ValueError(
                     f"ASR word segment {index} has non-numeric {label}")
-            if not math.isfinite(float(value)):
+            try:
+                finite = math.isfinite(float(value))
+            except OverflowError:
+                finite = False
+            if not finite:
                 raise ValueError(
                     f"ASR word segment {index} has non-finite {label}")
         start = float(start)
@@ -1584,7 +1588,7 @@ def _load_existing_checkpoint(temp_dir):
     if truncated:
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=temp_dir,
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=temp_dir,
                                              prefix=".metadata-repair-", delete=False) as f:
                 temporary = f.name
                 f.writelines(good_lines)
@@ -1993,6 +1997,40 @@ def _check_llm_fail_rate(stats):
             f"unannotated raw text) but check the LLM connection."
         )
 
+
+def get_average_word_confidence(word_segments):
+    """Average ASR word confidence, refusing values the filter cannot read.
+
+    Hardening, not a user-visible crash fix: annotate_chunks verifies the ASR
+    artifact's sha256 before reading it (is_verified_artifact), so an edited
+    file is refused earlier. The remaining source is an ASR provider whose
+    confidence get_validated_word_segments does not check. A boolean, string,
+    None, NaN or an integer too large for float() would otherwise become an
+    opaque TypeError/OverflowError or a NaN that silently passes the
+    ``< min_confidence`` test; the caller drops the chunk instead so a corrupt
+    value cannot stand in for a quality measurement.
+
+    Valid values are averaged exactly as before: np.mean over the original
+    validated values, so integer and numpy dtypes keep their base behaviour
+    (an empty list still yields 1.0).
+    """
+    values = []
+    for index, segment in enumerate(word_segments):
+        value = segment.get("confidence", 1.0)
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(
+                f"ASR word segment {index} has non-numeric confidence")
+        try:
+            finite = math.isfinite(float(value))
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(
+                f"ASR word segment {index} has non-finite confidence")
+        values.append(value)
+    return np.mean(values) if values else 1.0
+
+
 def annotate_chunks(word_segments, model_path, chunk_size, audio_24k_source,
                     resume=False, audio_source_path=None, fallback_model_path=None,
                     source_state=None, source_threshold=0.65, keep_unaligned=False,
@@ -2321,14 +2359,24 @@ def annotate_chunks(word_segments, model_path, chunk_size, audio_24k_source,
                         timing['audio_read'] += time.monotonic() - t0
 
                         # Check confidence
-                        confidences = [w.get("confidence", 1.0) for w in chunk_word_data]
-                        avg_confidence = np.mean(confidences) if confidences else 1.0
-                        if avg_confidence < min_confidence:
+                        try:
+                            avg_confidence = get_average_word_confidence(
+                                chunk_word_data)
+                        except ValueError as confidence_error:
                             drop_chunk = True
-                            reason_rejected = f"low_confidence ({avg_confidence:.2f} < {min_confidence})"
+                            reason_rejected = f"invalid_confidence ({confidence_error})"
                             stats['source_action']['dropped_low_quality'] += 1
                             timing['dropped_chunks'] += 1
-                            logger.info(f"  ↪ DROPPED chunk at {current_start:.2f}s ({reason_rejected})")
+                            logger.warning(
+                                f"  ↪ DROPPED chunk at {current_start:.2f}s "
+                                f"({reason_rejected})")
+                        else:
+                            if avg_confidence < min_confidence:
+                                drop_chunk = True
+                                reason_rejected = f"low_confidence ({avg_confidence:.2f} < {min_confidence})"
+                                stats['source_action']['dropped_low_quality'] += 1
+                                timing['dropped_chunks'] += 1
+                                logger.info(f"  ↪ DROPPED chunk at {current_start:.2f}s ({reason_rejected})")
 
                         # Check SNR
                         if not drop_chunk:
@@ -3489,6 +3537,7 @@ def main():
     audio_24k_scratch = audio_24k_path  # for the finally block cleanup
 
     decode_temp_dir = None
+    decoded_audio_mapping = None
     diarization_temp_dir = None
     try:
         if args.phase == "asr":
@@ -3518,6 +3567,7 @@ def main():
                     args.audio, audio_24k_path,
                     os.path.join(decode_temp_dir.name, "audio_16k.f32"),
                     **({"channel": args.audio_channel} if args.audio_channel != "mix" else {}))
+                decoded_audio_mapping = audio_16k
                 sf_info_24k = sf.info(audio_24k_path)
                 duration_secs = sf_info_24k.duration
                 logger.info(f"  Audio: {duration_secs:.1f}s @ {sf_info_24k.frames} samples (loaded in {time.monotonic()-load_t0:.1f}s)")
@@ -3724,7 +3774,7 @@ def main():
                 enrich_cmd.append("--emotional-tone")
 
             logger.info(f"▶ Running LLM enrichment: {' '.join(enrich_cmd)}")
-            res = subprocess.run(enrich_cmd)
+            res = run_phase(enrich_cmd)
             if res.returncode != 0:
                 logger.error(f"LLM enrichment failed with exit code {res.returncode}")
                 sys.exit(res.returncode)
@@ -3907,6 +3957,10 @@ def main():
     finally:
         if diarization_temp_dir is not None:
             diarization_temp_dir.cleanup()
+        if decoded_audio_mapping is not None:
+            # Slices and backend references can outlive audio_16k. Release our
+            # backing handle explicitly before removing its directory on Windows.
+            decoded_audio_mapping._mmap.close()
         if decode_temp_dir is not None:
             decode_temp_dir.cleanup()
         # Only clean up the scratch audio file after the final phase (annotation)
