@@ -126,7 +126,7 @@ TTS 权重在首次使用相应变体时下载，通常每个变体约 3.5 GB。
 
 普通 Pinokio/本地安装应备份 `app/config.json`、当前项目的 JSON 文件、`app/uploads/`、`voicelines/`、已保存脚本及声音/数据集/模型库。这些生成文件不会由 Git 自动备份。`ALEXANDRIA_DATA_DIR` 可移动应用数据目录，`ALEXANDRIA_CONFIG_PATH` 独立指定配置文件；请备份实际配置的路径。
 
-**Reset 会删除当前项目数据。** 它会删除默认位置的当前脚本、声音分配、片段/状态文件、生成的语音、合并 MP3 及 `app/config.json`，保留可复用的库。当前重置脚本针对默认仓库路径，不应假定它也会清空自定义数据/配置目录。操作前请核对 [reset.js](reset.js)。
+**Reset 会删除当前项目数据。** 它会直接删除（不再确认）当前脚本、声音分配、片段/状态文件、生成与审校检查点、音效提示、撤销文件、生成的语音、**所有已导出的成品**（MP3、M4B、Audacity ZIP、混音有声书、同步朗读文件和 `chapter_exports/`）以及设置文件。已保存的脚本、上传文件、声音/数据集/模型库、发音表和录音历史会保留。Reset 作用于实际配置的数据目录：如果启动器设置了 `ALEXANDRIA_DATA_DIR`，清空的是该目录，而不是仓库目录。需要保留的成品请先复制出来。Reset 需要 **Install** 安装的应用环境。操作前请核对 [reset.js](reset.js) 和 [app/reset_artifact_roots.py](app/reset_artifact_roots.py)。
 
 ## 其他安装方式与可选工具
 

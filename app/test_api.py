@@ -272,7 +272,7 @@ def test_save_review_prompts_roundtrip():
         "prompts": {
             **(original.get("prompts") or {}),
             "review_system_prompt": f"{TEST_PREFIX}review_sys",
-            "review_user_prompt": f"{TEST_PREFIX}review_usr",
+            "review_user_prompt": f"{TEST_PREFIX}review_usr {{context}} {{batch}}",
         },
         "generation": original.get("generation"),
     }
@@ -286,7 +286,7 @@ def test_save_review_prompts_roundtrip():
     prompts = readback.get("prompts", {})
     if prompts.get("review_system_prompt") != f"{TEST_PREFIX}review_sys":
         raise TestFailure(f"review_system_prompt not persisted: {prompts.get('review_system_prompt')}")
-    if prompts.get("review_user_prompt") != f"{TEST_PREFIX}review_usr":
+    if prompts.get("review_user_prompt") != f"{TEST_PREFIX}review_usr {{context}} {{batch}}":
         raise TestFailure(f"review_user_prompt not persisted: {prompts.get('review_user_prompt')}")
 
     # Restore original
